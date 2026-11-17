@@ -69,6 +69,21 @@ bench/         benchmarks and results
 docs/          plan, design, upstream research
 ```
 
+## Toolchain
+
+The pin is **Zig `0.17.0-dev.1857+3c46da14d`**: `minimum_zig_version` in `build.zig.zon`, `deps.yaml`
+for pantry, and the CI workflow all name it, and CI fails if they disagree. Install it with pantry
+(`pantry install` in the repo) or from a ziglang.org mirror that still serves that dev build.
+
+Changes in this dev std that bite ported code and memory of older Zig:
+
+- `std.time.Timer`, `std.time.nanoTimestamp` and `std.fs.cwd()` are gone; clocks and files take an
+  `Io`. Use the IO shim (`src/infra/io.zig`) instead of reaching for them.
+- The `**` array repetition operator is gone: write `var a: [100]u64 = @splat(0);`.
+- `std.ArrayList(T){}` no longer initialises: use `.empty`.
+- `b.args` is gone in build scripts: use `run.addPassthruArgs()`.
+- Dependencies are fetched into `./zig-pkg/` (gitignored), so format-check named paths, not `.`.
+
 ## Commands
 
 ```bash
@@ -76,7 +91,11 @@ zig build test
 ```
 
 ```bash
-zig fmt --check .
+zig fmt --check build.zig build.zig.zon src test
+```
+
+```bash
+zig build -Doptimize=ReleaseFast
 ```
 
 `zr bench` and `zr diff` (Phase 0) are how performance and parity are proven; use them once they
