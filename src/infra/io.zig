@@ -171,10 +171,12 @@ pub const File = struct {
         _ = c.close(self.fd);
     }
 
+    /// File size via lseek (portable: glibc does not export fstat as a
+    /// plain symbol). Leaves the file offset at the end; reads use pread.
     pub fn size(self: File) Error!u64 {
-        var st: c.Stat = undefined;
-        _ = try checkInt(c.fstat(self.fd, &st));
-        return @intCast(st.size);
+        const end = c.lseek(self.fd, 0, c.SEEK.END);
+        if (end < 0) return fail(@as(c_int, -1));
+        return @intCast(end);
     }
 
     /// Reads up to `buf.len` bytes at `offset`. Returns the count read (0 at end).
@@ -577,7 +579,7 @@ pub const Poller = struct {
         if (is_linux) {
             const linux = std.os.linux;
             var ev: c.epoll_event = .{
-                .events = (if (interest == .read) linux.EPOLL.IN else linux.EPOLL.OUT) | linux.EPOLL.ONESHOT | linux.EPOLL.RDHUP,
+                .events = @as(u32, if (interest == .read) linux.EPOLL.IN else linux.EPOLL.OUT) | linux.EPOLL.ONESHOT | linux.EPOLL.RDHUP,
                 .data = .{ .u64 = token },
             };
             if (c.epoll_ctl(self.fd, linux.EPOLL.CTL_MOD, fd, &ev) < 0) {
