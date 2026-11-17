@@ -99,6 +99,16 @@ zig fmt --check build.zig build.zig.zon src test packages
 zig build -Doptimize=ReleaseFast
 ```
 
+Before pushing from macOS, cross-compile for Linux: production runs there, and OS-specific code
+(epoll, glibc symbols) otherwise only fails in CI.
+
+```bash
+zig build test -Dtarget=x86_64-linux-gnu
+```
+
+That command ends by reporting that the host cannot run Linux binaries; that is expected. Any
+`error:` line before it is a real failure.
+
 `zr bench` and `zr diff` (Phase 0) are how performance and parity are proven; use them once they
 exist.
 
