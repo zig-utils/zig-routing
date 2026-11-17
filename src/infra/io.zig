@@ -502,6 +502,39 @@ pub const Stream = struct {
         }
     }
 
+    /// One writev call: returns the bytes written (possibly fewer than the
+    /// total) or WouldBlock on a nonblocking socket that cannot take more.
+    pub fn writev(self: Stream, buffers: []const []const u8) Error!usize {
+        var iov: [16]c.iovec_const = undefined;
+        var n: usize = 0;
+        for (buffers) |b| {
+            if (b.len == 0) continue;
+            if (n == iov.len) break;
+            iov[n] = .{ .base = b.ptr, .len = b.len };
+            n += 1;
+        }
+        if (n == 0) return 0;
+        while (true) {
+            const rc = c.writev(self.fd, &iov, @intCast(n));
+            if (rc < 0 and c.errno(rc) == .INTR) continue;
+            return checkSize(rc);
+        }
+    }
+
+    /// Whether the peer has closed its side, checked without blocking or
+    /// consuming data (a zero-byte peek). Used to cancel work for a client
+    /// that went away.
+    pub fn peerClosed(self: Stream) bool {
+        var b: [1]u8 = undefined;
+        const rc = c.recv(self.fd, &b, 1, c.MSG.PEEK | c.MSG.DONTWAIT);
+        if (rc == 0) return true;
+        if (rc < 0) {
+            const e = c.errno(rc);
+            return e != .AGAIN and e != .INTR;
+        }
+        return false;
+    }
+
     pub fn shutdownWrite(self: Stream) void {
         _ = c.shutdown(self.fd, 1);
     }

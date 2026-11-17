@@ -2,6 +2,8 @@
 
 const std = @import("std");
 
+pub const http = @import("http.zig");
+
 test {
     std.testing.refAllDecls(@This());
 }
