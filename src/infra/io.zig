@@ -847,3 +847,39 @@ pub fn sleepMs(ms: u64) void {
     var ts: c.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
     while (c.nanosleep(&ts, &ts) != 0) {}
 }
+
+// ---------------------------------------------------------------------------
+// Directory walking
+// ---------------------------------------------------------------------------
+
+/// Calls `visit(context, path)` for every regular file under `root`,
+/// recursively. Paths are built in a stack buffer and valid only during the
+/// call. Symlinks and special files are skipped; unreadable directories are
+/// skipped silently (as upstream's recursive_directory_iterator use treats
+/// them as absent data).
+pub fn walkFiles(root: []const u8, context: anytype, comptime visit: fn (@TypeOf(context), []const u8) void) void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (root.len >= buf.len) return;
+    @memcpy(buf[0..root.len], root);
+    walkDir(&buf, root.len, context, visit, 0);
+}
+
+fn walkDir(buf: *[std.fs.max_path_bytes]u8, len: usize, context: anytype, comptime visit: fn (@TypeOf(context), []const u8) void, depth: u32) void {
+    if (depth > 32) return;
+    buf[len] = 0;
+    const dir = c.opendir(@ptrCast(buf)) orelse return;
+    defer _ = c.closedir(dir);
+    while (c.readdir(dir)) |entry| {
+        const name = std.mem.sliceTo(&entry.name, 0);
+        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+        if (len + 1 + name.len >= buf.len) continue;
+        buf[len] = '/';
+        @memcpy(buf[len + 1 ..][0..name.len], name);
+        const sub_len = len + 1 + name.len;
+        switch (entry.type) {
+            c.DT.DIR => walkDir(buf, sub_len, context, visit, depth + 1),
+            c.DT.REG => visit(context, buf[0..sub_len]),
+            else => {},
+        }
+    }
+}

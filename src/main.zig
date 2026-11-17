@@ -1,6 +1,6 @@
 //! zr: the zig-routing command line.
 //!
-//!   zr serve [--host 0.0.0.0] [--port 8002] [--threads N]
+//!   zr serve [--host 0.0.0.0] [--port 8002] [--threads N] [--elevation DIR]
 //!   zr version
 //!
 //! Argument handling moves to zig-cli with the CLI skeleton issue; this
@@ -24,11 +24,12 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (!std.mem.eql(u8, cmd, "serve")) {
-        std.debug.print("usage: zr serve [--host IP] [--port N] [--threads N]\n       zr version\n", .{});
+        std.debug.print("usage: zr serve [--host IP] [--port N] [--threads N] [--elevation DIR]\n       zr version\n", .{});
         return;
     }
 
     var config: http.Config = .{ .address = io.Address.any(8002) };
+    var elevation_dir: ?[]const u8 = null;
     var i: usize = 1;
     while (i + 1 < args.items.len) : (i += 2) {
         const flag = args.items[i];
@@ -39,6 +40,8 @@ pub fn main(init: std.process.Init) !void {
             config.threads = try std.fmt.parseInt(usize, value, 10);
         } else if (std.mem.eql(u8, flag, "--host")) {
             config.address.ip = try parseIp4(value);
+        } else if (std.mem.eql(u8, flag, "--elevation")) {
+            elevation_dir = value;
         } else {
             std.debug.print("unknown option {s}\n", .{flag});
             return error.InvalidArgument;
@@ -47,6 +50,14 @@ pub fn main(init: std.process.Init) !void {
 
     io.installTerminationHandler();
     var svc: service.Service = .{};
+    var tiles: ?routing.elevation.hgt.Tiles = null;
+    defer if (tiles) |*t| t.deinit();
+    if (elevation_dir) |dir| {
+        tiles = try routing.elevation.hgt.Tiles.init(std.heap.c_allocator, dir);
+        svc.state = &tiles.?;
+        svc.register(.height, routing.api.height_action.handle);
+        std.debug.print("elevation: {d} tiles under {s}\n", .{ tiles.?.count, dir });
+    }
     var server = http.Server.init(std.heap.c_allocator, config, svc.handler());
     try server.start();
     std.debug.print("zr {s} listening on {d}.{d}.{d}.{d}:{d} with {d} workers\n", .{ routing.version, config.address.ip[0], config.address.ip[1], config.address.ip[2], config.address.ip[3], server.port, server.threads.items.len });
