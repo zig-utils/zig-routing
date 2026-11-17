@@ -2,6 +2,16 @@
 
 const std = @import("std");
 
+pub const constants = @import("constants.zig");
+pub const point = @import("point.zig");
+pub const aabb = @import("aabb.zig");
+pub const polyline = @import("polyline.zig");
+
+pub const PointLL = point.PointLL;
+pub const FixedLL = point.FixedLL;
+pub const DistanceApproximator = point.DistanceApproximator;
+pub const AABB = aabb.AABB;
+
 test {
     std.testing.refAllDecls(@This());
 }
