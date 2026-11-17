@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  # The one pinned toolchain. build.zig.zon and deps.yaml must name the same build.
+  ZIG_VERSION: 0.17.0-dev.1857+3c46da14d
+
+jobs:
+  pin:
+    name: Toolchain pin agrees
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: build.zig.zon and deps.yaml match the CI pin
+        run: |
+          zon=$(grep -o 'minimum_zig_version = "[^"]*"' build.zig.zon | cut -d'"' -f2)
+          deps=$(grep -o 'zig: .*' deps.yaml | cut -d' ' -f2)
+          echo "ci=$ZIG_VERSION zon=$zon deps=$deps"
+          [ "${ZIG_VERSION%%+*}" = "$zon" ] || { echo "build.zig.zon pins $zon, CI pins $ZIG_VERSION"; exit 1; }
+          [ "$ZIG_VERSION" = "$deps" ] || { echo "deps.yaml pins $deps, CI pins $ZIG_VERSION"; exit 1; }
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: ${{ matrix.os }}-${{ hashFiles('build.zig.zon') }}
+      - run: zig build
+      - run: zig build test --summary all
+      - run: zig build -Doptimize=ReleaseFast
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig fmt --check build.zig build.zig.zon src test
