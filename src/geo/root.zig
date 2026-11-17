@@ -7,6 +7,7 @@ pub const point = @import("point.zig");
 pub const aabb = @import("aabb.zig");
 pub const polyline = @import("polyline.zig");
 pub const line = @import("line.zig");
+pub const grid = @import("grid.zig");
 
 pub const PointLL = point.PointLL;
 pub const FixedLL = point.FixedLL;
