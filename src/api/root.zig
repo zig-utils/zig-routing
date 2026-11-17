@@ -3,6 +3,9 @@
 const std = @import("std");
 
 pub const json_writer = @import("json_writer.zig");
+pub const json = @import("json.zig");
+pub const errors = @import("errors.zig");
+pub const request = @import("request.zig");
 
 test {
     std.testing.refAllDecls(@This());
