@@ -49,7 +49,7 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-      - run: zig fmt --check build.zig build.zig.zon src test
+      - run: zig fmt --check build.zig build.zig.zon src test packages
       - name: OS access goes through the IO shim only
         run: |
           hits=$(grep -rnE 'std\.(Io\.(Dir|File|net|Clock|Threaded|Kqueue|Uring|Dispatch)|fs\.cwd|time\.Timer|posix\.(socket|accept|mmap))' src --include='*.zig' | grep -v '^src/infra/io.zig:' || true)

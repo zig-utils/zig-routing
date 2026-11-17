@@ -11,16 +11,21 @@ pub fn build(b: *std.Build) void {
     const tls = b.dependency("tls", dep_args).module("tls");
     const xml = b.dependency("xml", dep_args).module("xml");
 
+    // Packages written for this project, each extractable into its own zig-* repo later.
+    const lz4 = b.addModule("lz4", .{ .root_source_file = b.path("packages/lz4/lz4.zig"), .target = target, .optimize = optimize });
+
     // The library: every routing module hangs off src/root.zig.
     const lib_mod = b.addModule("routing", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
         .imports = &.{
             .{ .name = "zig_cli", .module = zig_cli },
             .{ .name = "zig_config", .module = zig_config },
             .{ .name = "tls", .module = tls },
             .{ .name = "xml", .module = xml },
+            .{ .name = "lz4", .module = lz4 },
         },
     });
 
@@ -48,6 +53,20 @@ pub fn build(b: *std.Build) void {
 
     const lib_tests = b.addTest(.{ .root_module = lib_mod });
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
+
+    for ([_]*std.Build.Module{lz4}) |pkg| test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = pkg })).step);
+
+    // Package benchmarks (always ReleaseFast).
+    const bench_lz4 = b.addExecutable(.{ .name = "bench-lz4", .root_module = b.createModule(.{
+        .root_source_file = b.path("packages/lz4/bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+        .imports = &.{.{ .name = "lz4", .module = b.createModule(.{ .root_source_file = b.path("packages/lz4/lz4.zig"), .target = target, .optimize = .ReleaseFast }) }},
+    }) });
+    const run_bench_lz4 = b.addRunArtifact(bench_lz4);
+    run_bench_lz4.addPassthruArgs();
+    b.step("bench-lz4", "LZ4 throughput").dependOn(&run_bench_lz4.step);
 
     // Every reused library compiles and is callable on the pinned toolchain.
     const smoke_tests = b.addTest(.{ .root_module = b.createModule(.{

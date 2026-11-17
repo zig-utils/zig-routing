@@ -92,7 +92,7 @@ zig build test
 ```
 
 ```bash
-zig fmt --check build.zig build.zig.zon src test
+zig fmt --check build.zig build.zig.zon src test packages
 ```
 
 ```bash
