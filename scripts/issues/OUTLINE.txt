@@ -1,0 +1,255 @@
+# zig-routing issue outline: the single source of truth for keys, titles, labels and dependencies.
+# Format: KEY | title | area | type | size | blocked-by keys (space separated, or -) | flags (optional: needs-human)
+# Order is execution order. A blocker must appear above the issue it blocks.
+# Phase headers: "## P<n> | milestone title | one-line goal"
+
+## P0 | P0 Baseline, oracle and harness | Measure Valhalla on our data and build the tools every later phase is gated by.
+P0.01 | Scaffold the build, pin the Zig toolchain, verify the zig-* dependencies compile | infra | infra | S | -
+P0.02 | CI: build, test and fmt on Linux and macOS with the pinned toolchain | infra | infra | S | P0.01
+P0.03 | Read-only inventory of the production routing box (Valhalla version, config, tiles, DEM, RSS, request mix) | infra | infra | S | - | needs-human
+P0.04 | Docker Valhalla oracle: pinned 3.9.3 image, tile builds for test extracts and US+DACH | infra | infra | M | P0.01
+P0.05 | Request corpora: upstream test_requests, de_benchmark_routes and a production-shaped corpus | cli | test | M | P0.04
+P0.06 | zr bench: load generator with latency histograms and machine-readable results | cli | new | M | P0.01
+P0.07 | zr diff: replay a corpus against two servers and score parity | cli | new | M | P0.06
+P0.08 | Baseline scoreboard: Valhalla 3.9.3 on the bench box, committed as docs/SCOREBOARD.md | infra | perf | M | P0.04 P0.05 P0.06
+P0.09 | Dedicated bench box and CI perf tracking with a 3% regression gate | infra | perf | M | P0.06 | needs-human
+P0.10 | IO shim: one file wrapping std.Io for accept, read, write, mmap, madvise and clocks | server | new | M | P0.01
+P0.11 | Request arena and counting allocator (zero steady-state allocation test helper) | infra | new | S | P0.01
+P0.12 | Bench tooling: hardware counters and flamegraphs for zr bench | cli | perf | S | P0.06
+
+## P1 | P1 Foundations | Geometry kernel, codecs, HTTP service skeleton and the test DSL.
+P1.01 | geo: PointLL, AABB2, distance approximator, haversine, headings | geo | port | M | P0.01
+P1.02 | geo: polyline codecs (5, 6 and 7 digit) with SIMD encode and fuzz tests | geo | port | S | P1.01
+P1.03 | geo: line operations (closest point, length, resample, trim, simplify) | geo | port | M | P1.01
+P1.04 | geo: tile and cell math, Hilbert order, grid traversal | geo | port | M | P1.01
+P1.05 | geo: polygon operations (ring assembly, point in polygon, box clipping, area) | geo | new | M | P1.01
+P1.06 | geo: gridded data and marching-squares contouring | geo | port | M | P1.04
+P1.07 | Protobuf wire codec with comptime message schemas | lib | new | M | P0.01
+P1.08 | Valhalla API protos as comptime schemas (all 14 .proto files) | api | port | M | P1.07
+P1.09 | LZ4 block and frame codec | lib | new | S | P0.01
+P1.10 | Streaming JSON writer with fixed-precision numbers and no allocation | api | new | S | P0.11
+P1.11 | JSON request scanner straight into structs (no DOM) | api | new | M | P0.11
+P1.12 | HTTP/1.1 server: thread per core, keep-alive, pipelining, SO_REUSEPORT, writev | server | new | L | P0.10 P0.11
+P1.13 | Service skeleton: action routing, GET ?json= and POST, Valhalla error codes, service limits | api | port | M | P1.10 P1.11 P1.12
+P1.14 | Config: load a valhalla.json-compatible config through zig-config with typed access | infra | new | S | P0.01
+P1.15 | CLI skeleton: zr serve, build, route, bench, diff, inspect via zig-cli | cli | new | S | P0.01
+P1.16 | Deadlines, cancellation and per-request memory caps | server | new | S | P1.12
+P1.17 | Logging and metrics: non-blocking logger, counters, histograms, /metrics | server | new | S | P1.12
+P1.18 | ASCII-map test DSL (gurka port): map to coordinates, ways, nodes, relations, synthetic OSM | infra | test | M | P1.01 P1.07
+P1.19 | Per-phase time budgets in the access log and asserted by zr bench | server | perf | S | P1.13 P0.06
+P1.20 | Fuzzing harness for request parsing and codecs | infra | test | S | P1.02 P1.11
+P1.21 | Phase 1 gate: midgard tests ported and green, HTTP echo benchmark beats prime_server | infra | gate | S | P1.06 P1.13 P1.16 P1.17 P1.18 P1.19 P1.20
+
+## P2 | P2 Elevation (/height) | First production slice: replace Valhalla's /height on the production routing box.
+P2.01 | Elevation tiles: .hgt, .hgt.gz, .hgt.lz4 reader with an mmap cache | elevation | port | M | P1.09 P0.10
+P2.02 | Bilinear elevation sampler matching skadi exactly, including no-data handling | elevation | port | S | P2.01
+P2.03 | /height API: shape, encoded_polyline, range, height_precision, resample_distance | api | port | M | P2.02 P1.13 P1.02 P1.03
+P2.04 | DEM repack: block-compressed mmap-friendly elevation format and zr dem pack | elevation | new | M | P2.01
+P2.05 | Bulk /height: sort by tile, SIMD batches, perf budget | elevation | perf | S | P2.03 P2.04
+P2.06 | Phase 2 gate: exact /height parity with the oracle and at least 10x points per second | elevation | gate | S | P2.05 P0.07 P0.08
+P2.07 | Deploy zr serve on the production routing box beside Valhalla and shadow-compare /height | infra | infra | M | P2.06 P0.03 | needs-human
+P2.08 | Cut over /height for the consuming apps with Valhalla as fallback | infra | infra | S | P2.07 | needs-human
+
+## P3 | P3 Pedestrian and bicycle routing (/route) | Second production slice: everything our apps send today.
+P3.01 | OSM PBF reader: blob framing, parallel inflate, header block | build | new | M | P1.07
+P3.02 | OSM PBF primitives: dense nodes, ways, relations, string tables, tags | build | new | M | P3.01
+P3.03 | OSM XML reader on zig-xml for fixtures | build | new | S | P0.01
+P3.04 | Node location store: delta-coded id-indexed array with no external sort | build | new | M | P3.02
+P3.05 | Tag transform framework: comptime tag tables and the OSMWay / OSMNode attribute model | build | port | M | P3.02
+P3.06 | Tag transform: highway classification, road class, use, surface, links, service roads | build | port | L | P3.05
+P3.07 | Tag transform: access per mode, oneway, barriers and node access | build | port | L | P3.05
+P3.08 | Tag transform: speeds, maxspeed parsing, lanes, names, refs and destination tags | build | port | L | P3.05
+P3.09 | Tag transform: bicycle and pedestrian tags (cycleways, networks, sac_scale, sidewalks, steps) | build | port | M | P3.05
+P3.10 | Tag-transform goldens against upstream graph.lua run in the oracle container | build | test | M | P3.06 P3.07 P3.08 P3.09 P0.04
+P3.11 | Ways to edges: intersection detection, splitting, shape capture, loops and duplicates | build | port | L | P3.04 P3.06 P3.07
+P3.12 | Graph format v1: section headers, extern structs, writer, comptime layout assertions | graph | new | M | P0.10
+P3.13 | Graph reader: mmap a bundle, validate headers, typed accessors, zr inspect | graph | new | M | P3.12
+P3.14 | Edge class table: deduplicated categorical tuples and class ids | graph | new | M | P3.12
+P3.15 | Graph assembly: CSR adjacency, opposing edges, local edge indices, node attributes | build | port | L | P3.11 P3.12 P3.14
+P3.16 | Turn tables: per-node turn type, stop impact, name consistency, deduplicated pool | build | port | M | P3.15
+P3.17 | Cold data: way ids, shapes, name table, chunking | graph | new | M | P3.15
+P3.18 | Elevation stamping: weighted grade, max slopes, mean elevation | build | port | M | P3.15 P2.02
+P3.19 | Enhance for foot and bike: density, intersection types, dead ends, not-thru regions | build | port | M | P3.15
+P3.20 | Spatial index: 1/256 degree grid, cell directory, delta-varint edge lists | graph | new | M | P3.17
+P3.21 | Node ordering interface with a Hilbert order as the first implementation | build | new | S | P3.15
+P3.22 | zr build driver: stages, restartability, progress and stats | build | new | M | P3.16 P3.17 P3.18 P3.19 P3.20 P3.21
+P3.23 | Snap: candidate search, projection and PathLocation semantics | snap | port | L | P3.20 P3.13
+P3.24 | Snap: reachability, connectivity and the no-suitable-edges error paths | snap | port | M | P3.23
+P3.25 | Compiled costing framework: options to POD, kernel interface, admissibility contract | costing | new | L | P3.14
+P3.26 | Costing base: shared option parsing and penalties (port of dynamiccost base behaviour) | costing | port | L | P3.25
+P3.27 | Pedestrian costing: full port of pedestriancost.cc with every option | costing | port | L | P3.26
+P3.28 | Bicycle costing: full port of bicyclecost.cc with every option | costing | port | L | P3.26
+P3.29 | Search core: Search(K, Q) label-setting A*, labels, paged status, 4-ary heap | search | new | L | P3.25 P3.13
+P3.30 | Search: partial origin and destination edges, trivial and same-edge routes | search | port | M | P3.29 P3.23
+P3.31 | Search: multi-location routes with break, through, via and break_through | search | port | M | P3.30
+P3.32 | Path to legs: shape assembly, summaries, elapsed time by recost | search | port | M | P3.30 P3.17
+P3.33 | /route serializer for directions_type none: units, shape formats, ids | api | port | M | P3.32 P1.13
+P3.34 | zr import-valhalla: test-only reader of Valhalla tiles into our format | cli | test | L | P3.12 P3.14
+P3.35 | Costing parity harness (gate A): per-call edge and transition cost against the oracle | costing | test | M | P3.27 P3.28 P0.04
+P3.36 | Experiment E1: label throughput of the search core on Germany | search | experiment | S | P3.29 P3.22
+P3.37 | Zero steady-state allocation tests for /height and /route | infra | perf | S | P3.33
+P3.38 | Fuzzing: PBF reader and graph format loader | infra | test | S | P3.02 P3.13
+P3.39 | Port the gurka suites that cover pedestrian and bicycle behaviour | infra | test | L | P3.33 P1.18 P3.22
+P3.40 | Phase 3 gate (E8): parity gates A to C on the foot and bike corpus, latency no worse than Valhalla | search | gate | M | P3.33 P3.34 P3.35 P3.39 P0.07
+P3.41 | Shadow-deploy /route on the production routing box with the US+DACH bundle and check memory | infra | infra | M | P3.40 P2.07 | needs-human
+P3.42 | Cut over /route for the consuming apps with Valhalla as fallback | infra | infra | S | P3.41 | needs-human
+
+## P4 | P4 Acceleration and scale | Customised potentials, node ordering, lazy loading and planet-scale builds.
+P4.01 | Separator partitioner (inertial flow) and nested-dissection order | accel | new | L | P3.15
+P4.02 | Make the nested-dissection order the graph id order, with cells as contiguous ranges | build | new | M | P4.01 P3.21
+P4.03 | CCH topology: contraction over the order, elimination tree, cch.topo section | accel | new | L | P4.02
+P4.04 | Metric customisation: lower-bound weights from compiled costing, parallel triangle relaxation | accel | new | L | P4.03 P3.25
+P4.05 | Metric keys and metric files: 128-bit key, u16 minifloat storage, mmap, versioning | accel | new | M | P4.04
+P4.06 | Lazy potentials over the elimination tree, forward and reverse | accel | new | M | P4.04
+P4.07 | Potentials in the search core: turn-cost folding and the relax-time admissibility assertion | search | new | M | P4.06 P3.29
+P4.08 | Metric cache: LRU, admission filter, background customisation, persistence | accel | new | M | P4.05
+P4.09 | Fallback ladder: L1 scaled closest metric, L2 haversine, optional factor-grid snapping | accel | new | M | P4.08 P4.07
+P4.10 | Admissibility property fuzzer over legal option ranges for every kernel | costing | test | M | P4.07
+P4.11 | Experiment E2: exact-key potentials with real costing, turn folding on and off | accel | experiment | S | P4.07
+P4.12 | Experiment E3: L1 scaling at walkway_factor 0.6 | accel | experiment | S | P4.09
+P4.13 | Experiment E4: ordering and customisation time at US+DACH scale | accel | experiment | S | P4.04
+P4.14 | Experiment E5: memory budget of the full bundle under mixed load with three metrics | accel | experiment | S | P4.08
+P4.15 | Memory placement: huge pages, mlock, madvise classes and startup warm-up | graph | perf | M | P3.13
+P4.16 | Lazy loading: range-fetchable bundles with sparse local fill over HTTP(S) | graph | new | L | P3.13
+P4.17 | Hot reload: atomic bundle swap without dropping requests | server | new | M | P3.13 P1.12
+P4.18 | Multi-bundle dispatch (US and DACH) and cross-bundle semantics | graph | new | M | P3.13 P3.23
+P4.19 | Planet-scale build: parallel stages, compact intermediates, rows per second and RSS reporting | build | perf | L | P3.22
+P4.20 | Deterministic builds: byte-identical output regardless of thread count | build | test | M | P3.22
+P4.21 | CPU-feature builds (x86-64-v3, baseline, aarch64) and dispatch for hot kernels | infra | perf | M | P3.29
+P4.22 | Binary size budget and instantiation count check in CI | infra | perf | S | P3.29 P0.02
+P4.23 | Potential-context cache for hot targets | accel | perf | S | P4.07
+P4.24 | Soak test: 24 hours of mixed load with flat RSS and no descriptor leaks | infra | test | M | P4.09
+P4.25 | Overload test: admission control, load shedding and tail latency | server | test | M | P1.16 P4.09
+P4.26 | Phase 4 gate: foot and bike at least 5x Valhalla, experiments resolved, 16 GB budget met | accel | gate | M | P4.09 P4.10 P4.11 P4.12 P4.13 P4.14 P4.15 P4.18
+
+## P5 | P5 Motor vehicle costing and restrictions | Auto, truck and friends, restrictions, time-dependent routing.
+P5.01 | Enhance (full): port of graphenhancer.cc (speed assignment, density, turn types, stop impact) | build | port | L | P3.19 P3.16
+P5.02 | Link reclassification and name consistency (linkclassification.cc) | build | port | M | P5.01
+P5.03 | Tag transform: truck attributes, hazmat, tolls, HOV, motorcycle and moped tags | build | port | M | P3.07 P3.08
+P5.04 | Admins: boundary relations to polygons, packed polygon index, admin lookup | build | new | L | P1.05 P3.02
+P5.05 | Country access defaults and driving side (countryaccess.cc) | build | port | M | P5.04 P3.07
+P5.06 | Timezones: polygon ingest, index and IANA rules with correct DST | graph | new | L | P1.05
+P5.07 | Date and time: port of baldr datetime (date_time types, seconds of week, TimeInfo) | graph | port | M | P5.06
+P5.08 | Simple turn restrictions in the build and turn entries | build | port | M | P3.16
+P5.09 | Complex multi-via restrictions: build and the restriction automaton in labels | search | new | L | P5.08 P3.29
+P5.10 | Conditional and timed restrictions, access restrictions and their conditions | build | port | L | P5.07 P5.09
+P5.11 | Auto costing: full port of autocost.cc (auto, bus, taxi, HOV variants) | costing | port | L | P3.26 P5.01
+P5.12 | Truck costing: full port of truckcost.cc with dimension, weight and hazmat checks | costing | port | L | P5.11 P5.03
+P5.13 | Motorcycle and motor scooter costing | costing | port | M | P5.11
+P5.14 | Speed model: live, predicted, constrained, free-flow and base resolution with speed_types | graph | port | M | P5.01
+P5.15 | Time-dependent search: depart_at, arrive_by, current, invariant, across timezones | search | port | L | P5.07 P5.14 P3.31
+P5.16 | Avoid and exclude: locations, polygons, edges and closures | snap | port | M | P3.23 P3.29
+P5.17 | Destination-only, private access and not-thru semantics in an exact search | search | port | M | P5.11
+P5.18 | Alternates by the penalty method with stretch, sharing and local-optimality filters | search | new | M | P5.11 P4.07
+P5.19 | Recost, recostings and linear_cost_factors | costing | port | M | P5.11
+P5.20 | Port the gurka suites for access, restrictions, time-dependence and closures | infra | test | L | P5.10 P5.15 P5.16 P5.17
+P5.21 | Experiment E7: time-dependent long route and synthetic congestion | search | experiment | S | P5.15 P4.07
+P5.22 | Phase 5 gate: auto and truck corpora at cost parity, suites green | costing | gate | M | P5.12 P5.13 P5.18 P5.19 P5.20 P5.21
+
+## P6 | P6 Narrative and serializers | Maneuvers, instructions in 36 locales, Valhalla, OSRM, GPX and pbf output.
+P6.01 | Trip leg data model as direct structs mirroring trip.proto | api | port | M | P1.08
+P6.02 | Signs, exits and junction names in the build and reader | build | port | M | P3.17 P3.08
+P6.03 | Turn lanes and lane connectivity in the build and reader | build | port | M | P3.17 P3.08
+P6.04 | Names: linguistics, pronunciations and tagged values | build | port | M | P3.17 P3.08
+P6.05 | Trip-leg builder: port of triplegbuilder.cc | search | port | L | P6.01 P6.02 P6.03 P6.04 P3.32
+P6.06 | Enhanced trip leg helpers (enhancedtrippath.cc) | narrative | port | M | P6.05
+P6.07 | Maneuvers builder I: creation, turn types and combine rules | narrative | port | L | P6.06
+P6.08 | Maneuvers builder II: ramps, exits, merges, roundabouts, forks, u-turns, internal intersections | narrative | port | L | P6.07
+P6.09 | Maneuvers builder III: ferries, stairs, elevators, indoor, guidance views, lane guidance | narrative | port | L | P6.08
+P6.10 | Locale dictionaries compiled at comptime from the 36 locale files | narrative | port | M | P0.01
+P6.11 | Narrative builder I: text instructions for every maneuver type | narrative | port | L | P6.08 P6.10
+P6.12 | Narrative builder II: verbal instructions, multi-cue, markup and per-locale formatters | narrative | port | L | P6.11
+P6.13 | Valhalla route serializer with maneuvers, lanes, signs and summaries | api | port | M | P6.11 P3.33
+P6.14 | OSRM serializer: routes, legs, steps, intersections, banner and voice instructions | api | port | L | P6.11
+P6.15 | GPX and pbf output for the route family | api | port | M | P6.05 P1.08
+P6.16 | Port the narrativebuilder and maneuversbuilder upstream tests as snapshot goldens | narrative | test | L | P6.09 P6.12
+P6.17 | Phase 6 gate: maneuver-for-maneuver equality on the corpus where paths match | narrative | gate | M | P6.13 P6.14 P6.15 P6.16
+
+## P7 | P7 Matrix, isochrone and the remaining endpoints | Everything else Valhalla serves over the street graph.
+P7.01 | Expansion base: bounded Dijkstra with a bucket queue, multi-origin, forward and reverse | search | port | M | P3.29
+P7.02 | Matrix v1: shared potential contexts per target, parallel exact searches, lower-bound pruning | search | new | L | P4.07 P7.01
+P7.03 | /sources_to_targets API and serializers (verbose, shapes, date_time, pbf, osrm) | api | port | M | P7.02
+P7.04 | Experiment E6: urban 50x50 and regional 200x200 matrices on v1 | search | experiment | S | P7.03
+P7.05 | Matrix v2: turn-aware multilevel overlay on the separator tree, customised per metric | accel | new | L | P7.04 P4.05
+P7.06 | Matrix v2 queries: one-to-many sweeps, many-to-many, memory budget | search | new | L | P7.05
+P7.07 | Isochrone expansion into the grid with multiple time and distance contours | search | port | M | P7.01 P1.06
+P7.08 | /isochrone API: polygons, lines, denoise, generalize, reverse, GeoJSON | api | port | M | P7.07
+P7.09 | /expansion endpoint | api | port | S | P7.01
+P7.10 | /centroid | search | port | M | P7.01
+P7.11 | /optimized_route: port of the optimizer on top of the matrix | search | port | M | P7.03 P6.13
+P7.12 | /locate with verbose edge and node info | api | port | M | P3.23 P3.17
+P7.13 | /status with verbose output | api | port | S | P1.13 P3.13
+P7.14 | /tile: graph MVT with an MVT encoder | tiles | port | M | P1.07 P3.20
+P7.15 | Scheduling classes: light and heavy request pools with bounded intra-request parallelism | server | new | M | P7.02 P1.16
+P7.16 | Response cache keyed by snapped edges, metric key and traffic epoch | server | perf | M | P4.08 P3.33
+P7.17 | Long-route scoreboard: auto 200, 1000 and 4000 km on Europe and planet corpora | search | perf | M | P5.11 P4.19
+P7.18 | Phase 7 gate: parity gates E and F, matrix and isochrone scoreboard rows | search | gate | M | P7.06 P7.08 P7.09 P7.10 P7.11 P7.12 P7.13 P7.14 P7.15
+
+## P8 | P8 Map matching | /trace_route and /trace_attributes.
+P8.01 | Trace candidate search on the shared spatial index | match | port | M | P3.23
+P8.02 | Emission and transition cost models with bounded routing between candidates | match | port | L | P8.01 P7.01
+P8.03 | Viterbi search and top-k | match | port | L | P8.02
+P8.04 | Match results to a path: match_route, discontinuities, edge walking | match | port | M | P8.03
+P8.05 | /trace_route API with shape_match modes and trace options | api | port | M | P8.04 P6.13
+P8.06 | /trace_attributes API with attribute filters | api | port | M | P8.04 P6.05
+P8.07 | Port the mapmatch tests, throughput target and byte-bounded memory | match | test | M | P8.05 P8.06
+P8.08 | Phase 8 gate: parity gate G on the trace corpus | match | gate | S | P8.07
+
+## P9 | P9 Transit and multimodal | GTFS, schedules, multimodal search, bike share.
+P9.01 | GTFS reader: zip and CSV into a feed model | build | new | M | P0.01
+P9.02 | Transit graph sections: stops, stations, lines, departures, schedules, transfers | graph | port | L | P3.12
+P9.03 | Transit build: connect stops to the street graph, schedule validity, timezones | build | port | L | P9.01 P9.02 P5.06
+P9.04 | Transit and multimodal costing with their options | costing | port | M | P3.26 P9.02
+P9.05 | Multimodal search: port of multimodal_astar and multimodal_transit | search | port | L | P9.03 P9.04 P5.15
+P9.06 | Transit narrative and transit info in serializers | narrative | port | M | P9.05 P6.12
+P9.07 | Bike share: stations, costing and the bike-share matrix | costing | port | M | P3.28 P7.03
+P9.08 | /transit_available | api | port | S | P9.03
+P9.09 | Phase 9 gate: transit gurka suites green | search | gate | M | P9.05 P9.06 P9.07 P9.08
+
+## P10 | P10 Traffic | Live and historical speeds on the accelerated search.
+P10.01 | Stable edge keys: way id and node pair to edge id map emitted by the build | build | new | M | P3.22
+P10.02 | Live traffic overlay: record layout, lock-free reads, epoch, live-to-bound ratio | traffic | new | M | P10.01 P5.14
+P10.03 | Traffic feeder: write speeds and closures by edge key | traffic | new | M | P10.02
+P10.04 | Predicted speeds: weekly profiles, SIMD DCT codec, deduplicated profile table | traffic | port | M | P10.01 P5.14
+P10.05 | Traffic in costing and the admissibility floors | costing | new | M | P10.02 P10.04 P4.07
+P10.06 | Time-dependent potentials for predicted and live traffic | accel | new | L | P10.05 P5.21
+P10.07 | Incidents in responses | api | port | M | P10.02 P6.13
+P10.08 | Feed adapters: generic speed feeds and OpenLR decoding | traffic | new | L | P10.03
+P10.09 | Historical speeds from map-matched traces | traffic | new | L | P10.04 P8.04
+P10.10 | Phase 10 gate: traffic-aware ETAs within budget on the accelerated search | traffic | gate | M | P10.06 P10.07 P10.08
+
+## P11 | P11 Vector map tiles | Basemap tiles from the same OSM extract.
+P11.01 | Basemap schema: layer spec matched to the styles ts-maps renders | tiles | new | M | - | needs-human
+P11.02 | Feature extraction from OSM: areas, lines and points with tag mapping | tiles | new | L | P11.01 P3.02
+P11.03 | Multipolygon assembly, clipping, per-zoom simplification and label points | tiles | new | L | P11.02 P1.05
+P11.04 | MVT feature encoder: geometry commands and key/value dedup | tiles | new | M | P1.07
+P11.05 | Tile pyramid build: parallel, generalisation, feature merging, size budgets | tiles | new | L | P11.03 P11.04
+P11.06 | Tile archive: single-file range-request format, endpoint, caching | tiles | new | M | P11.05 P1.13
+P11.07 | Low zooms: coastlines, ocean polygons and generalised boundaries | tiles | new | L | P11.05
+P11.08 | Contours and hillshade from the DEM | tiles | new | L | P11.05 P2.04
+P11.09 | ts-maps integration: source config, style and visual regression | tiles | new | M | P11.06
+P11.10 | Phase 11 gate: tiles render in ts-maps, build and serve budgets met | tiles | gate | M | P11.07 P11.09
+
+## P12 | P12 Geocoding and search | Replace the public Photon and Nominatim servers.
+P12.01 | Geocoder data model and extraction: places, addresses, POIs, streets, admin hierarchy | geocode | new | L | P3.02 P5.04
+P12.02 | Address interpolation and postcodes | geocode | new | M | P12.01
+P12.03 | Text analysis: normalisation, tokens, abbreviations and synonyms per language | geocode | new | L | P12.01
+P12.04 | Index structure: prefix index and postings, mmap | geocode | new | L | P12.03
+P12.05 | Query: parsing, retrieval, ranking with proximity bias, typo tolerance | geocode | new | L | P12.04
+P12.06 | Autocomplete within a latency budget | geocode | perf | M | P12.05
+P12.07 | Reverse geocoding | geocode | new | M | P12.01 P3.20
+P12.08 | Photon-compatible API | geocode | new | M | P12.05 P12.07 P1.13
+P12.09 | Nominatim-compatible API | geocode | new | M | P12.05 P12.07 P1.13
+P12.10 | Geocoding quality corpus and scoreboard against Photon and Nominatim | geocode | test | M | P12.08 P12.09
+P12.11 | Phase 12 gate and switching the apps off the public geocoders | geocode | gate | M | P12.06 P12.10 | needs-human
+
+## P13 | P13 Cutover and packaging | Finish the replacement and ship the tooling around it.
+P13.01 | Remove the Valhalla fallback and decommission the old service | infra | infra | S | P4.26 P3.42 | needs-human
+P13.02 | C ABI: an actor-style library interface | api | new | M | P6.13
+P13.03 | Bun FFI package for Stacks apps | api | new | M | P13.02
+P13.04 | ts-maps provider docs and migration guide | infra | infra | S | P3.42
+P13.05 | Release flow: versioning, changelog, binaries for Linux x64/arm64 and macOS, pantry package | infra | infra | M | P0.02
+P13.06 | Extract stable packages into standalone zig-* repositories | lib | infra | M | P13.05 | needs-human
+P13.07 | Operations runbook: build, deploy, rollback, monitoring, data refresh | infra | infra | S | P3.42
+P13.08 | Automated data refresh: scheduled extract download, build, verify, hot swap | infra | new | M | P4.17 P4.20
+P13.09 | Public benchmark report and reproducible bench kit | infra | perf | M | P7.18 | needs-human
