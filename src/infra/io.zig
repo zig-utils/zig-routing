@@ -625,10 +625,9 @@ fn unlink(path: []const u8) void {
 
 test "clocks move forward and deadlines expire" {
     const a = monotonicNs();
-    var timer = Timer.start();
-    var spin: u64 = 0;
-    while (monotonicNs() == a) spin += 1;
-    try testing.expect(timer.read() > 0);
+    const timer = Timer.start();
+    while (timer.read() == 0) {}
+    try testing.expect(monotonicNs() > a);
     try testing.expect(wallSeconds() > 1_700_000_000);
 
     try testing.expect(!Deadline.none.expired());
