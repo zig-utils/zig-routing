@@ -81,6 +81,7 @@ Changes in this dev std that bite ported code and memory of older Zig:
   `Io`. Use the IO shim (`src/infra/io.zig`) instead of reaching for them.
 - The `**` array repetition operator is gone: write `var a: [100]u64 = @splat(0);`.
 - `std.ArrayList(T){}` no longer initialises: use `.empty`.
+- `std.meta.Int` is gone: use the `@Int(.unsigned, bits)` builtin.
 - `b.args` is gone in build scripts: use `run.addPassthruArgs()`.
 - Dependencies are fetched into `./zig-pkg/` (gitignored), so format-check named paths, not `.`.
 
