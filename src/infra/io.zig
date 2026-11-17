@@ -817,3 +817,33 @@ test "poller reports a readable connection" {
     var one: [1]u8 = undefined;
     try testing.expectEqual(@as(usize, 1), try server.read(&one));
 }
+
+// ---------------------------------------------------------------------------
+// Process signals and sleeping
+// ---------------------------------------------------------------------------
+
+/// Set once SIGINT or SIGTERM arrives after `installTerminationHandler`.
+pub var termination_requested: std.atomic.Value(bool) = .init(false);
+
+fn onTerminate(_: c.SIG) callconv(.c) void {
+    termination_requested.store(true, .release);
+}
+
+/// Routes SIGINT and SIGTERM to `termination_requested` (for graceful
+/// shutdown) and ignores SIGPIPE (writes to closed sockets return errors).
+pub fn installTerminationHandler() void {
+    var act: c.Sigaction = std.mem.zeroes(c.Sigaction);
+    act.handler = .{ .handler = onTerminate };
+    _ = c.sigemptyset(&act.mask);
+    _ = c.sigaction(.INT, &act, null);
+    _ = c.sigaction(.TERM, &act, null);
+    var ignore: c.Sigaction = std.mem.zeroes(c.Sigaction);
+    ignore.handler = .{ .handler = c.SIG.IGN };
+    _ = c.sigemptyset(&ignore.mask);
+    _ = c.sigaction(.PIPE, &ignore, null);
+}
+
+pub fn sleepMs(ms: u64) void {
+    var ts: c.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
+    while (c.nanosleep(&ts, &ts) != 0) {}
+}
