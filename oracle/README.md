@@ -49,12 +49,18 @@ bun oracle/compare-height.ts http://127.0.0.1:8102 http://127.0.0.1:18005 4000 9
 Run `zr` on Linux for this (for example the Linux build inside the same image): responses depend on
 the platform libm, and upstream's numbers come from glibc.
 
-`bench-height.ts` measures throughput. Run it inside the VM on a shared Docker network so Colima's
-port forwarding does not dominate:
+`zr bench` measures throughput and latency against either server. A corpus is one request per
+line, `PATH<TAB>BODY`:
 
 ```bash
-docker run --rm --network zrbench -v "$PWD/oracle:/w:ro" oven/bun:1.3.4 bun /w/bench-height.ts http://zr-perf:18007 100 8 8
+zig-out/bin/zr bench http://127.0.0.1:8102 --corpus corpus.txt --connections 8 --duration 10s --label valhalla --out valhalla.json
+zig-out/bin/zr bench http://127.0.0.1:18102 --corpus corpus.txt --connections 8 --duration 10s --label zr --out zr.json
+zig-out/bin/zr bench --compare valhalla.json zr.json
 ```
+
+For numbers worth quoting, run both servers and the client inside the VM (a Linux `zr` built with
+`-Dtarget=aarch64-linux-gnu`, the oracle with `ORACLE_PLATFORM=linux/arm64`, all on one Docker
+network) so Colima's port forwarding and amd64 emulation do not dominate.
 
 ## Not done yet
 

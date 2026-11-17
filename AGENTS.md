@@ -109,8 +109,12 @@ zig build test -Dtarget=x86_64-linux-gnu
 That command ends by reporting that the host cannot run Linux binaries; that is expected. Any
 `error:` line before it is a real failure.
 
-`zr bench` and `zr diff` (Phase 0) are how performance and parity are proven; use them once they
-exist.
+`zr bench` and `zr diff` (Phase 0) are how performance and parity are proven. `zr bench URL
+--corpus FILE --out result.json` replays a corpus (closed loop, or open loop with `--rate`) and
+writes percentiles, throughput and errors with the hardware, dataset and commit; `zr bench
+--compare a.json b.json` prints the deltas. Quote numbers only from runs where both servers sit on
+the same machine class and platform (an emulated amd64 oracle against a native `zr` is not a
+comparison). `zr diff` does not exist yet.
 
 ## Reference material
 
