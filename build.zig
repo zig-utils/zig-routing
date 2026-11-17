@@ -54,6 +54,15 @@ pub fn build(b: *std.Build) void {
     const lib_tests = b.addTest(.{ .root_module = lib_mod });
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
 
+    // Stage timings (ReleaseFast): zig build perf
+    const perf = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("test/perf_height.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{.{ .name = "routing", .module = lib_mod }},
+    }) });
+    b.step("perf", "Stage timings for bulk requests").dependOn(&b.addRunArtifact(perf).step);
+
     for ([_]*std.Build.Module{lz4}) |pkg| test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = pkg })).step);
 
     // Package benchmarks (always ReleaseFast).

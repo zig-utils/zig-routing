@@ -36,3 +36,5 @@ coverage/
 *.log
 /.zig-cache
 zig-pkg/
+zig-out-linux/
+zig-out-linux-arm/

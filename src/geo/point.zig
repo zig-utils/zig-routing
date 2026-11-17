@@ -7,6 +7,7 @@
 //! the longitude scale, so results match to the last bit where upstream's do.
 
 const std = @import("std");
+const libm = @import("libm.zig");
 const k = @import("constants.zig");
 
 /// upstream INVALID_LL: (double)0xBADBADBAD.
@@ -77,22 +78,22 @@ pub const PointLL = struct {
         const lat1 = self.lat * k.rad_per_deg_d;
         const lon2 = p.lng * -k.rad_per_deg_d;
         const lat2 = p.lat * k.rad_per_deg_d;
-        const sl1 = @sin(lat1);
-        const sl2 = @sin(lat2);
-        const cl1 = @cos(lat1);
-        const cl2 = @cos(lat2);
-        const d = std.math.acos(sl1 * sl2 + cl1 * cl2 * @cos(lon1 - lon2));
-        const sd = @sin(d);
-        const a = @sin(d * (1 - fraction)) / sd;
-        const b = @sin(d * fraction) / sd;
+        const sl1 = libm.sinF(lat1);
+        const sl2 = libm.sinF(lat2);
+        const cl1 = libm.cosF(lat1);
+        const cl2 = libm.cosF(lat2);
+        const d = libm.acosF(sl1 * sl2 + cl1 * cl2 * libm.cosF(lon1 - lon2));
+        const sd = libm.sinF(d);
+        const a = libm.sinF(d * (1 - fraction)) / sd;
+        const b = libm.sinF(d * fraction) / sd;
         const acs1 = a * cl1;
         const bcs2 = b * cl2;
-        const x = acs1 * @cos(lon1) + bcs2 * @cos(lon2);
-        const y = acs1 * @sin(lon1) + bcs2 * @sin(lon2);
+        const x = acs1 * libm.cosF(lon1) + bcs2 * libm.cosF(lon2);
+        const y = acs1 * libm.sinF(lon1) + bcs2 * libm.sinF(lon2);
         const z = a * sl1 + b * sl2;
         return .{
-            .lng = std.math.atan2(y, x) * -k.deg_per_rad_d,
-            .lat = std.math.atan2(z, @sqrt(x * x + y * y)) * k.deg_per_rad_d,
+            .lng = libm.atan2F(y, x) * -k.deg_per_rad_d,
+            .lat = libm.atan2F(z, @sqrt(x * x + y * y)) * k.deg_per_rad_d,
         };
     }
 
@@ -109,13 +110,13 @@ pub const PointLL = struct {
         const lambda1 = self.lng * k.rad_per_deg_d;
         const lambda2 = other.lng * k.rad_per_deg_d;
         const dlambda = lambda2 - lambda1;
-        const c1 = @cos(phi1);
-        const c2 = @cos(phi2);
-        const sdphi2 = @sin(dphi / 2.0);
-        const sdlmb2 = @sin(dlambda / 2.0);
+        const c1 = libm.cosF(phi1);
+        const c2 = libm.cosF(phi2);
+        const sdphi2 = libm.sinF(dphi / 2.0);
+        const sdlmb2 = libm.sinF(dlambda / 2.0);
         var h = sdphi2 * sdphi2 + c1 * c2 * sdlmb2 * sdlmb2;
         h = @min(1.0, @max(0.0, h));
-        const d = 2.0 * std.math.asin(@sqrt(h));
+        const d = 2.0 * libm.asinF(@sqrt(h));
         return k.rad_earth_meters_d * d;
     }
 
@@ -142,9 +143,9 @@ pub const PointLL = struct {
         const lat1 = self.lat * k.rad_per_deg_d;
         const lat2 = ll2.lat * k.rad_per_deg_d;
         const dlng = (ll2.lng - self.lng) * k.rad_per_deg_d;
-        const y = @sin(dlng) * @cos(lat2);
-        const x = @cos(lat1) * @sin(lat2) - @sin(lat1) * @cos(lat2) * @cos(dlng);
-        const bearing = std.math.atan2(y, x) * k.deg_per_rad_d;
+        const y = libm.sinF(dlng) * libm.cosF(lat2);
+        const x = libm.cosF(lat1) * libm.sinF(lat2) - libm.sinF(lat1) * libm.cosF(lat2) * libm.cosF(dlng);
+        const bearing = libm.atan2F(y, x) * k.deg_per_rad_d;
         return if (bearing < 0.0) bearing + 360.0 else bearing;
     }
 
@@ -229,7 +230,7 @@ pub const PointLL = struct {
 
     /// upstream Project(u, v) with its default lon_scale: cos(lat) of this point.
     pub fn project(self: PointLL, u: PointLL, v: PointLL) PointLL {
-        return self.projectScaled(u, v, @cos(self.lat * k.rad_per_deg_d));
+        return self.projectScaled(u, v, libm.cosF(self.lat * k.rad_per_deg_d));
     }
 
     /// Point-in-polygon by winding number. Only the first and last vertices
@@ -385,7 +386,7 @@ pub const DistanceApproximator = struct {
     /// in double, then the cosine in single precision.
     pub fn lngScalePerLat(lat: f64) f64 {
         const arg: f32 = @floatCast(lat * @as(f64, k.rad_per_deg));
-        return @as(f64, @cos(arg));
+        return @as(f64, libm.cosf32(arg));
     }
 };
 
@@ -563,7 +564,7 @@ test "distance approximator (test/distanceapproximator.cc)" {
     }
     try testing.expectEqual(@as(f64, 0), approx.distanceSquared(a));
     // The longitude scale is computed with a single-precision cosine, as upstream.
-    try testing.expectEqual(@as(f64, @cos(@as(f32, @floatCast(40.0 * @as(f64, k.rad_per_deg))))), DistanceApproximator.lngScalePerLat(40.0));
+    try testing.expectEqual(@as(f64, libm.cosf32(@as(f32, @floatCast(40.0 * @as(f64, k.rad_per_deg))))), DistanceApproximator.lngScalePerLat(40.0));
 }
 
 test "batch squared distance is bit-identical to scalar" {

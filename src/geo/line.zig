@@ -7,6 +7,7 @@
 //! `resample_polyline` runs in float); the ports keep each choice.
 
 const std = @import("std");
+const libm = @import("libm.zig");
 const k = @import("constants.zig");
 const point = @import("point.zig");
 const PointLL = point.PointLL;
@@ -150,8 +151,8 @@ fn arc(last: PointLL, p: PointLL) f64 {
     if (last.eql(p)) return 0.0;
     const lon2 = p.lng * -k.rad_per_deg_d;
     const lat2 = p.lat * k.rad_per_deg_d;
-    return std.math.acos(@sin(last.lat * k.rad_per_deg_d) * @sin(lat2) +
-        @cos(last.lat * k.rad_per_deg_d) * @cos(lat2) * @cos(last.lng * -k.rad_per_deg_d - lon2));
+    return libm.acosF(libm.sinF(last.lat * k.rad_per_deg_d) * libm.sinF(lat2) +
+        libm.cosF(last.lat * k.rad_per_deg_d) * libm.cosF(lat2) * libm.cosF(last.lng * -k.rad_per_deg_d - lon2));
 }
 
 /// The point `remaining` radians from `last` toward `p` (which is `d`
@@ -161,15 +162,15 @@ fn interpolate(last: PointLL, p: PointLL, d: f64, remaining: f64) PointLL {
     const lat2 = p.lat * k.rad_per_deg_d;
     const lon1 = last.lng * -k.rad_per_deg_d;
     const lat1 = last.lat * k.rad_per_deg_d;
-    const sd = @sin(d);
-    const a = @sin(d - remaining) / sd;
-    const acs1 = a * @cos(lat1);
-    const b = @sin(remaining) / sd;
-    const bcs2 = b * @cos(lat2);
-    const x = acs1 * @cos(lon1) + bcs2 * @cos(lon2);
-    const y = acs1 * @sin(lon1) + bcs2 * @sin(lon2);
-    const z = a * @sin(lat1) + b * @sin(lat2);
-    return .{ .lng = std.math.atan2(y, x) * -k.deg_per_rad_d, .lat = std.math.atan2(z, @sqrt(x * x + y * y)) * k.deg_per_rad_d };
+    const sd = libm.sinF(d);
+    const a = libm.sinF(d - remaining) / sd;
+    const acs1 = a * libm.cosF(lat1);
+    const b = libm.sinF(remaining) / sd;
+    const bcs2 = b * libm.cosF(lat2);
+    const x = acs1 * libm.cosF(lon1) + bcs2 * libm.cosF(lon2);
+    const y = acs1 * libm.sinF(lon1) + bcs2 * libm.sinF(lon2);
+    const z = a * libm.sinF(lat1) + b * libm.sinF(lat2);
+    return .{ .lng = libm.atan2F(y, x) * -k.deg_per_rad_d, .lat = libm.atan2F(z, @sqrt(x * x + y * y)) * k.deg_per_rad_d };
 }
 
 /// util.cc `resample_spherical_polyline`: a point every `resolution`

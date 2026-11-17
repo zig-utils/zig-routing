@@ -5,6 +5,7 @@ const std = @import("std");
 pub const constants = @import("constants.zig");
 pub const point = @import("point.zig");
 pub const aabb = @import("aabb.zig");
+pub const libm = @import("libm.zig");
 pub const polyline = @import("polyline.zig");
 pub const line = @import("line.zig");
 pub const grid = @import("grid.zig");

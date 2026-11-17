@@ -8,6 +8,7 @@
 //! depend on it. Each tile can be subdivided into `subdivisions^2` bins.
 
 const std = @import("std");
+const libm = @import("libm.zig");
 const PointLL = @import("point.zig").PointLL;
 const AABB = @import("aabb.zig").AABB;
 const DistanceApproximator = @import("point.zig").DistanceApproximator;
@@ -505,7 +506,7 @@ pub fn mercatorTile(z: u5, p: PointLL) TileXYZ {
     const n: f64 = @floatFromInt(@as(u64, 1) << z);
     const lat = std.math.clamp(p.lat, -85.0511287798066, 85.0511287798066) * std.math.pi / 180.0;
     const x = std.math.clamp(@floor((p.lng + 180.0) / 360.0 * n), 0, n - 1);
-    const y = std.math.clamp(@floor((1.0 - std.math.log(f64, std.math.e, @tan(lat) + 1.0 / @cos(lat)) / std.math.pi) / 2.0 * n), 0, n - 1);
+    const y = std.math.clamp(@floor((1.0 - libm.logF(libm.tanF(lat) + 1.0 / libm.cosF(lat)) / std.math.pi) / 2.0 * n), 0, n - 1);
     return .{ .z = z, .x = @intFromFloat(x), .y = @intFromFloat(y) };
 }
 
@@ -520,7 +521,7 @@ pub fn mercatorBounds(t: TileXYZ) AABB {
 }
 
 fn mercatorLat(frac: f64) f64 {
-    return std.math.atan(std.math.sinh(std.math.pi * (1 - 2 * frac))) * 180.0 / std.math.pi;
+    return libm.atanF(libm.sinhF(std.math.pi * (1 - 2 * frac))) * 180.0 / std.math.pi;
 }
 
 // ---------------------------------------------------------------------------

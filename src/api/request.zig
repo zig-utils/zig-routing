@@ -346,7 +346,33 @@ fn parseLocations(arena: Allocator, doc: json.Value, path: []const u8, o: *const
     return .{ .ok = locs };
 }
 
+/// Location defaults that depend on the request, as the full parser sets them.
+fn defaultLocation(lat: f64, lng: f64, o: *const Options) Location {
+    var loc: Location = .{ .lat = lat, .lng = circularClamp(lng, -180, 180) };
+    if (o.action == .trace_attributes or o.action == .trace_route) loc.type = .via;
+    loc.search_filter.exclude_steps = o.costing == .bicycle;
+    return loc;
+}
+
 fn parseLocation(r: json.Value, o: *const Options) ?Location {
+    // Fast path: an object with only lat and lon (every /height point, most
+    // route stops). All other fields take their defaults, exactly as the
+    // full parser below would leave them.
+    if (r == .object and r.object.count() <= 2) fast: {
+        var lat: ?f64 = null;
+        var lon: ?f64 = null;
+        var it = r.object.iterator();
+        while (it.next()) |e| {
+            if (std.mem.eql(u8, e.key_ptr.*, "lat")) {
+                lat = json.convert(f64, e.value_ptr.*);
+            } else if (std.mem.eql(u8, e.key_ptr.*, "lon")) {
+                lon = json.convert(f64, e.value_ptr.*);
+            } else break :fast;
+        }
+        const la = lat orelse return null;
+        if (la < -90.0 or la > 90.0) return null;
+        return defaultLocation(la, lon orelse return null, o);
+    }
     const lat = json.getOptional(f64, r, "/lat") orelse return null;
     if (lat < -90.0 or lat > 90.0) return null;
     const lon_raw = json.getOptional(f64, r, "/lon") orelse return null;
