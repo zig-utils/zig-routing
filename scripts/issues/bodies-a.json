@@ -1,0 +1,1137 @@
+[
+  {
+    "key": "P0.01",
+    "goal": "A buildable repository with one pinned Zig 0.17-dev toolchain and proof that every zig-* library we plan to reuse compiles on it. Everything else assumes this pin.",
+    "upstream": [],
+    "scope": [
+      "build.zig with a library module, the `zr` executable and a `test` step; build.zig.zon with `minimum_zig_version` set to the pin",
+      "Pin the toolchain in deps.yaml (pantry-mirrored build, 0.17.0-dev.1857 or newer; zig-tls needs at least .1476)",
+      "Add zig-cli, zig-config, zig-tls, zig-xml and zig-benchmarks as URL + hash dependencies and import each from a smoke test",
+      "Create the `src/<area>/` directories from the module map with a root file that re-exports them",
+      "Record the pin and how to install it in AGENTS.md"
+    ],
+    "out_of_scope": [
+      "CI workflows (P0.02)",
+      "zig-js is deliberately not a dependency (needs 0.18-dev)"
+    ],
+    "notes": [
+      "Dependency convention and library versions: docs/upstream/zig-libs-inventory.md",
+      "If a library fails on the pin, fix it in its own repository and bump the hash; do not vendor a patched copy",
+      "Zero external deps: Zig std plus zig-* only (docs/PLAN.md, Dependencies)"
+    ],
+    "accept": [
+      "`zig build` and `zig build test` pass on macOS and Linux with the pinned toolchain",
+      "A test imports every reused zig-* library and calls one function from each",
+      "`zig fmt --check .` is clean"
+    ]
+  },
+  {
+    "key": "P0.02",
+    "goal": "Every push and pull request is built, tested and format-checked on Linux and macOS with exactly the pinned toolchain, so later issues can rely on a green main.",
+    "upstream": [],
+    "scope": [
+      ".github/workflows/ci.yml: matrix of ubuntu-latest and macos-latest, toolchain installed at the exact pinned version",
+      "Steps: `zig build`, `zig build test`, `zig fmt --check .`",
+      "Cache the Zig global cache and fetched dependencies",
+      "A ReleaseFast build job so optimised-only compile errors surface",
+      "Fail when build.zig.zon's `minimum_zig_version` and the CI pin disagree"
+    ],
+    "out_of_scope": [
+      "Performance tracking and the regression gate (P0.09)",
+      "Binary size budget (P4.22)",
+      "Release workflow (P13.05)"
+    ],
+    "notes": [
+      "Mirror the workflow layout of the other zig-* repositories (docs/upstream/zig-libs-inventory.md, section 5)",
+      "Dev toolchain builds get garbage-collected upstream; install from a mirror that keeps the pinned build"
+    ],
+    "accept": [
+      "CI is green on main for both operating systems",
+      "A deliberately unformatted file fails the fmt job (verified once, then reverted)",
+      "CI run time under 5 minutes on a warm cache"
+    ]
+  },
+  {
+    "key": "P0.03",
+    "goal": "A written, read-only inventory of the Valhalla deployment we are replacing, so the baseline and the cutover target match reality instead of assumptions.",
+    "upstream": [
+      "scripts/valhalla_build_config"
+    ],
+    "scope": [
+      "Record the Valhalla version, how it is started and its full JSON config (service limits, tile and elevation settings)",
+      "Record tileset size, format (tar extract or tile directory), build date and covered regions",
+      "Record elevation data: format, tile count, total size",
+      "Record steady-state RSS, CPU count, memory, disk type",
+      "Summarise a day of request shapes: endpoints, costings, costing_options sets, locations per request, payload sizes, latency if logged",
+      "Write the result to docs/baseline/production-inventory.md with anything sensitive removed"
+    ],
+    "out_of_scope": [
+      "Any change to the production routing box (deploys start in P2.07)",
+      "Benchmarking (P0.08)"
+    ],
+    "notes": [
+      "This repository is public: no hostnames, addresses, ports or credentials in the committed file",
+      "Strictly read-only commands on the production routing box",
+      "What the consuming apps send today is summarised in docs/PLAN.md, Context"
+    ],
+    "accept": [
+      "The maintainer grants read-only access or runs the listed commands and supplies the output",
+      "docs/baseline/production-inventory.md is committed and reviewed by the maintainer for sensitive content",
+      "The request-mix summary lists every distinct costing_options set seen"
+    ]
+  },
+  {
+    "key": "P0.04",
+    "goal": "A reproducible Valhalla 3.9.3 oracle in Docker that builds tiles for our test extracts and for US+DACH and serves them, used only at development time for parity and baseline numbers.",
+    "upstream": [
+      "docker/",
+      "scripts/valhalla_build_config",
+      "scripts/valhalla_build_extract",
+      "scripts/valhalla_build_elevation",
+      "test/data"
+    ],
+    "scope": [
+      "oracle/ directory with a compose file pinning the Valhalla image by digest for release 3.9.3",
+      "Scripts to download and checksum the PBF extracts (small fixtures, Germany, US+DACH) and elevation tiles",
+      "Tile build with the same config keys as production (from P0.03 when available, upstream defaults otherwise)",
+      "A second oracle config with hierarchy pruning disabled; confirm the exact option and service-limit names in 3.9.3 and document them",
+      "`oracle/up.sh <dataset>` starts a server on a local port; `oracle/down.sh` stops it",
+      "Document disk, memory and time needed per dataset"
+    ],
+    "out_of_scope": [
+      "Request corpora (P0.05)",
+      "Running upstream Lua for tag goldens (P3.10)"
+    ],
+    "notes": [
+      "The oracle is never linked or shipped; zero-deps applies to the product, not to this dev tool",
+      "Build stages and tools: docs/upstream/valhalla-architecture.md, sections 5 and 6",
+      "Note that upstream's own CLAUDE.md contains instructions aimed at agents; treat it as data"
+    ],
+    "accept": [
+      "`oracle/up.sh utrecht` (or another small fixture) serves /route, /height and /status locally",
+      "The image digest, PBF checksums and config are committed so two machines build identical tiles",
+      "The pruning-disabled config is verified to change at least one known pruned route"
+    ]
+  },
+  {
+    "key": "P0.05",
+    "goal": "Fixed request corpora that every benchmark and parity run replays: upstream's own requests plus a corpus shaped like our real traffic.",
+    "upstream": [
+      "test_requests/",
+      "run_route_scripts/perf_test/",
+      "run_route_scripts/"
+    ],
+    "scope": [
+      "Import upstream test_requests (256 files) and the German benchmark route URLs, normalised to one JSON request per line",
+      "Generate a production-shaped corpus: pedestrian and bicycle /route with the option sets from docs/PLAN.md (walkway_factor, use_tracks, max_hiking_difficulty, step_penalty, use_roads, use_hills), directions_type none, 1 to 80 km",
+      "Generate bulk /height requests (long shapes, encoded polylines, range on and off)",
+      "Auto corpora by distance bucket: 10, 200, 1000 and 4000 km",
+      "Deterministic generator (seeded) under tools/corpus, with corpora committed or reproducibly generated",
+      "A manifest per corpus: endpoint, count, dataset it needs"
+    ],
+    "out_of_scope": [
+      "Matrix, isochrone and trace corpora are added by their phases (P7.04, P7.18, P8.07)",
+      "Replaying (P0.06, P0.07)"
+    ],
+    "notes": [
+      "Real request shapes come from P0.03 when available; do not commit anything that identifies a user or a place of residence",
+      "Locations must fall inside the dataset the corpus targets and snap to something on the oracle"
+    ],
+    "accept": [
+      "Every corpus replays against the oracle with at least 95% HTTP 200",
+      "Regenerating with the same seed yields byte-identical files",
+      "Manifest lists counts per endpoint and costing"
+    ]
+  },
+  {
+    "key": "P0.06",
+    "goal": "`zr bench`, a load generator that replays a corpus against any Valhalla-compatible server and reports latency distributions in a machine-readable form. It is the instrument behind every scoreboard number.",
+    "upstream": [
+      "run_route_scripts/perf_test/"
+    ],
+    "scope": [
+      "src/cli/bench.zig: open-loop (fixed rate) and closed-loop (N connections) modes over keep-alive HTTP/1.1",
+      "HDR-style latency histogram with p50, p90, p99, p99.9, max, throughput and error counts by status code",
+      "Coordinated-omission-safe timing in open-loop mode",
+      "Warm-up phase excluded from results; fixed duration or fixed request count",
+      "JSON result file with hardware, dataset, commit and corpus identifiers; `--compare a.json b.json` prints deltas",
+      "Uses zig-benchmarks for statistics where it fits"
+    ],
+    "out_of_scope": [
+      "Response comparison (P0.07)",
+      "Hardware counters and flamegraphs (P0.12)",
+      "Server-side time budgets (P1.19)"
+    ],
+    "notes": [
+      "The client must not be the bottleneck: verify it can drive at least 50k requests per second against a trivial local responder",
+      "No allocation per request in the hot path (see docs/PLAN.md, Performance engineering rules)"
+    ],
+    "accept": [
+      "Runs the P0.05 corpora against the oracle and writes a result file",
+      "Histogram percentiles match a reference implementation on a synthetic latency set within 1%",
+      "`zig build test` green"
+    ]
+  },
+  {
+    "key": "P0.07",
+    "goal": "`zr diff` replays one corpus against two servers and scores how closely the responses agree, endpoint by endpoint. It is how every parity gate in the plan is evaluated.",
+    "upstream": [
+      "run_route_scripts/"
+    ],
+    "scope": [
+      "src/cli/diff.zig: send each request to server A and server B, pair the responses",
+      "Gate H checks: JSON key sets, value types, enums, error codes and HTTP status",
+      "/height: exact value equality",
+      "/route: length and time tolerances, shape overlap by shared length after polyline decode, leg and location counts",
+      "Pluggable scorers so later phases add matrix cells (E), isochrone IoU (F), trace edges (G) and cost parity (A to C)",
+      "Report: per-gate pass rate, worst offenders written as reproducible request files, non-zero exit below threshold"
+    ],
+    "out_of_scope": [
+      "Recosting paths under one cost function (P3.35 and P3.40 add gates A to C)",
+      "Load generation (P0.06)"
+    ],
+    "notes": [
+      "Gate definitions and thresholds: docs/PLAN.md, Verification",
+      "Routes that are strictly cheaper than the oracle's are classified by cause, not failed; leave room for that classification in the report format"
+    ],
+    "accept": [
+      "`zr diff oracle oracle` reports 100% on every implemented gate",
+      "A deliberately perturbed response (changed height, dropped key) is detected in tests",
+      "`zig build test` green"
+    ]
+  },
+  {
+    "key": "P0.08",
+    "goal": "The numbers to beat: Valhalla 3.9.3 measured on the bench box with the US+DACH data and the fixed corpora, committed as docs/SCOREBOARD.md.",
+    "upstream": [],
+    "scope": [
+      "Run every P0.05 corpus through `zr bench` against the oracle at 1 connection and at core-count connections",
+      "Record p50, p99, throughput, RSS after soak, startup-to-first-request time, tile build time and peak scratch disk",
+      "Record edges settled per route where the oracle exposes it (expansion or verbose logging)",
+      "Fill the scoreboard table from docs/PLAN.md with measured upstream values and our targets beside them",
+      "Commit raw result JSON under bench/baseline/ with hardware, kernel, dataset checksums and oracle digest"
+    ],
+    "out_of_scope": [
+      "Matrix, isochrone and map-matching baselines are measured by their phases if the corpora do not exist yet",
+      "Automated tracking (P0.09)"
+    ],
+    "notes": [
+      "Upstream publishes no benchmark suite; scattered reference numbers are collected in docs/upstream/valhalla-perf-issues.md, section 4",
+      "Same box class as production: 8 vCPU, 16 GB"
+    ],
+    "accept": [
+      "docs/SCOREBOARD.md has a measured upstream value for every row that Phase 2 and Phase 3 gate on",
+      "Two consecutive runs agree within 5% on p50",
+      "Method is documented well enough to reproduce on another machine"
+    ]
+  },
+  {
+    "key": "P0.09",
+    "goal": "A dedicated benchmark machine and a CI job that runs the tracked benchmarks on every merge and fails on regressions above 3%. Upstream has no such tracking; we start with it.",
+    "upstream": [],
+    "scope": [
+      "Self-hosted runner on a fixed, otherwise idle box with CPU frequency scaling pinned",
+      "Workflow that builds ReleaseFast, runs the tracked `zr bench` set and uploads result JSON",
+      "Comparison against the rolling baseline on main with a 3% threshold on p50 and p99 and noise-aware repeats",
+      "History stored as JSON in a results branch, with a small generated trend page",
+      "A `perf-ok` override label for intentional trade-offs, requiring a written reason"
+    ],
+    "out_of_scope": [
+      "Hardware counters (P0.12)",
+      "The benchmarks themselves (owned by each phase)"
+    ],
+    "notes": [
+      "CI shared runners are not a valid perf environment, which is why upstream deleted its bench directory (docs/upstream/valhalla-perf-issues.md, section 3)",
+      "Rule: docs/PLAN.md, Performance engineering rules, Budgets not hopes"
+    ],
+    "accept": [
+      "The maintainer provisions or approves the bench box and registers the runner",
+      "An injected 10% slowdown fails the job; an unchanged commit passes five times in a row",
+      "Trend data is visible for at least the echo and /height benchmarks once they exist"
+    ]
+  },
+  {
+    "key": "P0.10",
+    "goal": "One file that wraps the moving parts of std.Io and the OS (sockets, files, mmap, madvise, clocks) so the rest of the code does not break when the 0.17-dev standard library changes.",
+    "upstream": [],
+    "scope": [
+      "src/server/io.zig (or src/io.zig): listen, accept, read, write, writev, close with io_uring on Linux and kqueue on macOS",
+      "File open, pread and stat; mmap read-only and shared-writable; munmap",
+      "madvise wrappers: WILLNEED, RANDOM, SEQUENTIAL, HUGEPAGE (no-op where unsupported); mlock",
+      "Monotonic and wall clocks; a deadline type",
+      "Typed, aligned slice helpers over mapped regions with a single `@alignCast` at the boundary",
+      "A threaded blocking fallback for tests"
+    ],
+    "out_of_scope": [
+      "HTTP parsing and connection handling (P1.12)",
+      "Hot-section placement policy (P4.15)"
+    ],
+    "notes": [
+      "Rule: std.Io stays behind this shim; raw posix elsewhere (docs/design/engine-and-format.md, Q3 pitfalls)",
+      "Toolchain bumps should touch this file and little else"
+    ],
+    "accept": [
+      "Tests: mmap a file and read typed records; loopback accept, read and write on both operating systems",
+      "No other source file imports std.Io directly (checked by a grep test in CI)",
+      "`zig build test` green"
+    ]
+  },
+  {
+    "key": "P0.11",
+    "goal": "The per-request arena every worker uses, plus a counting allocator that lets tests assert an endpoint performs zero heap allocations once warm.",
+    "upstream": [],
+    "scope": [
+      "src/infra/arena.zig: bump arena with reset-and-retain-high-water semantics and a hard byte cap that returns a clean error",
+      "Page pool for fixed-size pages (used later by paged status arrays)",
+      "CountingAllocator wrapper recording allocation count, bytes and peak",
+      "Test helper `expectNoSteadyStateAlloc(fn)`: warm up, reset counters, run again, expect zero backing-allocator calls",
+      "Scratch buffer type for serializers that grows only inside the arena"
+    ],
+    "out_of_scope": [
+      "Per-endpoint allocation tests (P3.37)",
+      "Request deadlines and memory-cap plumbing through the server (P1.16)"
+    ],
+    "notes": [
+      "Upstream's per-worker heap growth is a top complaint (docs/upstream/valhalla-perf-issues.md, issues 5172, 4322); arenas reset wholesale are the answer",
+      "Rule: docs/PLAN.md, Zero steady-state allocation"
+    ],
+    "accept": [
+      "Arena reset reuses memory with zero backing calls on the second identical workload",
+      "Exceeding the cap returns error.RequestTooLarge without leaking",
+      "`zig build test` green"
+    ]
+  },
+  {
+    "key": "P0.12",
+    "goal": "`zr bench` and the micro-benchmarks can report hardware counters and produce flamegraphs, so performance work is argued with cache misses and call stacks rather than wall time alone.",
+    "upstream": [],
+    "scope": [
+      "Linux perf_event wrapper: cycles, instructions, cache misses, branch misses around a measured region",
+      "Per-unit reporting hook (for example per settled label) for search benchmarks",
+      "Flamegraph capture script for a running `zr serve` and for bench binaries, output as SVG or folded stacks",
+      "Reuse zig-benchmarks' flamegraph and export modules where they fit",
+      "Graceful no-op on macOS and when counters are unavailable"
+    ],
+    "out_of_scope": [
+      "CI regression gate (P0.09)",
+      "Server-side time budgets (P1.19)"
+    ],
+    "notes": [
+      "Rule: docs/PLAN.md, Measure the machine; every perf pull request attaches a flamegraph",
+      "No external profiler dependency in the product; scripts may call system perf"
+    ],
+    "accept": [
+      "A micro-benchmark prints instructions and cache misses per iteration on Linux",
+      "A documented one-liner produces a flamegraph of a bench run",
+      "`zig build test` green on both operating systems"
+    ]
+  },
+  {
+    "key": "P1.01",
+    "goal": "The basic geometry types every module builds on: geographic points, bounding boxes, fast distance approximation, haversine and headings, with results matching midgard.",
+    "upstream": [
+      "src/midgard/pointll.cc",
+      "src/midgard/util.cc",
+      "valhalla/midgard/"
+    ],
+    "scope": [
+      "src/geo/point.zig: PointLL (f64 lng, lat) plus a fixed-point 1e-7 degree i32 form with conversions",
+      "Haversine distance, heading between points, point at distance and heading, midpoint",
+      "DistanceApproximator: squared-distance approximation around a reference latitude, as upstream",
+      "AABB2: expand, intersects, contains, clip tests",
+      "Constants from midgard (earth radius, metres per degree) taken verbatim",
+      "`@Vector` batch variants for distance to many points"
+    ],
+    "out_of_scope": [
+      "Polyline codecs (P1.02)",
+      "Segment projection and line operations (P1.03)"
+    ],
+    "notes": [
+      "Use the same floating-point widths as upstream where results feed costing or snapping, so parity gates are not lost to rounding",
+      "Each ported file carries a 'ported from' note (docs/PLAN.md, Principles)"
+    ],
+    "accept": [
+      "Upstream midgard unit tests for these types ported and green",
+      "Batch and scalar distance agree bit-for-bit or within 1 ulp, documented",
+      "`zig build test` green"
+    ]
+  },
+  {
+    "key": "P1.02",
+    "goal": "Encoders and decoders for Google-style polylines at 5, 6 and 7 digits. API responses use precision 6, graph shapes upstream use 7, and requests may send either 5 or 6.",
+    "upstream": [
+      "src/midgard/polyline2.cc",
+      "valhalla/midgard/encoded.h"
+    ],
+    "scope": [
+      "src/geo/polyline.zig: encode and decode for precision 5, 6 and 7 with a comptime precision parameter",
+      "Streaming encoder that writes into a caller buffer or writer with no allocation",
+      "Decoder as an iterator, with bounds and overflow checks that return errors on malformed input",
+      "SIMD-assisted encode path (delta, zigzag, chunking) with a scalar reference",
+      "Round-trip and malformed-input fuzz tests"
+    ],
+    "out_of_scope": [
+      "Our own varint shape encoding for the graph (P3.17)",
+      "GeoJSON shape output (P3.33)"
+    ],
+    "notes": [
+      "Rounding must match upstream exactly, since gate H compares encoded shapes byte for byte when paths agree",
+      "Fuzz target is registered by P1.20"
+    ],
+    "accept": [
+      "Upstream encode/decode tests ported and green",
+      "Output is byte-identical to the oracle's shape for a fixed set of routes",
+      "SIMD and scalar encoders agree on 10^6 random lines; decoder never reads out of bounds under fuzzing"
+    ]
+  },
+  {
+    "key": "P1.03",
+    "goal": "Operations on lines that snapping, elevation sampling, serializers and map matching all share: closest point, length, resampling, trimming and simplification.",
+    "upstream": [
+      "src/midgard/util.cc",
+      "src/midgard/polyline2.cc",
+      "valhalla/midgard/"
+    ],
+    "scope": [
+      "src/geo/line.zig: closest point on a segment and on a polyline, returning point, distance, segment index and fraction along",
+      "Polyline length; point at distance along; trim between two distances",
+      "resample_spherical_polyline and resample_polyline equivalents used by /height `resample_distance`",
+      "Douglas-Peucker simplification with the same tolerance semantics as upstream `generalize`",
+      "`@Vector` batch projection of one point onto many segments"
+    ],
+    "out_of_scope": [
+      "Polygon operations (P1.05)",
+      "Snap candidate logic (P3.23)"
+    ],
+    "notes": [
+      "Resampling output must match upstream point for point: /height parity (P2.06) is exact equality",
+      "Batch projection is on the snapping hot path; keep it allocation-free"
+    ],
+    "accept": [
+      "Upstream util and polyline tests for these functions ported and green",
+      "Resampled shapes equal the oracle's /height resampling on the corpus",
+      "`zig build test` green"
+    ]
+  },
+  {
+    "key": "P1.04",
+    "goal": "Grid and tile arithmetic: mapping coordinates to cells, enumerating cells along a line or inside a box, and Hilbert ordering. Used by the spatial index, isochrone grid, elevation tiles and vector tiles.",
+    "upstream": [
+      "src/midgard/tiles.cc",
+      "valhalla/midgard/"
+    ],
+    "scope": [
+      "src/geo/grid.zig: a generic Tiles type (bounds, cell size) with row, column, id, base point and neighbour queries",
+      "Cells intersected by a line segment (grid ray traversal) and by a bounding box or circle",
+      "Hilbert curve index for 2D points at a given order, and its inverse",
+      "Web-mercator z/x/y tile math for the later tile endpoints",
+      "Helpers for the 1/256 degree snapping grid and 1 degree elevation tiles"
+    ],
+    "out_of_scope": [
+      "The spatial index file format (P3.20)",
+      "Marching squares (P1.06)"
+    ],
+    "notes": [
+      "We do not reproduce Valhalla's three-level tile hierarchy; this is general cell math (docs/PLAN.md, Native graph format)",
+      "Upstream meili's grid traversal is the reference for the line-cell enumeration"
+    ],
+    "accept": [
+      "Upstream tiles tests ported where the function exists in our API, and green",
+      "Line traversal visits exactly the cells a brute-force check finds on 10^5 random segments",
+      "Hilbert index round-trips for all orders up to 16"
+    ]
+  },
+  {
+    "key": "P1.05",
+    "goal": "A small polygon toolkit that replaces what upstream gets from GEOS and SpatiaLite: assembling rings from ways, point-in-polygon, clipping and area. Admins, timezones, avoid polygons and vector tiles depend on it.",
+    "upstream": [
+      "src/mjolnir/adminbuilder.cc",
+      "src/loki/polygon_search.cc"
+    ],
+    "scope": [
+      "src/geo/polygon.zig: ring assembly from unordered line segments (multipolygon outer and inner rings), with repair of unclosed and self-touching input",
+      "Point-in-polygon (with holes), ring orientation and signed area",
+      "Clip polygon and polyline to an axis-aligned box (Sutherland-Hodgman and Liang-Barsky style)",
+      "Polygon and segment intersection tests against a box and against a line",
+      "A packed polygon index (bounding boxes in a static R-tree) for point lookups"
+    ],
+    "out_of_scope": [
+      "Admin extraction from OSM relations (P5.04)",
+      "Per-zoom simplification for map tiles (P11.03)"
+    ],
+    "notes": [
+      "No general boolean polygon operations are needed; resist building them",
+      "Robustness matters more than speed here: admin boundaries in OSM are messy"
+    ],
+    "accept": [
+      "Tests for rings with holes, touching rings, degenerate and unclosed input",
+      "Clipped output is always inside the box and preserves winding",
+      "Index lookup agrees with brute force on random points"
+    ]
+  },
+  {
+    "key": "P1.06",
+    "goal": "The gridded-data container and contour generation that turn an expansion's reach times into isochrone lines and polygons, matching midgard's output.",
+    "upstream": [
+      "valhalla/midgard/gridded_data.h"
+    ],
+    "scope": [
+      "src/geo/gridded.zig: fixed-resolution grid over a bounding box holding one or more values per cell",
+      "Set-if-less update used during expansion",
+      "Contour generation (marching-squares style as upstream) for multiple thresholds, producing rings",
+      "Polygon assembly from rings: nesting, orientation, optional denoise by area ratio and generalize by tolerance",
+      "`@Vector` paths for bulk cell updates"
+    ],
+    "out_of_scope": [
+      "The expansion that fills the grid (P7.07)",
+      "GeoJSON serialization (P7.08)"
+    ],
+    "notes": [
+      "Upstream found the expansion, not the grid, to be the bottleneck (docs/upstream/valhalla-perf-issues.md, theme c); keep this simple and exact",
+      "Parity gate F (polygon IoU at least 0.97) depends on matching contour behaviour"
+    ],
+    "accept": [
+      "Upstream gridded_data tests ported and green",
+      "Contours of synthetic fields (cone, saddle, plateau) match expected rings",
+      "`zig build test` green"
+    ]
+  },
+  {
+    "key": "P1.07",
+    "goal": "A dependency-free Protocol Buffers wire codec where messages are described as Zig types at comptime. OSM PBF, Valhalla's pbf API, vector tiles and later GTFS-realtime all need it.",
+    "upstream": [
+      "proto/"
+    ],
+    "scope": [
+      "packages/protobuf: varint, zigzag, fixed32/64, length-delimited, packed repeated fields",
+      "Comptime message description (field number, type, repeated/optional/packed, nested) driving generated encode and decode",
+      "Zero-copy decode: strings and bytes as slices into the input; lazy iteration over repeated fields",
+      "Streaming encode with size pre-computation, no allocation beyond the output buffer",
+      "Unknown fields skipped on decode; proto2 and proto3 presence semantics as needed by the schemas we use",
+      "Malformed-input safety (length overruns, varint overflow)"
+    ],
+    "out_of_scope": [
+      "A .proto text parser or reflection",
+      "The Valhalla message schemas themselves (P1.08)",
+      "OSM PBF blob handling (P3.01)"
+    ],
+    "notes": [
+      "Developed in packages/ first and extracted to a standalone zig-protobuf repository later (P13.06)",
+      "Zero-copy decode matters for OSM PBF throughput in the build pipeline"
+    ],
+    "accept": [
+      "Round-trip tests for every wire type and for nested, packed and optional fields",
+      "Byte-identical encoding to reference encoder output for fixture messages",
+      "Decoder survives fuzzing without out-of-bounds reads"
+    ]
+  },
+  {
+    "key": "P1.08",
+    "goal": "All fourteen Valhalla API .proto files expressed as comptime schemas, so requests and responses in `application/x-protobuf` are wire-compatible with upstream clients.",
+    "upstream": [
+      "proto/api.proto",
+      "proto/options.proto",
+      "proto/trip.proto",
+      "proto/directions.proto",
+      "proto/common.proto",
+      "proto/info.proto",
+      "proto/status.proto",
+      "proto/matrix.proto",
+      "proto/isochrone.proto",
+      "proto/expansion.proto",
+      "proto/sign.proto",
+      "proto/incidents.proto",
+      "proto/transit.proto",
+      "proto/transit_fetch.proto"
+    ],
+    "scope": [
+      "src/api/proto/*.zig: one file per upstream .proto with field numbers, types and enums copied exactly",
+      "Enum values and names preserved, including deprecated members, so JSON enum strings can be derived from them",
+      "A checker script that parses the upstream .proto files in the oracle checkout and diffs field numbers against our schemas",
+      "Encode and decode smoke tests for Api, Options, Trip and Directions"
+    ],
+    "out_of_scope": [
+      "Filling these messages from engine results (P6.15 and the per-endpoint API issues)",
+      "JSON to Options parsing (P1.13)"
+    ],
+    "notes": [
+      "Internally the engine passes plain structs between stages; protobuf is only an edge format (docs/PLAN.md, Principles 4)",
+      "The upstream directory is proto/; confirm the exact file list at the pinned commit"
+    ],
+    "accept": [
+      "The checker reports zero field-number or type mismatches against upstream 3.9.3",
+      "A pbf response captured from the oracle decodes and re-encodes to identical bytes",
+      "`zig build test` green"
+    ]
+  },
+  {
+    "key": "P1.09",
+    "goal": "A pure-Zig LZ4 codec (block and frame formats). Elevation tiles may be LZ4-compressed, OSM PBF blobs may use it, and our own block-compressed formats will.",
+    "upstream": [
+      "src/skadi/sample.cc"
+    ],
+    "scope": [
+      "packages/lz4: block decompress with strict bounds checking; block compress (fast mode)",
+      "Frame format: magic, descriptor, block sizes, content size, optional checksums (xxh32)",
+      "Streaming decompress into a caller buffer; one-shot helpers",
+      "xxh32 and xxh3-64 hashes (the latter is reused for graph section checksums)",
+      "Fuzz tests on the decompressor"
+    ],
+    "out_of_scope": [
+      "High-compression (HC) mode",
+      "zstd (std provides decompression; not needed yet)"
+    ],
+    "notes": [
+      "Developed in packages/ and extracted to a standalone zig-lz4 repository later (P13.06)",
+      "No C library fallback; zero deps"
+    ],
+    "accept": [
+      "Decompresses frames produced by the reference lz4 tool (fixtures committed) to identical bytes",
+      "Our compressed output decompresses with the reference tool (verified in the oracle container)",
+      "Decompression of at least 1.5 GB per second on one core on the bench box, measured"
+    ]
+  },
+  {
+    "key": "P1.10",
+    "goal": "A streaming JSON writer that produces responses directly into arena buffers with fixed-precision number formatting and no heap allocation. Upstream's JSON layer is a known slow spot.",
+    "upstream": [
+      "src/tyr/serializers.cc",
+      "valhalla/baldr/"
+    ],
+    "scope": [
+      "src/api/json_writer.zig: object, array, key, string, bool, null, integer and float emitters with automatic comma handling",
+      "Fixed-precision floats (for example 6 decimals for coordinates, 3 for lengths) matching upstream's output formatting",
+      "String escaping with a fast path for clean ASCII",
+      "Raw-value splice for pre-encoded fragments (polylines)",
+      "Depth and state checks in debug builds only"
+    ],
+    "out_of_scope": [
+      "Request parsing (P1.11)",
+      "Per-endpoint serializers"
+    ],
+    "notes": [
+      "Number formatting must reproduce upstream's rounding so gate H can compare values exactly",
+      "Writes into the request arena scratch buffer from P0.11; no intermediate DOM (docs/PLAN.md, Parsing and serialization)"
+    ],
+    "accept": [
+      "Golden tests: fixture objects serialise to the exact bytes the oracle emits",
+      "Zero allocations after warm-up, asserted with the counting allocator",
+      "Throughput of at least 1 GB per second on a coordinate-heavy payload, measured"
+    ]
+  },
+  {
+    "key": "P1.11",
+    "goal": "A request parser that scans JSON straight into typed request structs with no DOM, covering the shared parts of every Valhalla request.",
+    "upstream": [
+      "src/worker.cc",
+      "proto/options.proto"
+    ],
+    "scope": [
+      "src/api/request.zig: scanner-based parsing into a Request struct (action, locations, costing, costing_options as a deferred raw slice per costing, units, language, format, id, date_time, directions_type, shape_format)",
+      "Location fields: lat, lon, type, heading, heading_tolerance, radius, minimum_reachability, search_filter, street-side options, as upstream names them",
+      "Merging of URL query parameters with the JSON body, and the `?json=` form",
+      "Unknown keys ignored; type errors mapped to the upstream error codes",
+      "Strings as slices into the request buffer; lists into the arena"
+    ],
+    "out_of_scope": [
+      "Costing option semantics (P3.26 onwards)",
+      "Protobuf requests (wired in P1.13 using P1.08)"
+    ],
+    "notes": [
+      "Mirror the parsing rules of `from_json` in upstream worker.cc, including defaults and deprecated aliases",
+      "Fuzz target is registered by P1.20"
+    ],
+    "accept": [
+      "Upstream parse_request tests ported for the fields in scope and green",
+      "Every request in the P0.05 corpora parses",
+      "Zero allocations outside the request arena"
+    ]
+  },
+  {
+    "key": "P1.12",
+    "goal": "The HTTP/1.1 server that replaces prime_server and ZeroMQ: one process, one event loop per core, no hand-offs between stages.",
+    "upstream": [
+      "src/valhalla_service.cc"
+    ],
+    "scope": [
+      "src/server/http.zig: SO_REUSEPORT listener per worker thread on the P0.10 shim",
+      "Request head parsing, Content-Length bodies, keep-alive and pipelining, 100-continue",
+      "Responses written with writev from arena buffers; no copies",
+      "Limits: header size, body size, idle and read timeouts; clean 4xx on violation",
+      "Client-disconnect detection surfaced as a cancellation signal",
+      "Graceful shutdown that drains in-flight requests",
+      "Handler interface: `fn(*Request, *Response, *WorkerCtx)` run to completion on the worker"
+    ],
+    "out_of_scope": [
+      "Routing actions and Valhalla error bodies (P1.13)",
+      "Deadlines and memory caps (P1.16)",
+      "TLS termination, HTTP/2 and response compression (not planned; the service sits on a private network)"
+    ],
+    "notes": [
+      "Upstream needs about 15 threads per worker and serialises protobuf between stages (docs/upstream/valhalla-perf-issues.md, theme g)",
+      "Each worker owns one request arena, reset after every response"
+    ],
+    "accept": [
+      "Conformance tests: pipelined requests, partial reads, oversized headers, slow clients",
+      "Echo benchmark recorded with `zr bench` on the bench box (the comparison against prime_server is P1.21)",
+      "Zero allocations per request after warm-up"
+    ]
+  },
+  {
+    "key": "P1.13",
+    "goal": "A running `zr serve` that accepts every Valhalla action URL, parses requests the way upstream does and answers with upstream's exact error format, even though no action is implemented yet.",
+    "upstream": [
+      "src/worker.cc",
+      "src/valhalla_service.cc",
+      "proto/options.proto"
+    ],
+    "scope": [
+      "src/api/service.zig: route `/route`, `/locate`, `/sources_to_targets`, `/optimized_route`, `/isochrone`, `/trace_route`, `/trace_attributes`, `/height`, `/transit_available`, `/expansion`, `/centroid`, `/status`, `/tile` to handlers",
+      "GET with `?json=` and query parameters, POST with JSON body, POST with `application/x-protobuf`",
+      "The full upstream error table: error_code, error, status_code, status, with the same HTTP statuses",
+      "Service limits per costing and action (max_locations, max_distance and friends) read from config and enforced with the upstream codes",
+      "`format` handling (json, osrm, gpx, pbf) and JSONP `callback` if upstream still supports it at the pin",
+      "Unimplemented actions return a clear 501 until their issue lands"
+    ],
+    "out_of_scope": [
+      "Any action's behaviour",
+      "Config file loading (P1.14)"
+    ],
+    "notes": [
+      "Error codes and messages live in upstream's exceptions table referenced from src/worker.cc; copy text exactly, gate H compares them",
+      "Action list and format support matrix: docs/upstream/valhalla-architecture.md, sections 4 and 6"
+    ],
+    "accept": [
+      "`zr diff` gate H passes against the oracle for a corpus of malformed and over-limit requests",
+      "Each of the 13 action paths is reachable by GET and POST",
+      "`zig build test` green"
+    ]
+  },
+  {
+    "key": "P1.14",
+    "goal": "Configuration loading that accepts an existing valhalla.json, so the production config can be reused, with typed access instead of string lookups at request time.",
+    "upstream": [
+      "scripts/valhalla_build_config"
+    ],
+    "scope": [
+      "src/infra/config.zig: load JSON through zig-config (file, then environment overrides) into a typed Config struct",
+      "Honour the upstream keys we implement: service_limits.*, httpd.service.*, additional_data.elevation, loki.actions, thor and meili tunables as they become relevant",
+      "A `zig_routing` section for our own settings (bundle paths, worker count, memory caps, metric cache size)",
+      "Unknown upstream keys are accepted and listed in a startup warning, never fatal",
+      "`zr config check <file>` prints the effective config and what is ignored"
+    ],
+    "out_of_scope": [
+      "Hot reload of config",
+      "Generating configs (upstream's script stays the reference)"
+    ],
+    "notes": [
+      "Upstream resolves boost::property_tree paths at runtime; we resolve once at startup into plain fields",
+      "zig-config API: docs/upstream/zig-libs-inventory.md"
+    ],
+    "accept": [
+      "The default config produced by upstream's build_config script loads without error",
+      "Tests cover precedence (file, env) and typed defaults equal to upstream defaults for service limits",
+      "`zig build test` green"
+    ]
+  },
+  {
+    "key": "P1.15",
+    "goal": "The single `zr` binary with its subcommand structure in place, so each later issue only fills in a command body.",
+    "upstream": [],
+    "scope": [
+      "src/cli/main.zig using zig-cli: `serve`, `build`, `route`, `bench`, `diff`, `inspect`, `config`, `dem`, `import-valhalla`",
+      "Shared flags: `--config`, `--threads`, `--log-level`, `--json` output",
+      "`zr route '<json>'` and `zr route --action <name> --file req.json` run one request in-process, mirroring upstream's one-shot `valhalla_service config action json`",
+      "`zr --version` prints version, commit, toolchain and enabled CPU features",
+      "Consistent exit codes and error output to stderr"
+    ],
+    "out_of_scope": [
+      "Command implementations beyond stubs (owned by their issues)",
+      "Shell completions"
+    ],
+    "notes": [
+      "zig-cli API: docs/upstream/zig-libs-inventory.md",
+      "One binary keeps deployment trivial: copy a file, point it at a bundle"
+    ],
+    "accept": [
+      "`zr --help` lists every subcommand with a one-line description",
+      "Unknown commands and flags exit non-zero with a helpful message",
+      "`zig build test` green"
+    ]
+  },
+  {
+    "key": "P1.16",
+    "goal": "Every request carries a deadline, a cancellation flag and a memory cap from the moment it is accepted, so no later code path can hang or exhaust memory. Upstream has open issues for all three failure modes.",
+    "upstream": [
+      "src/worker.cc"
+    ],
+    "scope": [
+      "A Ctl struct on the worker context: deadline, atomic cancel flag, bytes budget",
+      "Deadline from config with a per-action override; client disconnect sets the cancel flag",
+      "`ctl.check()` cheap enough for hot loops (flag load, clock read every N calls)",
+      "Arena byte cap wired to the upstream-compatible error for over-limit requests",
+      "Timeout and cancellation mapped to the upstream error codes and HTTP statuses",
+      "Test hooks to inject a deadline expiry at a chosen iteration"
+    ],
+    "out_of_scope": [
+      "Calling `check()` inside searches (each algorithm issue does this; the rule is every 1024 pops)",
+      "Load shedding and scheduling classes (P4.25, P7.15)"
+    ],
+    "notes": [
+      "Upstream hangs and missing cancellation: issues 3823, 4398, 6294 in docs/upstream/valhalla-perf-issues.md",
+      "No recursion in request handling paths; a bounded stack is part of the contract"
+    ],
+    "accept": [
+      "A handler that loops forever is cut off at the deadline and the worker serves the next request",
+      "Closing the client socket cancels the in-flight request within one check interval",
+      "A request exceeding the byte cap returns the expected error and leaves the arena reusable"
+    ]
+  },
+  {
+    "key": "P1.17",
+    "goal": "Logging and metrics that never block a worker: a structured access log with timings and a `/metrics` endpoint, in place before the first endpoint ships.",
+    "upstream": [
+      "valhalla/midgard/"
+    ],
+    "scope": [
+      "src/server/log.zig: levelled logger writing through a lock-free per-thread ring to a background flusher; drops and counts rather than blocks",
+      "Access log line per request: action, status, bytes, total time, plus a slot array for per-phase timings",
+      "src/server/metrics.zig: per-thread counters and fixed-bucket histograms merged on read",
+      "`/metrics` in Prometheus text format: requests by action and status, latency histograms, arena high-water, open connections",
+      "Config for level, destination and sampling"
+    ],
+    "out_of_scope": [
+      "The per-phase budget definitions and bench assertions (P1.19)",
+      "statsd output (upstream has it; not planned)"
+    ],
+    "notes": [
+      "Upstream's logger can block request threads (issue 2215)",
+      "Metrics are per-thread to avoid shared-cache-line contention on the hot path"
+    ],
+    "accept": [
+      "With the log destination stalled, request latency is unaffected and a dropped-lines counter increases",
+      "`/metrics` parses with a Prometheus text parser",
+      "Zero allocations per logged request"
+    ]
+  },
+  {
+    "key": "P1.18",
+    "goal": "The ASCII-map test DSL from upstream's gurka framework, so its 136 integration test files can be carried over as our behaviour specification.",
+    "upstream": [
+      "test/gurka/gurka.h",
+      "test/gurka/gurka.cc"
+    ],
+    "scope": [
+      "test/gurka/gurka.zig: `mapToCoordinates(ascii, grid_size_m)` turning characters into node coordinates",
+      "Builders for ways, nodes and relations with tag maps, as in upstream",
+      "Emit the map as an in-memory OSM dataset and as a synthetic OSM PBF file via P1.07",
+      "A `Map` fixture type with hooks `build()` and `doAction()` left as stubs until the builder and endpoints exist",
+      "Assertion helper signatures: expectPath, expectManeuvers, expectSteps, findWay, findNode",
+      "Port three small upstream gurka tests as compile-only examples"
+    ],
+    "out_of_scope": [
+      "Building a graph from the map (P3.22 wires `build()`)",
+      "Porting the test suites themselves (P3.39, P5.20, P9.09)"
+    ],
+    "notes": [
+      "Keep names close to upstream so tests translate mechanically",
+      "Coordinates must match upstream's grid layout exactly, otherwise distance-based expectations drift"
+    ],
+    "accept": [
+      "Coordinates for a reference ASCII map equal upstream's output (captured from the oracle checkout)",
+      "The synthetic PBF is readable by upstream's tile builder in the oracle container",
+      "`zig build test` green"
+    ]
+  },
+  {
+    "key": "P1.19",
+    "goal": "Every request reports how long each phase took (parse, snap, search, build legs, serialize), and `zr bench` can assert budgets against those numbers.",
+    "upstream": [],
+    "scope": [
+      "Phase timer API on the worker context: `phase(.snap)` scopes writing into the access-log slot array from P1.17",
+      "Optional `Server-Timing` response header behind a config flag",
+      "`zr bench --budgets file.json`: per-action, per-phase p50 and p99 limits; exit non-zero when exceeded",
+      "Budget files under bench/budgets/, one per corpus, starting with the echo and error paths",
+      "Per-phase histograms exported on `/metrics`"
+    ],
+    "out_of_scope": [
+      "Budgets for endpoints that do not exist yet (each phase gate adds its own)",
+      "CI regression tracking (P0.09)"
+    ],
+    "notes": [
+      "Rule: docs/PLAN.md, Budgets not hopes",
+      "Timer overhead must stay under 20 ns per phase boundary; use the monotonic clock from the IO shim"
+    ],
+    "accept": [
+      "Access log shows non-zero parse and serialize timings for error-path requests",
+      "A budget file with an impossible limit makes `zr bench` fail; a realistic one passes",
+      "Measured timer overhead documented"
+    ]
+  },
+  {
+    "key": "P1.20",
+    "goal": "A fuzzing harness with targets for the first untrusted-input parsers, runnable locally and on a schedule, so malformed input is found by us and not by the internet.",
+    "upstream": [],
+    "scope": [
+      "`zig build fuzz -Dtarget=<name>` using std.testing.fuzz",
+      "Targets: JSON request scanner, polyline decoders, protobuf decoder, LZ4 decompressor, HTTP head parser",
+      "Seed corpora from the request corpora and upstream test fixtures",
+      "A scheduled CI job running each target for a fixed time and uploading crashers",
+      "Crash reproduction test file per finding, committed with the fix"
+    ],
+    "out_of_scope": [
+      "PBF reader and graph loader targets (P3.38)",
+      "Costing admissibility fuzzing (P4.10)"
+    ],
+    "notes": [
+      "Parsers must return errors, never panic or read out of bounds, in ReleaseFast as well as Debug",
+      "Rule: docs/PLAN.md, Verification item 5"
+    ],
+    "accept": [
+      "Each target runs for 10 minutes locally without a crash",
+      "The scheduled job exists and has produced at least one clean run",
+      "`zig build test` green"
+    ]
+  },
+  {
+    "key": "P1.21",
+    "goal": "Phase 1 is closed: the geometry kernel is proven against upstream's tests and the HTTP layer is proven faster than what it replaces.",
+    "upstream": [
+      "test/",
+      "src/midgard/"
+    ],
+    "scope": [
+      "Confirm the midgard unit tests relevant to P1.01 to P1.06 are ported, listing any upstream test intentionally skipped and why",
+      "Echo benchmark: `zr serve` versus the oracle's prime_server-based service on a trivial request (for example /status), same box, same client",
+      "Record results in docs/SCOREBOARD.md and bench/results/",
+      "Check zero-allocation and fuzz jobs are green",
+      "Update the Phase 1 epic checklist and open follow-up issues for anything deferred"
+    ],
+    "out_of_scope": [
+      "Any new feature work"
+    ],
+    "notes": [
+      "A gate issue closes only when every acceptance line is met; if a number misses, fix it or record an explicit, reviewed exception",
+      "Gate rule: docs/PLAN.md, Phases"
+    ],
+    "accept": [
+      "All ported midgard tests green in CI",
+      "Requests per second on the echo benchmark exceed the oracle's at equal connection counts, with p99 no worse",
+      "Skipped-test list reviewed and committed under docs/"
+    ]
+  },
+  {
+    "key": "P2.01",
+    "goal": "Reading SRTM-style elevation tiles in every form Valhalla accepts (raw, gzip, LZ4) through a memory-mapped cache, as the base for /height and for elevation stamping in the graph build.",
+    "upstream": [
+      "src/skadi/sample.cc",
+      "valhalla/skadi/"
+    ],
+    "scope": [
+      "src/elevation/tiles.zig: tile naming and directory layout exactly as upstream (N/S dd, E/W ddd, per-latitude folders)",
+      "Raw `.hgt` tiles (3601 x 3601 big-endian i16) memory-mapped",
+      "`.hgt.gz` via std flate and `.hgt.lz4` via P1.09, decompressed on first use into a bounded cache",
+      "Cache with a byte limit and eviction that never blocks readers on other tiles",
+      "Missing tiles and short files handled as no-data, not errors",
+      "Directory scan at startup that records available tiles without opening them"
+    ],
+    "out_of_scope": [
+      "Sampling and interpolation (P2.02)",
+      "Our repacked format (P2.04)",
+      "Remote tile fetching"
+    ],
+    "notes": [
+      "Works directly on the DEM files the production routing box already has, so the first deploy needs no data conversion",
+      "Shared immutable data, per-thread nothing: the cache is the only mutable structure and must be contention-free on hits"
+    ],
+    "accept": [
+      "Reads fixtures in all three encodings to identical sample arrays",
+      "Cache stays under its byte limit under a random-access test",
+      "`zig build test` green"
+    ]
+  },
+  {
+    "key": "P2.02",
+    "goal": "Elevation at an arbitrary coordinate, computed exactly as skadi does, so /height answers are value-identical to Valhalla's.",
+    "upstream": [
+      "src/skadi/sample.cc"
+    ],
+    "scope": [
+      "src/elevation/sample.zig: `get(point)` and `getAll(points, out)`",
+      "Bilinear interpolation over the four surrounding posts with upstream's exact index and weight arithmetic",
+      "No-data handling as upstream: void posts excluded and weights renormalised, all-void returns the no-data sentinel",
+      "Tile edge and corner cases (neighbouring tile lookups, poles, antimeridian)",
+      "Same floating-point types and operation order as upstream"
+    ],
+    "out_of_scope": [
+      "Batching and SIMD (P2.05)",
+      "The HTTP endpoint (P2.03)"
+    ],
+    "notes": [
+      "Parity here is exact equality (gate H), so match rounding and evaluation order, not just the formula",
+      "This sampler is reused by the graph build for grades and slopes (P3.18)"
+    ],
+    "accept": [
+      "Upstream skadi sample tests ported and green",
+      "Values equal the oracle's for 10^5 random points across tile interiors, edges and voids",
+      "`zig build test` green"
+    ]
+  },
+  {
+    "key": "P2.03",
+    "goal": "A complete `/height` endpoint compatible with Valhalla's: same inputs, same options, same JSON output. This is the first endpoint that can serve production traffic.",
+    "upstream": [
+      "src/tyr/height_serializer.cc",
+      "src/loki/",
+      "src/skadi/sample.cc"
+    ],
+    "scope": [
+      "src/api/height.zig: inputs `shape` (list of lat/lon) and `encoded_polyline` with `shape_format` polyline5 or polyline6",
+      "`range` (cumulative distance paired with height), `height_precision` (0 to 2 decimals), `resample_distance`",
+      "Output keys and ordering as upstream: `shape` or `encoded_polyline` echoed, `height` or `range_height`, `id`",
+      "No-data represented as upstream does (null)",
+      "Service limits: max shape points and min resample distance with the upstream error codes",
+      "JSON and pbf response formats"
+    ],
+    "out_of_scope": [
+      "Throughput work (P2.05)",
+      "Elevation in /route responses (later serializer issues)"
+    ],
+    "notes": [
+      "The consuming apps send long shapes in bulk; the request scanner and writer must stay allocation-free",
+      "Confirm the handler location under src/loki at the pinned commit before porting option names"
+    ],
+    "accept": [
+      "`zr diff` reports exact equality with the oracle on the /height corpus (gate H)",
+      "Over-limit and malformed requests return the same error codes as the oracle",
+      "Zero steady-state allocations for the endpoint"
+    ]
+  },
+  {
+    "key": "P2.04",
+    "goal": "Our own elevation storage: block-compressed, memory-mappable and seekable, so samples come from hot pages without inflating whole 25 MB tiles, at a fraction of the disk size of raw .hgt.",
+    "upstream": [],
+    "scope": [
+      "Format spec in docs/formats/dem.md: header, tile directory, fixed-size blocks (for example 64 x 64 posts) delta-encoded and LZ4-compressed, block index, checksums",
+      "`zr dem pack <hgt dir> <out>`: parallel conversion from .hgt, .hgt.gz and .hgt.lz4",
+      "Reader in src/elevation/packed.zig behind the same interface as P2.01, with a small per-thread decoded-block cache",
+      "`zr dem verify` comparing every post against the source tiles",
+      "Ocean and void tiles stored as constant blocks"
+    ],
+    "out_of_scope": [
+      "Changing sampling semantics (P2.02 stays the reference)",
+      "Contours and hillshade (P11.08)"
+    ],
+    "notes": [
+      "Lossless: values must be bit-identical to the source so /height parity is unaffected",
+      "Follow the on-disk rules: extern structs, little-endian, comptime size assertions (docs/design/engine-and-format.md, Q3 pitfalls)"
+    ],
+    "accept": [
+      "`zr dem verify` passes for the test region",
+      "Packed size at most 40% of raw .hgt for the test region, measured and recorded",
+      "Sampling through the packed reader equals the tile reader on 10^6 random points"
+    ]
+  },
+  {
+    "key": "P2.05",
+    "goal": "Bulk elevation lookups at least ten times faster than Valhalla, since one consumer measures hundreds of thousands of trails through this endpoint.",
+    "upstream": [
+      "src/skadi/sample.cc"
+    ],
+    "scope": [
+      "Batch sampler: bucket points by tile and block, visit in memory order, write results back in request order",
+      "`@Vector` bilinear interpolation over batches with a scalar path for edges and voids",
+      "Prefetch of the next block; decoded-block reuse across consecutive points",
+      "Fast path for `resample_distance` that generates points and samples in one pass",
+      "Per-phase timings (parse, sample, serialize) and a budget file for the /height corpus"
+    ],
+    "out_of_scope": [
+      "Intra-request multi-threading (reconsidered with scheduling classes in P7.15)",
+      "Response caching"
+    ],
+    "notes": [
+      "Results must remain value-identical to P2.02; the batch path is checked against the scalar path in tests",
+      "Rule: docs/PLAN.md, Performance engineering rules, Elevation"
+    ],
+    "accept": [
+      "Batch and scalar samplers agree exactly on 10^6 points",
+      "Points per second at least 10x the oracle on the bulk /height corpus, single connection and at core-count connections",
+      "Zero steady-state allocations; flamegraph attached"
+    ]
+  },
+  {
+    "key": "P2.06",
+    "goal": "Phase 2 is closed: /height is proven identical to Valhalla's and at least ten times faster, with the evidence committed.",
+    "upstream": [],
+    "scope": [
+      "Run `zr diff` on the full /height corpus against the oracle, both tile and packed readers",
+      "Run `zr bench` for both servers on the bench box; update docs/SCOREBOARD.md",
+      "Soak: one hour of bulk requests with flat RSS",
+      "Confirm fuzz, zero-allocation and budget checks are green",
+      "Update the Phase 2 epic and file follow-ups for anything deferred"
+    ],
+    "out_of_scope": [
+      "Deployment (P2.07)"
+    ],
+    "notes": [
+      "Gate H for /height is exact equality, including null handling and number formatting",
+      "If the 10x line is missed, the gate stays open; do not lower it without a reviewed exception"
+    ],
+    "accept": [
+      "100% exact parity on the corpus",
+      "At least 10x points per second versus the oracle, results committed under bench/results/",
+      "RSS after the soak within 5% of RSS after warm-up"
+    ]
+  },
+  {
+    "key": "P2.07",
+    "goal": "zig-routing runs on the production routing box next to Valhalla, reading the same elevation data, with live /height requests mirrored and compared before anything depends on it.",
+    "upstream": [],
+    "scope": [
+      "A release build for the box's CPU and a systemd unit with memory limits, restart policy and a health check on /status",
+      "A second listening port restricted by the same firewall rule as the existing service",
+      "Deployment script: upload binary and config, start, verify, roll back",
+      "Shadow comparison: replay a sample of recent real /height requests against both services with `zr diff` and report",
+      "Dashboards or log queries for latency, errors and RSS",
+      "Runbook section: start, stop, roll back, where logs are"
+    ],
+    "out_of_scope": [
+      "Pointing any app at the new service (P2.08)",
+      "Graph bundles on the box (P3.41)"
+    ],
+    "notes": [
+      "No hostnames, addresses or ports in this public repository; deployment specifics live in the private infrastructure config",
+      "Valhalla keeps running untouched; this deploy must not compete with it for memory"
+    ],
+    "accept": [
+      "The maintainer approves the deploy and provides access to the production routing box",
+      "Shadow comparison shows exact parity on at least 10,000 real requests",
+      "Service survives a restart and a 24 hour run with flat RSS"
+    ]
+  },
+  {
+    "key": "P2.08",
+    "goal": "The consuming apps get elevation from zig-routing in production, with Valhalla as automatic fallback. First real traffic served by the new engine.",
+    "upstream": [],
+    "scope": [
+      "Point the apps' primary elevation URL at the new service; keep Valhalla as the next server in their existing fallback chain",
+      "If routing and elevation share one base URL in the apps, add a path-based split (new service for /height, Valhalla for the rest) without client code changes",
+      "Run one full bulk elevation job from the heaviest consumer and compare a sample of results with a Valhalla run",
+      "Watch error rate, fallback rate and latency for one week",
+      "Document the rollback: one environment change"
+    ],
+    "out_of_scope": [
+      "/route traffic (P3.42)",
+      "Removing Valhalla (P13.01)"
+    ],
+    "notes": [
+      "Changes to the apps' environment and deploys are made by the maintainer or with explicit approval",
+      "Keep app names and URLs out of this repository"
+    ],
+    "accept": [
+      "The maintainer approves and performs or authorises the environment change",
+      "Fallback rate under 0.1% over the observation week with no elevation-related errors in the apps",
+      "The bulk job completes and its sample matches Valhalla exactly"
+    ]
+  }
+]

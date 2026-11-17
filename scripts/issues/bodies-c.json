@@ -1,0 +1,1222 @@
+[
+  {
+    "key": "P4.01",
+    "goal": "A partitioner that recursively splits the street graph with small balanced separators and emits a nested-dissection order. This order is the foundation of the acceleration hierarchy, the id layout and cold-data chunking, so its quality bounds everything in this phase.",
+    "upstream": [],
+    "scope": [
+      "Implement inertial flow: project nodes on several directions, fix the outer fractions as source and sink, run a max-flow (Dinic on unit capacities) and take the minimum cut.",
+      "Derive a vertex separator from the edge cut and recurse on both sides until cells reach a leaf size (about 64k edges), in parallel across independent subtrees.",
+      "Emit the order (separator nodes last at each level) plus the separator tree with cell boundaries.",
+      "Treat the graph as undirected and ignore turn data; handle disconnected components and islands deterministically.",
+      "Report separator sizes per level, balance and wall time."
+    ],
+    "out_of_scope": [
+      "Applying the order as the graph id order (P4.02).",
+      "Contraction and the elimination tree (P4.03)."
+    ],
+    "notes": [
+      "Design: docs/design/engine-and-format.md (Q1 and Q2) and docs/PLAN.md, Query engine.",
+      "Reference: Customizable Contraction Hierarchies by Dibbelt, Strasser and Wagner for nested-dissection orders; inertial flow by Schild and Sommer.",
+      "Output must be byte-identical regardless of thread count."
+    ],
+    "accept": [
+      "Unit tests on grid and synthetic road graphs: the order is a permutation, separators disconnect their two sides, balance stays within a configured bound.",
+      "On the Germany extract, top-level separator size and total time are printed and recorded for experiment E4 (P4.13).",
+      "Same input gives the same order with 1 and 8 threads.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P4.02",
+    "goal": "The nested-dissection order becomes the node id order of the bundle, so node id equals elimination rank, cells are contiguous id ranges and no permutation arrays are needed at query time.",
+    "upstream": [],
+    "scope": [
+      "Implement the ordering interface from P3.21 with the nested-dissection order from P4.01.",
+      "Renumber nodes and directed edges in the build so CSR adjacency, opposing-edge computation, turn tables and the spatial index all use the new ids.",
+      "Write the cell table (separator tree levels as id ranges) as its own section.",
+      "Chunk cold data (shapes, names, attributes) by leaf cell instead of by build order.",
+      "Keep the Hilbert order selectable for comparison and for builds without acceleration."
+    ],
+    "out_of_scope": [
+      "The partitioner itself (P4.01).",
+      "CCH topology (P4.03)."
+    ],
+    "notes": [
+      "Format rules: docs/PLAN.md, Native graph format (v1).",
+      "The format version must change if section meaning changes; add a section-kind for the cell table rather than overloading an existing one."
+    ],
+    "accept": [
+      "A bundle built with the new order passes every existing reader, snap and routing test unchanged.",
+      "Test: for every cell, node ids form one contiguous range and its separator nodes rank above its interior.",
+      "Median id distance between adjacent nodes is reported and is lower than with the Hilbert order on the Germany extract.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P4.03",
+    "goal": "The customizable contraction hierarchy topology for a bundle: the chordal supergraph produced by contracting nodes in id order, its elimination tree, and a versioned `cch.topo` section that every metric refers to.",
+    "upstream": [],
+    "scope": [
+      "Contract nodes in rank order over the undirected, turn-free node graph, inserting shortcut arcs between higher-ranked neighbours (no witness search; this is metric independent).",
+      "Store upward adjacency as CSR sorted by head, plus the elimination tree parent per node.",
+      "Record for each original edge the CCH arc it maps to, for customisation input.",
+      "Precompute the lower-triangle enumeration order needed by customisation, level by level, so it can run in parallel.",
+      "Write `cch.topo` with the dataset UUID and a hash of the order; reject a topology whose hash does not match the bundle."
+    ],
+    "out_of_scope": [
+      "Assigning weights (P4.04).",
+      "Queries and potentials (P4.06)."
+    ],
+    "notes": [
+      "Reference: Customizable Contraction Hierarchies by Dibbelt, Strasser and Wagner (contraction without metric, elimination tree).",
+      "Budget from the design: at most about 4 arcs per node and about 16 B per node for the query-hot part; see docs/design/engine-and-format.md."
+    ],
+    "accept": [
+      "Tests on small graphs compare the arc set against a brute-force chordal completion for the same order.",
+      "Elimination tree invariants hold: parent is the lowest-ranked upward neighbour, every upward neighbour is an ancestor.",
+      "Arcs per node and build time on the Germany extract are reported for P4.13.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P4.04",
+    "goal": "Given a compiled costing table, produce a lower-bound metric on the CCH: every arc gets the cheapest possible cost of travelling between its endpoints under that request's own factors. This is what makes potentials tight for arbitrary costing options.",
+    "upstream": [],
+    "scope": [
+      "Vectorisable weight pass over original edges: length x seconds-per-metre at the edge's fastest speed x class factor + minimum incoming turn cost + entry penalty, rounded down to integer ticks; forbidden edges are infinite.",
+      "Keep separate upward and downward weights so one-way streets and per-direction access are respected.",
+      "Basic customisation: process arcs bottom-up and relax lower triangles (min-plus), parallel by elimination-tree level.",
+      "Customise in u32 scratch from the request arena or a dedicated pool; no allocation inside the triangle loop.",
+      "Expose `customise(topology, compiled_costing) -> Metric` with timing and thread-count parameters."
+    ],
+    "out_of_scope": [
+      "Metric keys, storage and compression (P4.05).",
+      "Caching and background scheduling (P4.08)."
+    ],
+    "notes": [
+      "The lower bound must satisfy admissibility invariants I1, I2, I3 and I5 from docs/PLAN.md (Query engine, item 5); the costing kernel supplies edge and turn lower bounds, this issue only consumes them.",
+      "Reference: Customizable Contraction Hierarchies by Dibbelt, Strasser and Wagner (basic customisation, triangle enumeration)."
+    ],
+    "accept": [
+      "Test: on random graphs and random factor tables, CCH distances from the customised metric equal Dijkstra distances on the lower-bound graph.",
+      "Test: 1-thread and 8-thread customisation produce identical metrics.",
+      "Customisation of the Germany extract completes and reports time per thread count (input to P4.13).",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P4.05",
+    "goal": "Metrics become durable, shareable artefacts: each is identified by a 128-bit key derived from the compiled costing, stored compactly on disk and mmap'd on restart so no request ever waits for a metric that was already built.",
+    "upstream": [],
+    "scope": [
+      "Define the static projection of the compiled costing POD (class-to-factor table, speed table, turn-class table, scalars that affect lower bounds) and hash it to a 128-bit metric key; different raw options that compile to the same tables share a key.",
+      "Store weights as u16 minifloats (4-bit exponent, 12-bit mantissa) rounded down once, upward and downward arrays.",
+      "File header: topology hash, metric key, costing ABI version, traffic epoch, record counts, payload hash.",
+      "mmap loader that rejects mismatched topology hash or costing ABI.",
+      "Tool command to list, verify and delete metric files in a bundle."
+    ],
+    "out_of_scope": [
+      "Eviction and admission policy (P4.08)."
+    ],
+    "notes": [
+      "A rounded-down metric is still a valid lower bound, so admissibility is preserved (I5).",
+      "Budget from the design: about 12 B per node per metric; see docs/design/engine-and-format.md."
+    ],
+    "accept": [
+      "Test: decode(encode(w)) is never greater than w and is within 0.03% of w across the full u32 range.",
+      "Test: two option sets that compile to identical tables produce the same key; changing any lower-bound-relevant field changes it.",
+      "Round-trip test: customise, write, mmap, compare potentials against the in-memory metric.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P4.06",
+    "goal": "Exact lower-bound distances to a target (or from a source) are available on demand per node, computed lazily over the elimination tree. These are the A* potentials for route, matrix and alternates.",
+    "upstream": [],
+    "scope": [
+      "Potential context for one target: an upward elimination-tree sweep from the target computes distances to its ancestors using the downward metric.",
+      "`get(node)`: memoised recursive evaluation over upward arcs, written iteratively with an explicit stack (no recursion), results stored in a paged memo array from the request arena.",
+      "Reverse variant (potential from a source) for arrive-by searches.",
+      "Support several target edges with offsets (partial destination edges and multiple snap candidates) by seeding the sweep with multiple nodes.",
+      "Counters: memo hits, arcs scanned, setup time."
+    ],
+    "out_of_scope": [
+      "Using the potential inside the search loop (P4.07).",
+      "Caching contexts across requests (P4.23)."
+    ],
+    "notes": [
+      "Reference: CH-Potentials by Strasser and Zeitz (lazy potential evaluation) and the lazy RPHAST formulation by Zeitz.",
+      "Expected setup cost from the design is about 0.2 ms; see docs/design/engine-and-format.md."
+    ],
+    "accept": [
+      "Test: for random nodes, `get(node)` equals the Dijkstra distance on the lower-bound graph, forward and reverse.",
+      "Test: potentials are consistent, h(u) <= w(u,v) + h(v), on every edge of test graphs.",
+      "Zero heap allocation after warm-up, asserted with the counting allocator.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P4.07",
+    "goal": "The search core uses customised potentials as its A* heuristic, with minimum turn costs folded into the bound, and proves in debug builds that the heuristic never overestimates. This is the change that turns the exact search from Valhalla-speed into the plan's target speed.",
+    "upstream": [],
+    "scope": [
+      "Add a potential provider parameter to `Search(K, Q)`; the queue key becomes cost + potential(head) x sigma.",
+      "Turn-cost folding: the lower-bound edge weight includes the minimum incoming transition cost and entry penalties, so city turn costs do not loosen the bound; make folding switchable for experiment E2.",
+      "Stopping criterion and tie handling stay exact for label-setting on directed edges with partial origin and destination edges.",
+      "Debug-build relax-time assertion h(u) <= c(u,v) + h(v) with a clear failure report (edge, options, both values).",
+      "Arrive-by uses the reverse potential and the mirrored search."
+    ],
+    "out_of_scope": [
+      "Fallback when no exact metric is cached (P4.09).",
+      "Time-dependent potentials (P10.06)."
+    ],
+    "notes": [
+      "Admissibility contract I1 to I5: docs/PLAN.md, Query engine. Restrictions, excludes and closures are monotone and need no change to the potential.",
+      "Reference: CH-Potentials by Strasser and Zeitz."
+    ],
+    "accept": [
+      "Parity gate B holds at 100% on the pedestrian and bicycle corpus: results are identical in cost to the unguided search.",
+      "The relax-time assertion never fires across the corpus in a debug build.",
+      "Settled labels per route drop by at least 10x against the L2 heuristic on routes over 10 km (measured, recorded).",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P4.08",
+    "goal": "A metric cache that makes exact-key potentials the normal case in production: metrics are loaded from disk at startup, built in the background when a new option set repeats, and evicted under a memory bound.",
+    "upstream": [],
+    "scope": [
+      "Cache keyed by metric key with LRU eviction under a configurable byte budget and a minimum of one metric per active mode.",
+      "Admission filter: a key is customised only after it has been seen twice within a window (default 60 s), so one-off option sets do not trigger work.",
+      "Background customisation on a bounded worker pool that never blocks request threads; in-flight keys are deduplicated.",
+      "Persist finished metrics to the bundle directory and mmap them on restart; preload a configured list of option sets at startup.",
+      "Metrics for cache state: hits per ladder level, customisations, evictions, bytes."
+    ],
+    "out_of_scope": [
+      "What a request does on a miss (P4.09)."
+    ],
+    "notes": [
+      "The consuming apps send a handful of constant option sets, so the expected steady state is a 100% L0 hit rate.",
+      "Readers must be able to keep using a metric that is being evicted; use reference counting or epochs, not locks in the request path."
+    ],
+    "accept": [
+      "Test: concurrent requests with the same new key trigger exactly one customisation.",
+      "Test: eviction never frees a metric in use by a running request.",
+      "Restart test: previously built metrics are served without customisation.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P4.09",
+    "goal": "Every request gets an admissible heuristic even when its exact metric is not cached: a ladder from the exact metric, to a scaled neighbouring metric, to plain haversine. Results stay exact at every level; only speed changes.",
+    "upstream": [],
+    "scope": [
+      "L0: exact key cached, sigma = 1.",
+      "L1: pick the cached metric M of the same mode maximising sigma = min over classes of request_factor(c) / M_factor(c) (a loop over the class table, not over edges); use h = sigma x h_M; optionally the maximum over two cached metrics.",
+      "L2: no hierarchy or no usable metric: haversine x minimum seconds per metre, as in the Phase 3 search.",
+      "Optional factor-grid snapping: round class factors down to a geometric grid so the number of distinct keys is finite.",
+      "Record the ladder level per request in the access log and metrics."
+    ],
+    "out_of_scope": [
+      "Cache policy (P4.08).",
+      "The fuzzer that proves admissibility across option ranges (P4.10)."
+    ],
+    "notes": [
+      "Published measurements show a scaled bound degrades quickly as it loosens, which is why L1 is a transient and not the main path; see docs/PLAN.md, Query engine, and experiment E3 (P4.12).",
+      "Classes forbidden in M but allowed in the request make M unusable for that request; detect this and fall through."
+    ],
+    "accept": [
+      "Test: for random option pairs, sigma x h_M never exceeds the true lower-bound distance of the request's metric.",
+      "Parity gate B holds at 100% when the corpus is replayed with the cache forced to L1 and to L2.",
+      "The debug relax-time assertion never fires at any ladder level.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P4.10",
+    "goal": "A property fuzzer that searches the legal option space of every costing kernel for violations of the admissibility contract, so a costing quirk can never silently make routes non-optimal.",
+    "upstream": [
+      "src/sif/pedestriancost.cc",
+      "src/sif/bicyclecost.cc",
+      "valhalla/sif/dynamiccost.h"
+    ],
+    "scope": [
+      "Generator of option sets within each option's documented legal range, including extremes and combinations.",
+      "Checks per sampled (predecessor, edge, options, time): I1 edge lower bound <= real edge cost; I2 0 <= turn lower bound <= real transition cost; I3 costs non-negative or infinite; I5 bounds rounded down.",
+      "I4 check: every request feature is declared monotone or supplies a scalar floor, verified by sampling with the feature on and off.",
+      "End-to-end check on small graphs: guided search cost equals unguided search cost.",
+      "Run under `std.testing.fuzz` with a seed corpus checked in; failures print a minimal reproducing option set."
+    ],
+    "out_of_scope": [
+      "Motor vehicle kernels are added to the fuzzer by their own issues in P5 (P5.11 to P5.13)."
+    ],
+    "notes": [
+      "Factors that can drop below 1 upstream (walkway, sidewalk, alley, driveway factors; use_highways and use_tolls incentives; density and ferry factors; bicycle lane and network discounts) are the cases to target first; see docs/design/engine-and-format.md."
+    ],
+    "accept": [
+      "Fuzzer runs in CI for a fixed budget on every PR touching costing or accel code.",
+      "At least 10^6 sampled cases per kernel pass locally with no violation.",
+      "A deliberately broken lower bound in a test kernel is caught within seconds.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P4.11",
+    "goal": "Experiment E2: measure how tight exact-key potentials are with real Valhalla-faithful costing, with turn-cost folding on and off. This is the make-or-break measurement for the whole acceleration design.",
+    "upstream": [],
+    "scope": [
+      "Run the pedestrian and bicycle corpus and an auto-kernel stand-in on the Germany extract with exact-key metrics.",
+      "Record per route: path edges, settled labels, potential setup time, latency; with folding on and off.",
+      "Pass line: median settled labels <= 20x path edges and p95 <= 100x; pedestrian 10 km p95 under 1 ms; auto 500 km p95 under 15 ms.",
+      "If it fails: implement stronger folding (per-class turn minima, entry penalties) or prototype an edge-based bound for motor modes, and re-measure.",
+      "Write results and the decision to `bench/experiments/E2.md`."
+    ],
+    "out_of_scope": [
+      "L1 behaviour (P4.12)."
+    ],
+    "notes": [
+      "Risk being tested: Valhalla's transition costs are large in cities, which loosens any turn-free bound; see docs/PLAN.md, Risks.",
+      "Reference numbers: CH-Potentials by Strasser and Zeitz report 0.6 ms tight and 2.8 ms with turns on Germany."
+    ],
+    "accept": [
+      "`bench/experiments/E2.md` committed with hardware, data, commit, tables and a pass or fail verdict.",
+      "If failed, the fallback is implemented or a follow-up issue is opened and linked from the Phase 4 gate (P4.26).",
+      "The benchmark is reproducible with one `zr bench` command."
+    ]
+  },
+  {
+    "key": "P4.12",
+    "goal": "Experiment E3: measure the L1 fallback (scaled closest metric) in the regime our real requests create, `walkway_factor: 0.6`, to confirm a cache miss is never worse than Valhalla.",
+    "upstream": [],
+    "scope": [
+      "Customise a default pedestrian metric only, then replay the pedestrian corpus with the production option sets so every request runs at L1.",
+      "Record sigma, settled labels and latency per route length bucket; compare with L0 and with the oracle's latency from the baseline scoreboard.",
+      "Pass line: p95 at L1 no worse than upstream for the same requests.",
+      "If it fails: enable the two-metric maximum or factor-grid snapping from P4.09 and re-measure.",
+      "Write results and the decision to `bench/experiments/E3.md`."
+    ],
+    "out_of_scope": [],
+    "notes": [
+      "Published data: a uniform 5% gap between query weights and the bound slowed CH-Potentials about 25x on Germany, so expect L1 to be far slower than L0; the question is only whether it is acceptable as a transient."
+    ],
+    "accept": [
+      "`bench/experiments/E3.md` committed with tables and a verdict.",
+      "The chosen L1 configuration becomes the default in the server config.",
+      "The benchmark is reproducible with one `zr bench` command."
+    ]
+  },
+  {
+    "key": "P4.13",
+    "goal": "Experiment E4: confirm our own partitioner and customisation are fast and compact enough at the scale of the first production bundle (US plus Germany, Austria and Switzerland).",
+    "upstream": [],
+    "scope": [
+      "Run ordering, CCH topology build and one customisation on the full production-sized bundle on an 8 vCPU / 16 GB class machine.",
+      "Record ordering time, top-level separator sizes, arcs per node, customisation time at 1, 4 and 8 threads, metric size and peak RSS.",
+      "Pass line: order under 30 min and customisation under 10 s on 8 threads; at most 4 arcs per node; metric under 1.5 GB.",
+      "If it fails: improve the partitioner (more directions, flow refinement, better leaf handling) before any other Phase 4 work.",
+      "Write results and the decision to `bench/experiments/E4.md`."
+    ],
+    "out_of_scope": [],
+    "notes": [
+      "Reference: on an 18M-node Europe graph, published CCH customisation is about 4.1 s on one thread and 0.81 s on 8; see docs/design/engine-and-format.md."
+    ],
+    "accept": [
+      "`bench/experiments/E4.md` committed with tables and a verdict.",
+      "Real node and directed-edge counts of the production bundle are recorded (they replace the 27%-of-planet estimate in docs/PLAN.md).",
+      "Any failed line has a linked follow-up issue."
+    ]
+  },
+  {
+    "key": "P4.14",
+    "goal": "Experiment E5: prove the full production bundle, with acceleration data and three cached metrics, serves mixed load inside the memory of the production routing box.",
+    "upstream": [],
+    "scope": [
+      "Load the full bundle with CCH topology and three metrics (two pedestrian option sets and one bicycle) on a 16 GB machine.",
+      "Drive mixed `/route` and `/height` load on 8 threads for at least 30 minutes with the production-shaped corpus.",
+      "Record RSS, page cache use, per-thread scratch high-water marks and major page faults over time.",
+      "Pass line: RSS under 13 GB with no swap and no growth trend.",
+      "If it fails: drop to two metrics by default or split the hierarchy per mode, and re-measure. Write `bench/experiments/E5.md`."
+    ],
+    "out_of_scope": [
+      "The 24-hour soak (P4.24)."
+    ],
+    "notes": [
+      "Budget table: docs/PLAN.md, Native graph format (estimated 12.7 GB resident).",
+      "Upstream context: per-worker RSS of 2 to 2.5 GB and growing is documented in docs/upstream/valhalla-perf-issues.md."
+    ],
+    "accept": [
+      "`bench/experiments/E5.md` committed with a memory breakdown per component and a verdict.",
+      "The default metric-cache byte budget in the server config is set from the measured numbers.",
+      "Any failed line has a linked follow-up issue."
+    ]
+  },
+  {
+    "key": "P4.15",
+    "goal": "Hot graph data is placed and warmed deliberately, so the first requests after startup are not page-fault bound and steady-state TLB misses are low.",
+    "upstream": [],
+    "scope": [
+      "Classify sections as hot (topology, edge and node records, turn pool, CCH, metrics), warm (coordinates, spatial index) or cold (shapes, names, attributes).",
+      "Hot: request transparent huge pages and optionally mlock under a config flag; cold: random-access advice; all through the IO shim.",
+      "Startup warm-up: will-need advice over hot sections, then touch the cells of a recent-traffic list persisted by the previous run.",
+      "Report resident bytes per section in `/status` verbose output and `zr inspect`.",
+      "macOS: degrade gracefully where an advice flag does not exist."
+    ],
+    "out_of_scope": [
+      "Fetching missing sections over the network (P4.16)."
+    ],
+    "notes": [
+      "Upstream never implemented cache warming and skipping the tar scan made first requests slow; see docs/upstream/valhalla-perf-issues.md (#3117, #3953).",
+      "Rule: docs/PLAN.md, Performance engineering rules, Memory placement."
+    ],
+    "accept": [
+      "Benchmark: first-request p99 after a cold start is within 2x of warm p99 on the production-shaped corpus.",
+      "Startup to first served request stays under 1 s with warm-up running in the background.",
+      "Test: every advice call goes through the IO shim and failures are non-fatal.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P4.16",
+    "goal": "A new instance can start serving from a bundle it does not yet have locally: sections are fetched by HTTP range requests into a sparse local file on first touch. This is the scale-out design upstream discusses but never built.",
+    "upstream": [],
+    "scope": [
+      "Bundle manifest listing sections, sizes, hashes and 64 KiB-aligned extents.",
+      "Sparse local files created at full size; a fill bitmap per section records which extents are present.",
+      "On access to a missing extent, fetch it with an HTTP(S) range request (TLS via zig-tls), verify its hash, write it, then mark it present; concurrent waiters share one fetch.",
+      "Background filler that completes the bundle in priority order (hot sections first, then cells near recent traffic).",
+      "Timeouts, retries with backoff and a clean error for requests that cannot be served yet."
+    ],
+    "out_of_scope": [
+      "Warm-up of already-local data (P4.15).",
+      "Swapping to a newer bundle (P4.17)."
+    ],
+    "notes": [
+      "Problem statement and upstream's unfinished attempts: docs/upstream/valhalla-perf-issues.md, section 1 (#3953, #6206, #6422).",
+      "The request path must never block on the network without a deadline."
+    ],
+    "accept": [
+      "Integration test against a local HTTP range server: routes succeed from an empty local directory and results equal the fully local bundle.",
+      "Test: corrupted extents are rejected and refetched; a dead server yields a bounded-time error.",
+      "After the filler completes, the local files are byte-identical to the source.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P4.17",
+    "goal": "The server can switch to a newer bundle without restarting and without dropping or corrupting in-flight requests, something upstream cannot do.",
+    "upstream": [],
+    "scope": [
+      "Bundle handle with epoch-based reclamation: each request pins the current bundle at start and releases it at the end.",
+      "Reload trigger (signal and admin endpoint) that maps the new bundle beside the old, validates headers and UUIDs, then swaps atomically.",
+      "Old bundle is unmapped only after the last pinned request finishes.",
+      "Metric cache entries are tied to the topology hash; metrics for the new bundle are loaded or scheduled before the swap when configured.",
+      "Failure to validate the new bundle leaves the old one serving and reports the reason."
+    ],
+    "out_of_scope": [
+      "Scheduled data refresh that produces the new bundle (P13.08)."
+    ],
+    "notes": [
+      "Upstream limitation: docs/upstream/valhalla-perf-issues.md, theme g (#2156, #3938)."
+    ],
+    "accept": [
+      "Test under load: continuous requests during 50 consecutive swaps produce zero errors and every response matches one of the two bundles.",
+      "Test: a truncated or mismatched bundle is rejected without interrupting service.",
+      "No request-path lock is taken for pinning (verified by code review and a contention benchmark).",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P4.18",
+    "goal": "One server serves several regional bundles and dispatches each request to the right one, so a region can be rebuilt and swapped without touching the others.",
+    "upstream": [],
+    "scope": [
+      "Bundle registry with a coverage polygon or bounding box per bundle from its header.",
+      "Dispatch by snapped locations: all locations of a request must resolve to one bundle.",
+      "Cross-bundle requests return the upstream-compatible no-path or unreachable error with a clear message; document this as a known limit.",
+      "Per-bundle metric caches and status output.",
+      "Snap must not pick candidates from a bundle that does not cover the location."
+    ],
+    "out_of_scope": [
+      "Routing across bundle borders; a merged bundle is the answer for that."
+    ],
+    "notes": [
+      "Regional sharding and its trade-offs as discussed upstream: docs/upstream/valhalla-perf-issues.md, section 1.",
+      "Format: docs/PLAN.md, Native graph format (bundles)."
+    ],
+    "accept": [
+      "Test with two synthetic bundles: requests inside each succeed, a cross-bundle request returns the documented error code.",
+      "Test: hot-reloading one bundle does not disturb requests on the other.",
+      "Parity run on the production-shaped corpus passes with both regional bundles loaded.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P4.19",
+    "goal": "The build pipeline handles a planet extract quickly and with bounded scratch space: every stage is parallel, intermediates are compact and sequential, and each stage reports its throughput.",
+    "upstream": [
+      "src/mjolnir/pbfgraphparser.cc",
+      "src/mjolnir/graphbuilder.cc",
+      "src/mjolnir/util.cc"
+    ],
+    "scope": [
+      "Profile each stage of `zr build` on a continent-sized extract and remove serial sections (PBF decode, tag transform, edge construction, assembly, enhancement, ordering, CCH).",
+      "Keep intermediates sequential and delta-coded; no external sort where PBF id order already gives sortedness.",
+      "Bound memory with streaming stages and explicit per-stage budgets; spill only when configured.",
+      "Per-stage report: rows per second, wall time, peak RSS, bytes written.",
+      "Planet run on a 32 vCPU / 128 GB class machine with results recorded."
+    ],
+    "out_of_scope": [
+      "Determinism across thread counts (P4.20)."
+    ],
+    "notes": [
+      "Upstream numbers to beat and their causes (about 4 to 7 h, 250+ GiB of intermediates, a 110 GiB way-nodes file, Lua capped at 8 states): docs/upstream/valhalla-perf-issues.md, theme e.",
+      "Target: docs/PLAN.md, Scoreboard (planet under 1 h, scratch under 100 GiB)."
+    ],
+    "accept": [
+      "Planet build completes under 1 h on 32 vCPU with scratch under 100 GiB, or the gap is documented with a per-stage breakdown and follow-up issues.",
+      "Per-stage throughput report is emitted as JSON and committed for the run.",
+      "The resulting bundle passes `zr inspect --verify`.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P4.20",
+    "goal": "Builds are reproducible: the same input and configuration produce byte-identical bundles regardless of thread count or machine, which makes caching, diffing and debugging builds possible.",
+    "upstream": [],
+    "scope": [
+      "Find and remove ordering nondeterminism: hash-map iteration order, parallel merge order, unstable sorts, thread-dependent id assignment.",
+      "Make the dataset UUID a function of input hashes and configuration, with timestamps stored outside hashed payloads.",
+      "Deterministic tie-breaking in the partitioner, class-table dedup, string table and turn-table pool.",
+      "CI job that builds a test extract with 1 and N threads and compares section hashes."
+    ],
+    "out_of_scope": [],
+    "notes": [
+      "Upstream builds are non-deterministic at high thread counts; see docs/upstream/valhalla-perf-issues.md, theme e (#5473, #5561, #6112)."
+    ],
+    "accept": [
+      "CI: section hashes are identical for 1, 4 and 16 threads on the test extracts.",
+      "Two builds of the Germany extract on different machines produce identical section hashes.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P4.21",
+    "goal": "Release binaries use the CPU they run on: an x86-64-v3 build for the production box, a baseline x86-64 build, and an aarch64 build, with hot kernels dispatching on CPU features where it pays.",
+    "upstream": [],
+    "scope": [
+      "Build matrix in `build.zig`: ReleaseFast with LTO for x86-64-v3, baseline x86-64 and aarch64 (Linux and macOS).",
+      "Identify kernels where wider SIMD matters (snap projection batches, polyline encode, customisation weight pass and triangle min-plus, DCT) and add runtime dispatch only where measured gain exceeds 10%.",
+      "Startup check that refuses to run a v3 binary on a CPU without the required features, with a clear message.",
+      "Benchmark table per target in `bench/`."
+    ],
+    "out_of_scope": [
+      "Release packaging and distribution (P13.05)."
+    ],
+    "notes": [
+      "Rule: docs/PLAN.md, Performance engineering rules, Build flags."
+    ],
+    "accept": [
+      "All three targets build in CI and pass the test suite (aarch64 natively or under emulation).",
+      "Benchmark table committed showing per-kernel gain of v3 over baseline.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P4.22",
+    "goal": "Comptime monomorphisation stays under control: CI tracks binary size and the number of search and kernel instantiations, and fails when either grows past a budget.",
+    "upstream": [],
+    "scope": [
+      "Script that extracts binary size and counts instantiations of `Search(K, Q)` and costing kernels from the symbol table.",
+      "Checked-in budget file; CI fails when a budget is exceeded and prints the delta against the base branch.",
+      "Mark cold checks `noinline` where the report shows duplication in the relax loop.",
+      "Document how to raise a budget intentionally."
+    ],
+    "out_of_scope": [],
+    "notes": [
+      "Design intent: three or four kernels by about five algorithms, roughly 20 small instantiations; see docs/design/engine-and-format.md, Q3."
+    ],
+    "accept": [
+      "CI job runs on every PR and reports size and instantiation counts.",
+      "A test PR that adds a redundant instantiation fails the job.",
+      "Budget file and procedure are documented in AGENTS.md."
+    ]
+  },
+  {
+    "key": "P4.23",
+    "goal": "Potential contexts for frequently requested targets are reused across requests, removing setup cost and memo warm-up for popular destinations.",
+    "upstream": [],
+    "scope": [
+      "Small per-thread cache of potential contexts keyed by (bundle epoch, metric key, target edge set).",
+      "Bounded by entry count and bytes; contexts are immutable once warmed past a threshold or copied on reuse.",
+      "Invalidate on bundle swap and metric eviction.",
+      "Measure hit rate and saved time on the production-shaped corpus."
+    ],
+    "out_of_scope": [
+      "Whole-response caching (P7.16)."
+    ],
+    "notes": [
+      "Keep it only if it pays: remove the cache if the measured p50 gain is under 5%.",
+      "Rule: docs/PLAN.md, Performance engineering rules, Caching where it is exact."
+    ],
+    "accept": [
+      "Results are bit-identical with the cache on and off across the corpus.",
+      "Benchmark committed showing hit rate and latency effect, with the keep or remove decision.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P4.24",
+    "goal": "A 24-hour soak proves the server's memory is flat and nothing leaks, the failure mode upstream users report most for long-running workers.",
+    "upstream": [],
+    "scope": [
+      "Soak driver using `zr bench` with the mixed production-shaped corpus, including metric-cache misses, hot reloads and cancelled requests.",
+      "Sample RSS, per-thread arena high-water marks, open descriptors, mapped regions and metric-cache bytes every minute.",
+      "Automatic verdict: linear fit of RSS over the last 20 hours must have no significant positive slope; descriptor and mapping counts must be constant.",
+      "Report written to `bench/soak/` with plots as data files."
+    ],
+    "out_of_scope": [
+      "Overload behaviour (P4.25)."
+    ],
+    "notes": [
+      "Upstream context (RSS ratchet per worker, unbounded caches): docs/upstream/valhalla-perf-issues.md, themes b and f (#5172, #4322, #4667)."
+    ],
+    "accept": [
+      "Soak report committed with a pass verdict: RSS growth under 1% over the last 20 hours and zero descriptor growth.",
+      "Zero request errors other than deliberately cancelled ones.",
+      "The soak can be started with one command and is documented."
+    ]
+  },
+  {
+    "key": "P4.25",
+    "goal": "Under more load than it can serve, the server sheds requests early with the upstream-compatible error and keeps tail latency of accepted requests bounded, instead of queueing until everything times out.",
+    "upstream": [],
+    "scope": [
+      "Admission control: bounded per-thread queue and an estimate of queue delay; reject when the deadline cannot be met.",
+      "Shed with the same HTTP status and error JSON shape Valhalla clients already handle.",
+      "Per-request deadline propagated into search loops; client disconnect cancels work.",
+      "Overload benchmark at 1x, 2x and 5x of measured capacity, recording goodput and p99 of accepted requests.",
+      "Metrics for rejected, cancelled and timed-out requests."
+    ],
+    "out_of_scope": [
+      "Separate pools for heavy requests (P7.15)."
+    ],
+    "notes": [
+      "Upstream context (hangs, missing cancellation, throughput not scaling): docs/upstream/valhalla-perf-issues.md, themes c and g.",
+      "Rule: docs/PLAN.md, Performance engineering rules, Tail latency under load."
+    ],
+    "accept": [
+      "At 5x offered load, goodput stays within 10% of capacity and p99 of accepted requests stays within 2x of the uncongested p99.",
+      "Test: a disconnected client's search stops within 1024 pops.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P4.26",
+    "goal": "Phase 4 is done when the accelerated engine is at least 5x faster than Valhalla on our real pedestrian and bicycle traffic, every experiment is resolved, and the production bundle fits the production routing box.",
+    "upstream": [],
+    "scope": [
+      "Run the full pedestrian and bicycle scoreboard against the Phase 0 baseline and update docs/SCOREBOARD.md.",
+      "Collect verdicts of experiments E1 to E5 (E6 and E7 are tracked in P7.04 and P5.21) and confirm each failure has its fallback in place.",
+      "Re-run parity gates A, B and C with acceleration enabled.",
+      "Deploy the accelerated build to the production routing box as primary, keeping Valhalla as fallback.",
+      "Record remaining gaps as issues in the right phase."
+    ],
+    "out_of_scope": [
+      "Motor-vehicle long-route scoreboard rows (P7.17)."
+    ],
+    "notes": [
+      "Targets: docs/PLAN.md, Scoreboard and Phase 4 gate."
+    ],
+    "accept": [
+      "Pedestrian and bicycle `/route` p50 and p99 are at least 5x lower than the Valhalla baseline on the same hardware and data.",
+      "Parity gates A and B at their hard thresholds; gate C within 1e-4 on 99.9%.",
+      "RSS on the production-sized bundle under 13 GB under mixed load.",
+      "docs/SCOREBOARD.md updated with hardware, data and commit."
+    ]
+  },
+  {
+    "key": "P5.01",
+    "goal": "The full enhancement stage: every edge and node carries the derived attributes motor-vehicle costing and narrative depend on, matching upstream's results.",
+    "upstream": [
+      "src/mjolnir/graphenhancer.cc",
+      "valhalla/baldr/directededge.h",
+      "valhalla/baldr/nodeinfo.h"
+    ],
+    "scope": [
+      "Speed assignment for edges without a tagged speed, by road class, use, surface, density and country or state rules, including free-flow and constrained-flow defaults and truck speed.",
+      "Road density per node and edge.",
+      "Turn types between local edges and edge-to-left / edge-to-right flags, written into the turn tables.",
+      "Stop impact per transition (signals, stop and yield signs, class crossings).",
+      "Intersection type, internal intersection edges, curvature, unreachable and not-thru marking for driving modes.",
+      "Run per cell in parallel with deterministic output."
+    ],
+    "out_of_scope": [
+      "Link reclassification and name consistency (P5.02).",
+      "Country access defaults (P5.05)."
+    ],
+    "notes": [
+      "Stage map: docs/upstream/valhalla-architecture.md, section 5 (kEnhance).",
+      "Extends the foot and bike subset from P3.19; keep one code path."
+    ],
+    "accept": [
+      "Same-graph comparison through `zr import-valhalla`: assigned speeds, density, turn types and stop impact match the oracle's tiles on the test extracts (report mismatch rate, target under 0.1% with causes listed).",
+      "Relevant upstream enhancer unit tests ported and green.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P5.02",
+    "goal": "Ramps and links get the road class upstream gives them and every transition knows whether the street name continues, which costing and maneuver generation both rely on.",
+    "upstream": [
+      "src/mjolnir/linkclassification.cc",
+      "src/mjolnir/graphenhancer.cc"
+    ],
+    "scope": [
+      "Port link reclassification: walk link trees, assign the class of the lower-class road they connect, mark ramps versus turn channels.",
+      "Name consistency between every pair of local edges at a node, stored in the turn entry bit.",
+      "Handle links that span cell boundaries.",
+      "Feed the reclassified class into the edge class table before ids are assigned."
+    ],
+    "out_of_scope": [
+      "Speed assignment (P5.01)."
+    ],
+    "notes": [
+      "Turn-channel detection affects the 0.6 turn-channel cost factor in auto costing, so it also affects lower bounds."
+    ],
+    "accept": [
+      "Upstream link classification tests (unit and gurka) ported and green.",
+      "Same-graph comparison on the test extracts: link classes and name-consistency bits match the oracle.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P5.03",
+    "goal": "The tag transform covers everything motor vehicles need beyond basic access: truck dimensions and weights, hazmat, tolls, HOV lanes, and motorcycle and moped specifics.",
+    "upstream": [
+      "lua/graph.lua",
+      "src/mjolnir/pbfgraphparser.cc",
+      "src/mjolnir/osmway.cc"
+    ],
+    "scope": [
+      "Truck: maxheight, maxwidth, maxlength, maxweight, maxaxleload, axle count, hazmat, truck routes, hgv access and destination-only for hgv.",
+      "Tolls and toll booths, HOV lanes and HOV types.",
+      "Motorcycle and moped access and designations.",
+      "Unit parsing (feet and inches, tons, pounds) identical to upstream.",
+      "Write dimension and hazmat values into the cold side table reached via `cold_checks`."
+    ],
+    "out_of_scope": [
+      "Conditional restrictions with time conditions (P5.10)."
+    ],
+    "notes": [
+      "The transform framework and golden harness come from P3.05 and P3.10; add these tag families to the goldens."
+    ],
+    "accept": [
+      "Tag-transform goldens against upstream `graph.lua` output match for these tag families on all test extracts.",
+      "Unit tests for unit parsing edge cases.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P5.04",
+    "goal": "Country and state polygons are built from OSM boundary relations and stored in a packed polygon index inside the bundle, replacing upstream's SQLite, SpatiaLite and GEOS pipeline.",
+    "upstream": [
+      "src/mjolnir/adminbuilder.cc",
+      "src/mjolnir/admin.cc",
+      "lua/admin.lua"
+    ],
+    "scope": [
+      "Port the `admin.lua` relation filter (admin levels, ISO codes, names, drive-on-right and other per-admin attributes).",
+      "Assemble multipolygons from relation members with our ring builder (geo polygon operations from P1.05): ring stitching, inner rings, broken-relation tolerance.",
+      "Packed polygon index: grid or Hilbert R-tree over polygon pieces clipped to cells, mmap-friendly.",
+      "Lookup API: admin (country, state) for a point; assign admin index to every node during the build.",
+      "Emit the admin name and ISO table as a graph section."
+    ],
+    "out_of_scope": [
+      "Using admin data for access defaults (P5.05).",
+      "Timezone polygons (P5.06)."
+    ],
+    "notes": [
+      "Dependency replacement table: docs/upstream/valhalla-architecture.md, section 2."
+    ],
+    "accept": [
+      "Admin assignment for nodes matches the oracle on the test extracts except within a small distance of borders (report rate and tolerance).",
+      "Tests for multipolygons with holes, enclaves and unclosed rings.",
+      "No SQLite or C library is linked.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P5.05",
+    "goal": "Default access rules that depend on the country (for example whether pedestrians may use trunk roads) and the driving side are applied during the build exactly as upstream does.",
+    "upstream": [
+      "src/mjolnir/countryaccess.cc",
+      "src/mjolnir/graphenhancer.cc"
+    ],
+    "scope": [
+      "Port the per-country default access table by highway type and mode.",
+      "Apply defaults only where the way had no explicit access tags (track the tagged-access flags from the transform).",
+      "Set drive-on-right per node from the admin lookup.",
+      "Country crossing flags on edges that cross a border."
+    ],
+    "out_of_scope": [
+      "Admin polygon construction (P5.04)."
+    ],
+    "notes": [
+      "This changes access masks, so it must run before the edge class table is finalised."
+    ],
+    "accept": [
+      "Upstream country access tests (unit and gurka) ported and green.",
+      "Same-graph comparison: access masks match the oracle on the multi-country test extracts.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P5.06",
+    "goal": "Every node knows its timezone and the engine can convert between UTC and local time with correct daylight-saving rules, with no external timezone database at runtime.",
+    "upstream": [
+      "scripts/valhalla_build_timezones",
+      "src/baldr/datetime.cc",
+      "src/baldr/tz_alt.cpp"
+    ],
+    "scope": [
+      "Ingest timezone polygons from the timezone-boundary-builder GeoJSON release into the packed polygon index.",
+      "Assign a timezone index to every node during the build, with the same index numbering scheme documented for the format.",
+      "IANA rules package: compile tzdata into a compact transition table at build time (comptime or generated file) and expose UTC offset lookup for a zone and instant.",
+      "Handle zones added in newer tzdata releases and the upstream extension bit for newer zone ids.",
+      "Attribution for ODbL timezone data in NOTICE and `/status`."
+    ],
+    "out_of_scope": [
+      "Date parsing and seconds-of-week logic (P5.07)."
+    ],
+    "notes": [
+      "Zig std has TZif parsing (`std.tz`); decide between embedding compiled TZif blobs and a generated table, and record the choice.",
+      "This package is a candidate for extraction as a standalone library later (P13.06)."
+    ],
+    "accept": [
+      "Tests: offsets for a set of zones and instants (including DST transitions and historical changes) match reference values.",
+      "Timezone assignment matches the oracle on the test extracts away from zone borders.",
+      "No C library or system tz database is used at runtime.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P5.07",
+    "goal": "The date and time layer that time-dependent routing and timed restrictions use: request date_time parsing, local time at a node, seconds of week, and the TimeInfo carried through a search.",
+    "upstream": [
+      "src/baldr/datetime.cc",
+      "valhalla/baldr/"
+    ],
+    "scope": [
+      "Parse `date_time` values and types 0 to 3 (current, depart at, arrive by, invariant) with upstream's validation and error codes.",
+      "TimeInfo: local time, seconds of week, timezone index, with forward and reverse advancement across timezone changes during a search.",
+      "Day-of-week, week-of-month and date-range helpers used by conditional restrictions.",
+      "ISO 8601 formatting for responses (local time with offset).",
+      "Port upstream datetime unit tests."
+    ],
+    "out_of_scope": [
+      "Timezone polygons and rules (P5.06).",
+      "Using TimeInfo in the search (P5.15)."
+    ],
+    "notes": [
+      "Predicted-speed buckets are 5 minutes, 2016 per week; see docs/upstream/valhalla-architecture.md, section 3."
+    ],
+    "accept": [
+      "Upstream datetime tests ported and green, including DST edge cases.",
+      "Parity gate H for date_time validation errors on the request corpus.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P5.08",
+    "goal": "Simple turn restrictions (no left turn, only straight on, and similar with a single via node) are built from OSM relations and enforced by one bit in the turn entry, with no cost in the relax loop beyond the existing load.",
+    "upstream": [
+      "src/mjolnir/restrictionbuilder.cc",
+      "src/mjolnir/pbfgraphparser.cc",
+      "src/mjolnir/graphbuilder.cc"
+    ],
+    "scope": [
+      "Parse restriction relations (no_* and only_* types, via node) with mode exceptions.",
+      "Resolve from-way, via-node and to-way to local edge indices after edge splitting.",
+      "Set the restricted bit in the per-node turn table for the affected (in, out) pairs; only_* restrictions restrict all other exits.",
+      "Restrictions that apply only to some modes are stored for the per-mode path (handled with P5.10) and flagged so the search checks them.",
+      "Stats: restrictions parsed, resolved, dropped with reasons."
+    ],
+    "out_of_scope": [
+      "Multi-via and via-way restrictions (P5.09).",
+      "Time conditions (P5.10)."
+    ],
+    "notes": [
+      "Restrictions only remove options, so potentials stay admissible (monotone feature, I4)."
+    ],
+    "accept": [
+      "Upstream gurka tests for simple turn restrictions ported and green.",
+      "Same-graph comparison: restriction masks match the oracle on the test extracts.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P5.09",
+    "goal": "Complex restrictions with one or more via ways are enforced exactly by carrying a small automaton state in the search label, instead of upstream's predecessor-chain walk that interacts badly with label dominance.",
+    "upstream": [
+      "src/mjolnir/restrictionbuilder.cc",
+      "valhalla/sif/dynamiccost.h",
+      "valhalla/baldr/"
+    ],
+    "scope": [
+      "Build: resolve via-way restrictions into edge sequences (up to 31 vias as upstream) and write them to `restr.bin`, keyed by first edge, forward and reverse.",
+      "Compile the sequences into a matching automaton; edges that start any restriction carry the start flag in their class.",
+      "Search: the label's context field holds the automaton state; labels on the same edge with different states do not dominate each other; via edges are addressed as virtual edge ids in the status arrays.",
+      "Entering the final edge of a matched no-restriction is forbidden; only-restrictions forbid leaving the sequence.",
+      "Works in forward and reverse searches."
+    ],
+    "out_of_scope": [
+      "Time-conditional complex restrictions (P5.10)."
+    ],
+    "notes": [
+      "Design: docs/PLAN.md, Query engine, item 6, and docs/design/engine-and-format.md (turn costs and restrictions).",
+      "Expect parity noise where upstream's dominance behaviour misses a legal path; classify such differences under gate D rather than hiding them."
+    ],
+    "accept": [
+      "Upstream gurka complex-restriction tests ported and green.",
+      "Property test on random graphs with random restrictions: search cost equals brute-force search on the explicitly expanded state graph.",
+      "Relax-loop throughput on graphs without restrictions regresses by less than 2%.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P5.10",
+    "goal": "Restrictions and access rules that depend on time, mode or vehicle properties are built and enforced: conditional turn restrictions, timed access, and per-edge access restrictions such as weight or height limits.",
+    "upstream": [
+      "src/mjolnir/pbfgraphparser.cc",
+      "src/mjolnir/restrictionbuilder.cc",
+      "valhalla/sif/dynamiccost.h",
+      "lua/graph.lua"
+    ],
+    "scope": [
+      "Parse conditional tags (`*:conditional`) and restriction relations with day, date-range and hour conditions into upstream's condition encoding (day of week, begin and end week, month, hours, minutes).",
+      "Access restriction records per edge: type, modes, value, except-destination, as upstream's AccessRestriction.",
+      "Evaluation at relax time through the cold path (`cold_checks`), port of the restriction evaluation in the costing base, using TimeInfo.",
+      "Timed complex restrictions through the automaton from P5.09 with a time check on the final transition.",
+      "Behaviour without a request date_time matches upstream (which restrictions apply when time is unknown)."
+    ],
+    "out_of_scope": [
+      "Truck dimension values themselves (P5.03) and truck costing checks (P5.12)."
+    ],
+    "notes": [
+      "Use zig-regex only where a hand-written parser for the condition grammar is not clearer.",
+      "Record layouts: docs/upstream/valhalla-architecture.md, section 3."
+    ],
+    "accept": [
+      "Upstream gurka tests for conditional restrictions and access restrictions ported and green.",
+      "Unit tests for the condition parser on the tag values present in the test extracts.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P5.11",
+    "goal": "Auto costing is ported in full, covering auto, bus, taxi and HOV variants with every option, as a compiled-table kernel with a valid lower bound.",
+    "upstream": [
+      "src/sif/autocost.cc",
+      "valhalla/sif/dynamiccost.h",
+      "test/gurka/"
+    ],
+    "scope": [
+      "Port `Allowed`, `AllowedReverse`, node access, `EdgeCost`, `TransitionCost`, `TransitionCostReverse` and the A* cost factor for auto, bus, taxi and the HOV modes.",
+      "All options with upstream names, defaults and ranges: use_highways, use_tolls, use_ferry, use_tracks, use_living_streets, use_distance, shortest, top_speed, fixed_speed, maneuver, gate, private access, toll booth, ferry, country crossing and service penalties, ignore_* flags, closure factor.",
+      "Compile options into the motor kernel's POD; density, surface and class factors become table entries.",
+      "Lower bounds for I1 and I2, including incentives that push factors below 1 (use_highways, use_tolls) and the turn-channel factor.",
+      "Add the kernel to the admissibility fuzzer."
+    ],
+    "out_of_scope": [
+      "Truck (P5.12), motorcycle and scooter (P5.13).",
+      "Destination-only and not-thru search semantics (P5.17)."
+    ],
+    "notes": [
+      "Costs stay f32 so recosting matches upstream arithmetic.",
+      "Contract: docs/PLAN.md, Query engine, items 2 and 5."
+    ],
+    "accept": [
+      "Parity gate A: per-call edge and transition cost within 1e-5 of the oracle on sampled cases across option sets.",
+      "Upstream auto costing tests ported and green.",
+      "Admissibility fuzzer passes for the motor kernel across legal option ranges.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P5.12",
+    "goal": "Truck costing is ported in full: dimension, weight, axle and hazmat checks, truck speeds and truck-route preferences, with the expensive checks kept out of the hot loop.",
+    "upstream": [
+      "src/sif/truckcost.cc",
+      "valhalla/sif/dynamiccost.h"
+    ],
+    "scope": [
+      "Port truck `Allowed`, `EdgeCost` and `TransitionCost` with options height, width, length, weight, axle_load, axle_count, hazmat, use_truck_route, low class penalty, top_speed and the shared auto options.",
+      "Dimension and hazmat checks read the cold side table only when the edge's `cold_checks` bit is set, in a `noinline` slow path.",
+      "Truck speed selection and truck-specific destination-only access.",
+      "Lower bounds for I1 and I2; access restriction checks are monotone (I4).",
+      "Add truck option ranges to the admissibility fuzzer."
+    ],
+    "out_of_scope": [
+      "Parsing dimension tags (P5.03) and access restriction records (P5.10)."
+    ],
+    "notes": [
+      "Upstream has open issues with truck searches exhausting under hierarchy pruning; an exact search should not reproduce them. See docs/upstream/valhalla-perf-issues.md (#3874)."
+    ],
+    "accept": [
+      "Parity gate A for truck on sampled cases across option sets.",
+      "Upstream truck costing tests (unit and gurka) ported and green.",
+      "Relax throughput for auto is unchanged by the presence of the truck slow path.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P5.13",
+    "goal": "Motorcycle and motor scooter costing are ported in full with every option, reusing the motor kernel.",
+    "upstream": [
+      "src/sif/motorcyclecost.cc",
+      "src/sif/motorscootercost.cc"
+    ],
+    "scope": [
+      "Motorcycle: access, edge and transition cost, use_highways, use_tolls, use_trails and shared penalties.",
+      "Motor scooter: top_speed, use_primary, use_hills, grade-based factors and its access rules.",
+      "Compile both into the motor kernel's POD; add table columns only where behaviour differs.",
+      "Lower bounds and fuzzer coverage for both."
+    ],
+    "out_of_scope": [],
+    "notes": [
+      "Models differ mostly in tables, not code; avoid a new kernel instantiation unless measurements require it (see P4.22)."
+    ],
+    "accept": [
+      "Parity gate A for both models on sampled cases.",
+      "Upstream tests for both models ported and green.",
+      "Admissibility fuzzer passes for both.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P5.14",
+    "goal": "One function answers what speed applies to an edge at a given time, resolving live, predicted, constrained, free-flow and base speeds in upstream's order and honouring the request's speed_types.",
+    "upstream": [
+      "src/baldr/graphtile.cc",
+      "valhalla/baldr/traffictile.h",
+      "valhalla/baldr/directededge.h"
+    ],
+    "scope": [
+      "Port the speed resolution of `GraphTile::GetSpeed`: live, then predicted, then constrained or free-flow by time of day, then base speed, with flow-source reporting.",
+      "`speed_types` request option to restrict which sources are used.",
+      "Interfaces for the live and predicted overlays that return absent until Phase 10 provides data.",
+      "Per-edge `lb_speed`: the build-time maximum over all speeds an edge can ever have, used by lower bounds (I1).",
+      "Truck speed handling consistent with truck costing."
+    ],
+    "out_of_scope": [
+      "Traffic overlay files and feeders (P10.02 to P10.04)."
+    ],
+    "notes": [
+      "Resolution order and bucket sizes: docs/upstream/valhalla-architecture.md, section 3."
+    ],
+    "accept": [
+      "Unit tests cover every branch of the resolution order with synthetic overlays.",
+      "Test: `lb_speed` is never below any speed the function can return for that edge.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P5.15",
+    "goal": "Time-dependent routing works on the same exact search as static routing: depart-at, arrive-by, current-time and invariant requests, with local time tracked across timezones.",
+    "upstream": [
+      "src/thor/unidirectional_astar.cc",
+      "src/thor/route_action.cc",
+      "src/baldr/datetime.cc"
+    ],
+    "scope": [
+      "Carry TimeInfo through labels; edge cost and timed restrictions are evaluated at the label's local time.",
+      "Depart-at uses the forward search, arrive-by the mirrored reverse search with time running backwards.",
+      "Timezone changes along the path adjust local time correctly, including DST.",
+      "Multi-leg routes propagate time across legs and waiting at break locations.",
+      "Response fields: local date_time per location and time zone info as upstream.",
+      "No distance cap equivalent to upstream's `max_timedep_distance` is needed; keep the config key accepted."
+    ],
+    "out_of_scope": [
+      "Traffic data (Phase 10) and time-dependent potentials (P10.06)."
+    ],
+    "notes": [
+      "Upstream loses shortcuts and bidirectional search for time-dependent routes; this design does not. See docs/upstream/valhalla-perf-issues.md, theme a (#1895, #1190)."
+    ],
+    "accept": [
+      "Upstream time-dependent tests (unit and gurka) ported and green.",
+      "Parity gate B on the time-dependent corpus.",
+      "A time-dependent request without traffic data returns the same path as the static request.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P5.16",
+    "goal": "Requests can exclude parts of the network: avoid locations, avoid polygons, explicit edge exclusions and closures, with the same request semantics and limits as upstream.",
+    "upstream": [
+      "src/loki/polygon_search.cc",
+      "src/loki/search.cc",
+      "src/loki/worker.cc"
+    ],
+    "scope": [
+      "`exclude_locations`: snap each to edges and mark them excluded in the request's status pages before the search starts.",
+      "`exclude_polygons`: find intersecting edges through the spatial index with ring clipping, within the upstream length limit.",
+      "Closures: live-traffic closure handling hooks, `ignore_closures` and `search_filter.exclude_closures`.",
+      "Pre-marked excluded edges cost nothing in the relax loop beyond the existing status check.",
+      "Service limits and error codes as upstream."
+    ],
+    "out_of_scope": [
+      "Live traffic data that produces closures (P10.02)."
+    ],
+    "notes": [
+      "Exclusions only remove edges, so potentials stay admissible (monotone feature, I4)."
+    ],
+    "accept": [
+      "Upstream gurka tests for exclude locations, exclude polygons and closures ported and green.",
+      "Parity gate H for limit and validation errors.",
+      "Benchmark: a request with a large avoid polygon stays within its time budget.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P5.17",
+    "goal": "Destination-only roads, private access and not-thru regions behave as users expect from Valhalla, implemented as costs and state in an exact search rather than as bidirectional pruning rules.",
+    "upstream": [
+      "src/thor/bidirectional_astar.cc",
+      "src/sif/autocost.cc",
+      "valhalla/sif/dynamiccost.h"
+    ],
+    "scope": [
+      "Destination-only and private access: penalties on entry and the rule that such edges are allowed when the origin or destination lies on them, as upstream costing defines.",
+      "Not-thru regions: allowed at origin and destination, otherwise penalised or forbidden per upstream semantics, without upstream's second-pass retry.",
+      "Label flags needed to tell entering from continuing inside such regions.",
+      "Parity analysis: run the oracle with and without hierarchy pruning and classify differences caused by upstream's pruning."
+    ],
+    "out_of_scope": [],
+    "notes": [
+      "Upstream disallows destination-only edges in bidirectional search and disables not-thru pruning on a second pass; see docs/upstream/valhalla-architecture.md, section 4.",
+      "These penalties add cost only, so potentials stay admissible."
+    ],
+    "accept": [
+      "Upstream gurka tests for destination-only, private access and not-thru ported and green.",
+      "Parity gate B at 100% and a written classification of gate D differences for these cases.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P5.18",
+    "goal": "Alternative routes are available through the `alternates` parameter, produced by the penalty method on the exact search and filtered so only meaningfully different, reasonable routes are returned.",
+    "upstream": [
+      "src/thor/alternates.cc",
+      "src/thor/bidirectional_astar.cc"
+    ],
+    "scope": [
+      "After the best path, re-run the search with path edges penalised; repeat up to the requested count.",
+      "Filters ported from upstream's alternate validation: stretch limit, shared-length limit, local optimality.",
+      "Penalties add cost only, so the same potentials remain admissible.",
+      "Service limits and the response shape for alternates in the Valhalla and OSRM formats."
+    ],
+    "out_of_scope": [],
+    "notes": [
+      "Upstream finds alternates by extending the bidirectional search; route sets will differ. Judge by the filter criteria, not by identity with the oracle."
+    ],
+    "accept": [
+      "Tests: every returned alternate satisfies the stretch, sharing and local-optimality thresholds.",
+      "Each alternate costs at most about 2x the base query time on the corpus (measured).",
+      "Parity gate H for the alternates response shape.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P5.19",
+    "goal": "A fixed path can be re-costed under any costing, which powers `recostings` in responses, elapsed-time computation and the parity gates themselves.",
+    "upstream": [
+      "src/sif/recost.cc",
+      "valhalla/sif/dynamiccost.h"
+    ],
+    "scope": [
+      "Port recost: walk a path's edges with a costing and TimeInfo, returning cost and elapsed time per edge, forward and reverse.",
+      "`recostings` request option with named costings; results serialised per leg and maneuver as upstream.",
+      "`linear_cost_factors`: per-request cost factors along given shapes, resolved to edges at snap time and applied in edge cost, with the scalar floor declared for I4.",
+      "Use recost as the single implementation behind parity gates B and C in `zr diff`."
+    ],
+    "out_of_scope": [],
+    "notes": [
+      "Per-edge user cost factors below 1 are the non-monotone case of I4: the request must supply the floor that scales potentials."
+    ],
+    "accept": [
+      "Upstream recost tests ported and green.",
+      "Recost of a path found by the search reproduces the search's own cost within 1e-4.",
+      "Admissibility fuzzer covers linear_cost_factors below and above 1.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P5.20",
+    "goal": "The upstream gurka integration suites for access, restrictions, time-dependence and closures run against our engine on the ASCII-map DSL and pass.",
+    "upstream": [
+      "test/gurka/"
+    ],
+    "scope": [
+      "Inventory the gurka test files in these areas and list them in the issue as a checklist.",
+      "Port each onto the Zig ASCII-map DSL from P1.18, keeping test names traceable to the upstream file.",
+      "Where a test asserts upstream's pruned (suboptimal) behaviour, assert the exact result instead and note the reason beside the test.",
+      "Record any test that cannot be ported yet with the blocking issue key."
+    ],
+    "out_of_scope": [
+      "Narrative assertions inside these tests (Phase 6)."
+    ],
+    "notes": [
+      "Upstream has 136 gurka files; this batch is the routing-behaviour subset. See docs/upstream/valhalla-architecture.md, section 7."
+    ],
+    "accept": [
+      "Checklist of ported files in the PR description, each green or linked to a blocking issue.",
+      "No test is silently skipped.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P5.21",
+    "goal": "Experiment E7: measure time-dependent long routes and routes under heavy congestion on the accelerated search, to decide whether time-dependent potentials must be pulled forward.",
+    "upstream": [],
+    "scope": [
+      "Berlin to Prague class route (about 350 km) with `date_time`, using the free-flow lower bound.",
+      "Synthetic congestion overlay: 30% of drivable edges at half speed.",
+      "Record settled labels and latency for both, against upstream's roughly 3M touched edges for the same route.",
+      "Pass line: at most 150k labels and 40 ms uncongested; congested p95 under 250 ms.",
+      "If it fails: move time-dependent potentials (P10.06) ahead of other work. Write `bench/experiments/E7.md`."
+    ],
+    "out_of_scope": [],
+    "notes": [
+      "Published reference: potentials on a free-flow bound run at roughly 10 to 16x over Dijkstra with predicted and live traffic; see docs/design/engine-and-format.md."
+    ],
+    "accept": [
+      "`bench/experiments/E7.md` committed with tables and a verdict.",
+      "If failed, P10.06 is re-prioritised and the change is recorded in docs/PLAN.md.",
+      "The benchmark is reproducible with one `zr bench` command."
+    ]
+  },
+  {
+    "key": "P5.22",
+    "goal": "Phase 5 is done when motor-vehicle routing matches Valhalla's costs on the auto and truck corpora, the ported suites are green, and the time-dependent experiment is resolved.",
+    "upstream": [],
+    "scope": [
+      "Run parity gates A, B and C for auto, bus, taxi, truck, motorcycle and motor scooter on the request corpora.",
+      "Run gate D and classify every difference by cause (exact versus pruned search, restriction handling, build differences).",
+      "Confirm the admissibility fuzzer covers all motor kernels and option ranges.",
+      "Update docs/SCOREBOARD.md with motor-vehicle latency rows measured so far.",
+      "File follow-ups for anything outside thresholds."
+    ],
+    "out_of_scope": [
+      "Long-route scoreboard on continental data (P7.17)."
+    ],
+    "notes": [
+      "Gate definitions and thresholds: docs/PLAN.md, Verification."
+    ],
+    "accept": [
+      "Gate A within 1e-5 per call and 1e-4 per path for all motor models; gate B at 100%; gate C within 1e-4 on 99.9%.",
+      "Gurka suites from P5.20 green.",
+      "E7 verdict recorded and acted on.",
+      "docs/SCOREBOARD.md updated with hardware, data and commit."
+    ]
+  }
+]

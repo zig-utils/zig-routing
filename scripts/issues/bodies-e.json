@@ -1,0 +1,1108 @@
+[
+  {
+    "key": "P9.01",
+    "goal": "A dependency-free GTFS reader that opens a feed zip and yields a typed in-memory feed model. It is the entry point for all transit data and replaces upstream's just_gtfs dependency.",
+    "upstream": ["src/mjolnir/ingest_transit.cc", "proto/transit.proto"],
+    "scope": [
+      "Zip reading through std.zip and inflate through std.compress.flate, streaming each member without extracting to disk",
+      "RFC 4180 CSV parser in src/build/gtfs/csv.zig: quoted fields, embedded newlines, BOM, CRLF, missing optional columns",
+      "Typed tables: agency, stops, routes, trips, stop_times, calendar, calendar_dates, shapes, frequencies, transfers, feed_info, pathways, levels",
+      "GTFS time parsing above 24:00:00, date parsing, enum validation with row and column in every error",
+      "Column lookup by header name so column order does not matter; unknown columns ignored",
+      "Feed model stored in arenas with interned strings and ids mapped to dense u32"
+    ],
+    "out_of_scope": ["Writing graph sections (P9.02)", "Connecting stops to streets (P9.03)", "GTFS-realtime (P10.08)"],
+    "notes": [
+      "Zero external deps: Zig std only",
+      "stop_times is the large table: parse it in parallel chunks and keep it columnar",
+      "See docs/upstream/valhalla-architecture.md section 5 for the upstream ingest flow"
+    ],
+    "accept": [
+      "Parses at least three public feeds of different sizes with row counts matching a reference count of the CSV files",
+      "Malformed rows produce an error naming file, row and column; fuzz test on the CSV parser passes",
+      "stop_times throughput of at least 5 million rows per second on 8 cores",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P9.02",
+    "goal": "Transit sections in the native graph bundle that hold stops, stations, lines, departures, schedules and transfers in mmap-friendly form, with every attribute Valhalla's transit records carry.",
+    "upstream": ["valhalla/baldr/", "proto/transit.proto"],
+    "scope": [
+      "Extern-struct records in src/graph/transit.zig for stop, station, egress, route, line, departure (fixed and frequency based), schedule and transfer, with comptime size assertions",
+      "Departures sorted by line then departure time so the next departure is a binary search",
+      "Schedule validity as day bitsets relative to a bundle start date plus day-of-week mask and exception lists",
+      "Text (names, headsigns, onestop ids, colours) in the shared deduplicated string table",
+      "Section headers, checksums and versioning consistent with graph format v1; reader accessors and zr inspect output",
+      "Lift upstream limits: 64-day schedule window, 12-bit route and schedule indices"
+    ],
+    "out_of_scope": ["Populating the sections from GTFS (P9.03)", "Costing and search (P9.04, P9.05)"],
+    "notes": [
+      "Field inventory for TransitDeparture, TransitStop, TransitRoute, TransitSchedule and TransitTransfer is in docs/upstream/valhalla-architecture.md section 3",
+      "On-disk rules from docs/design/engine-and-format.md: extern struct with packed struct(u32) members only, little-endian"
+    ],
+    "accept": [
+      "Round-trip test: write then read every record type with all fields preserved",
+      "Next-departure lookup for a line and time is O(log n) and allocation free",
+      "Bundle without transit sections still loads; zr inspect lists section sizes",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P9.03",
+    "goal": "The build stage that turns a parsed GTFS feed into the transit sections and connects every stop to the street graph, so multimodal search can walk to and from transit.",
+    "upstream": ["src/mjolnir/convert_transit.cc", "src/mjolnir/transitbuilder.cc", "src/mjolnir/ingest_transit.cc"],
+    "scope": [
+      "Build stations, platforms and egress nodes from stops.txt with parent_station hierarchy and pathways",
+      "Snap egresses to the nearest pedestrian-accessible edge with the shared spatial index and add transit connection edges",
+      "Group trips into lines by route, stop pair and pattern; emit departures with elapsed time, headsign, block id, wheelchair and bicycle flags",
+      "Frequency-based trips from frequencies.txt",
+      "Schedule validity from calendar and calendar_dates into day bitsets, in the stop's timezone",
+      "Transfers from transfers.txt plus generated in-station transfers",
+      "Multiple feeds merged with stable feed-scoped ids"
+    ],
+    "out_of_scope": ["CSV and zip parsing (P9.01)", "Record layouts (P9.02)", "Timezone polygon lookup itself (P5.06)"],
+    "notes": [
+      "Runs as a restartable stage of zr build and must be deterministic for a given input",
+      "Stops that cannot be connected are reported with a count and reason, never silently dropped"
+    ],
+    "accept": [
+      "A small synthetic feed on an ASCII-map test graph produces the expected stations, lines, departures and connection edges",
+      "A real city feed builds with at least 99% of stops connected and a report of the rest",
+      "Stage is byte-identical across thread counts",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P9.04",
+    "goal": "Transit and multimodal costing kernels with all of Valhalla's transit options, so a multimodal request is costed exactly as upstream costs it.",
+    "upstream": ["src/sif/transitcost.cc", "src/sif/dynamiccost.cc", "src/sif/pedestriancost.cc"],
+    "scope": [
+      "Port TransitCost: use_bus, use_rail, use_transfers, transit_start_end_max_distance, transit_transfer_max_distance, mode weights and transfer cost and penalty",
+      "Filters: include or exclude lists for stops, routes and operators",
+      "Wheelchair and bicycle accessibility checks on departures and stations",
+      "Transfer cost and BSS-style mode-change hooks in the kernel interface",
+      "Compile options into the POD used by the multimodal kernel in src/costing/",
+      "Unit tests ported from upstream transit costing tests where they exist"
+    ],
+    "out_of_scope": ["The multimodal search itself (P9.05)", "Bike share costing (P9.07)"],
+    "notes": [
+      "The multimodal label is wider than the 32-byte street label; keep it a separate kernel instantiation",
+      "Schedule-dependent costs are outside the lower-bound contract; multimodal search runs without CCH potentials"
+    ],
+    "accept": [
+      "Option parsing matches upstream names, defaults and clamping ranges",
+      "Per-call cost parity with the oracle within 1e-5 on sampled transit edges and transfers",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P9.05",
+    "goal": "Multimodal routing: walk, board, ride, transfer and walk again on real schedules, returning the same itineraries as Valhalla's multimodal algorithm.",
+    "upstream": ["src/thor/multimodal_astar.cc", "src/thor/multimodal_transit.cc", "src/thor/route_action.cc"],
+    "scope": [
+      "Multimodal label with prior stop, trip id, block id, operator, walking distance and transit flag",
+      "Forward time-dependent search using next-departure lookups, schedule validity and timezone-correct local time",
+      "Boarding, alighting, in-vehicle continuation by block id, transfer penalties and maximum walking distances",
+      "depart_at and arrive_by semantics as upstream supports them, with the same error codes when no schedule data applies",
+      "Route action dispatch: multimodal and transit costing select this search",
+      "Trip-leg output with transit route info for the narrative"
+    ],
+    "out_of_scope": ["Transit instructions text (P9.06)", "Bike share mode (P9.07)"],
+    "notes": [
+      "Reuses the search core's arena, paged status arrays and cancellation checks",
+      "See docs/upstream/valhalla-architecture.md section 4 for MMEdgeLabel fields"
+    ],
+    "accept": [
+      "Upstream multimodal unit and gurka scenarios ported and green",
+      "Itinerary equality (lines, stops, departure times) with the oracle on at least 95% of a transit corpus",
+      "No allocation after warm-up; deadline honoured within 5 ms",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P9.06",
+    "goal": "Transit maneuvers and instructions in every locale, and transit info in the Valhalla and OSRM serializers, so multimodal responses are complete.",
+    "upstream": ["src/odin/maneuversbuilder.cc", "src/odin/narrativebuilder.cc", "src/tyr/route_serializer_valhalla.cc", "locales/"],
+    "scope": [
+      "Transit maneuver types: enter station, exit station, transit, transfer, remain on, connection start, transfer and destination",
+      "Instruction, verbal alert and verbal instruction templates for transit phrases from the locale dictionaries",
+      "transit_info object: onestop ids, short and long names, headsign, colours, operator, transit_stops with arrival and departure times",
+      "travel_mode and travel_type values for transit legs",
+      "Snapshot goldens for the transit sections of the upstream narrative tests"
+    ],
+    "out_of_scope": ["Search and itineraries (P9.05)", "Street maneuvers (P6.07 to P6.12)"],
+    "notes": [
+      "Locale templates are compiled at comptime (P6.10); add only the transit phrase families here"
+    ],
+    "accept": [
+      "Transit maneuver sequence and text equal to the oracle on the transit corpus where itineraries match",
+      "All 36 locales render transit phrases without missing-key fallbacks",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P9.07",
+    "goal": "Bike share support: stations in the graph, the bikeshare costing mode that switches between walking and cycling at stations, and the bike-share matrix.",
+    "upstream": ["src/mjolnir/bssbuilder.cc", "src/thor/timedistancebssmatrix.cc", "src/sif/bicyclecost.cc", "src/sif/pedestriancost.cc"],
+    "scope": [
+      "Build: bike share station nodes from OSM amenity tags, connection edges to the street graph for foot and bicycle",
+      "BSS info tagged value: name, operator, network, capacity",
+      "Mode-change cost (rent and return penalties) and the bss_connection edge handling in pedestrian and bicycle kernels",
+      "bikeshare costing: pedestrian to station, bicycle between stations, pedestrian from station",
+      "Bike-share time-distance matrix on the expansion base",
+      "Narrative travel_mode switches for rent and return maneuvers"
+    ],
+    "out_of_scope": ["Live station availability feeds"],
+    "notes": [
+      "Mode changes make cost non-uniform per label; run without CCH potentials or with the pedestrian lower bound only"
+    ],
+    "accept": [
+      "Upstream bike share gurka scenarios ported and green",
+      "Route parity with the oracle on a city with a bike share network: same stations used on at least 95% of requests",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P9.08",
+    "goal": "The /transit_available endpoint answers whether transit data exists near each requested location, with the same request and response shape as Valhalla.",
+    "upstream": ["src/loki/transit_available_action.cc", "src/tyr/transit_available_serializer.cc"],
+    "scope": [
+      "Request: locations with radius per location, same validation and limits as upstream",
+      "Lookup of transit stops within the radius through the spatial index or a stop grid",
+      "Response array with lat, lon, radius and istransit per location",
+      "Replace the stub wired in the service skeleton"
+    ],
+    "out_of_scope": ["Transit routing (P9.05)"],
+    "notes": ["Must answer in well under 1 ms per location; no graph search involved"],
+    "accept": [
+      "Golden response equality with the oracle on a location set inside and outside transit coverage",
+      "Bundles without transit sections return istransit false, not an error",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P9.09",
+    "goal": "Phase 9 is complete when the transit and bike share behaviour matches upstream's test suites and the oracle on a real feed.",
+    "upstream": ["test/gurka/", "test/"],
+    "scope": [
+      "Port the remaining transit and multimodal gurka and unit tests onto the ASCII-map DSL",
+      "Run zr diff on a transit corpus for a city with a public GTFS feed",
+      "Record transit build time and multimodal latency rows in docs/SCOREBOARD.md",
+      "File follow-up issues for every classified mismatch"
+    ],
+    "out_of_scope": [],
+    "notes": ["Gate issue: no new features, only verification and fixes"],
+    "accept": [
+      "All ported transit suites green in CI",
+      "Itinerary equality with the oracle on at least 95% of the transit corpus, remaining differences classified by cause",
+      "Multimodal p50 latency at least 3x better than the oracle on the same corpus",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P10.01",
+    "goal": "A stable edge key that survives rebuilds: the build emits a map from way id plus node pair to edge id, so traffic feeds and saved references can address edges without knowing internal ids.",
+    "upstream": ["valhalla/baldr/"],
+    "scope": [
+      "Key definition: OSM way id, begin node id, end node id, direction; document collisions for split ways and loops",
+      "edge-keys section in the bundle: sorted key array with edge ids, binary search and a minimal perfect hash option",
+      "Reverse lookup from edge id to key through the cold data",
+      "zr inspect edge-key commands in both directions",
+      "Diff tool reporting keys added, removed and changed between two bundles"
+    ],
+    "out_of_scope": ["Writing traffic values (P10.03)", "OpenLR decoding (P10.08)"],
+    "notes": [
+      "Edge ids change with every build because node order is nested dissection; nothing outside the bundle may store raw ids",
+      "Section must be mmap-able and not loaded by the routing hot path"
+    ],
+    "accept": [
+      "Every directed edge has exactly one key and the lookup round-trips for 100% of edges on the test extract",
+      "Rebuilding the same extract yields an identical key set",
+      "Lookup under 200 ns warm",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P10.02",
+    "goal": "A live traffic overlay file beside the bundle that a separate process updates in place and the router reads lock-free, so speeds change without a rebuild or restart.",
+    "upstream": ["valhalla/baldr/traffictile.h"],
+    "scope": [
+      "File layout in src/traffic/live.zig: header with dataset UUID, epoch, last update and live-to-bound ratio; one 8-byte record per drivable edge addressed by rank over a drivable bitmap",
+      "Record fields mirroring upstream TrafficSpeed: overall speed, three sub-segment speeds with breakpoints, congestion levels, incident flag, unknown sentinel",
+      "Reader: one aligned u64 atomic load per edge, no locks, tolerant of concurrent writes",
+      "Writer API with bulk update and epoch bump",
+      "Speed resolution hook so live values take precedence where present and recent",
+      "Mismatched dataset UUID is rejected at startup with a clear error"
+    ],
+    "out_of_scope": ["The feeder tool (P10.03)", "Costing integration and admissibility floors (P10.05)"],
+    "notes": [
+      "Upstream's record layout is documented in docs/upstream/valhalla-architecture.md section 3",
+      "The header must carry the live-to-bound ratio required by admissibility rule I4 in docs/PLAN.md"
+    ],
+    "accept": [
+      "Concurrent writer and 8 reader threads run for 60 s with no torn reads under a stress test",
+      "Reading a speed costs one cache line and under 5 ns warm",
+      "Overlay absent or stale falls back to the next speed source",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P10.03",
+    "goal": "A feeder that writes speeds and closures into the live overlay by stable edge key, as a CLI and as an authenticated local endpoint, so any speed source can drive traffic.",
+    "upstream": ["valhalla/baldr/traffictile.h"],
+    "scope": [
+      "zr traffic set: read CSV or JSON lines of edge key, speed, optional sub-segments and congestion, and apply them",
+      "Closures as speed zero with the upstream closure semantics",
+      "Expiry: entries older than a configurable age revert to unknown",
+      "Local admin endpoint for batched updates, bound to loopback by default",
+      "Maintain the header's live-to-bound ratio and epoch on every batch",
+      "Report rows applied, unknown keys and out-of-range values"
+    ],
+    "out_of_scope": ["Vendor feed formats and OpenLR (P10.08)", "Incident details in responses (P10.07)"],
+    "notes": [
+      "The feeder is a separate process writing a shared mmap; the router never blocks on it",
+      "No credentials in the repository or in logs"
+    ],
+    "accept": [
+      "Applying 10 million updates completes in under 5 s",
+      "A route through an updated edge changes its ETA within one request after the batch, without restart",
+      "Unknown keys are counted and listed, never fatal",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P10.04",
+    "goal": "Predicted (historical) speeds: weekly speed profiles per edge stored compactly and decoded fast, compatible with the data Valhalla's predicted-traffic tool consumes.",
+    "upstream": ["src/mjolnir/add_predicted_speeds.cc", "valhalla/baldr/"],
+    "scope": [
+      "Profile model: 2016 five-minute buckets per week compressed to 200 DCT-II coefficients as i16",
+      "SIMD encoder and decoder with @Vector; speed at seconds-of-week in about 20 ns",
+      "Deduplicated profile table: edges reference a profile id so identical profiles are stored once",
+      "zr traffic add-predicted: ingest the upstream CSV format (edge key, free-flow, constrained, base64 coefficients)",
+      "Free-flow and constrained-flow speed updates from the same input",
+      "traffic-pred section with header, checksum and dataset UUID"
+    ],
+    "out_of_scope": ["Deriving profiles from traces (P10.09)", "Using them in costing (P10.05)"],
+    "notes": [
+      "Bucket size, coefficient count and encoding are documented in docs/upstream/valhalla-architecture.md section 3",
+      "Upstream found profile deduplication can shrink storage by orders of magnitude; measure and record the ratio"
+    ],
+    "accept": [
+      "Decoded speeds match upstream's decoder within 1 kph on every bucket for a reference coefficient set",
+      "Decode under 30 ns per lookup warm",
+      "Deduplication ratio reported by the tool",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P10.05",
+    "goal": "Costing uses live and predicted speeds with the same precedence as Valhalla, while the search stays exact because the lower bound remains valid under any traffic state.",
+    "upstream": ["src/sif/dynamiccost.cc", "src/sif/autocost.cc", "valhalla/baldr/"],
+    "scope": [
+      "Speed resolution in the motor kernels: live, then predicted, then constrained, then free-flow, then base, honouring the speed_types option",
+      "Per-edge lb_speed at build time as the maximum over all speed sources and predicted buckets",
+      "Admissibility floor: when a live speed exceeds lb_speed, apply the scalar floor from the overlay header",
+      "Closures from live traffic as forbidden edges unless ignore_closures is set",
+      "Time tracking so the correct bucket is used as the search advances",
+      "Property test: random traffic states never violate the relax-time assertion"
+    ],
+    "out_of_scope": ["Time-dependent potentials (P10.06)", "Feed ingestion (P10.03, P10.08)"],
+    "notes": [
+      "Admissibility rules I1 and I4 in docs/PLAN.md are the contract; a violation is a bug, not a tuning problem",
+      "See docs/design/engine-and-format.md for the expected slowdown with the free-flow bound"
+    ],
+    "accept": [
+      "ETA parity with the oracle within 1% on a corpus with predicted speeds loaded in both engines",
+      "Admissibility fuzzer passes with traffic enabled for 10^6 random cases",
+      "Congested long-route p95 recorded in docs/SCOREBOARD.md",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P10.06",
+    "goal": "Time-dependent potentials so traffic-aware and time-dependent queries regain most of the speed of static ones, instead of running on the loose free-flow bound.",
+    "upstream": [],
+    "scope": [
+      "Implement interval or multi-metric potentials following Werner and Zeitz: lower bounds per time window from predicted profiles",
+      "Customise window metrics on the existing CCH and select by departure time",
+      "Live traffic handled through a fast partial re-customisation or a global scale from the live-to-bound ratio",
+      "Fallback to the static free-flow potential when no window metric is cached",
+      "Memory budget: window metrics share topology and stay within the bundle's metric cache limits",
+      "Benchmark against experiment E7's baseline"
+    ],
+    "out_of_scope": ["Speed resolution in costing (P10.05)"],
+    "notes": [
+      "Sources are listed at the end of docs/design/engine-and-format.md",
+      "Every potential must stay a valid lower bound for the actual time-dependent cost; reuse the relax-time assertion and fuzzer"
+    ],
+    "accept": [
+      "Congested long-route p95 at least 5x better than with the static free-flow potential",
+      "Live update to usable potentials in under 60 s on the regional bundle",
+      "Admissibility fuzzer passes for 10^6 time-dependent cases",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P10.07",
+    "goal": "Incidents (closures, accidents, construction) appear in route responses the way Valhalla reports them, so clients can show why a route is slow or diverted.",
+    "upstream": ["proto/incidents.proto", "src/tyr/route_serializer_valhalla.cc", "src/thor/triplegbuilder.cc"],
+    "scope": [
+      "Incident store keyed by edge with the incidents.proto fields: type, impact, description, start and end time, begin and end percent along the edge, lanes blocked",
+      "Loader for an incidents file updated atomically beside the live overlay",
+      "Attach incidents to trip legs for edges flagged has_incidents",
+      "Serialize incidents in Valhalla JSON and pbf output; OSRM output where upstream emits them",
+      "filters and the include_incidents style option as upstream names them"
+    ],
+    "out_of_scope": ["Ingesting vendor incident feeds (P10.08)"],
+    "notes": ["Incident data is cold: never touched by the relax loop, only by leg building"],
+    "accept": [
+      "Golden response equality with the oracle on a fixture with incidents on three edges",
+      "Requests without incidents show zero extra work in the per-phase timings",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P10.08",
+    "goal": "Adapters that turn common traffic feed shapes into feeder updates, including OpenLR location decoding, so real speed feeds can be connected without custom code per source.",
+    "upstream": [],
+    "scope": [
+      "Generic JSON and CSV speed feed adapter with a declarative field mapping",
+      "GTFS-realtime vehicle positions and trip updates decoded with our protobuf codec, as input for speed estimation",
+      "OpenLR binary and base64 line location decoder and a matcher onto our graph using the spatial index and bounded searches",
+      "Polling loop with HTTPS fetch through zig-tls, backoff, ETag support and per-feed rate limits",
+      "Match rate and unmatched location reporting"
+    ],
+    "out_of_scope": ["Writing the overlay (P10.03)", "Vendor-specific proprietary formats without a public spec"],
+    "notes": [
+      "No vendor credentials in the repository; feeds are configured at deploy time",
+      "Check each feed's licence before connecting it and record attribution requirements"
+    ],
+    "accept": [
+      "OpenLR test vectors from the public specification decode and match correctly",
+      "At least 95% match rate on a reference set of line locations on the test extract",
+      "Adapter survives a 24 h run against a mock feed with injected failures",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P10.09",
+    "goal": "Our own historical speed profiles derived from map-matched GPS traces, so predicted traffic does not depend on a third-party data source.",
+    "upstream": ["src/mjolnir/add_predicted_speeds.cc"],
+    "scope": [
+      "Batch pipeline: map-match traces, attribute travel time to edges, bucket by five-minute slot of the week",
+      "Robust aggregation: outlier rejection, minimum sample counts, smoothing across neighbouring buckets",
+      "Fill gaps from free-flow and constrained speeds by road class",
+      "Emit DCT profiles through the P10.04 encoder and the deduplicated profile table",
+      "Privacy: drop trace start and end segments, aggregate only, no raw traces kept in outputs",
+      "Coverage and confidence report per road class"
+    ],
+    "out_of_scope": ["Collecting traces from clients", "Live speed estimation (P10.08)"],
+    "notes": [
+      "Only aggregated, anonymised statistics may leave the pipeline",
+      "Reuses map matching from Phase 8 in batch mode with parallel traces"
+    ],
+    "accept": [
+      "On synthetic traces generated from known speeds, recovered profiles are within 5% of ground truth where sample counts are sufficient",
+      "Pipeline processes at least 1 million trace points per second on 8 cores",
+      "No output contains individual trace identifiers",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P10.10",
+    "goal": "Phase 10 is complete when traffic-aware ETAs are correct against the oracle and fast on the accelerated search.",
+    "upstream": [],
+    "scope": [
+      "Load identical predicted and live traffic into the oracle and zig-routing and run zr diff",
+      "Run the congested and time-dependent rows of the scoreboard",
+      "Verify live updates without restart end to end",
+      "File follow-up issues for every classified mismatch"
+    ],
+    "out_of_scope": [],
+    "notes": ["Gate issue: verification and fixes only"],
+    "accept": [
+      "ETA within 1% of the oracle on at least 99% of the traffic corpus",
+      "Congested long-route p95 under 250 ms on the regional bundle",
+      "A live update is visible to routing within 2 s of the feeder batch",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P11.01",
+    "goal": "A written basemap schema: the layers, fields and zoom ranges our vector tiles expose, chosen so the map styles rendered by ts-maps work with minimal change.",
+    "upstream": [],
+    "scope": [
+      "Survey the layers and fields the current map styles read",
+      "Evaluate an open schema with a permissive licence against a custom schema; record licence and attribution obligations",
+      "Write docs/tiles/SCHEMA.md: layer list, geometry types, fields, value enums, min and max zoom per feature class",
+      "Define label ranking fields and the name and name:lang policy",
+      "Define tile extent, buffer and maximum tile size budgets"
+    ],
+    "out_of_scope": ["Extraction code (P11.02)", "Style changes in the client (P11.09)"],
+    "notes": [
+      "OSM-derived tiles carry ODbL attribution; the schema document must state the attribution string",
+      "This is a decision document; no code"
+    ],
+    "accept": [
+      "Maintainer approves the schema choice (existing open schema or custom) and its licence",
+      "docs/tiles/SCHEMA.md lists every layer with fields and zoom ranges",
+      "A mapping table from the current style's source layers to the schema is included"
+    ]
+  },
+  {
+    "key": "P11.02",
+    "goal": "Feature extraction from OSM for the basemap: every area, line and point the schema needs, with tags mapped to schema fields, reusing the PBF reader from the routing build.",
+    "upstream": [],
+    "scope": [
+      "Comptime tag-to-layer tables in src/tiles/schema.zig driven by docs/tiles/SCHEMA.md",
+      "Second pass over the PBF selecting ways, nodes and relations for landuse, water, buildings, roads, rail, boundaries, places and POIs",
+      "Node location reuse from the build's location store",
+      "Intermediate feature store: geometry plus compact attribute tuples, spatially sorted",
+      "Name handling: default name plus selected name:lang values",
+      "Road layer derived from the routing graph's classification where it agrees with the schema"
+    ],
+    "out_of_scope": ["Multipolygon assembly and simplification (P11.03)", "Encoding (P11.04)"],
+    "notes": [
+      "Parallel and streaming; peak memory stays bounded by the location store plus per-thread buffers",
+      "Zero external deps"
+    ],
+    "accept": [
+      "Feature counts per layer on the test extract match a reference count computed from tag queries",
+      "Extraction of a country-size extract in under 5 minutes on 8 cores",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P11.03",
+    "goal": "Correct polygons and zoom-appropriate geometry: multipolygon relations assembled, features clipped to tiles, simplified per zoom, with label points for polygons.",
+    "upstream": [],
+    "scope": [
+      "Multipolygon assembly from relation members: ring stitching, inner and outer assignment, repair of unclosed or self-touching rings",
+      "Clipping of lines and polygons to tile bounds plus buffer",
+      "Per-zoom simplification that preserves topology between adjacent tiles",
+      "Minimum area and length thresholds per layer and zoom",
+      "Label point computation (pole of inaccessibility) for polygons",
+      "Winding order and validity guarantees required by the MVT spec"
+    ],
+    "out_of_scope": ["Feature merging across tiles and size budgets (P11.05)"],
+    "notes": [
+      "Builds on the polygon operations in the geo kernel (P1.05)",
+      "Invalid input geometry is counted and reported, never fatal"
+    ],
+    "accept": [
+      "Test suite of tricky multipolygons (holes, touching rings, islands in lakes) assembles correctly",
+      "No gaps or overlaps along tile edges in a seam test across 100 adjacent tiles",
+      "Clipping and simplification fuzz tests pass",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P11.04",
+    "goal": "An MVT encoder on our own protobuf codec that turns features into spec-compliant vector tiles with minimal bytes and no allocation per feature.",
+    "upstream": ["src/loki/tile_action.cc"],
+    "scope": [
+      "Geometry command encoding: MoveTo, LineTo, ClosePath with zigzag delta coordinates",
+      "Layer key and value tables with deduplication; all MVT value types",
+      "Coordinate quantisation to the tile extent with correct rounding",
+      "Streaming writer into an arena buffer; optional gzip through std.compress.flate",
+      "A decoder for tests and for zr inspect",
+      "Shared with the graph /tile endpoint (P7.14)"
+    ],
+    "out_of_scope": ["Choosing what goes in a tile (P11.05)"],
+    "notes": [
+      "Mapbox Vector Tile specification 2.1 is the reference",
+      "Zero external deps: the protobuf wire codec is P1.07"
+    ],
+    "accept": [
+      "Tiles decode identically in our decoder and validate against the spec's rules (winding, command counts, extent)",
+      "Round-trip property test over random features",
+      "Encode throughput of at least 200 MB of tile output per second per core",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P11.05",
+    "goal": "The tile pyramid build: every tile from zoom 0 to the maximum zoom generated in parallel, generalised and merged so tiles stay within size budgets.",
+    "upstream": [],
+    "scope": [
+      "Work scheduling over the tile pyramid with a spatially sorted feature store",
+      "Per-zoom feature selection by class, area and rank",
+      "Merging of adjacent line features with equal attributes and of small polygons",
+      "Tile size budget enforcement with progressive feature dropping and reporting",
+      "Overzoom policy above the maximum built zoom",
+      "Progress, rows per second and peak RSS reporting consistent with zr build"
+    ],
+    "out_of_scope": ["Archive format and serving (P11.06)", "Low-zoom special data (P11.07)"],
+    "notes": [
+      "Deterministic output for a given input regardless of thread count",
+      "Memory bounded: features are streamed per tile range, not loaded whole"
+    ],
+    "accept": [
+      "Regional extract builds zoom 0 to 14 with no tile above the size budget",
+      "Build time and peak RSS recorded in docs/SCOREBOARD.md",
+      "Byte-identical output across thread counts",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P11.06",
+    "goal": "A single-file tile archive readable by range requests, and a tile endpoint in the server, so tiles are served from disk or object storage with correct caching.",
+    "upstream": [],
+    "scope": [
+      "Archive layout: header, directory of tile id to offset and length, deduplicated tile blobs, clustered by a space-filling curve",
+      "mmap reader with O(log n) or better directory lookup",
+      "Endpoint for z/x/y tile requests with content type, content encoding, ETag, Cache-Control and 204 for empty tiles",
+      "TileJSON metadata endpoint with bounds, zoom range, layers and attribution",
+      "Range-request reader so the archive can be served from object storage",
+      "zr tiles inspect for directory and size statistics"
+    ],
+    "out_of_scope": ["Building tiles (P11.05)", "Client configuration (P11.09)"],
+    "notes": [
+      "Attribution string for OSM-derived data must be present in the metadata",
+      "Serving a tile is a directory lookup plus writev of the blob: no decompression, no allocation"
+    ],
+    "accept": [
+      "Tile serving p99 under 1 ms warm and at least 50k tiles per second on 8 cores",
+      "Identical tiles stored once (ocean and empty tiles)",
+      "Conditional requests return 304 correctly",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P11.07",
+    "goal": "Low zoom levels that look right: continuous coastlines and ocean polygons, generalised boundaries and place selection, built from OSM without external preprocessed datasets where possible.",
+    "upstream": [],
+    "scope": [
+      "Coastline assembly from natural=coastline ways into land and ocean polygons, with detection of broken coastlines",
+      "Generalised coastline and water polygons for zooms 0 to 7",
+      "Country and region boundaries from admin relations, simplified per zoom, with disputed flags",
+      "Place ranking for cities and countries by population and capital status",
+      "Label placement hints for countries and oceans",
+      "Fallback to a pinned, licence-checked coastline dataset if assembly fails validation"
+    ],
+    "out_of_scope": ["High-zoom water polygons (P11.03)"],
+    "notes": [
+      "Coastline assembly is the classic failure point; validate ring closure and report gaps with coordinates",
+      "Any external fallback dataset needs its licence recorded in NOTICE"
+    ],
+    "accept": [
+      "World coastline assembles with zero unclosed rings on a current planet extract, or failures are reported precisely",
+      "Zoom 0 to 5 world tiles each under 100 KB",
+      "Visual check of zooms 0 to 7 attached to the issue",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P11.08",
+    "goal": "Terrain layers from the same DEM the elevation service uses: contour lines as vector features and hillshade tiles for outdoor maps.",
+    "upstream": [],
+    "scope": [
+      "Contour generation with the marching-squares code from the geo kernel at zoom-dependent intervals",
+      "Contour smoothing, index-contour flag and elevation label field",
+      "Hillshade raster tiles: slope and aspect from the DEM, encoded with our own lossless image encoder or as terrain-RGB data tiles",
+      "Tile seams handled by sampling a one-cell border",
+      "Build as an optional stage with its own archive"
+    ],
+    "out_of_scope": ["DEM storage format (P2.04)"],
+    "notes": [
+      "Zero external deps: any image encoding is implemented in-repo on std.compress.flate",
+      "Record the DEM source licence and attribution in the tile metadata"
+    ],
+    "accept": [
+      "Contours are continuous across tile seams in a 100-tile seam test",
+      "Contour elevations match the sampler within the DEM's resolution on spot checks",
+      "Terrain build time per region recorded in docs/SCOREBOARD.md",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P11.09",
+    "goal": "The map client renders our tiles: a source configuration and style for ts-maps, plus visual regression tests so tile changes cannot silently break the map.",
+    "upstream": [],
+    "scope": [
+      "Source and TileJSON configuration pointing the client at the tile endpoint",
+      "Style adapted to the schema from P11.01 for the existing basemap looks",
+      "Screenshot-based visual regression at fixed centres and zooms, with stored baselines",
+      "Label, road casing and landuse checks at zooms 4, 8, 12 and 16",
+      "Documentation for switching an app's basemap source"
+    ],
+    "out_of_scope": ["Schema changes (P11.01)", "Tile generation (P11.05)"],
+    "notes": [
+      "Changes to the client library happen in its own repository; this issue tracks the integration and links the pull request",
+      "Attribution must be visible on the rendered map"
+    ],
+    "accept": [
+      "Visual regression suite runs in CI with baselines for at least 12 views",
+      "No missing layers or unstyled features at the checked zooms",
+      "Switching documentation reviewed by the maintainer",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P11.10",
+    "goal": "Phase 11 is complete when our own tiles render correctly in the client and the build and serve budgets are met.",
+    "upstream": [],
+    "scope": [
+      "Full regional tile build from the same extract as the routing bundle",
+      "Serve benchmark with zr bench on a tile request corpus",
+      "Visual regression run against the fresh build",
+      "File follow-up issues for defects found"
+    ],
+    "out_of_scope": [],
+    "notes": ["Gate issue: verification and fixes only"],
+    "accept": [
+      "Regional build time, archive size and serving p99 recorded in docs/SCOREBOARD.md and within the budgets set in P11.05 and P11.06",
+      "Visual regression green",
+      "Attribution present in metadata and on the map",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P12.01",
+    "goal": "The geocoder's data model and its extraction from OSM: places, addresses, POIs and streets, each linked to its admin hierarchy, in a compact mmap-able store.",
+    "upstream": [],
+    "scope": [
+      "Record types in src/geocode/model.zig: place, street, address point, POI, with coordinates, names in several languages, type and importance",
+      "Extraction pass over the PBF for place=*, addr:* tags, named highways, amenities, shops and other POI classes",
+      "Admin hierarchy per record (country, state, county, city, district, postcode) through the admin polygon index",
+      "Street deduplication: merge way segments of the same street within a locality",
+      "Importance score from place type, population and tag signals",
+      "geocode bundle sections with headers and checksums like the graph format"
+    ],
+    "out_of_scope": ["Interpolation and postcodes (P12.02)", "Text analysis and indexing (P12.03, P12.04)"],
+    "notes": [
+      "Reuses the PBF reader and admin polygons; zero external deps",
+      "OSM-derived: responses must carry ODbL attribution"
+    ],
+    "accept": [
+      "Record counts per class on the test extract match reference tag-query counts within 0.5%",
+      "At least 99% of records receive a country and city-level admin",
+      "Extraction of a country-size extract in under 5 minutes on 8 cores",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P12.02",
+    "goal": "House number coverage beyond tagged points: address interpolation along streets and proper postcode handling, so address search works where only ranges are mapped.",
+    "upstream": [],
+    "scope": [
+      "addr:interpolation ways: even, odd, all and alphabetic schemes between endpoint nodes",
+      "Associate address points and interpolations with their street by name and proximity",
+      "Postcode records from addr:postcode and postal_code boundaries, with centroid and extent",
+      "House number normalisation: units, letters, ranges, fractions",
+      "Compact per-street house number index with positions along the street geometry",
+      "Country-specific address format table for output formatting"
+    ],
+    "out_of_scope": ["Query-time parsing of house numbers (P12.05)"],
+    "notes": ["Interpolated results must be marked as approximate in the response properties"],
+    "accept": [
+      "Interpolation test cases for each scheme produce positions within 10 m of expected",
+      "Postcode lookup returns the correct centroid for a sample of 1000 postcodes per country in scope",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P12.03",
+    "goal": "Text analysis that makes queries and names comparable across scripts, spellings and abbreviations, per language, without external libraries.",
+    "upstream": [],
+    "scope": [
+      "Unicode normalisation, case folding and diacritic stripping using tables generated at comptime",
+      "Tokenisation for Latin, Cyrillic, Greek and CJK-aware fallbacks",
+      "Abbreviation and synonym tables per language (street types, directions, common contractions) as comptime data",
+      "Transliteration to Latin for supported scripts",
+      "Token classes: house number, postcode pattern per country, street type, stop words",
+      "Deterministic analyser used identically at index time and query time"
+    ],
+    "out_of_scope": ["Index structure (P12.04)", "Ranking (P12.05)"],
+    "notes": [
+      "Unicode data tables may be generated from the Unicode Character Database with the generator script and source version checked in",
+      "No runtime allocation in the analyser beyond the request arena"
+    ],
+    "accept": [
+      "Analyser test corpus per language: expected tokens for at least 200 name and query pairs each for English and German",
+      "Index-time and query-time analysis are byte-identical for the same input",
+      "Throughput of at least 20 MB of text per second per core",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P12.04",
+    "goal": "The search index: a prefix-capable term dictionary and compressed postings in one mmap-able file, sized for a planet of places and addresses.",
+    "upstream": [],
+    "scope": [
+      "Term dictionary as a minimal finite-state transducer or front-coded sorted blocks with prefix iteration",
+      "Postings lists delta and varint coded with skip pointers; record ids ordered by importance for early termination",
+      "Separate fields for name, street, city, postcode and house number",
+      "Parallel index build with external-memory-free merging where input order allows",
+      "Index file with header, version, checksum and dataset UUID tied to the geocode bundle",
+      "zr geocode inspect: term counts, postings size, top terms"
+    ],
+    "out_of_scope": ["Query evaluation and ranking (P12.05)"],
+    "notes": [
+      "Same on-disk discipline as the graph format in docs/design/engine-and-format.md: little-endian, extern structs, comptime layout assertions",
+      "Hot dictionary levels should fit in memory; postings may be paged"
+    ],
+    "accept": [
+      "Prefix lookup of a term under 1 microsecond warm",
+      "Index size at most 40% of the raw analysed text for the test extract",
+      "Fuzz test on the index loader passes",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P12.05",
+    "goal": "Forward geocoding queries: parse free text, retrieve candidates, and rank them well, including proximity bias and tolerance for typos.",
+    "upstream": [],
+    "scope": [
+      "Query parsing into token interpretations (house number, street, city, postcode, country) with multiple hypotheses",
+      "Candidate retrieval by intersecting postings across fields with early termination",
+      "Ranking: text match quality, importance, proximity to a bias point, bounding box and layer filters, language preference",
+      "Typo tolerance through bounded edit-distance dictionary traversal",
+      "Structured queries with explicit fields",
+      "Result assembly with formatted address, coordinates, bounding box and type"
+    ],
+    "out_of_scope": ["Autocomplete latency work (P12.06)", "API shapes (P12.08, P12.09)"],
+    "notes": [
+      "All per-query memory comes from the request arena; deadlines apply as for routing",
+      "Ranking weights live in one documented table so they can be tuned against the quality corpus (P12.10)"
+    ],
+    "accept": [
+      "On a seed quality set of 500 queries the expected result is in the top 3 for at least 85%",
+      "p99 query latency under 10 ms on the regional index",
+      "Proximity bias changes ranking as specified in tests",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P12.06",
+    "goal": "Search-as-you-type that feels instant: prefix queries on every keystroke within a strict latency budget.",
+    "upstream": [],
+    "scope": [
+      "Prefix matching on the last token with full matching on earlier tokens",
+      "Top-k retrieval by importance and proximity without scanning full postings",
+      "Precomputed top results for very short prefixes",
+      "Per-keystroke budget measured in zr bench with a keystroke corpus derived from real query strings",
+      "Result stability between keystrokes to avoid flicker",
+      "Optional response cache keyed by prefix, bias cell and language"
+    ],
+    "out_of_scope": ["Ranking model changes (P12.05)"],
+    "notes": ["Performance rules in docs/PLAN.md apply: zero steady-state allocation and a tracked benchmark in CI"],
+    "accept": [
+      "p99 under 5 ms and p50 under 1 ms per keystroke on the regional index on 8 cores",
+      "One- and two-character prefixes answer under 1 ms",
+      "At least 10k autocomplete requests per second sustained",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P12.07",
+    "goal": "Reverse geocoding: a coordinate in, the nearest address, street or place out, with its full admin hierarchy.",
+    "upstream": [],
+    "scope": [
+      "Nearest address point, interpolated house number, street and POI lookup through a spatial index over geocode records",
+      "Street lookup may reuse the routing graph's spatial index and edge names",
+      "Admin hierarchy from the polygon index for any point, including points far from roads",
+      "Zoom or layer parameter controlling result granularity (address, street, city, country)",
+      "Distance-ranked multiple results with a radius limit",
+      "Language selection for names"
+    ],
+    "out_of_scope": ["API shapes (P12.08, P12.09)"],
+    "notes": ["Batch reverse geocoding should sort points by cell for locality, as bulk /height does"],
+    "accept": [
+      "For 10k sampled address points, reverse geocoding returns the same address for at least 98%",
+      "p99 under 1 ms on the regional data",
+      "Points in the ocean return the correct empty or country-level result, not an error",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P12.08",
+    "goal": "A Photon-compatible HTTP API so existing Photon clients work unchanged against our geocoder.",
+    "upstream": [],
+    "scope": [
+      "Forward endpoint with q, limit, lang, lat and lon bias, location_bias_scale, bbox, osm_tag filters and layer",
+      "Reverse endpoint with lat, lon, radius, limit and lang",
+      "GeoJSON FeatureCollection responses with the Photon property names (osm_id, osm_type, osm_key, osm_value, name, street, housenumber, postcode, city, state, country, countrycode, extent, type)",
+      "Error responses and status codes as Photon returns them",
+      "Golden tests against recorded public-spec examples"
+    ],
+    "out_of_scope": ["Nominatim shapes (P12.09)", "Ranking (P12.05)"],
+    "notes": [
+      "Compatibility target is the public Photon API documentation; do not copy server code",
+      "Responses must be valid for the existing map client's Photon provider without client changes"
+    ],
+    "accept": [
+      "The client library's Photon provider test suite passes against our endpoint",
+      "Response key set and types match the documented API for forward and reverse",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P12.09",
+    "goal": "A Nominatim-compatible HTTP API so existing Nominatim clients work unchanged against our geocoder.",
+    "upstream": [],
+    "scope": [
+      "Search endpoint with q and structured parameters, format json and jsonv2 and geojson, limit, countrycodes, viewbox, bounded, addressdetails, accept-language",
+      "Reverse endpoint with lat, lon, zoom, format and addressdetails",
+      "Lookup by OSM id",
+      "Response fields: place_id, licence, osm_type, osm_id, lat, lon, display_name, class or category, type, importance, boundingbox, address object",
+      "The licence field carries the ODbL attribution text",
+      "Golden tests against documented examples"
+    ],
+    "out_of_scope": ["Photon shapes (P12.08)", "Polygon output options beyond bounding boxes"],
+    "notes": [
+      "Compatibility target is the public Nominatim API documentation",
+      "display_name formatting uses the country address format table from P12.02"
+    ],
+    "accept": [
+      "The client library's Nominatim provider test suite passes against our endpoint",
+      "Response key set and types match the documented API for search and reverse",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P12.10",
+    "goal": "A geocoding quality corpus and scoreboard, so ranking changes are measured against Photon and Nominatim rather than judged by feel.",
+    "upstream": [],
+    "scope": [
+      "Query corpus per country in scope: addresses, streets, cities, POIs, postcodes, misspellings and partial queries, each with an expected result",
+      "Corpus generated from OSM data plus hand-written hard cases; no personal data",
+      "Metrics: top-1 and top-3 accuracy, mean reciprocal rank, distance error, latency",
+      "zr geocode eval command producing a machine-readable report",
+      "Comparison runs against self-hosted Photon and Nominatim instances used as dev-time oracles only",
+      "Results in docs/SCOREBOARD.md and tracked in CI"
+    ],
+    "out_of_scope": ["Fixing ranking (P12.05)"],
+    "notes": [
+      "Do not benchmark against public geocoding servers: their usage policies forbid bulk queries",
+      "Oracles run in containers and are never linked or shipped"
+    ],
+    "accept": [
+      "Corpus of at least 5000 queries checked in with expected results",
+      "Report shows our top-3 accuracy at or above the better of the two oracles on the corpus",
+      "Evaluation runs in CI in under 10 minutes",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P12.11",
+    "goal": "Phase 12 is complete when the geocoder meets its quality and latency targets and the consuming apps use it instead of public geocoding servers.",
+    "upstream": [],
+    "scope": [
+      "Final quality and latency run on the regions in production scope",
+      "Deploy the geocoder beside the router on the production routing box or a sibling, within the memory budget",
+      "Configure the consuming apps' geocoder base URLs with the public servers kept as fallback for a soak period",
+      "Monitor error rate and latency for one week, then remove the fallback"
+    ],
+    "out_of_scope": [],
+    "notes": [
+      "Deployment and app configuration are maintainer actions; this issue prepares the artefacts and the checklist",
+      "No hostnames or credentials in the repository"
+    ],
+    "accept": [
+      "Quality corpus targets from P12.10 met and autocomplete budget from P12.06 met on production-scope data",
+      "Maintainer approves the deployment plan and performs or authorises the configuration change",
+      "One week of production use with error rate below 0.1% before the fallback is removed",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P13.01",
+    "goal": "Valhalla is no longer needed: the fallback is removed from the consuming apps and the old service is shut down on the production routing box.",
+    "upstream": [],
+    "scope": [
+      "Confirm every endpoint the consuming apps call is served by zig-routing with the Phase 4 gate green",
+      "Review fallback usage in the access logs over the soak period and resolve every case",
+      "Checklist for removing the fallback configuration from the apps",
+      "Checklist for stopping and removing the old service, its tiles and its container images, with a retention period for rollback",
+      "Update the operations runbook"
+    ],
+    "out_of_scope": ["Runbook authoring (P13.07)"],
+    "notes": [
+      "Destructive steps on production are performed by the maintainer, not by an agent",
+      "Keep the old tiles for the agreed rollback window before deletion"
+    ],
+    "accept": [
+      "Fallback hit rate is zero for 14 consecutive days, with the evidence attached",
+      "Maintainer approves and performs the decommission",
+      "Rollback procedure tested once before the old data is deleted"
+    ]
+  },
+  {
+    "key": "P13.02",
+    "goal": "A C ABI for embedding zig-routing in other languages: load a bundle, send a request, get a response, mirroring Valhalla's actor interface.",
+    "upstream": ["src/tyr/actor.cc", "valhalla/tyr/"],
+    "scope": [
+      "Exported functions: create from config, one call per action taking a JSON or pbf request and returning a buffer, free, cancel, last error",
+      "Thread-safety contract: one actor per thread over a shared immutable bundle",
+      "Generated C header with documentation comments",
+      "Static and shared library build targets for Linux x64, Linux arm64 and macOS",
+      "Example C program and a test that links against the shared library",
+      "Stable ABI versioning function"
+    ],
+    "out_of_scope": ["Language-specific wrappers (P13.03)"],
+    "notes": [
+      "No allocator crosses the boundary: buffers are owned by the library and released through its free function",
+      "The ABI exposes requests and responses only, never internal structs"
+    ],
+    "accept": [
+      "The C example routes on the test bundle and its output equals the HTTP response for the same request",
+      "Leak check clean over 1 million calls",
+      "Header compiles as C and C++",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P13.03",
+    "goal": "A Bun FFI package so Stacks apps can call the router in-process, without an HTTP hop, with typed requests and responses.",
+    "upstream": [],
+    "scope": [
+      "TypeScript package wrapping the C ABI through bun:ffi with prebuilt binaries per platform",
+      "Typed request and response interfaces for route, height, matrix, isochrone, locate and trace endpoints",
+      "Async wrappers that run calls off the main thread",
+      "Cancellation through AbortSignal",
+      "Tests under bun test against the test bundle",
+      "Package conventions following the organisation's other TypeScript libraries, with no Bun catalog protocol"
+    ],
+    "out_of_scope": ["The C ABI itself (P13.02)", "Publishing to the registry (maintainer action)"],
+    "notes": [
+      "The Zig library keeps zero external deps; this package is a thin binding layer living in a packages subfolder or its own repository as the maintainer prefers"
+    ],
+    "accept": [
+      "In-process /route call overhead under 20 microseconds above the engine time",
+      "Type tests cover every exposed endpoint",
+      "bun test green on macOS and Linux"
+    ]
+  },
+  {
+    "key": "P13.04",
+    "goal": "Documentation that lets an app move from a Valhalla server to zig-routing: provider docs for ts-maps and a migration guide listing every behavioural difference.",
+    "upstream": [],
+    "scope": [
+      "Migration guide: endpoint compatibility table, known differences (exact search may return cheaper routes, lifted limits, error cases), configuration mapping from valhalla.json",
+      "Provider documentation showing the existing Valhalla providers pointed at a zig-routing base URL",
+      "Fallback-chain recommendation for staged cutovers",
+      "Notes on costing options: all upstream options supported, with any deviations listed",
+      "Docs page in this repository and a pull request to the client library's docs"
+    ],
+    "out_of_scope": ["Client code changes beyond docs"],
+    "notes": ["Public documentation: no internal hostnames, app names or deployment details"],
+    "accept": [
+      "Every endpoint in the compatibility table links to its parity gate result",
+      "A reader can switch an app by changing one base URL following the guide",
+      "Maintainer review of the guide"
+    ]
+  },
+  {
+    "key": "P13.05",
+    "goal": "A repeatable release: version bump, changelog, signed-off binaries for Linux x64, Linux arm64 and macOS, and a package for the organisation's package manager.",
+    "upstream": [],
+    "scope": [
+      "Release workflow modelled on the sibling zig-* libraries, using zig-bump and zig-changelog",
+      "Cross-compiled ReleaseFast binaries: x86-64 baseline, x86-64-v3, aarch64 Linux, aarch64 macOS",
+      "Checksums and a build provenance file per artefact",
+      "Package manifest for the package manager with the pinned toolchain recorded",
+      "Release gate: CI green, perf tracking within budget, no open gate issues for the released scope",
+      "Version embedded in /status and zr --version"
+    ],
+    "out_of_scope": ["Extracting sub-packages (P13.06)"],
+    "notes": [
+      "Never cut a 1.0 release without explicit maintainer approval",
+      "No top-level side effects in published library entry points"
+    ],
+    "accept": [
+      "A dry-run release produces all four binaries with checksums",
+      "Released binary reports the tagged version and commit",
+      "Workflow documented in CONTRIBUTING or the runbook",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P13.06",
+    "goal": "The general-purpose packages developed inside this repository become standalone zig-* libraries that other projects can depend on.",
+    "upstream": [],
+    "scope": [
+      "Candidates: protobuf codec, geo kernel, LZ4, OSM PBF reader, HTTP server, timezone rules",
+      "For each: confirm the API is stable, split history or copy with attribution, add README, tests, CI and release workflow from the starter template",
+      "Switch this repository from path dependencies to URL plus hash pins",
+      "Verify the full test and bench suites after each switch",
+      "Document the dependency convention in AGENTS.md"
+    ],
+    "out_of_scope": ["API redesign of the packages"],
+    "notes": [
+      "Creating public repositories is a maintainer decision per package",
+      "Extract one package at a time so a regression can be bisected"
+    ],
+    "accept": [
+      "Maintainer approves the list of packages to extract and creates or authorises each repository",
+      "This repository builds and passes all tests against the pinned external packages",
+      "No performance regression above 1% on tracked benchmarks after the switch"
+    ]
+  },
+  {
+    "key": "P13.07",
+    "goal": "An operations runbook: how to build data, deploy, roll back, monitor and refresh, written so someone new can run the service.",
+    "upstream": [],
+    "scope": [
+      "docs/OPERATIONS.md covering: hardware sizing per region, building bundles and metrics, deploying a new binary, hot-swapping data, rollback",
+      "Monitoring: the metrics exposed, suggested alerts (error rate, p99, RSS, metric cache misses, fallback ladder level counts)",
+      "Troubleshooting: slow first requests, memory pressure, metric-key churn, stale traffic",
+      "Capacity planning from the scoreboard numbers",
+      "Security notes: bind addresses, admin endpoints on loopback, no secrets in config files committed to the repository"
+    ],
+    "out_of_scope": ["Automating the refresh (P13.08)"],
+    "notes": ["Public document: describe procedures generically, without hostnames, addresses or app names"],
+    "accept": [
+      "A dry run of deploy and rollback following only the runbook succeeds on a staging machine",
+      "Every alert has a documented response",
+      "Maintainer review"
+    ]
+  },
+  {
+    "key": "P13.08",
+    "goal": "Data stays fresh automatically: a scheduled job downloads new OSM extracts, builds bundles, verifies them and hot-swaps them with no downtime.",
+    "upstream": [],
+    "scope": [
+      "zr data refresh command: download extracts with checksum verification over HTTPS through zig-tls",
+      "Build into a staging directory, then run verification: header checks, checksums, a smoke corpus through zr diff against the previous bundle with tolerance thresholds",
+      "Atomic swap through the hot reload path and retention of the previous bundle for rollback",
+      "Metric re-customisation for the cached keys before the swap so latency does not regress",
+      "Failure handling: keep serving the old bundle and report the reason",
+      "Example systemd timer and unit files"
+    ],
+    "out_of_scope": ["Traffic updates (Phase 10)"],
+    "notes": [
+      "Respect extract providers' download policies and attribution",
+      "Deterministic builds (P4.20) make verification diffs meaningful"
+    ],
+    "accept": [
+      "End-to-end refresh on a small extract completes and swaps with zero failed requests under load",
+      "A deliberately corrupted download is rejected and the old bundle keeps serving",
+      "Post-swap p99 within 10% of pre-swap",
+      "zig build test green"
+    ]
+  },
+  {
+    "key": "P13.09",
+    "goal": "A public, reproducible benchmark report comparing zig-routing with Valhalla on the same hardware and data, with a kit anyone can rerun.",
+    "upstream": ["run_route_scripts/", "test_requests/"],
+    "scope": [
+      "Bench kit: scripts to fetch extracts, build both engines' data, start both servers and run the corpora with zr bench",
+      "Report covering route latency by distance and costing, matrix sizes, isochrones, map matching, /height, build time, memory and startup",
+      "Methodology section: hardware, versions, configuration, warm-up, statistical treatment",
+      "Fairness notes: upstream configured per its documentation, results shared with upstream maintainers before publication where practical",
+      "Charts generated from the machine-readable results"
+    ],
+    "out_of_scope": ["Comparisons with engines other than Valhalla unless the maintainer asks"],
+    "notes": [
+      "Publish only measured numbers with their conditions; no extrapolated claims",
+      "The kit must not depend on any private infrastructure"
+    ],
+    "accept": [
+      "A third party can reproduce the headline numbers within 10% following the kit's README",
+      "Maintainer approves the report text before publication",
+      "All figures trace to a committed results file"
+    ]
+  }
+]

@@ -1,0 +1,826 @@
+[
+  {
+    "key": "P3.01",
+    "goal": "A streaming OSM PBF file reader that splits a file into blobs and inflates them on all cores, so every later build stage receives decoded primitive blocks without a C library.",
+    "upstream": ["src/mjolnir/pbfgraphparser.cc", "third_party/libosmium", "third_party/protozero"],
+    "scope": [
+      "`src/build/pbf/file.zig`: read the BlobHeader / Blob framing (4-byte big-endian length, `OSMHeader` and `OSMData` types) using the protobuf wire codec from P1.07.",
+      "Support `raw`, `zlib_data` (std.compress.flate) and `lz4_data` (our LZ4) blobs; reject unsupported compression with a clear error.",
+      "Parse the HeaderBlock: bbox, required and optional features, `Sort.Type_then_ID`, replication timestamp.",
+      "A blob index pass (offset, size, kind) so workers can inflate blobs in parallel and hand them to consumers in file order.",
+      "Bounded memory: a fixed pool of inflate buffers reused across blobs, no per-blob heap allocation in steady state."
+    ],
+    "out_of_scope": ["Decoding nodes, ways and relations inside a PrimitiveBlock: P3.02.", "OSM XML input: P3.03."],
+    "notes": [
+      "Zero external deps: Zig std and in-repo packages only.",
+      "Build throughput rule in docs/PLAN.md: report blobs per second and peak RSS.",
+      "docs/upstream/valhalla-perf-issues.md section 2e lists upstream parse timings to beat."
+    ],
+    "accept": [
+      "Reads the upstream test extracts (utrecht, liechtenstein) and reports blob counts equal to an independent count from the oracle container.",
+      "Truncated and corrupt files return errors, never crash (unit tests with damaged fixtures).",
+      "Inflate throughput scales with thread count on a country extract (numbers recorded in the PR).",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.02",
+    "goal": "Decoders that turn a PrimitiveBlock into nodes, ways and relations with their tags, with no per-element allocation, so the tag transform and graph build can iterate OSM data at memory speed.",
+    "upstream": ["src/mjolnir/pbfgraphparser.cc", "third_party/libosmium"],
+    "scope": [
+      "`src/build/pbf/block.zig`: string table as slices into the inflated buffer; granularity, lat/lon offsets and date granularity.",
+      "DenseNodes: delta-decoded ids, lat, lon and the packed `keys_vals` stream; plain Node groups as well.",
+      "Ways: delta-coded refs, key/value index arrays. Relations: member ids (delta), roles, member types.",
+      "Iterator API: `nodes()`, `ways()`, `relations()` yielding views valid until the block is released; tags exposed as key/value string slices.",
+      "Coordinates converted to fixed-point 1e-7 degree `i32` exactly as OSM stores them.",
+      "Handle blocks with mixed groups and empty groups."
+    ],
+    "out_of_scope": ["Blob framing and inflate: P3.01.", "Interpreting tags: P3.05 onwards."],
+    "notes": [
+      "Views borrow from the block buffer; document lifetimes in the API.",
+      "Fuzzing of this decoder is tracked in P3.38."
+    ],
+    "accept": [
+      "Node, way and relation counts and a checksum over ids and tags match the oracle for the test extracts.",
+      "Round-trip test against PBFs written by the ASCII-map DSL from P1.18.",
+      "No allocator calls while iterating a block (counting allocator from P0.11).",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.03",
+    "goal": "An OSM XML reader producing the same node, way and relation views as the PBF path, so small hand-written fixtures and upstream XML test data can feed the build.",
+    "upstream": ["src/mjolnir/pbfgraphparser.cc"],
+    "scope": [
+      "`src/build/osmxml.zig` on top of `zig-xml`'s pull `Reader`: `<node>`, `<way>` with `<nd ref>`, `<relation>` with `<member>`, nested `<tag k v>`.",
+      "Entity decoding for tag values, negative ids, missing optional attributes.",
+      "Same iterator interface as the PBF block reader so build stages are input-agnostic.",
+      "Reject unsorted input with a clear error (the build expects nodes, then ways, then relations)."
+    ],
+    "out_of_scope": ["PBF input: P3.01 and P3.02.", "OSM change files (.osc)."],
+    "notes": ["Fixtures only: this path does not need to be fast.", "`zig-xml` is a lenient tokenizer, so validate structure in our code."],
+    "accept": [
+      "An XML fixture and the equivalent PBF produce identical element streams.",
+      "Malformed XML returns an error with a line number.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.04",
+    "goal": "A node location store that resolves OSM node ids to coordinates without upstream's roughly 110 GiB way-node file and external sort, removing the largest IO cost of the build.",
+    "upstream": ["src/mjolnir/pbfgraphparser.cc", "valhalla/midgard/sequence.h"],
+    "scope": [
+      "`src/build/node_store.zig`: an id-indexed, delta-coded on-disk array of fixed-point coordinates, written sequentially as nodes arrive in id order.",
+      "Sparse block directory so lookups are one directory probe plus a short block decode; handle id gaps and unsorted input with a fallback path.",
+      "A usage bitset pass first (which node ids are referenced by routable ways) so only needed nodes are stored.",
+      "Parallel batched lookup API used by way processing, with read-ahead that follows way order.",
+      "Node use counts (1, 2, more) in a second bitset pair for intersection detection."
+    ],
+    "out_of_scope": ["Edge splitting at intersections: P3.11."],
+    "notes": [
+      "docs/upstream/valhalla-perf-issues.md: #6312 and #4548 describe the upstream intermediates this replaces.",
+      "Build throughput rule: sequential, compact intermediates; report bytes per stored node."
+    ],
+    "accept": [
+      "Every way node in the test extracts resolves to the same coordinate as the raw PBF.",
+      "Store size and lookups per second reported for a country extract; store is at most 6 bytes per kept node on average.",
+      "Peak RSS independent of extract size (measured on two extract sizes).",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.05",
+    "goal": "The framework that replaces Valhalla's Lua tag transform: comptime perfect-hash tag tables and the attribute model each way and node is reduced to, running on every core.",
+    "upstream": ["lua/graph.lua", "valhalla/mjolnir/osmway.h", "src/mjolnir/osmway.cc", "src/mjolnir/pbfgraphparser.cc"],
+    "scope": [
+      "`src/build/tags/table.zig`: comptime-generated perfect hash from tag key and value strings to enum ids, with a fallback for free-form values.",
+      "`WayAttrs` and `NodeAttrs` structs mirroring the fields upstream's `OSMWay` / `OSMNode` carry (class, use, access masks, speeds, surface, flags, name refs).",
+      "A `transformWay(tags) -> ?WayAttrs` / `transformNode(tags) -> ?NodeAttrs` entry point with the same keep-or-drop decision as `ways_proc` / `nodes_proc`.",
+      "Shared helpers ported from graph.lua: boolean normalisation, unit parsing hooks, default tables by highway type.",
+      "A per-thread scratch so transforms allocate nothing."
+    ],
+    "out_of_scope": ["The rule families themselves: P3.06 to P3.09.", "Truck, HOV, toll and motorcycle tags: P5.03."],
+    "notes": [
+      "No Lua and no script engine: this is plain Zig, so it is not capped at 8 states like upstream.",
+      "Keep the mapping to graph.lua line ranges in comments so goldens (P3.10) can be traced back."
+    ],
+    "accept": [
+      "Unit tests for the hash tables (no collisions, unknown values fall through).",
+      "A way with no routable tags is dropped exactly when graph.lua drops it (cases enumerated in tests).",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.06",
+    "goal": "Highway classification ported from graph.lua: road class, use, surface, link and service-road attributes for every way, the base every costing model reads.",
+    "upstream": ["lua/graph.lua", "valhalla/mjolnir/osmway.h", "valhalla/baldr/graphconstants.h"],
+    "scope": [
+      "`src/build/tags/highway.zig`: `highway=*` to road class (motorway to service_other) and `Use` (road, ramp, track, footway, path, steps, cycleway, living_street, driveway, alley, parking_aisle, ferry and the rest of upstream's enum).",
+      "Links (`*_link`), `service=*`, `junction=roundabout`, `tunnel`, `bridge`, `route=ferry` and `route=shuttle_train`.",
+      "Surface from `surface`, `tracktype` and defaults per class, to upstream's surface enum.",
+      "Internal-intersection, turn-channel candidates and `private` / `destination` flags that graph.lua sets at this stage.",
+      "Constants for every enum in `src/graph/constants.zig` with the same numeric values as upstream."
+    ],
+    "out_of_scope": ["Access masks and oneway: P3.07.", "Speeds, lanes, names: P3.08.", "Link reclassification after graph build: P5.02."],
+    "notes": ["Port rule by rule; do not reinterpret OSM tagging.", "docs/upstream/valhalla-architecture.md section 5 describes the Lua stage."],
+    "accept": [
+      "Table-driven tests covering every `highway` value graph.lua handles.",
+      "Feeds the golden comparison in P3.10 with zero diffs for these fields on the test extracts.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.07",
+    "goal": "Access rules ported from graph.lua: per-mode forward and reverse access, oneway handling, and barrier or node access, so costing can decide who may use an edge.",
+    "upstream": ["lua/graph.lua", "valhalla/mjolnir/osmway.h", "valhalla/baldr/graphconstants.h"],
+    "scope": [
+      "`src/build/tags/access.zig`: access masks for auto, truck, bus, taxi, motorcycle, moped, bicycle, pedestrian, wheelchair, HOV and emergency, forward and backward.",
+      "The access tag hierarchy (`access`, `vehicle`, `motor_vehicle`, mode-specific keys) with upstream's precedence, including `private`, `destination`, `delivery`, `permissive`, `no`.",
+      "`oneway`, `oneway:bicycle`, `cycleway=opposite*`, `junction` implied oneway, reversible lanes as upstream treats them.",
+      "Node access from `barrier=*`, `bollard`, `gate`, `access` on nodes, plus node type (gate, bollard, toll booth, border control).",
+      "16-bit access masks in our format; keep upstream's bit order in the low 12 bits."
+    ],
+    "out_of_scope": ["Country-specific access defaults: P5.05.", "Conditional and timed access: P5.10."],
+    "notes": ["Access is correctness-critical: every rule gets a test named after its graph.lua section."],
+    "accept": [
+      "Tests for each access key and value combination graph.lua handles, forward and reverse.",
+      "Zero diffs for access fields in the P3.10 goldens on the test extracts.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.08",
+    "goal": "Speed, lane and naming attributes ported from graph.lua and the parser: parsed speed limits, default speeds, lane counts, names, refs and destination tags.",
+    "upstream": ["lua/graph.lua", "src/mjolnir/pbfgraphparser.cc", "valhalla/mjolnir/osmway.h"],
+    "scope": [
+      "`src/build/tags/speed.zig`: `maxspeed` parsing (kph, mph, `walk`, `none`, country zone codes), `maxspeed:forward` / `backward`, `maxspeed:hgv`, advisory speeds, and default speed by class and use.",
+      "Lanes: `lanes`, `lanes:forward`, `lanes:backward`, and raw `turn:lanes` strings carried for P6.03.",
+      "Names: `name`, `alt_name`, `official_name`, `name:<lang>`, `ref`, `int_ref`, tunnel and bridge names into a build-time string table.",
+      "Destination tags (`destination`, `destination:ref`, `destination:street`, `junction:ref`) carried for sign building in P6.02.",
+      "Speed type (tagged or classified) as upstream records it."
+    ],
+    "out_of_scope": ["Truck speeds and dimensions: P5.03.", "Building signs and turn-lane records: P6.02 and P6.03."],
+    "notes": ["Speed parsing is hand-written; use `zig-regex` only if it is clearer than a small parser."],
+    "accept": [
+      "Tests for each maxspeed format, including invalid input.",
+      "Zero diffs for speed, lane and name fields in the P3.10 goldens.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.09",
+    "goal": "The bicycle and pedestrian tag rules our production traffic depends on: cycleways, bike networks, hiking difficulty, sidewalks, steps and related flags.",
+    "upstream": ["lua/graph.lua", "valhalla/mjolnir/osmway.h", "valhalla/baldr/graphconstants.h"],
+    "scope": [
+      "`src/build/tags/bike_foot.zig`: `cycleway`, `cycleway:left/right/both`, `bicycle=use_sidepath`, `dismount`, cycle lane type (none, shared, dedicated, separated).",
+      "Bike networks from way tags (`lcn`, `rcn`, `ncn`, `icn`, `mtb`) with relation-derived networks left as a hook for the relations pass.",
+      "`sac_scale` to upstream's enum (hiking through difficult alpine hiking), `trail_visibility`, `mtb:scale`.",
+      "`sidewalk` left/right/both/no, `foot=*` designations, `footway=sidewalk|crossing`, `highway=steps`, `step_count`, `lit`, `wheelchair`, `indoor`, `elevator`.",
+      "Pedestrian type inputs (blind, wheelchair) that pedestrian costing reads."
+    ],
+    "out_of_scope": ["Pedestrian areas (plazas) and their traversal edges: later phase.", "Bike share stations: P9.07."],
+    "notes": ["These fields decide `max_hiking_difficulty`, `walkway_factor`, `use_tracks` and `use_roads` behaviour in P3.27 and P3.28."],
+    "accept": [
+      "Tests for every `sac_scale`, `cycleway` and `sidewalk` value.",
+      "Zero diffs for these fields in the P3.10 goldens.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.10",
+    "goal": "A golden test that proves our Zig tag transform equals upstream's graph.lua on real data, so tag parity is measured rather than assumed.",
+    "upstream": ["lua/graph.lua", "src/mjolnir/pbfgraphparser.cc", "test/data"],
+    "scope": [
+      "A script in the oracle container that runs upstream `ways_proc` / `nodes_proc` under LuaJIT over every way and node of the test extracts and dumps the resulting attribute tables as line-delimited records.",
+      "`zr tags dump` producing the same record format from our transform.",
+      "A comparator that reports per-field diff counts and the first N differing OSM ids per field.",
+      "Goldens checked in (compressed) for the small upstream extracts; a larger country run available on demand.",
+      "A documented allow-list for deliberate differences, each with a reason."
+    ],
+    "out_of_scope": ["Fields added in P5.03.", "Post-build attributes (enhance stage): P3.19 and P5.01."],
+    "notes": ["LuaJIT runs only inside the dev-time oracle container; it is never a dependency of the product."],
+    "accept": [
+      "Zero unexplained diffs on the upstream test extracts for all fields from P3.06 to P3.09.",
+      "The comparison runs in CI against the checked-in goldens.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.11",
+    "goal": "Turn ways into graph edges: find intersections, split ways there, capture shapes, and handle loops and duplicates the way upstream's graph builder does.",
+    "upstream": ["src/mjolnir/graphbuilder.cc", "src/mjolnir/pbfgraphparser.cc"],
+    "scope": [
+      "`src/build/edges.zig`: a node is a graph node when it is a way end, is used by more than one routable way, or carries routing-relevant node attributes.",
+      "Split each way into edges between graph nodes, keeping the intermediate coordinates as the edge shape and computing length from the shape.",
+      "Loop edges (same start and end) and ways that pass through a node twice: split as upstream does so no edge starts and ends at the same node.",
+      "Duplicate and zero-length edges, ways with fewer than two resolvable nodes: counted and reported, not fatal.",
+      "Emit a compact edge stream (way attrs ref, node ids, shape offset) consumed by graph assembly.",
+      "Runs in parallel over way chunks with deterministic output order."
+    ],
+    "out_of_scope": ["CSR assembly and opposing edges: P3.15.", "Node ordering: P3.21."],
+    "notes": ["Determinism matters for P4.20: sort by a stable key, never by thread arrival order."],
+    "accept": [
+      "Edge and node counts match the oracle's level-2 tile totals for the test extracts within the documented allow-list.",
+      "ASCII-map tests (P1.18) for loops, duplicated nodes and dead ends.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.12",
+    "goal": "Graph format v1 defined in code: section file headers, the on-disk extern structs and a writer, with layout guaranteed at comptime.",
+    "upstream": ["valhalla/baldr/graphtileheader.h", "valhalla/baldr/directededge.h", "valhalla/baldr/nodeinfo.h"],
+    "scope": [
+      "`src/graph/format.zig`: 64-byte section header (magic, format version, 16-byte dataset UUID, section kind, record size, count, xxh3 of payload) and the section kind enum.",
+      "`EdgeHot` (16 B) and `NodeHot` (8 B) exactly as in docs/PLAN.md, `first_edge: u32` CSR array, turn entry `u8`, opaque `NodeId` / `EdgeId` as `enum(u32)`.",
+      "Comptime assertions: `@sizeOf`, `@offsetOf`, little-endian target, `packed struct(u32)` members only inside `extern struct`.",
+      "`BundleWriter`: one file per section, 64 KiB alignment, payload hash, atomic rename of the bundle directory on success.",
+      "xxh3 implemented in-repo if std does not provide the needed variant."
+    ],
+    "out_of_scope": ["Reading and validation: P3.13.", "Class table contents: P3.14.", "Acceleration sections: P4.03 and P4.05."],
+    "notes": [
+      "Never use a bare `packed struct` wider than 64 bits or as an array element.",
+      "docs/design/engine-and-format.md Q2 is the reference; upstream headers are listed only for attribute coverage."
+    ],
+    "accept": [
+      "Layout assertions compile on x86-64 and aarch64.",
+      "Write then hex-compare a tiny bundle against a checked-in golden.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.13",
+    "goal": "A graph reader that maps a bundle in well under a second, validates it, and exposes typed slices, plus `zr inspect` to look inside one.",
+    "upstream": ["src/baldr/graphreader.cc", "src/baldr/graphtile.cc"],
+    "scope": [
+      "`src/graph/reader.zig`: mmap each section through the IO shim, check magic, version, record size, count and matching dataset UUIDs; one `@alignCast` per section boundary.",
+      "Typed accessors: `edge(id)`, `node(id)`, `outEdges(node)`, `oppEdge(edge)` computed as `first_edge[head] + opp_local`, `turnRow(node, in_local)`.",
+      "Clear errors for version mismatch, truncated files and mixed bundles.",
+      "`zr inspect <bundle>`: section table, counts, sizes, `--verify` to check payload hashes, `--edge` / `--node` to print one record.",
+      "The reader is immutable and shared by all threads; no per-thread caches."
+    ],
+    "out_of_scope": ["Huge pages and warm-up: P4.15.", "Lazy range-fetch loading: P4.16.", "Multiple bundles: P4.18."],
+    "notes": ["Startup checks headers only; hashing is offline (`--verify`).", "docs/upstream/valhalla-perf-issues.md: #3953 and #3117 for the startup problem being solved."],
+    "accept": [
+      "Open time under 50 ms for a country bundle on a warm page cache (measured in a test).",
+      "Corrupt or truncated sections are rejected with a specific error.",
+      "`zr inspect --verify` passes on a freshly built bundle.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.14",
+    "goal": "The edge class table: every distinct combination of categorical edge attributes stored once and referenced by a 20-bit class id, so costing reduces to one table lookup per edge.",
+    "upstream": ["valhalla/baldr/directededge.h", "valhalla/baldr/graphconstants.h"],
+    "scope": [
+      "`src/graph/class_table.zig`: `EdgeClass` tuple (use, road class, surface, forward and reverse access masks, toll, tunnel, bridge, roundabout, link, internal, destination-only, sac_scale, lit, sidewalk left/right, cycle lane, bike network, dismount, use_sidepath, HOV, truck route, restriction start/end flags).",
+      "Build-time interning with a hash map, deterministic id assignment (sorted by tuple bytes).",
+      "On-disk section and reader accessor `class(id)`.",
+      "Report distinct class counts; fail the build clearly if the 20-bit limit is exceeded.",
+      "Document which upstream DirectedEdge fields live in the class, in `EdgeHot`, or in cold data."
+    ],
+    "out_of_scope": ["Per-request factor tables indexed by class id: P3.25."],
+    "notes": ["Attributes read in the relax loop must be reachable from `EdgeHot` or the class table, never from cold data."],
+    "accept": [
+      "Every costing-relevant DirectedEdge field from upstream is mapped (checklist in the PR).",
+      "Distinct class count for a country extract reported and far below 2^20.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.15",
+    "goal": "Graph assembly: the edge stream becomes the hot topology sections, with opposing edges, local edge indices and node attributes in place.",
+    "upstream": ["src/mjolnir/graphbuilder.cc", "src/mjolnir/graphtilebuilder.cc", "src/mjolnir/graphvalidator.cc"],
+    "scope": [
+      "`src/build/assemble.zig`: create both directed edges per way segment, sort by start node, write `first_edge` (CSR) and `EdgeHot`.",
+      "`local` and `opp_local` indices (5 bits, up to 32 edges per node); nodes with more edges are split with zero-length connectors, counted in stats.",
+      "`len_m`, the four speed bytes, `class_id` from P3.14, `cold_checks` and `pred_speed` flags.",
+      "`NodeHot.attr`: access mask, node type, density placeholder, signal flag; node coordinates as a separate warm `2 x i32` array.",
+      "Validation pass: every edge has a correct opposing edge, lengths are non-zero, ids are dense.",
+      "Parallel by node-range chunk, deterministic output."
+    ],
+    "out_of_scope": ["Turn tables: P3.16.", "Shapes and names: P3.17.", "Final node order: P3.21 and P4.02."],
+    "notes": ["Opposing edge is computed, not stored: this lifts upstream's 7-bit opposing index limit."],
+    "accept": [
+      "Round trip: build an ASCII-map fixture, read it with P3.13, and check adjacency and opposing edges.",
+      "Validation pass reports zero errors on the test extracts.",
+      "Edges per second and peak RSS reported for a country extract.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.16",
+    "goal": "Per-node turn tables holding what costing needs about each (incoming edge, outgoing edge) pair, deduplicated globally so they cost under a byte per node.",
+    "upstream": ["src/mjolnir/graphenhancer.cc", "valhalla/baldr/directededge.h", "valhalla/baldr/nodeinfo.h"],
+    "scope": [
+      "`src/build/turns.zig`: for each node a `degree x degree` matrix of `u8` entries: `turn_type:3 | stop_impact:3 | name_consistent:1 | restricted:1`.",
+      "Turn type from the heading difference of the two edges at the node, using upstream's turn-degree thresholds.",
+      "Initial stop impact from the classes of the edges meeting at the node as upstream computes it; name consistency from shared names.",
+      "Global dedup of identical matrices into one pool; `NodeHot.turn_off` points into it.",
+      "Reader accessor `turnRow(node, in_local) []const u8`."
+    ],
+    "out_of_scope": ["Restriction bits: P5.08.", "Full stop-impact refinement: P5.01."],
+    "notes": ["Lookup is `pool[turn_off + in_local * degree + out_local]`; the edge-expanded graph is never materialised."],
+    "accept": [
+      "Turn types match the oracle's `turntype` for sampled intersections (via P3.34 when available, hand-checked fixtures before).",
+      "Pool size reported; under 1 byte per node on a country extract.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.17",
+    "goal": "Cold data sections: way ids, shapes and names stored compactly and out of the relax loop's way, read only by leg building, serializers and inspection.",
+    "upstream": ["src/baldr/edgeinfo.cc", "src/mjolnir/graphtilebuilder.cc"],
+    "scope": [
+      "`src/graph/cold.zig`: one record per undirected edge reached through `cold_idx: u32` per directed edge.",
+      "Record: `u64` way id, shape as delta zigzag varints at 1e-7 degrees with a `u32` length, name references, mean elevation slot, speed limit.",
+      "A deduplicated string table for names (up to 255 names per edge).",
+      "Chunking by contiguous id range with a chunk directory, so pages stay local under any node order.",
+      "Accessors: `shape(edge, arena)` decoding in travel direction, `names(edge)`, `wayId(edge)`."
+    ],
+    "out_of_scope": ["Signs: P6.02.", "Turn lanes and lane connectivity: P6.03.", "Linguistics: P6.04."],
+    "notes": ["Lifts upstream limits: 15 names per edge, 65,535-byte shapes, 25-bit edgeinfo offset (docs/upstream/valhalla-perf-issues.md, #6148)."],
+    "accept": [
+      "Shapes round-trip exactly at 1e-7 degrees; reverse-direction decode tested.",
+      "Bytes per edge for cold data reported on a country extract.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.18",
+    "goal": "Elevation stamped onto edges at build time: weighted grade, maximum up and down slopes and mean elevation, which bicycle and pedestrian costing use for hills.",
+    "upstream": ["src/mjolnir/elevationbuilder.cc", "src/skadi/sample.cc", "valhalla/baldr/directededge.h"],
+    "scope": [
+      "`src/build/elevation.zig`: sample each edge shape at upstream's posting interval using the sampler from P2.02.",
+      "Compute weighted grade (the 4-bit value, default 6 meaning flat), max up slope and max down slope with upstream's formulas and clamps.",
+      "Store `grade` in `EdgeHot.geom`, slopes and mean elevation in cold or side data as costing requires.",
+      "Skip gracefully when DEM tiles are missing; record coverage in build stats.",
+      "Parallel by edge chunk, sorted by DEM tile to keep tile cache hits high."
+    ],
+    "out_of_scope": ["Serving `/height`: P2.03.", "Per-shape-point elevation in responses: later serializer work."],
+    "notes": ["`use_hills` and grade-based speed factors depend on this matching upstream."],
+    "accept": [
+      "Weighted grade matches the oracle for sampled edges on a hilly test extract (via P3.34 or the oracle's `/locate`).",
+      "A build without DEM produces flat grades and a clear stat line.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.19",
+    "goal": "The subset of upstream's enhance stage that pedestrian and bicycle routing needs: density, intersection types, dead ends and not-thru regions.",
+    "upstream": ["src/mjolnir/graphenhancer.cc"],
+    "scope": [
+      "`src/build/enhance.zig`: node and edge density (the 4-bit relative road density) with upstream's radius and scaling.",
+      "Intersection type per node (regular, false, dead end, fork) and the dead-end edge flag.",
+      "Not-thru region detection (bounded expansion from an edge that cannot reach a higher-class road) with upstream's limits.",
+      "Driving side per node defaulted, with a hook for admin data in P5.05.",
+      "Parallel, deterministic, writing back into the hot sections or class ids."
+    ],
+    "out_of_scope": ["Speed assignment, turn-type refinement and stop impact: P5.01.", "Link reclassification: P5.02."],
+    "notes": ["Density feeds pedestrian and bicycle cost factors, so it must match before P3.35 can pass."],
+    "accept": [
+      "Density and dead-end flags match the oracle on sampled nodes and edges of a test extract.",
+      "ASCII-map tests for not-thru detection and dead ends.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.20",
+    "goal": "One spatial index for snapping, map matching and `/locate`: a fine fixed grid with compact edge lists, replacing upstream's coarse bins and the duplicate map-matching grid.",
+    "upstream": ["src/mjolnir/graphvalidator.cc", "src/loki/search.cc", "valhalla/meili/grid_range_query.h"],
+    "scope": [
+      "`src/graph/spatial.zig`: cells of 1/256 degree; a sorted directory of non-empty cell ids with offsets.",
+      "Each cell lists the undirected edges whose shape intersects it, as delta-varint ids.",
+      "Build: rasterise each shape through the grid (grid traversal from P1.04), parallel, deterministic.",
+      "Query API: cells within a radius of a point in expanding rings, and cells along a segment.",
+      "Section written through `BundleWriter`, read through the graph reader."
+    ],
+    "out_of_scope": ["Candidate projection and filtering: P3.23.", "Trace candidate search: P8.01."],
+    "notes": ["docs/upstream/valhalla-perf-issues.md: #2529 explains why the bins are too coarse upstream."],
+    "accept": [
+      "Every edge is found from any point on its shape (property test).",
+      "Index size reported; at most 3 bytes per edge on a country extract.",
+      "Ring queries return cells in non-decreasing distance order.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.21",
+    "goal": "A node ordering interface with a Hilbert-curve order as the first implementation, so ids are spatially local now and the nested-dissection order can replace it later without touching other stages.",
+    "upstream": [],
+    "scope": [
+      "`src/build/order.zig`: `Ordering` interface returning a permutation of provisional node ids.",
+      "Hilbert order over node coordinates using the curve from P1.04.",
+      "Apply the permutation: renumber nodes, re-sort edges, rewrite `head` values and every section keyed by node or edge id.",
+      "Record the ordering kind and a hash of the order in the bundle metadata."
+    ],
+    "out_of_scope": ["Nested dissection and making it the id order: P4.01 and P4.02."],
+    "notes": ["Upstream measured the locality gain from spatial ordering in PRs #4455 and #6342 (docs/upstream/valhalla-perf-issues.md)."],
+    "accept": [
+      "Graph is isomorphic before and after reordering (routes on a fixture are identical).",
+      "Median id distance between adjacent nodes reported before and after.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.22",
+    "goal": "`zr build`: one command that runs every build stage from an OSM file to a bundle, restartable from any stage, with progress and stats.",
+    "upstream": ["src/mjolnir/util.cc", "valhalla/mjolnir/util.h"],
+    "scope": [
+      "`src/build/driver.zig`: ordered stages (read, tags, node store, edges, assemble, turns, cold, elevation, enhance, order, spatial, validate, finalize).",
+      "`--from <stage>` and `--to <stage>` using intermediates in a work directory, like upstream's `start_stage` / `end_stage`.",
+      "Per-stage timing, rows per second, peak RSS and output sizes printed and written to `build-stats.json`.",
+      "Config: input files, DEM directory, work directory, thread count, output bundle path.",
+      "Fail fast with a clear message on missing inputs; clean up partial bundles."
+    ],
+    "out_of_scope": ["Planet-scale tuning: P4.19.", "Determinism guarantees across thread counts: P4.20."],
+    "notes": ["Used by the ASCII-map test DSL, so it must also run fully in memory or a temp directory for tiny inputs."],
+    "accept": [
+      "Builds the upstream test extracts end to end; `zr inspect --verify` passes.",
+      "Restarting from a middle stage produces a byte-identical bundle.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.23",
+    "goal": "Location snapping: from a request location to ranked edge candidates with the same PathLocation semantics as Valhalla, on the new spatial index.",
+    "upstream": ["src/loki/search.cc", "src/loki/worker.cc", "proto/common.proto"],
+    "scope": [
+      "`src/snap/search.zig`: ring search over the grid from P3.20, projecting the point onto candidate shapes with SIMD batches.",
+      "Location options with upstream names and defaults: `radius`, `heading`, `heading_tolerance`, `node_snap_tolerance`, `search_cutoff`, `street_side_tolerance`, `street_side_max_distance`, `preferred_side`, `rank_candidates`, `search_filter`.",
+      "Costing-aware filtering: an edge is a candidate only if the request's compiled costing allows it.",
+      "Result: correlated edges with percent along, projected point, distance, side of street, and snapping to nodes within tolerance (all edges at the node).",
+      "Ranking and tie-breaking as upstream so the same candidate wins."
+    ],
+    "out_of_scope": ["Reachability and connectivity checks: P3.24.", "Avoid locations and polygons: P5.16."],
+    "notes": ["All scratch memory from the request arena.", "This index is shared with map matching later; keep the query API general."],
+    "accept": [
+      "Port the applicable cases from upstream's loki search tests.",
+      "Same top candidate as the oracle's `/locate` for at least 99% of a sampled location corpus.",
+      "Median snap time recorded in the bench results.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.24",
+    "goal": "Reachability and connectivity checks for snapped locations, with the same error codes as Valhalla when no suitable edge exists.",
+    "upstream": ["src/loki/reach.cc", "src/loki/search.cc", "src/loki/worker.cc"],
+    "scope": [
+      "`src/snap/reach.zig`: bounded expansion from a candidate, forward and reverse, to count reachable nodes up to `minimum_reachability`.",
+      "Demote or drop candidates that fail reachability, as upstream does.",
+      "Connectivity: precomputed connected-component ids per node (build stage addition) so unconnected location pairs fail fast.",
+      "Error paths: no suitable edges near location (171), locations in unconnected regions (170), and the related loki errors with upstream messages.",
+      "Reuse the request arena and paged status arrays; no hashing."
+    ],
+    "out_of_scope": ["Service limit errors such as max distance (154): P3.33."],
+    "notes": ["docs/upstream/valhalla-perf-issues.md: PR #5384 shows Reach was a measurable hot spot upstream."],
+    "accept": [
+      "Port upstream's reach test cases onto ASCII maps.",
+      "Island and one-way dead-end fixtures return the expected error codes.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.25",
+    "goal": "The compiled costing framework: request options become a small table-driven POD that monomorphised kernels read with no virtual calls, under an explicit admissibility contract.",
+    "upstream": ["valhalla/sif/dynamiccost.h", "src/sif/dynamiccost.cc"],
+    "scope": [
+      "`src/costing/compiled.zig`: `Compiled` POD with a class-id to factor table (`+inf` means not allowed), speed to seconds-per-metre table, turn-class to cost table, and scalars.",
+      "Kernel interface used by `Search(K, Q)`: `edgeCost`, `turnCost`, `slowAllowed` (noinline cold path), `unitSize`, plus `edgeLowerBound` and `turnLowerBound`.",
+      "Contract documented and asserted: I1 edge bound never exceeds real cost, I2 turn bound never exceeds real transition cost, I3 costs non-negative and forbidden is infinite, I4 features are monotone or supply a scalar floor, I5 bounds round down.",
+      "128-bit metric key hashing the static projection of the POD.",
+      "A compile cache keyed by the canonicalised options; compile cost budget about 100 microseconds.",
+      "`Cost { cost: f32, secs: f32 }` matching upstream arithmetic."
+    ],
+    "out_of_scope": ["Option parsing shared across models: P3.26.", "Model formulas: P3.27 and P3.28.", "Metric customisation from the POD: P4.04."],
+    "notes": ["docs/design/engine-and-format.md Q1 defines the invariants.", "Three or four kernels, not one per model: models differ in tables more than code."],
+    "accept": [
+      "A toy kernel passes a property test of I1 to I3 over random options.",
+      "Equal compiled tables from different raw options produce the same metric key.",
+      "No allocation after the compile cache is warm.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.26",
+    "goal": "The shared costing base ported from DynamicCost: common option parsing with upstream names, ranges and defaults, and the penalties every model shares.",
+    "upstream": ["valhalla/sif/dynamiccost.h", "src/sif/dynamiccost.cc", "proto/options.proto", "src/worker.cc"],
+    "scope": [
+      "`src/costing/base.zig`: port `ParseBaseCostOptions` (maneuver, gate, private access, destination-only, toll booth, ferry, rail ferry, country crossing, service, closure and similar penalties and costs, `use_*` factors, `shortest`, `ignore_*` flags).",
+      "Range clamping and defaults identical to upstream's ranged-default handling.",
+      "Shared transition-cost pieces: turn-type costs, stop impact, name consistency, density factors.",
+      "Shared allowed checks: access mask, closures hook, destination-only and private access handling.",
+      "Each option contributes its lower-bound effect for the admissibility contract."
+    ],
+    "out_of_scope": ["Model-specific formulas: P3.27, P3.28 and Phase 5.", "Time and traffic dependent parts: P5.14 and P10.05."],
+    "notes": ["Costs stay `f32` so per-call parity (gate A) can reach 1e-5."],
+    "accept": [
+      "Table tests: every base option name, default, minimum and maximum equals upstream.",
+      "Out-of-range values clamp or reset exactly as upstream.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.27",
+    "goal": "Pedestrian costing ported in full from pedestriancost.cc, including every option the consuming apps send, with per-call cost parity against Valhalla.",
+    "upstream": ["src/sif/pedestriancost.cc", "valhalla/sif/dynamiccost.h", "proto/options.proto"],
+    "scope": [
+      "`src/costing/pedestrian.zig`: `Allowed`, `EdgeCost`, `TransitionCost` and their reverse forms compiled into the POD and kernel.",
+      "Options with upstream defaults and ranges: `walking_speed`, `walkway_factor`, `sidewalk_factor`, `alley_factor`, `driveway_factor`, `step_penalty`, `elevator_penalty`, `max_hiking_difficulty`, `use_tracks`, `use_living_streets`, `use_ferry`, `use_hills`, `use_lit`, `service_penalty`, `service_factor`, `max_distance`, `type` (foot, wheelchair, blind) and transit-related distances.",
+      "Grade-based speed factors, surface and sac_scale access limits, steps and elevator handling.",
+      "Lower bounds per the admissibility contract, including factors below 1.",
+      "Unit size and the A* cost factor equivalent for the L2 heuristic."
+    ],
+    "out_of_scope": ["Multimodal and transit use of pedestrian costing: P9.04.", "Bike share: P9.07."],
+    "notes": ["Port formula by formula with a comment naming the upstream function.", "Production requests use `walkway_factor`, `sidewalk_factor`, `use_tracks`, `use_living_streets`, `max_hiking_difficulty`, `step_penalty`."],
+    "accept": [
+      "Gate A: per-call edge and transition cost within 1e-5 relative of the oracle (harness in P3.35).",
+      "Port the pedestrian cases from upstream's sif tests.",
+      "Property test of invariants I1 to I3 over the legal option ranges.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.28",
+    "goal": "Bicycle costing ported in full from bicyclecost.cc with every option, with per-call cost parity against Valhalla.",
+    "upstream": ["src/sif/bicyclecost.cc", "valhalla/sif/dynamiccost.h", "proto/options.proto"],
+    "scope": [
+      "`src/costing/bicycle.zig`: `Allowed`, `EdgeCost`, `TransitionCost` and reverse forms compiled into the POD and kernel.",
+      "Options with upstream defaults and ranges: `bicycle_type` (road, hybrid, cross, mountain), `cycling_speed`, `use_roads`, `use_hills`, `avoid_bad_surfaces`, `use_ferry`, `use_living_streets`, `bss_return_cost`, `bss_return_penalty`, plus base penalties.",
+      "Road-class and cycle-lane factors, bike-network preference, surface limits per bicycle type, dismount and use_sidepath handling, grade-based speed and penalty tables.",
+      "Turn costs including the bicycle-specific stress terms.",
+      "Lower bounds per the admissibility contract."
+    ],
+    "out_of_scope": ["Bike share stations and mode changes: P9.07."],
+    "notes": ["Production requests use `use_roads` and `use_hills`.", "Depends on grades from P3.18 and bike tags from P3.09."],
+    "accept": [
+      "Gate A: per-call cost within 1e-5 relative of the oracle (harness in P3.35).",
+      "Port the bicycle cases from upstream's sif tests.",
+      "Property test of invariants I1 to I3 over the legal option ranges.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.29",
+    "goal": "The search core every endpoint will share: an exact label-setting A* over directed-edge labels, generic over costing kernel and queue, with zero steady-state allocation.",
+    "upstream": ["src/thor/bidirectional_astar.cc", "src/thor/unidirectional_astar.cc", "valhalla/sif/edgelabel.h", "valhalla/baldr/double_bucket_queue.h"],
+    "scope": [
+      "`src/search/search.zig`: `Search(comptime K, comptime Q)` with the relax loop from docs/design/engine-and-format.md Q3.",
+      "32-byte label: `cost f32, secs f32, pred u32, edge u32, dist_m u32, tcost f32, flags u32, ctx u32`.",
+      "Edge status as a two-level paged array (directory by `id >> 12`, 16 KB pages from the request arena), reset by rewinding the arena.",
+      "4-ary heap of `{key u32, label u32}` with lazy deletion; a potential interface with the L2 implementation (haversine times fastest seconds per metre).",
+      "Forward and mirrored reverse expansion from one code path.",
+      "Cancellation: deadline and atomic flag checked every 1024 pops; no recursion anywhere."
+    ],
+    "out_of_scope": ["Origin and destination partial edges: P3.30.", "CCH potentials: P4.06 and P4.07.", "Bucket queue for sweeps: P7.01."],
+    "notes": ["No hierarchy pruning and no shortcuts: results are exact.", "Mark cold checks `noinline`; watch instantiation count."],
+    "accept": [
+      "Matches a reference Dijkstra on random ASCII-map graphs (property test, cost equality).",
+      "No allocator calls on the second and later runs of the same search.",
+      "Throughput measured by P3.36.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.30",
+    "goal": "Correct handling of where routes start and end: partial edges, several candidates per location, trivial routes and both ends on the same edge.",
+    "upstream": ["src/thor/bidirectional_astar.cc", "src/thor/unidirectional_astar.cc", "src/thor/route_action.cc"],
+    "scope": [
+      "`src/search/endpoints.zig`: seed the queue from every origin candidate with partial edge cost for the remaining fraction, in both travel directions where allowed.",
+      "Destination handling: partial cost to the projected point, all destination candidates, node-snapped destinations.",
+      "Trivial routes: origin and destination on the same edge in order, and the out-and-back case when they are in the wrong order.",
+      "Heading and side-of-street preferences applied as upstream applies them to candidate costs.",
+      "Result: an ordered list of (edge, begin fraction, end fraction) plus accumulated cost and time."
+    ],
+    "out_of_scope": ["Multiple locations and through or via handling: P3.31."],
+    "notes": ["This is where most small parity diffs come from; test against the oracle on short routes first."],
+    "accept": [
+      "ASCII-map tests for same-edge, opposite-direction, node-snapped and multi-candidate cases.",
+      "Gate B holds on a corpus of routes under 2 km.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.31",
+    "goal": "Routes through more than two locations with Valhalla's location types: break, through, via and break_through.",
+    "upstream": ["src/thor/route_action.cc", "proto/common.proto"],
+    "scope": [
+      "`src/search/multi.zig`: leg-by-leg search between consecutive locations, carrying the arrival edge into the next leg.",
+      "`break` and `break_through` end a leg; `through` and `via` continue the same leg; `through` and `break_through` forbid u-turns at the location.",
+      "Carry elapsed time across legs for later time-dependent support.",
+      "Waiting and `date_time` hooks left as explicit TODO interfaces for P5.15."
+    ],
+    "out_of_scope": ["Time-dependent legs: P5.15.", "Optimised ordering of locations: P7.11."],
+    "notes": ["Leg boundaries must match upstream so `trip.legs[]` lines up for clients that stitch leg shapes."],
+    "accept": [
+      "ASCII-map tests for each location type, including the no-u-turn rule.",
+      "Leg count and per-leg lengths equal the oracle on a multi-location corpus.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.32",
+    "goal": "Turn a found path into legs: the stitched shape, and the length, time and cost summaries a route response needs.",
+    "upstream": ["src/thor/triplegbuilder.cc", "src/sif/recost.cc", "src/thor/route_action.cc"],
+    "scope": [
+      "`src/search/legs.zig`: decode cold shapes in travel direction, trim partial first and last edges, drop duplicate joint points.",
+      "Length in metres and elapsed seconds per edge and per leg, recomputed by a recost pass so times match upstream's reporting.",
+      "Leg and trip summary fields: `length`, `time`, `cost`, bounding box, `has_toll`, `has_highway`, `has_ferry` and the other summary flags.",
+      "Output as plain structs in the request arena; no protobuf intermediates.",
+      "SIMD polyline encoding of the leg shape through P1.02."
+    ],
+    "out_of_scope": ["Maneuvers and the full trip-leg attribute set: P6.05.", "Serialisation: P3.33."],
+    "notes": ["Keep this path cheap: for `directions_type: none` requests it is most of the post-search time."],
+    "accept": [
+      "Shape equals the oracle's decoded leg shape point for point when paths match.",
+      "Summary length within 0.5% and time within 1% of the oracle.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.33",
+    "goal": "The `/route` endpoint for `directions_type: none`, response-compatible with Valhalla, which is exactly what the consuming apps call today.",
+    "upstream": ["src/tyr/route_serializer_valhalla.cc", "src/tyr/serializers.cc", "src/worker.cc", "src/loki/route_action.cc"],
+    "scope": [
+      "`src/api/route.zig`: request parsing for `locations`, `costing`, `costing_options`, `directions_type`, `units`, `shape_format` (polyline6, polyline5, geojson), `id`, `language` passthrough.",
+      "Response: `trip.locations`, `trip.legs[].shape`, `trip.legs[].summary`, `trip.summary`, `status`, `status_message`, `units`, `language`, `id`.",
+      "Service limits per costing (`max_distance`, `max_locations`) with error 154 and friends, matching upstream messages and HTTP status.",
+      "Error JSON for no-path (442) and the loki errors from P3.24.",
+      "Per-phase timings (parse, snap, search, legs, serialize) in the access log."
+    ],
+    "out_of_scope": ["Maneuvers and instructions: P6.13.", "OSRM, GPX and pbf output: P6.14 and P6.15."],
+    "notes": ["Parity gate H applies: keys, types, enums and error codes are exact."],
+    "accept": [
+      "Golden JSON key sets and types equal the oracle for the foot and bike corpus (gate H).",
+      "Error cases return the same `error_code` and HTTP status as the oracle.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.34",
+    "goal": "A test-only importer that converts Valhalla graph tiles into our format, so both engines can route on the identical graph and algorithm differences are separated from builder differences.",
+    "upstream": ["valhalla/baldr/graphtileheader.h", "valhalla/baldr/directededge.h", "valhalla/baldr/nodeinfo.h", "valhalla/baldr/graphid.h", "src/baldr/edgeinfo.cc", "src/baldr/graphtile.cc"],
+    "scope": [
+      "`src/cli/import_valhalla.zig`: read `.gph` files or a `tiles.tar` with `index.bin`; local level (2) only, ignoring shortcuts and transitions.",
+      "Mirror upstream bitfield layouts with `extern struct` plus `packed struct(u64)` words exactly as recorded in docs/upstream/valhalla-architecture.md section 3, including the header padding quirk.",
+      "Map DirectedEdge and NodeInfo fields into `EdgeHot`, the class table, turn tables and cold data; decode EdgeInfo shapes (7-digit) and names.",
+      "Resolve cross-tile end nodes into dense ids; rebuild opposing-edge local indices.",
+      "Write a normal bundle through `BundleWriter` so every other tool works on it."
+    ],
+    "out_of_scope": ["Any runtime use of Valhalla tiles.", "Transit level and hierarchy levels 0 and 1."],
+    "notes": ["This never ships in the server binary path.", "Tile version check: warn like upstream when the major version differs."],
+    "accept": [
+      "Imports the oracle's tiles for a test extract; node and edge counts equal the tile header totals for level 2.",
+      "Sampled edges and nodes equal the oracle's `/locate` output field by field.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.35",
+    "goal": "The costing parity harness for gate A: compare our edge and transition costs call by call with Valhalla's, so a wrong formula is caught before any route is compared.",
+    "upstream": ["src/sif/pedestriancost.cc", "src/sif/bicyclecost.cc", "src/sif/dynamiccost.cc", "src/sif/recost.cc"],
+    "scope": [
+      "A small instrumented program built in the oracle container that links upstream and dumps `EdgeCost` and `TransitionCost` for sampled (predecessor edge, edge, options) tuples.",
+      "`zr parity costing`: evaluate the same tuples on a bundle imported with P3.34 and report relative error per call and per option set.",
+      "Option-set sampling across the legal ranges plus the exact production option sets.",
+      "Path-level check: recost oracle paths with our costing and compare to the oracle-reported cost (tolerance 1e-4).",
+      "Machine-readable report consumed by the phase gate."
+    ],
+    "out_of_scope": ["Route-level comparison: P3.40."],
+    "notes": ["Gate A is a hard gate: any violation is a bug in the port, not noise."],
+    "accept": [
+      "At least 10^7 sampled calls for pedestrian and bicycle within 1e-5 relative error.",
+      "Recost of oracle paths within 1e-4.",
+      "Any failing tuple is printed with enough detail to reproduce.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.36",
+    "goal": "Experiment E1: measure how fast the search core settles labels on a real country graph, to confirm the data layout before more is built on it.",
+    "upstream": [],
+    "scope": [
+      "Run plain edge-based Dijkstra (no potential) with the pedestrian kernel, and a stub motor kernel, on a Germany bundle from random sources to 10^6 settled labels.",
+      "Record nanoseconds per settled label, cache misses and branch misses per label (tooling from P0.12).",
+      "Measure the oracle's label throughput for the same expansions for comparison.",
+      "Write up results and any layout changes proposed in `docs/experiments/E1.md`."
+    ],
+    "out_of_scope": ["Potential-guided searches: P4.11."],
+    "notes": ["Pass line from docs/PLAN.md: at most 150 ns per settled label and at least 5x upstream label throughput.", "If it fails, revisit the record layout before continuing."],
+    "accept": [
+      "Results file committed with hardware, dataset and commit.",
+      "Pass or fail stated against the 150 ns and 5x lines, with the follow-up issue opened if it fails.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.37",
+    "goal": "Tests that prove `/height` and `/route` allocate nothing from the heap once warm, locking in the per-request arena design.",
+    "upstream": [],
+    "scope": [
+      "A test harness that warms each endpoint, then swaps in the counting allocator from P0.11 and replays a request mix.",
+      "Assert zero allocator calls outside the request arena for `/height` and `/route`.",
+      "Assert the arena high-water mark stays under the per-request cap for the corpus.",
+      "A helper so later endpoints add themselves with one line."
+    ],
+    "out_of_scope": ["Soak testing over hours: P4.24."],
+    "notes": ["docs/upstream/valhalla-perf-issues.md: #5172 is the heap ratchet this design avoids."],
+    "accept": [
+      "Tests fail if a heap allocation is introduced on either endpoint's steady-state path.",
+      "Arena high-water figures recorded for the corpus.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.38",
+    "goal": "Fuzz targets for the two parsers that read untrusted bytes in this phase: the OSM PBF reader and the graph bundle loader.",
+    "upstream": [],
+    "scope": [
+      "`std.testing.fuzz` targets for blob framing, PrimitiveBlock decoding and DenseNodes.",
+      "Fuzz target for bundle header validation and section accessors on mutated bundles.",
+      "Seed corpora from the test extracts and a tiny bundle.",
+      "Every crash found becomes a regression test."
+    ],
+    "out_of_scope": ["Request parser and codec fuzzing: P1.20."],
+    "notes": ["A corrupt bundle must be rejected at open, never read out of bounds later."],
+    "accept": [
+      "Each target runs for a fixed budget in CI without findings.",
+      "Bounds are checked on every offset read from a file (review checklist in the PR).",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.39",
+    "goal": "Upstream's behaviour spec for foot and bike routing running against our engine: the relevant gurka suites ported onto the ASCII-map DSL.",
+    "upstream": ["test/gurka", "test/gurka/gurka.h"],
+    "scope": [
+      "Select the gurka test files that exercise pedestrian and bicycle access, costing options, hiking difficulty, steps, sidewalks, cycleways, one-ways for bikes, and basic route shape.",
+      "Port each as a Zig test using the DSL from P1.18 and `zr build` in a temp directory.",
+      "Port the assertion helpers needed: expected path by way names, expected failure with error code.",
+      "Keep a ledger file listing every upstream gurka test and its status (ported, deferred with the owning issue, not applicable)."
+    ],
+    "out_of_scope": ["Suites that need maneuvers: P6.16.", "Access restriction and time-dependent suites: P5.20."],
+    "notes": ["Where our exact search finds a cheaper path than the upstream expectation, record it in the ledger with the recost evidence rather than editing the expectation silently."],
+    "accept": [
+      "All selected suites pass or are explained in the ledger.",
+      "The ledger covers all 136 upstream gurka files.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P3.40",
+    "goal": "The Phase 3 gate and experiment E8: prove parity and acceptable latency for pedestrian and bicycle routing before any production traffic is moved.",
+    "upstream": [],
+    "scope": [
+      "Run gates A, B and C from docs/PLAN.md on the foot and bike corpus and on 100k random routes: same graph via P3.34, oracle with hierarchy pruning disabled for gate C.",
+      "Run the default-oracle comparison and classify every differing route by cause (cheaper for us, tie, snap difference, bug).",
+      "Latency: p50 and p99 for the production-shaped corpus against the Phase 0 baseline.",
+      "Write `docs/gates/P3.md` with numbers, hardware, data and commit."
+    ],
+    "out_of_scope": ["The 5x latency target: P4.26."],
+    "notes": ["Gate B is absolute: our cost of our path must never exceed our cost of the oracle's path."],
+    "accept": [
+      "Gate A within 1e-5 per call and 1e-4 per path; gate B at 100%; gate C within 1e-4 on at least 99.9%.",
+      "Length and time within 1% of the oracle where paths match.",
+      "p50 and p99 no worse than the baseline.",
+      "Report committed."
+    ]
+  },
+  {
+    "key": "P3.41",
+    "goal": "zig-routing serving `/route` beside Valhalla on the production routing box with the full regional bundle, receiving mirrored traffic, with memory verified.",
+    "upstream": [],
+    "scope": [
+      "Build the production region bundle and copy it to the box.",
+      "Extend the service unit from P2.07 to serve `/route`; keep it private to the same clients as the existing service.",
+      "Mirror a sample of live `/route` requests and diff responses with `zr diff`; collect a day of results.",
+      "Record RSS, page-cache use and latency under the mirrored load.",
+      "Document rollback (stop the unit; clients are unaffected because they still use Valhalla)."
+    ],
+    "out_of_scope": ["Changing which server the apps call: P3.42."],
+    "notes": ["Needs maintainer access to the box; no secrets or addresses belong in the repository or this issue."],
+    "accept": [
+      "Maintainer approves the deployment and provides access.",
+      "One day of mirrored traffic with no gate B violations and no errors that Valhalla did not also return.",
+      "RSS within the memory budget in docs/PLAN.md with headroom recorded.",
+      "Results summarised in `docs/gates/P3-shadow.md`."
+    ]
+  },
+  {
+    "key": "P3.42",
+    "goal": "The consuming apps route through zig-routing first, with Valhalla kept as the automatic fallback during a soak period.",
+    "upstream": [],
+    "scope": [
+      "Switch the apps' primary routing URL to zig-routing and set the existing Valhalla service as the fallback.",
+      "Watch error rates, fallback rate and latency for the soak period; alert on fallback spikes.",
+      "Keep `zr diff` sampling running through the soak.",
+      "Write down the rollback step (revert the URL) and who can perform it."
+    ],
+    "out_of_scope": ["Removing the fallback and decommissioning Valhalla: P13.01."],
+    "notes": ["The apps already try servers in order, so this is a configuration change, not a code change."],
+    "accept": [
+      "Maintainer performs or approves the configuration change.",
+      "Soak period completes with fallback rate and error rate at or below the pre-cutover level.",
+      "Outcome and numbers recorded in `docs/gates/P3-cutover.md`."
+    ]
+  }
+]

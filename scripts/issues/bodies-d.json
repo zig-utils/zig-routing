@@ -1,0 +1,970 @@
+[
+  {
+    "key": "P6.01",
+    "goal": "A trip leg data model exists as plain Zig structs that mirror trip.proto field for field, so the trip-leg builder, narrative and serializers share one in-memory shape with no protobuf object in between. Pbf output later encodes straight from these structs.",
+    "upstream": ["proto/trip.proto", "proto/common.proto", "proto/sign.proto", "proto/directions.proto"],
+    "scope": [
+      "Define `src/api/trip.zig`: TripLeg, Node, Edge, IntersectingEdge, Sign, TurnLane, Admin, ShapeAttributes, Incident placeholders, matching proto field names and enum values.",
+      "Define `src/api/directions.zig`: DirectionsLeg, Maneuver, Summary, TransitInfo placeholders matching directions.proto.",
+      "Use slices backed by the request arena; no per-field heap allocation and no optional wrappers beyond what the proto marks optional.",
+      "Add comptime checks that every enum value equals the number in the .proto schema from P1.08.",
+      "Add a debug dump helper used by tests."
+    ],
+    "out_of_scope": ["Filling the structs from a path (P6.05).", "Pbf encoding of the structs (P6.15)."],
+    "notes": [
+      "No intermediate protobuf between stages: these structs are the only representation (docs/PLAN.md, Principles).",
+      "All memory comes from the per-request arena."
+    ],
+    "accept": [
+      "Every message and enum of trip.proto and directions.proto has a struct or enum with a comptime field-number check against P1.08.",
+      "A unit test builds a two-edge leg by hand and round-trips it through the debug dump.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P6.02",
+    "goal": "Exit numbers, branch, toward and name signs, guide signs and junction names are written by the build and readable per edge and per node, which the maneuver builder needs for ramp, exit and fork instructions.",
+    "upstream": ["src/mjolnir/graphbuilder.cc", "src/mjolnir/pbfgraphparser.cc", "src/mjolnir/graphtilebuilder.cc", "src/odin/signs.cc", "valhalla/baldr/", "proto/sign.proto"],
+    "scope": [
+      "Carry destination, destination:ref, destination:street, junction:ref, exit_to and junction name tags from the tag transform into the build.",
+      "Add a cold `signs` section keyed by edge (and node for named junctions) with sign type, route-number flag, tagged flag and text reference into the name table.",
+      "Reader API in `src/graph/signs.zig`: `signsForEdge`, `signsForNode`, returning slices without allocation.",
+      "Preserve upstream ordering and splitting rules for semicolon-separated values.",
+      "Set the per-edge `sign` presence bit so narrative can skip the lookup."
+    ],
+    "out_of_scope": ["Turn lanes (P6.03).", "Pronunciations attached to signs (P6.04).", "Using signs in maneuvers (P6.08)."],
+    "notes": [
+      "Cold data is chunked by cell and never touched by the relax loop (docs/PLAN.md, Native graph format).",
+      "Sign record layout upstream is documented in docs/upstream/valhalla-architecture.md section 3."
+    ],
+    "accept": [
+      "Gurka-style test maps with exits, forks and named junctions produce the same sign lists as the oracle's /locate verbose output.",
+      "Upstream sign unit tests ported and green.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P6.03",
+    "goal": "Turn lane strings and lane connectivity are stored by the build and readable per edge, so the trip leg can carry lanes and the narrative can compute active lanes for guidance.",
+    "upstream": ["src/mjolnir/graphbuilder.cc", "src/mjolnir/pbfgraphparser.cc", "src/mjolnir/graphenhancer.cc", "valhalla/baldr/", "src/odin/"],
+    "scope": [
+      "Carry turn:lanes, turn:lanes:forward and turn:lanes:backward plus lane counts from the tag transform.",
+      "Add a cold `turnlanes` section (edge to encoded lane masks) and a `lane_connectivity` section (to edge, from way id, to-lanes and from-lanes masks).",
+      "Port the upstream turn lane mask encoding and the enhancer pass that validates and trims lane data against lane counts.",
+      "Reader API in `src/graph/lanes.zig`: `turnLanes(edge)`, `laneConnectivity(edge)`.",
+      "Set the per-edge `turnlanes` and `lane_conn` presence bits."
+    ],
+    "out_of_scope": ["Active lane computation for a maneuver (P6.09).", "Signs (P6.02)."],
+    "notes": [
+      "Lift the upstream 22-bit edge index limit: our ids are dense u32.",
+      "See docs/upstream/valhalla-architecture.md for the TurnLanes and LaneConnectivity record layouts."
+    ],
+    "accept": [
+      "Upstream turn lane unit tests ported and green.",
+      "Test maps with tagged turn lanes yield identical lane masks to the oracle's trace_attributes or verbose locate output.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P6.04",
+    "goal": "Edge names carry their language, pronunciations and tagged values (tunnel and bridge names, levels, layer), so narrative and serializers can emit the same street names and phonemes as Valhalla.",
+    "upstream": ["src/mjolnir/pbfgraphparser.cc", "src/mjolnir/graphbuilder.cc", "src/baldr/edgeinfo.cc", "valhalla/baldr/", "src/mjolnir/"],
+    "scope": [
+      "Extend the cold name records with per-name flags: is route number, tagged, language id, and a link to a pronunciation record.",
+      "Store linguistic records (language, phonetic alphabet, name index) and tagged values (layer, level, level ref, levels, tunnel name, bridge name) per upstream's tagged-value kinds.",
+      "Port the build rules that pick names by language for an admin area and pair name:pronunciation tags with names.",
+      "Reader API: `names(edge, opts)` returning name, route-number flag, language and optional pronunciation.",
+      "Lift the 15 names per edge limit to 255."
+    ],
+    "out_of_scope": ["Admin lookup itself (P5.04).", "Sign text (P6.02)."],
+    "notes": [
+      "Names live in one deduplicated string table shared with signs (docs/PLAN.md, Native graph format).",
+      "Tagged value kinds are listed in docs/upstream/valhalla-architecture.md section 3 (EdgeInfo)."
+    ],
+    "accept": [
+      "Upstream linguistics and tagged-value unit tests ported and green.",
+      "Multilingual gurka-style maps return the same names and pronunciations as the oracle.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P6.05",
+    "goal": "A found path becomes a complete trip leg: every node and edge attribute, intersecting edges, signs, lanes, admins, shape and elapsed times, filtered by the request's attribute controller. This is the input to narrative and to every route-family serializer.",
+    "upstream": ["src/thor/triplegbuilder.cc", "valhalla/thor/", "proto/trip.proto", "src/thor/route_action.cc"],
+    "scope": [
+      "Port `TripLegBuilder::Build` into `src/search/tripleg.zig`, writing the structs from P6.01.",
+      "Fill edge attributes (names, speed, length, use, road class, surface, toll, tunnel, bridge, roundabout, internal, drive on right, begin and end heading, shape indexes, way id, sac scale, sidewalk, grades, lane count, speed limit).",
+      "Fill node attributes, intersecting edges with their traversability and name consistency, admin index, time zone, elapsed time and cost.",
+      "Trim first and last edge shape and length by the partial-edge percentages; handle through and via locations inside a leg.",
+      "Port the attributes controller (include and exclude filters) so unrequested attributes are skipped, not computed and dropped.",
+      "Attach signs (P6.02), turn lanes (P6.03) and name details (P6.04)."
+    ],
+    "out_of_scope": ["Transit legs (P9.06).", "Incidents (P10.07).", "Maneuver building (P6.07)."],
+    "notes": [
+      "Cold data is read here, never in the relax loop.",
+      "Arena allocation only; budget this step in the access log (docs/PLAN.md, Performance engineering rules)."
+    ],
+    "accept": [
+      "Upstream trip leg builder tests ported and green.",
+      "trace_attributes-style dumps of legs on the corpus match the oracle field for field where paths match (gate H for keys and types).",
+      "No heap allocation outside the request arena.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P6.06",
+    "goal": "The helper layer the maneuver builder works through exists: an enhanced view over a trip leg with the navigation queries odin asks (previous and next edge, intersecting edge counts, turn degree, forks, ramps, highway tests).",
+    "upstream": ["src/odin/enhancedtrippath.cc", "valhalla/odin/", "src/odin/maneuver.cc"],
+    "scope": [
+      "Port EnhancedTripLeg, EnhancedTripLeg_Edge, EnhancedTripLeg_Node, IntersectingEdge and Admin helpers into `src/narrative/enhanced.zig` as thin views over the P6.01 structs.",
+      "Port the edge predicates (IsHighway, IsRampUse, IsTurnChannelUse, IsFerryUse, IsUnnamed, IsStraightest and friends) and name list helpers.",
+      "Port node helpers that count intersecting edges by traversability and find the straightest or right-most and left-most edges.",
+      "Port the Maneuver value type and its accessors.",
+      "Port the debug string output used by upstream tests."
+    ],
+    "out_of_scope": ["Maneuver creation and combination (P6.07)."],
+    "notes": [
+      "Views hold pointers into the arena-backed leg; no copies.",
+      "Module sizes are in docs/upstream/valhalla-architecture.md section 1."
+    ],
+    "accept": [
+      "Upstream enhanced trip path unit tests ported and green.",
+      "Every predicate has a table-driven test against values taken from upstream tests.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P6.07",
+    "goal": "The first third of the maneuver builder runs: maneuvers are created from a trip leg, each gets a turn type and base attributes, and consecutive maneuvers are combined by upstream's rules. Simple urban routes produce the same maneuver list as Valhalla.",
+    "upstream": ["src/odin/maneuversbuilder.cc", "src/odin/maneuver.cc", "valhalla/odin/", "test/maneuversbuilder.cc"],
+    "scope": [
+      "Port `ManeuversBuilder::Build`, `Produce`, `CreateStartManeuver`, `CreateDestinationManeuver`, `InitializeManeuver`, `UpdateManeuver`, `FinalizeManeuver` into `src/narrative/maneuvers.zig`.",
+      "Port `SetManeuverType` and `SetSimpleDirectionalManeuverType` with relative direction and turn degree logic.",
+      "Port `Combine` and the name-consistency, turn-channel and unnamed-path combine rules.",
+      "Port begin and end street name handling, cardinal directions and distance and time accumulation.",
+      "Start, destination, continue, slight, sharp, left, right and becomes maneuvers produce upstream-identical lists."
+    ],
+    "out_of_scope": ["Ramps, exits, merges, roundabouts, forks, u-turns, internal intersections (P6.08).", "Ferries, stairs, indoor, lanes, guidance views (P6.09)."],
+    "notes": [
+      "Port rule by rule with a `ported from` note per function; the upstream test file is the spec.",
+      "This file is about 172 KB upstream, hence the three-way split."
+    ],
+    "accept": [
+      "The subset of test/maneuversbuilder.cc covering the ported rules is ported and green.",
+      "Gate D maneuver type sequence equality on simple urban corpus routes.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P6.08",
+    "goal": "The maneuver builder handles highway and junction geometry: ramps, exits, merges, forks, roundabouts, u-turns and internal intersection collapsing, matching Valhalla's maneuver types and attributes.",
+    "upstream": ["src/odin/maneuversbuilder.cc", "src/odin/signs.cc", "valhalla/odin/", "test/maneuversbuilder.cc"],
+    "scope": [
+      "Port ramp and exit typing (ramp straight, right, left; exit right, left), including sign attachment from P6.02 and the keep-versus-exit decision.",
+      "Port merge typing and merge side determination.",
+      "Port fork detection (stay left, right, straight) and the `IsFork` and `IsLeftPencilPointUturn` family of tests.",
+      "Port roundabout enter and exit maneuvers with exit counts and roundabout exit street names.",
+      "Port u-turn typing and the internal intersection logic (`UpdateInternalTurnCount`, internal edge collapsing, turn channel handling).",
+      "Port obvious-maneuver suppression and intersecting-forward-edge checks."
+    ],
+    "out_of_scope": ["Ferries, stairs, elevators, indoor and lane guidance (P6.09)."],
+    "notes": [
+      "Depends on signs being present on edges and nodes (P6.02).",
+      "Keep each rule in its own function so the upstream test for it maps one to one."
+    ],
+    "accept": [
+      "The ramp, exit, merge, fork, roundabout, u-turn and internal-intersection cases of test/maneuversbuilder.cc are ported and green.",
+      "Gate D maneuver type and name sequence equality on highway corpus routes.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P6.09",
+    "goal": "The maneuver builder is complete: ferries, stairs, elevators, escalators, indoor transitions, building enter and exit, guidance views, active lanes and the remaining post-processing passes all match Valhalla.",
+    "upstream": ["src/odin/maneuversbuilder.cc", "src/odin/maneuver.cc", "valhalla/odin/", "test/maneuversbuilder.cc"],
+    "scope": [
+      "Port ferry enter and exit maneuvers and rail-ferry handling.",
+      "Port steps, elevator, escalator, building enter and exit and level-change maneuvers for pedestrian routes.",
+      "Port guidance view (junction, signboard) matching and attachment.",
+      "Port active lane computation (`ProcessTurnLanes`, lane activation by turn direction, lane validity states) using P6.03 data.",
+      "Port the remaining passes: verbal multi-cue flags, roundabout exit shape indexes, to-stay-on logic, short-maneuver collapsing, bike-share and transit-connection placeholders.",
+      "Port the bss maneuver types as no-ops until P9.07 supplies data."
+    ],
+    "out_of_scope": ["Transit maneuvers (P9.06).", "Instruction text (P6.11)."],
+    "notes": [
+      "After this issue the whole of maneuversbuilder.cc is ported; record any deliberate deviation in the file header.",
+      "Lane guidance reads only cold data from the trip leg."
+    ],
+    "accept": [
+      "All of test/maneuversbuilder.cc is ported and green.",
+      "Pedestrian gurka-style maps with steps, elevators and indoor levels match the oracle's maneuver list.",
+      "Active lanes match the oracle on the lane test maps.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P6.10",
+    "goal": "All 36 upstream locale files are compiled into the binary at comptime as typed dictionaries, so nothing is parsed at startup and a missing phrase or tag is a compile error.",
+    "upstream": ["locales/", "src/odin/narrative_dictionary.cc", "valhalla/odin/"],
+    "scope": [
+      "Copy the 36 locale JSON files into `locales/` with their license and a NOTICE entry.",
+      "Write a comptime loader in `src/narrative/dictionary.zig` that turns each file into a struct of phrase sets (phrases, cardinal directions, relative directions, ordinals, metric and US customary lengths, empty street name labels, transit and verbal variants).",
+      "Port the NarrativeDictionary structure and its subset types one to one.",
+      "Language tag lookup with upstream's alias and fallback behaviour (for example plain `en` to `en-US`).",
+      "Keep the build fast: measure compile time and cache the parsed form if comptime JSON parsing is too slow."
+    ],
+    "out_of_scope": ["Using the phrases to form sentences (P6.11, P6.12)."],
+    "notes": [
+      "Zero deps: use std.json at comptime or a small build step in Zig; no external tools.",
+      "Performance rule: locale templates are compiled in, nothing is parsed at startup (docs/PLAN.md)."
+    ],
+    "accept": [
+      "All 36 locales load; a test asserts every phrase id present in en-US exists in every locale or is listed as an upstream gap.",
+      "Server startup does no locale parsing (asserted by the zero-allocation startup test).",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P6.11",
+    "goal": "Text instructions are generated for every maneuver type in every locale, producing the same strings as Valhalla's narrative builder.",
+    "upstream": ["src/odin/narrativebuilder.cc", "valhalla/odin/", "test/narrativebuilder.cc", "locales/"],
+    "scope": [
+      "Port `NarrativeBuilder::Build` dispatch and the `Form*Instruction` functions for start, destination, becomes, continue, turn, sharp, bear, u-turn, ramp, exit, keep, keep-to-stay-on, merge, roundabout enter and exit, ferry enter and exit, steps, elevator, escalator, building enter and exit, and post-transition instructions.",
+      "Port phrase selection by available data (street names, signs, junction names, guide signs) and tag substitution.",
+      "Port street name and sign list formatting with per-locale delimiters and element limits.",
+      "Port the locale-specific builder subclasses' overrides (for example languages with different ordinal or article handling).",
+      "Write into arena buffers through a small formatter, no intermediate strings."
+    ],
+    "out_of_scope": ["Verbal alert, pre and post instructions and markup (P6.12).", "Transit instructions (P9.06)."],
+    "notes": [
+      "narrativebuilder.cc is about 204 KB upstream; port function by function with the upstream test as spec.",
+      "Phrases come from the comptime dictionaries of P6.10."
+    ],
+    "accept": [
+      "The text-instruction cases of test/narrativebuilder.cc are ported and green as snapshot goldens.",
+      "Gate D: instruction text equality on corpus routes where maneuvers match, for en-US and at least three other locales.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P6.12",
+    "goal": "Verbal guidance is complete: transition alert, pre-transition and post-transition instructions, multi-cue combining, succinct variants, SSML-style markup and per-locale text formatting all match Valhalla.",
+    "upstream": ["src/odin/narrativebuilder.cc", "src/odin/markup_formatter.cc", "src/baldr/", "valhalla/odin/", "test/narrativebuilder.cc"],
+    "scope": [
+      "Port the `FormVerbalAlert*`, `FormVerbal*Instruction`, `FormVerbalPostTransitionInstruction` and `FormVerbalMultiCue` functions.",
+      "Port succinct instruction variants and the length-based selection between them.",
+      "Port distance phrasing for metric and US customary units (rounding thresholds, fractions of a mile, feet and metres).",
+      "Port the markup formatter (phoneme markup around street names and signs using P6.04 pronunciations).",
+      "Port the verbal text formatters and their factory (US and state-specific route number reading rules) from baldr.",
+      "Port time-of-arrival and departure verbal strings used by depart and arrive instructions."
+    ],
+    "out_of_scope": ["Transit verbal instructions (P9.06)."],
+    "notes": [
+      "Verbal text formatters live in baldr upstream; place them under `src/narrative/verbal_text.zig`.",
+      "Keep output byte-identical: clients cache and speak these strings."
+    ],
+    "accept": [
+      "All remaining cases of test/narrativebuilder.cc are ported and green as snapshot goldens.",
+      "Upstream verbal text formatter and markup tests ported and green.",
+      "Gate D verbal instruction equality on the corpus for en-US.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P6.13",
+    "goal": "The Valhalla-format /route response is complete: trip, legs, maneuvers with instructions, lanes, signs, summaries and all optional blocks, for every directions_type, byte-compatible in keys, types and number formatting.",
+    "upstream": ["src/tyr/route_serializer_valhalla.cc", "src/tyr/serializers.cc", "src/tyr/route_serializer.cc", "valhalla/tyr/", "src/tyr/actor.cc"],
+    "scope": [
+      "Extend the P3.33 serializer with the maneuvers array: type, instruction, verbal fields, street names, begin and end shape index, time, length, cost, travel mode and type, toll, highway, rough, gate, ferry flags.",
+      "Add sign, lane, roundabout exit count, bearing before and after, guidance view and bss blocks.",
+      "Honour `directions_type` (none, maneuvers, instructions), `units`, `language`, `banner_instructions`, `voice_instructions` where the Valhalla format uses them, and `admin_crossings`.",
+      "Emit warnings, alternates, `linear_references`, status and error fields exactly as upstream.",
+      "Stream through the JSON writer from P1.10; fixed-precision numbers matching upstream rounding."
+    ],
+    "out_of_scope": ["OSRM format (P6.14).", "GPX and pbf (P6.15).", "Transit info blocks (P9.06)."],
+    "notes": [
+      "Performance rule: responses stream through a writer with no DOM (docs/PLAN.md).",
+      "Serialize time is a budgeted phase in the access log."
+    ],
+    "accept": [
+      "Gate H: key sets, types and enums identical to the oracle on the corpus.",
+      "Golden JSON snapshots for at least 20 routes across costings and locales.",
+      "Zero heap allocation outside the request arena.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P6.14",
+    "goal": "`format=osrm` works for the route family: routes, legs, steps, intersections, maneuvers, banner and voice instructions and waypoints, compatible with OSRM-speaking clients in the same way Valhalla's serializer is.",
+    "upstream": ["src/tyr/route_serializer_osrm.cc", "src/tyr/serializers.cc", "valhalla/tyr/", "test/gurka/"],
+    "scope": [
+      "Port the OSRM route serializer into `src/api/osrm.zig`: routes with geometry, weight, duration, distance, legs with summary, steps with geometry, mode, driving side, name, ref, pronunciation, destinations, exits, rotary names.",
+      "Port step maneuver mapping (type and modifier) from Valhalla maneuver types, including roundabout and rotary handling.",
+      "Port intersections: bearings, entry flags, in and out indexes, lanes with valid and active indications, classes, tunnel and toll markers, admin index, geometry index.",
+      "Port banner instructions (primary, secondary, sub, components with lane and icon types) and voice instructions with SSML announcements and distance-along-geometry.",
+      "Port waypoints output and the OSRM error envelope (`code`, `message`).",
+      "Geometry as polyline5, polyline6 or GeoJSON per `shape_format`."
+    ],
+    "out_of_scope": ["OSRM format for matrix (P7.03), locate (P7.12), trace (P8.05, P8.06)."],
+    "notes": [
+      "The upstream file is about 101 KB; port with the gurka OSRM step assertions as spec.",
+      "Streams through the P1.10 writer."
+    ],
+    "accept": [
+      "Upstream OSRM serializer tests and gurka `osrm::expect_steps` cases ported and green.",
+      "Gate H against the oracle with `format=osrm` on the corpus.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P6.15",
+    "goal": "`format=gpx` and `format=pbf` work for /route, /optimized_route and /trace_route, so clients that exchange the protobuf Api message or GPX tracks get the same output as from Valhalla.",
+    "upstream": ["src/tyr/serializers.cc", "src/tyr/route_serializer.cc", "proto/api.proto", "proto/trip.proto", "proto/directions.proto", "proto/options.proto"],
+    "scope": [
+      "GPX writer: track and route points from leg shapes with upstream's metadata and naming.",
+      "Pbf output: encode Options, Trip and Directions from the P6.01 structs with the P1.07 codec into an `Api` message.",
+      "Honour `pbf_field_selector` to include or drop options, trip, directions, status, info, matrix, isochrone and expansion fields.",
+      "Accept `application/x-protobuf` request bodies for the route family and map them onto the same request struct as JSON.",
+      "Set content types and the format support matrix exactly as upstream (which formats each action allows)."
+    ],
+    "out_of_scope": ["Pbf for matrix, isochrone and expansion (their own issues in P7)."],
+    "notes": [
+      "Encoding is direct from structs; no generated message classes and no intermediate copy.",
+      "The action and format support table is in docs/upstream/valhalla-architecture.md section 4 (tyr)."
+    ],
+    "accept": [
+      "Pbf responses decode with the oracle's schema and match its field values on the corpus (gate H).",
+      "GPX output is identical to the oracle's for the same path.",
+      "A pbf request and its JSON equivalent produce the same response.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P6.16",
+    "goal": "Upstream's two largest behaviour specs, the narrative builder and maneuvers builder test files, run against our port as snapshot goldens, so any drift in instructions is caught in CI.",
+    "upstream": ["test/narrativebuilder.cc", "test/maneuversbuilder.cc", "test/"],
+    "scope": [
+      "Write a converter (Zig tool under `scripts/` or test helper) that turns upstream's hand-built maneuver fixtures into Zig test tables.",
+      "Port every case of test/narrativebuilder.cc (about 498 KB) as snapshot tests using zig-test-framework snapshots.",
+      "Port every case of test/maneuversbuilder.cc.",
+      "Port the smaller odin tests that exist alongside them (signs, markup formatter, verbal text formatters, narrative dictionary) if not already ported by their issues.",
+      "Document how to refresh snapshots when upstream is re-pinned."
+    ],
+    "out_of_scope": ["Fixing failures in the builders themselves: reopen or file against P6.07 to P6.12."],
+    "notes": [
+      "Snapshots are the expected strings from upstream, not our output; never regenerate them from our code.",
+      "Risk called out in docs/PLAN.md: narrative parity is mostly rules and strings."
+    ],
+    "accept": [
+      "100% of upstream cases are present; a count check in the test compares against the number of upstream TEST cases at the pinned commit.",
+      "All ported cases pass.",
+      "`zig build test` green and the suite runs in under 30 seconds."
+    ]
+  },
+  {
+    "key": "P6.17",
+    "goal": "Phase 6 is proven: on the corpus, wherever our path matches Valhalla's, the maneuver list and instructions are equal, in the Valhalla and OSRM formats.",
+    "upstream": ["run_route_scripts/", "test_requests/"],
+    "scope": [
+      "Extend `zr diff` with gate D scoring: for routes within 0.1% cost, compare maneuver type sequence, street name sequence, instruction text, time within 1% and distance within 0.5%.",
+      "Run the full route corpus for auto, truck, bicycle and pedestrian against the oracle in both `format=json` and `format=osrm`.",
+      "Classify every mismatch by cause (path differs and ours is cheaper, attribute differs, rule differs, locale differs) and file follow-ups.",
+      "Record results in docs/SCOREBOARD.md."
+    ],
+    "out_of_scope": ["Performance targets for long routes (P7.17)."],
+    "notes": [
+      "Gate definitions are in docs/PLAN.md, Verification.",
+      "Strictly cheaper routes are classified, not failed."
+    ],
+    "accept": [
+      "Gate D passes: at least 95% of comparable routes equal on maneuvers and names.",
+      "Gate H passes for both serializers.",
+      "Scoreboard updated and committed; all open mismatches have issues."
+    ]
+  },
+  {
+    "key": "P7.01",
+    "goal": "A reusable bounded expansion exists: label-setting Dijkstra over the search core with a bucket queue, multiple origins, forward and reverse directions and expansion callbacks. Isochrones, expansion, centroid, reachability and map matching all sit on it.",
+    "upstream": ["src/thor/dijkstras.cc", "valhalla/thor/", "valhalla/baldr/double_bucket_queue.h"],
+    "scope": [
+      "Add `src/search/expand.zig`: `Expansion(K, Q)` built on the P3.29 search core with no potential.",
+      "Two-level bucket queue as a `Q` implementation, bucket width from the costing unit size.",
+      "Multi-origin seeding with partial edges; forward and reverse (mirrored costing) modes.",
+      "Callbacks or a comptime visitor for `shouldExpand`, `expandingNode`, `getExpansionHints` equivalents: stop by time, distance or cost bound.",
+      "Time tracking per label for time-dependent expansions.",
+      "Deadline and cancel checks every 1024 pops; no recursion."
+    ],
+    "out_of_scope": ["Multimodal expansion (P9.05).", "Contour generation (P7.07)."],
+    "notes": [
+      "Upstream hangs here on some inputs and lacks cancellation (docs/upstream/valhalla-perf-issues.md, theme c); bounds and deadlines are mandatory.",
+      "Paged status arrays and the request arena as in docs/design/engine-and-format.md Q3."
+    ],
+    "accept": [
+      "Upstream Dijkstra unit tests ported and green.",
+      "Label throughput within 10% of the E1 number for the same kernel.",
+      "A cancelled expansion returns within one check interval.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P7.02",
+    "goal": "Matrix v1 computes many-to-many time and distance exactly: one potential context per target shared by all sources, exact searches per pair run in parallel across cores, with a free lower-bound matrix for pruning. It replaces both of upstream's matrix algorithms.",
+    "upstream": ["src/thor/costmatrix.cc", "src/thor/timedistancematrix.cc", "src/thor/matrix_action.cc", "valhalla/thor/"],
+    "scope": [
+      "Add `src/search/matrix.zig`: for each target build one lazy potential context (P4.06) and reuse it for every source.",
+      "Run exact edge-based A* per source and target pair with the full dynamic costing; fork-join across worker threads with a per-request parallelism bound.",
+      "Compute the lower-bound matrix from potentials first; use it to skip pairs beyond `max_matrix_distance` and to order work.",
+      "For pedestrian and bicycle or when no metric is mapped, fall back to bounded one-to-many expansion per source (P7.01).",
+      "Support time-dependent matrices (date_time per source) through the same search.",
+      "Per-request memory cap and arena use; no per-location long-lived state."
+    ],
+    "out_of_scope": ["API parsing and serialization (P7.03).", "The multilevel overlay (P7.05)."],
+    "notes": [
+      "Upstream's matrix is single-threaded and keeps a label set per location (docs/upstream/valhalla-perf-issues.md, theme b).",
+      "Design and expected numbers: docs/design/engine-and-format.md, Other query types."
+    ],
+    "accept": [
+      "Every cell equals the cost of our /route for the same pair (exact, not within tolerance).",
+      "Gate E against the oracle on the matrix corpus.",
+      "At least 5x faster than Valhalla on the 50x50 urban corpus on 8 cores; peak memory under 1 GB.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P7.03",
+    "goal": "`/sources_to_targets` is served with Valhalla's request and response shapes in JSON, OSRM and pbf, including verbose and concise output, shapes and time-dependent options.",
+    "upstream": ["src/loki/matrix_action.cc", "src/thor/matrix_action.cc", "src/tyr/matrix_serializer.cc", "proto/matrix.proto", "proto/options.proto"],
+    "scope": [
+      "Parse sources, targets, costing and options, `matrix_locations`, `date_time`, `verbose`, `shape_format`, `units`, `id`.",
+      "Apply service limits: `max_matrix_distance`, `max_matrix_location_pairs`, max locations, with upstream error codes.",
+      "Serialize concise (arrays of durations and distances) and verbose (per-cell objects with from and to indexes, time, distance, date_time, time zone info, optional shape).",
+      "OSRM table format and pbf Matrix message output.",
+      "Report unreachable cells as null exactly as upstream; emit warnings where upstream does."
+    ],
+    "out_of_scope": ["Matrix algorithm internals (P7.02, P7.06).", "Bike-share matrix (P9.07)."],
+    "notes": [
+      "Stream the response; a 1000x1000 concise matrix must not build an intermediate tree.",
+      "Upstream's matrix and route disagree for some pairs (#5811); ours must not."
+    ],
+    "accept": [
+      "Gate H: key sets and types identical to the oracle for concise, verbose, osrm and pbf.",
+      "Limit violations return the same error codes as the oracle.",
+      "Zero heap allocation outside the request arena.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P7.04",
+    "goal": "Experiment E6 answers whether matrix v1 is fast enough or whether the multilevel overlay must be pulled forward, with numbers on our data.",
+    "upstream": [],
+    "scope": [
+      "Build two matrix corpora: 50x50 urban (dense city, auto and pedestrian) and 200x200 regional (auto), on the Germany bundle.",
+      "Measure v1 wall time on 8 cores, labels settled per pair, peak memory, and the same requests against the oracle.",
+      "Pass line: 50x50 urban at most 100 ms and 200x200 regional at most 1.5 s on 8 cores, and at least 5x faster than Valhalla.",
+      "Break down time by potential setup, search and turn-cost looseness to explain the result.",
+      "Write the result and decision into docs/SCOREBOARD.md and an experiment note under docs/design/."
+    ],
+    "out_of_scope": ["Implementing the overlay (P7.05)."],
+    "notes": [
+      "If it fails: the fallback is to prioritise P7.05 and P7.06 ahead of the other P7 endpoints.",
+      "Pass and fail lines come from docs/PLAN.md, Phase 4 experiments table."
+    ],
+    "accept": [
+      "Numbers for both corpora committed with hardware, data and commit.",
+      "A written pass or fail decision; if fail, P7.05 and P7.06 are re-prioritised and this is stated in the phase epic."
+    ]
+  },
+  {
+    "key": "P7.05",
+    "goal": "A turn-aware multilevel cell overlay exists on the same separator tree as the hierarchy: per-cell cliques between cut arcs, customised per metric key. It makes one-to-many queries cost milliseconds and is the structure behind OSRM-class matrices with dynamic costing.",
+    "upstream": [],
+    "scope": [
+      "Derive overlay levels from the nested-dissection tree (P4.01, P4.02): cells are contiguous id ranges, boundary arcs are the cut arcs.",
+      "Define the overlay file section: per level, cell boundaries, entry and exit arcs, clique weight matrices addressed by metric key.",
+      "Customisation: per cell, edge-based searches between entry and exit arcs with the compiled costing (turn costs and simple restrictions included), bottom-up across levels, parallel across cells.",
+      "Key and cache overlay metrics with the same 128-bit metric key and LRU as P4.05 and P4.08.",
+      "Incremental re-customisation of only the cells whose weights changed (for traffic later).",
+      "Report customisation time and bytes per metric."
+    ],
+    "out_of_scope": ["Queries over the overlay (P7.06).", "Time-dependent weights."],
+    "notes": [
+      "Estimated 0.3 to 0.7 GB per metric for US+DACH and about 1 s customisation; treat as estimates (docs/design/engine-and-format.md Q1).",
+      "A node-based CCH cannot give turn-exact matrices, which is why this structure exists."
+    ],
+    "accept": [
+      "Overlay shortest-path distances between boundary arcs equal exact edge-based search results on test graphs and on Germany samples.",
+      "Customisation of the US+DACH bundle within 10 s on 8 threads and under 1 GB per metric, or the measured numbers and a plan.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P7.06",
+    "goal": "Matrix v2 answers one-to-many and many-to-many queries over the overlay, turn-exact, in a few milliseconds per source, and takes over from v1 wherever a customised overlay metric is available.",
+    "upstream": [],
+    "scope": [
+      "Multilevel query: search the source and target cells on the base graph and the rest on overlay cliques, with the full costing at the base level.",
+      "One-to-many sweep per source reusing target-side cell searches; parallel across sources.",
+      "Path unpacking for `shape_format` requests and for distance alongside time.",
+      "Selection logic in `src/search/matrix.zig`: v2 when the metric key is cached, v1 otherwise; identical results either way.",
+      "Memory budget per request with a clean error when exceeded.",
+      "Benchmarks: 100x100, 1000x1000 on Germany and US+DACH."
+    ],
+    "out_of_scope": ["Overlay construction (P7.05).", "Isochrone sweeps on the overlay (future work, note only)."],
+    "notes": [
+      "Scoreboard target: 1000x1000 under 5 s, beating OSRM's published 12 to 31 s (docs/PLAN.md).",
+      "Requests with avoid polygons or excluded edges that cut through cells must fall back to v1 for affected cells."
+    ],
+    "accept": [
+      "v2 cells equal v1 cells exactly on the matrix corpus.",
+      "1000x1000 auto on Germany under 5 s on 8 cores; peak memory under 1 GB.",
+      "Gate E against the oracle.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P7.07",
+    "goal": "Isochrone computation works: a bounded expansion writes arrival times and distances into a grid, for multiple contours at once, ready for contouring. It must be much faster than upstream, where the expansion itself is the bottleneck.",
+    "upstream": ["src/thor/isochrone.cc", "valhalla/thor/", "valhalla/midgard/gridded_data.h", "src/thor/dijkstras.cc"],
+    "scope": [
+      "Add `src/search/isochrone.zig` on the P7.01 expansion: forward and reverse, single and multiple origins.",
+      "Size the grid from the costing's max speed and the largest contour, as upstream does.",
+      "Update grid cells along each settled edge's shape (segment marching) with time and distance, using SIMD batches for the grid min updates.",
+      "Support time contours, distance contours and both in one request.",
+      "Stop expansion at the largest contour bound; honour deadlines.",
+      "Multimodal isochrones left as a stub that returns upstream's error until P9.05."
+    ],
+    "out_of_scope": ["Request parsing and GeoJSON output (P7.08).", "GeoTIFF output (later, note in P7.08)."],
+    "notes": [
+      "Upstream comment: the isogrid update is not the bottleneck, the graph expansion is (docs/upstream/valhalla-perf-issues.md, theme c).",
+      "Contouring comes from P1.06."
+    ],
+    "accept": [
+      "Upstream isochrone unit tests ported and green.",
+      "Edge reach times within 1% or 5 s of the oracle (gate F input).",
+      "At least 5x faster than Valhalla on the isochrone corpus.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P7.08",
+    "goal": "`/isochrone` is served with Valhalla's request options and GeoJSON output: polygons or lines, multiple contours with colors, denoise and generalize, reverse isochrones and optional location features.",
+    "upstream": ["src/loki/isochrone_action.cc", "src/thor/isochrone_action.cc", "src/tyr/isochrone_serializer.cc", "proto/isochrone.proto", "valhalla/midgard/gridded_data.h"],
+    "scope": [
+      "Parse `contours` (time, distance, color), `polygons`, `denoise`, `generalize`, `show_locations`, `reverse`, `date_time`, costing and options.",
+      "Apply service limits (max contours, max time, max distance, max locations) with upstream error codes.",
+      "Generate contours from the grid (P1.06), apply denoise (drop small rings) and generalize (simplify) with upstream's defaults.",
+      "Serialize GeoJSON FeatureCollection with the same properties (fill, fillOpacity, fill-opacity, fillColor, color, contour, opacity, metric) and ring orientation.",
+      "Pbf Isochrone message output.",
+      "Leave `format=geotiff` returning a clear unsupported error and note it as follow-up."
+    ],
+    "out_of_scope": ["The expansion and grid (P7.07)."],
+    "notes": [
+      "Zero deps: GeoTIFF would need our own TIFF writer; track separately.",
+      "Stream GeoJSON coordinates with fixed precision through the P1.10 writer."
+    ],
+    "accept": [
+      "Gate F: polygon intersection-over-union at least 0.97 against the oracle on the isochrone corpus.",
+      "Gate H: property keys and types identical.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P7.09",
+    "goal": "`/expansion` returns the edges a route, isochrone or matrix search touched, as GeoJSON or pbf, with Valhalla's properties and dedupe options. It is also our own debugging view of search behaviour.",
+    "upstream": ["src/thor/expansion_action.cc", "src/tyr/expansion_serializer.cc", "proto/expansion.proto"],
+    "scope": [
+      "Hook an expansion recorder into the search core and the P7.01 expansion behind a comptime flag so normal requests pay nothing.",
+      "Parse `action` (route, isochrone, sources_to_targets), `expansion_properties` (duration, distance, cost, edge_status, edge_id, pred_edge_id, expansion_type), `skip_opposites`, `dedupe`.",
+      "Serialize GeoJSON features (MultiLineString or per-edge LineString as upstream) and the pbf Expansion message.",
+      "Map our dense edge ids to a stable printable id in place of GraphId.",
+      "Apply the expansion service limits."
+    ],
+    "out_of_scope": ["Any change to search order to imitate upstream: our expansion is smaller by design."],
+    "notes": [
+      "Edge sets will differ from Valhalla's because our search is guided; parity here is shape and schema, not edge set.",
+      "Useful for experiments E2 and E6 visualisation."
+    ],
+    "accept": [
+      "Gate H for keys, types and property names against the oracle.",
+      "The recorder adds no measurable cost when disabled (bench within noise).",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P7.10",
+    "goal": "`/centroid` finds the meeting point that minimises cost from several origins and returns the routes to it, as Valhalla does.",
+    "upstream": ["src/thor/centroid.cc", "valhalla/thor/", "src/thor/route_action.cc"],
+    "scope": [
+      "Port the centroid algorithm onto the P7.01 multi-origin expansion: track per-origin reach of each edge and stop at the first edge reached by all origins under upstream's criterion.",
+      "Build one path per origin to the centroid and run them through the leg and serializer pipeline.",
+      "Parse the request (locations, costing) and apply limits and error codes.",
+      "JSON and pbf output as upstream.",
+      "Handle origins in disconnected components with the upstream error."
+    ],
+    "out_of_scope": ["Narrative details beyond what /route already provides (P6)."],
+    "notes": [
+      "Bounded by deadline and by the route distance limits.",
+      "Label storage per origin must come from the arena and be released at request end."
+    ],
+    "accept": [
+      "Upstream centroid tests ported and green.",
+      "Centroid location and per-origin costs match the oracle on test maps.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P7.11",
+    "goal": "`/optimized_route` orders intermediate locations to minimise total cost and returns the resulting route, using our matrix for costs and a port of Valhalla's optimizer.",
+    "upstream": ["src/thor/optimizer.cc", "src/thor/optimized_route_action.cc", "src/loki/", "valhalla/thor/"],
+    "scope": [
+      "Port the optimizer into `src/search/optimizer.zig` with the same algorithm, parameters and deterministic seeding rules as upstream.",
+      "Compute the cost matrix through P7.02 or P7.06 and feed it to the optimizer.",
+      "Keep first and last locations fixed as upstream; reorder the rest and report `original_index` on locations.",
+      "Route the optimized order through the normal route pipeline and serializers, all formats.",
+      "Apply the optimized route limits and error codes."
+    ],
+    "out_of_scope": ["Better solvers than upstream's (follow-up once parity holds)."],
+    "notes": [
+      "Parity target is total cost at most upstream's, since tie-breaking and randomisation can change the order.",
+      "No floating-point surprises: costs are f32 as in the search."
+    ],
+    "accept": [
+      "Upstream optimizer unit tests ported and green.",
+      "On the corpus, our tour cost is at most the oracle's tour cost under the same matrix.",
+      "Gate H for the response.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P7.12",
+    "goal": "`/locate` returns the edges and nodes a location snaps to, with Valhalla's verbose edge and node information, reading everything from our format.",
+    "upstream": ["src/loki/locate_action.cc", "src/tyr/locate_serializer.cc", "src/loki/search.cc"],
+    "scope": [
+      "Parse locations, costing, `verbose`, search filters and radius options; reuse snap from P3.23.",
+      "Concise output: way id, correlated lat and lon, side of street, percent along.",
+      "Verbose output: edge attributes (classification, access, speeds, flags, geo attributes), edge info (names, shape, way id, speed limit), node info, bounding circle or equivalent, predicted speeds placeholder, live speed placeholder.",
+      "Map our ids to a printable edge id object in place of GraphId fields, documented as a deliberate difference.",
+      "OSRM nearest-style format output.",
+      "Error and warning envelopes per location as upstream (null edges, reason)."
+    ],
+    "out_of_scope": ["Traffic values in verbose output (P10.02).", "Transit stops (P9.02)."],
+    "notes": [
+      "Fields that expose Valhalla tile internals (level, tile id) have no meaning in our format; emit stable substitutes and list them in the docs.",
+      "Reads cold data only."
+    ],
+    "accept": [
+      "Gate H against the oracle for all fields that are format-independent; documented list of the intentional differences.",
+      "Snapped point and percent along equal the oracle's within 1e-6 degrees on test maps.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P7.13",
+    "goal": "`/status` reports service health and, when verbose, dataset facts: version, tileset age, bounding box, which features and costings the data supports.",
+    "upstream": ["src/loki/status_action.cc", "src/thor/status_action.cc", "proto/status.proto", "src/tyr/serializers.cc"],
+    "scope": [
+      "Non-verbose: version, tileset_last_modified, available actions.",
+      "Verbose: has_tiles, has_admins, has_timezones, has_live_traffic, has_transit_tiles, osm_changeset, bbox as GeoJSON, warnings.",
+      "Source the facts from bundle headers written at build time (dataset UUID, build time, changeset, bbox, section presence).",
+      "Respect the config flag that allows verbose status.",
+      "JSON, OSRM-style and pbf Status output."
+    ],
+    "out_of_scope": ["Prometheus metrics (P1.17)."],
+    "notes": [
+      "Must not touch cold pages: status is a health check and should be microseconds.",
+      "With several bundles loaded, report the union bbox and per-bundle entries in an extra field."
+    ],
+    "accept": [
+      "Gate H against the oracle for both modes.",
+      "p99 under 100 microseconds under load.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P7.14",
+    "goal": "`/tile` serves Mapbox Vector Tiles of the routing graph (edges and nodes with their attributes) for a z/x/y, as Valhalla does, backed by our own MVT encoder.",
+    "upstream": ["src/loki/tile_action.cc", "src/loki/", "proto/"],
+    "scope": [
+      "MVT encoder in `src/tiles/mvt.zig` on the P1.07 wire codec: layers, features, geometry commands with zigzag deltas, key and value dedup.",
+      "Query edges for a tile bbox through the spatial index (P3.20), clip shapes to the tile with a buffer, project to tile coordinates.",
+      "Emit the edges and nodes layers with upstream's attribute names and the request's attribute filters.",
+      "Zoom-dependent road class filtering and simplification matching upstream's thresholds.",
+      "Service limits for min zoom and tile cache headers."
+    ],
+    "out_of_scope": ["Basemap tiles (P11).", "The MVT feature encoder for basemap features is shared later in P11.04."],
+    "notes": [
+      "Upstream measured 280 to 164 ms for a tile after bounding circles; our index should beat that by a wide margin (docs/upstream/valhalla-perf-issues.md).",
+      "Zero deps: no vtzero."
+    ],
+    "accept": [
+      "Tiles decode in a standard MVT decoder; layer names, attribute keys and feature counts match the oracle on test tiles.",
+      "p50 under 20 ms for a z14 urban tile.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P7.15",
+    "goal": "Heavy requests cannot starve light ones: the server has separate scheduling classes for short routes and for matrices and isochrones, and intra-request parallelism is bounded per request and per class.",
+    "upstream": [],
+    "scope": [
+      "Classify requests at parse time (light: route, locate, height, status; heavy: matrix, isochrone, optimized route, large trace) with config-tunable thresholds.",
+      "Reserve worker capacity for the light class; heavy requests queue with a bounded depth.",
+      "Fork-join helper for matrix and isochrone that borrows only idle heavy-class workers, up to a per-request cap.",
+      "Load shedding: reject with the upstream-compatible error and status code when queues are full or the deadline cannot be met.",
+      "Expose queue depth, wait time and shed counts in metrics and the access log."
+    ],
+    "out_of_scope": ["Rate limiting per client (operations concern, not in this binary)."],
+    "notes": [
+      "Performance rule: tail latency under load (docs/PLAN.md).",
+      "Upstream gives each worker one request and has no intra-request parallelism (docs/upstream/valhalla-perf-issues.md, theme g)."
+    ],
+    "accept": [
+      "Under a sustained 1000x1000 matrix load, route p99 stays within 2x of its unloaded value.",
+      "Overload returns the documented error, never a hang or OOM.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P7.16",
+    "goal": "An optional exact response cache serves repeated requests without recomputing: keyed by snapped edges, compiled costing key and traffic epoch, so a hit is guaranteed to be the same answer.",
+    "upstream": [],
+    "scope": [
+      "Compute the cache key after snapping: action, snapped edge ids and percents (quantised), metric key from the compiled costing, time bucket for time-dependent requests, traffic epoch, output format and options that affect output.",
+      "Bounded in bytes, sharded per worker or lock-striped; LRU eviction.",
+      "Store serialized response bytes; serve with `writev` and no copy.",
+      "Invalidate wholesale on bundle swap (P4.17) and on traffic epoch change.",
+      "Config switch, off by default; hit and miss counters in metrics."
+    ],
+    "out_of_scope": ["Caching customised metrics (P4.08).", "Potential contexts for hot targets (P4.23)."],
+    "notes": [
+      "Only exact caching: never serve a response for a different snap or cost table.",
+      "Performance rule: caching where it is exact (docs/PLAN.md)."
+    ],
+    "accept": [
+      "A property test shows a hit returns bytes identical to a fresh computation.",
+      "Hit path p99 under 50 microseconds.",
+      "Memory stays under the configured bound in the soak test.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P7.17",
+    "goal": "The long-route rows of the scoreboard are measured: auto routes of about 200, 1000 and 4000 km on Europe and planet-scale data, against Valhalla on the same hardware.",
+    "upstream": ["test_requests/", "run_route_scripts/"],
+    "scope": [
+      "Build Europe and planet (or the largest feasible) bundles with the P4.19 build and customise the default auto metric.",
+      "Corpora of 200, 1000 and 4000 km auto routes, plus time-dependent variants of a 350 km route.",
+      "Measure labels settled, p50 and p99 latency, and memory for our engine and the oracle with `zr bench`.",
+      "Record cache misses and instructions per label (P0.12).",
+      "Update docs/SCOREBOARD.md and attach flamegraphs for the slowest bucket."
+    ],
+    "out_of_scope": ["Fixing shortfalls: file targeted perf issues."],
+    "notes": [
+      "Targets: at least 20x fewer edges settled and p50 at least 10x lower; time-dependent at least 50x fewer edges (docs/PLAN.md, Scoreboard).",
+      "Upstream reference points: about 485k, 800k and 1M edges touched for 190, 1000 and 4679 km."
+    ],
+    "accept": [
+      "Numbers for all buckets committed with hardware, data and commit.",
+      "Each target is met or has a linked follow-up issue with a hypothesis.",
+      "Planet bundle serves within the documented memory estimate or the estimate is corrected."
+    ]
+  },
+  {
+    "key": "P7.18",
+    "goal": "Phase 7 is proven: matrix and isochrone parity gates pass, every remaining street-graph endpoint answers with Valhalla's shapes, and the matrix and isochrone scoreboard rows are filled in.",
+    "upstream": ["test_requests/"],
+    "scope": [
+      "Extend `zr diff` with gate E (matrix cells within 1% or 5 s, remainder ours cheaper) and gate F (isochrone IoU).",
+      "Run the matrix, isochrone, expansion, centroid, optimized route, locate, status and tile corpora against the oracle.",
+      "Run the matrix and isochrone benchmarks and record them in docs/SCOREBOARD.md.",
+      "Confirm scheduling classes hold route latency under heavy load (P7.15).",
+      "Classify and file every mismatch."
+    ],
+    "out_of_scope": ["Map matching (P8).", "Transit (P9)."],
+    "notes": [
+      "Gate thresholds are in docs/PLAN.md, Verification.",
+      "Matrix cells must also equal our own /route costs exactly."
+    ],
+    "accept": [
+      "Gate E passes on at least 99% of cells; gate F IoU at least 0.97; gate H for every endpoint.",
+      "Matrix 1000x1000 under 5 s with v2 (or v1 at least 5x Valhalla if E6 passed); isochrone at least 5x Valhalla.",
+      "Scoreboard updated and committed."
+    ]
+  },
+  {
+    "key": "P8.01",
+    "goal": "Trace points get candidate edges from the same spatial index routing uses, fast enough that map matching needs no private grid cache as upstream does.",
+    "upstream": ["src/meili/candidate_search.cc", "valhalla/meili/grid_range_query.h", "valhalla/meili/grid_traversal.h", "src/meili/"],
+    "scope": [
+      "Add `src/match/candidates.zig`: for each measurement query edges within `search_radius` (scaled by `gps_accuracy`) through the P3.20 index.",
+      "Project the point onto candidate shapes in SIMD batches; keep distance, percent along and heading.",
+      "Filter by costing access and by upstream's rules (max candidates, distinct edges, opposing edge pairing).",
+      "Decode shapes once per request into the arena and reuse them across points.",
+      "Port interpolation of measurements closer than `interpolation_distance` and the breakage distance test inputs."
+    ],
+    "out_of_scope": ["Cost models and routing between candidates (P8.02)."],
+    "notes": [
+      "Upstream keeps a 100 m grid because its tile bins are coarse (docs/upstream/valhalla-perf-issues.md, theme d); our 1/256 degree index removes the duplicate.",
+      "Cache bounded in bytes, not item count."
+    ],
+    "accept": [
+      "Candidate sets equal the oracle's on the trace corpus (same edges, distances within 1e-3 m).",
+      "Median candidate search under 5 microseconds per point warm.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P8.02",
+    "goal": "The HMM's two cost models exist with the routing between candidates they need: emission cost from GPS distance and transition cost from the difference between route distance and great-circle distance, computed by bounded one-to-many searches.",
+    "upstream": ["src/meili/transition_cost_model.cc", "src/meili/routing.cc", "valhalla/meili/", "src/meili/map_matcher.cc"],
+    "scope": [
+      "Port the emission cost model (sigma_z, gps_accuracy) into `src/match/emission.zig`.",
+      "Port the transition cost model (beta, turn penalty factor, max route distance and time factors, breakage distance).",
+      "Port `find_shortest_path` semantics onto the P7.01 expansion: one bounded one-to-many search per candidate to all candidates of the next column, with the turn cost table.",
+      "Label storage from the arena; reuse across columns; cap by bytes.",
+      "Parallelise across independent trace segments."
+    ],
+    "out_of_scope": ["Viterbi itself (P8.03)."],
+    "notes": [
+      "No recursion: upstream overflows the stack on long expansions (#6294 in docs/upstream/valhalla-perf-issues.md).",
+      "Interrupt checks at the expansion's interval, not per point (upstream found per-point checks cost more than the work)."
+    ],
+    "accept": [
+      "Transition and emission costs equal the oracle's within 1e-4 on instrumented test traces.",
+      "Upstream routing and transition cost tests ported and green.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P8.03",
+    "goal": "The Viterbi search over candidate columns runs, including lazy state expansion and top-k alternative matches, producing the same most-likely state sequence as Valhalla.",
+    "upstream": ["src/meili/viterbi_search.cc", "src/meili/topk_search.cc", "src/meili/map_matcher.cc", "valhalla/meili/"],
+    "scope": [
+      "Port the state container, state ids and columns into `src/match/viterbi.zig`.",
+      "Port `ViterbiSearch` (lazy Dijkstra-style variant with a priority queue over states) including winner tracking and search resumption after breaks.",
+      "Port the naive Viterbi used by upstream tests as a reference implementation.",
+      "Port top-k search (`EnlargedViterbiSearch`, state cloning, path removal) for `best_paths` above 1.",
+      "Handle unreachable columns and breakage by splitting into sub-matches."
+    ],
+    "out_of_scope": ["Turning states into edges and a path (P8.04)."],
+    "notes": [
+      "All state memory from the arena; no per-state heap nodes.",
+      "Tie-breaking must follow upstream so sequences match."
+    ],
+    "accept": [
+      "Upstream viterbi and topk unit tests ported and green, with the naive implementation agreeing on random inputs.",
+      "State sequences equal the oracle's on the trace corpus.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P8.04",
+    "goal": "Match results become a routable path: matched points with edge and percent, the stitched edge sequence with discontinuities, and the edge-walk matcher for traces that follow edges exactly.",
+    "upstream": ["src/meili/match_route.cc", "src/meili/map_matcher.cc", "src/thor/map_matcher.cc", "src/thor/route_matcher.cc", "valhalla/meili/"],
+    "scope": [
+      "Port match result construction (matched lat and lon, distance from trace, edge, state id, type matched, interpolated, unmatched).",
+      "Port `match_route` and segment merging into `src/match/route.zig`: build edge segments between states, merge consecutive segments on the same edge, mark discontinuities.",
+      "Port thor's `MapMatcher::FormPath` to produce path infos with elapsed time, using timestamps when `use_timestamps` is set.",
+      "Port `RouteMatcher::FormPath` (edge walking) with its tolerance and failure conditions.",
+      "Implement `walk_or_snap`: try edge walk, fall back to map snap."
+    ],
+    "out_of_scope": ["HTTP endpoints (P8.05, P8.06)."],
+    "notes": [
+      "Paths feed the same trip-leg builder as routes (P6.05).",
+      "Elapsed time by recost so it matches /route for the same edges."
+    ],
+    "accept": [
+      "Upstream match_route and route matcher tests ported and green.",
+      "Edge sequences equal the oracle's on the trace corpus (gate G input).",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P8.05",
+    "goal": "`/trace_route` turns a GPS trace into a route with maneuvers, in all route output formats, with Valhalla's shape matching modes and trace options.",
+    "upstream": ["src/loki/trace_route_action.cc", "src/thor/trace_route_action.cc", "src/meili/", "src/tyr/route_serializer.cc"],
+    "scope": [
+      "Parse `shape` or `encoded_polyline`, `shape_match` (edge_walk, map_snap, walk_or_snap), `begin_time`, `durations`, `use_timestamps`, `trace_options` (search_radius, gps_accuracy, breakage_distance, interpolation_distance, turn_penalty_factor), `linear_references`.",
+      "Apply trace service limits (max shape, max distance, max gps accuracy, max search radius, max alternates) with upstream error codes.",
+      "Run P8.01 to P8.04, split into legs at discontinuities and break locations, and build trip legs.",
+      "Serialize through the Valhalla, OSRM, GPX and pbf route serializers.",
+      "Report matching warnings and the upstream errors for unmatched traces."
+    ],
+    "out_of_scope": ["Attribute output (P8.06)."],
+    "notes": [
+      "Large traces are a heavy scheduling class (P7.15).",
+      "No private grid cache: candidates come from the shared index."
+    ],
+    "accept": [
+      "Gate G: matched edge sequence equal on at least 99% of corpus traces.",
+      "Gate H for the response in JSON and OSRM formats.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P8.06",
+    "goal": "`/trace_attributes` returns per-edge and per-point attributes along a matched trace, with include and exclude filters, as Valhalla does.",
+    "upstream": ["src/thor/trace_attributes_action.cc", "src/tyr/trace_serializer.cc", "src/loki/trace_route_action.cc", "valhalla/thor/"],
+    "scope": [
+      "Parse `filters` (attributes list with include or exclude action) into the attributes controller from P6.05.",
+      "Serialize edges (names, length, speed, road class, begin and end shape index, traversability, use, toll, tunnel, bridge, way id, surface, lane count, speed limit, grades, sidewalk, end node with intersecting edges, admin, elapsed time) honouring filters.",
+      "Serialize matched points (lat, lon, type, edge index, distance along edge, distance from trace point, begin and end route discontinuity).",
+      "Serialize shape, units, admins, osm changeset, confidence and raw score, and alternate paths for `best_paths`.",
+      "OSRM and pbf formats as upstream."
+    ],
+    "out_of_scope": ["Maneuver output (that is /trace_route, P8.05)."],
+    "notes": [
+      "Only compute attributes that pass the filter; upstream decodes edge info lazily and it is costly here.",
+      "Memory bounded in bytes across calls; upstream grows across trace_attributes calls (#4322, #4667)."
+    ],
+    "accept": [
+      "Gate H against the oracle with default filters and with include and exclude lists.",
+      "Edge list equals the oracle's on the trace corpus where matches agree.",
+      "RSS flat across 100k repeated calls.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P8.07",
+    "goal": "Upstream's map matching tests run against our port, and the map matching scoreboard row is measured: throughput target met and memory bounded in bytes.",
+    "upstream": ["test/mapmatch.cc", "test/", "run_route_scripts/"],
+    "scope": [
+      "Port test/mapmatch.cc and the smaller meili unit tests onto our fixtures and the ASCII-map DSL.",
+      "Build a trace corpus: synthetic traces from routes with noise, plus upstream's trace fixtures.",
+      "Benchmark points per second and traces per second for /trace_route and /trace_attributes against the oracle.",
+      "Soak: one million trace requests with flat RSS; assert the candidate and shape caches respect their byte bounds.",
+      "Zero steady-state allocation test for both endpoints."
+    ],
+    "out_of_scope": ["Fixing algorithm mismatches: file against P8.01 to P8.04."],
+    "notes": [
+      "Scoreboard target: at least 5x Valhalla (docs/PLAN.md).",
+      "Upstream prototype numbers for candidate search are in docs/upstream/valhalla-perf-issues.md, theme d."
+    ],
+    "accept": [
+      "All ported upstream mapmatch tests pass.",
+      "Throughput at least 5x the oracle on the trace corpus.",
+      "RSS flat in the soak; zero allocation after warm-up.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P8.08",
+    "goal": "Phase 8 is proven: on the trace corpus our matched edge sequences equal Valhalla's, and both trace endpoints answer with Valhalla's shapes.",
+    "upstream": ["test_requests/"],
+    "scope": [
+      "Extend `zr diff` with gate G: matched edge sequence equality per trace, with a report of the first divergence.",
+      "Run the trace corpus for auto, bicycle and pedestrian with each `shape_match` mode against the oracle.",
+      "Classify mismatches (candidate set, cost model, tie-break, path differs and ours is cheaper) and file follow-ups.",
+      "Record throughput and parity in docs/SCOREBOARD.md."
+    ],
+    "out_of_scope": ["Historical speed derivation from traces (P10.09)."],
+    "notes": [
+      "Gate thresholds are in docs/PLAN.md, Verification."
+    ],
+    "accept": [
+      "Gate G passes on at least 99% of traces.",
+      "Gate H passes for /trace_route and /trace_attributes.",
+      "Scoreboard updated and committed."
+    ]
+  }
+]
