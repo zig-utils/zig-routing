@@ -37,10 +37,11 @@ kill_tree() {
 failed=0
 for t in "${targets[@]}"; do
   log=$(mktemp)
-  rm -f .zig-cache/f/crash
+  stopped="$log.stopped"
+  rm -f .zig-cache/f/crash "$stopped"
   "$ZIG" build fuzz -Dfuzz-target="$t" --fuzz=100G >"$log" 2>&1 &
   pid=$!
-  ( sleep "$seconds"; kill_tree "$pid" ) &
+  ( sleep "$seconds"; touch "$stopped"; kill_tree "$pid" ) &
   watcher=$!
   wait "$pid" 2>/dev/null
   kill_tree "$watcher" 2>/dev/null
@@ -53,9 +54,15 @@ for t in "${targets[@]}"; do
     echo "fuzz $t: CRASH (fuzz-crashers/$t-$stamp.*)"
     grep -E 'panic:|terminated with signal|error:' "$log" | head -5
     failed=1
+  elif [ ! -f "$stopped" ]; then
+    # The fuzzer must still be running when the time is up; an early exit without a crash
+    # means it never fuzzed (unsupported platform, build failure), which is not a clean run.
+    echo "fuzz $t: exited before ${seconds}s without fuzzing:"
+    tail -20 "$log"
+    failed=1
   else
     echo "fuzz $t: clean for ${seconds}s"
   fi
-  rm -f "$log"
+  rm -f "$log" "$stopped"
 done
 exit "$failed"
