@@ -114,7 +114,11 @@ That command ends by reporting that the host cannot run Linux binaries; that is 
 writes percentiles, throughput and errors with the hardware, dataset and commit; `zr bench
 --compare a.json b.json` prints the deltas. Quote numbers only from runs where both servers sit on
 the same machine class and platform (an emulated amd64 oracle against a native `zr` is not a
-comparison). `zr diff` does not exist yet.
+comparison). `zr diff A_URL B_URL --corpus FILE` sends every request to both servers and scores
+the pairs against the parity gates (status, JSON schema and enums, error codes, exact `/height`
+values, route legs, length, time and shape overlap). It exits 1 when a gate is below its threshold,
+and `--worst DIR` writes the worst cases as one-line corpora that reproduce them. New gates are
+entries in `default_scorers` in `src/cli/diff.zig`.
 
 The corpora live in `bench/corpora/`, written by `bun tools/corpus/generate.ts` (seeded, about 15 s
 with the upstream fetch). Only `manifest.json` is committed. It lists each corpus's dataset,

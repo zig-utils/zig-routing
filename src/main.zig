@@ -2,6 +2,7 @@
 //!
 //!   zr serve [--host 0.0.0.0] [--port 8002] [--threads N] [--elevation DIR]
 //!   zr bench URL --corpus FILE [options]   (zr bench with no arguments lists them)
+//!   zr diff A_URL B_URL --corpus FILE      (zr diff with no arguments lists them)
 //!   zr version
 //!
 //! Argument handling moves to zig-cli with the CLI skeleton issue; this
@@ -31,8 +32,16 @@ pub fn main(init: std.process.Init) !void {
         };
         return;
     }
+    if (std.mem.eql(u8, cmd, "diff")) {
+        const ok = routing.cli.diff.main(std.heap.c_allocator, args.items[1..]) catch |e| switch (e) {
+            error.InvalidArgument => std.process.exit(2),
+            else => return e,
+        };
+        if (!ok) std.process.exit(1);
+        return;
+    }
     if (!std.mem.eql(u8, cmd, "serve")) {
-        std.debug.print("usage: zr serve [--host IP] [--port N] [--threads N] [--elevation DIR]\n       zr bench URL --corpus FILE [options]\n       zr version\n", .{});
+        std.debug.print("usage: zr serve [--host IP] [--port N] [--threads N] [--elevation DIR]\n       zr bench URL --corpus FILE [options]\n       zr diff A_URL B_URL --corpus FILE [options]\n       zr version\n", .{});
         return;
     }
 

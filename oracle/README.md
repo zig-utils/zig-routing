@@ -85,6 +85,13 @@ For numbers worth quoting, run both servers and the client inside the VM (a Linu
 `-Dtarget=aarch64-linux-gnu`, the oracle with `ORACLE_PLATFORM=linux/arm64`, all on one Docker
 network) so Colima's port forwarding and amd64 emulation do not dominate.
 
+`zr diff` compares two servers response by response; with the same oracle on both sides every
+gate must report 100%:
+
+```bash
+zig-out/bin/zr diff http://127.0.0.1:8102 http://127.0.0.1:18102 --corpus bench/corpora/route-foot-bike.liechtenstein.tsv --out diff.json --worst worst/
+```
+
 ## Not done yet
 
 - The second config with hierarchy pruning disabled (needed for route parity, P3).
