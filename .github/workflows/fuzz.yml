@@ -1,0 +1,34 @@
+name: Fuzz
+
+# Each fuzz target for ten minutes, nightly; crashing inputs are uploaded as artifacts.
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        default: '600'
+
+env:
+  ZIG_VERSION: 0.17.0-dev.1857+3c46da14d
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [request, http, polyline, lz4]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: scripts/fuzz.sh -s "${{ github.event.inputs.seconds || '600' }}" ${{ matrix.target }}
+      - if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: crashers-${{ matrix.target }}
+          path: fuzz-crashers/

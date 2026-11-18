@@ -77,6 +77,42 @@ pub fn build(b: *std.Build) void {
     run_bench_lz4.addPassthruArgs();
     b.step("bench-lz4", "LZ4 throughput").dependOn(&run_bench_lz4.step);
 
+    // Fuzz targets (test/fuzz.zig). `zig build test` replays their seeds; `zig build fuzz
+    // --fuzz` fuzzes, ReleaseSafe by default so bounds and overflow checks stay on.
+    const fuzz_filter = b.option([]const u8, "fuzz-target", "Fuzz one target: request, http, polyline, lz4");
+    const fuzz_opt: @TypeOf(optimize) = .ReleaseSafe;
+    const seed_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("test/fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "routing", .module = lib_mod }, .{ .name = "lz4", .module = lz4 } },
+    }) });
+    test_step.dependOn(&b.addRunArtifact(seed_tests).step);
+    const fuzz_lz4 = b.createModule(.{ .root_source_file = b.path("packages/lz4/lz4.zig"), .target = target, .optimize = fuzz_opt });
+    const fuzz_lib = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = fuzz_opt,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "zig_cli", .module = b.dependency("zig_cli", .{ .target = target, .optimize = fuzz_opt }).module("zig_cli") },
+            .{ .name = "zig_config", .module = b.dependency("zig_config", .{ .target = target, .optimize = fuzz_opt }).module("zig_config") },
+            .{ .name = "tls", .module = b.dependency("tls", .{ .target = target, .optimize = fuzz_opt }).module("tls") },
+            .{ .name = "xml", .module = b.dependency("xml", .{ .target = target, .optimize = fuzz_opt }).module("xml") },
+            .{ .name = "lz4", .module = fuzz_lz4 },
+        },
+    });
+    const fuzz_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/fuzz.zig"),
+            .target = target,
+            .optimize = fuzz_opt,
+            .imports = &.{ .{ .name = "routing", .module = fuzz_lib }, .{ .name = "lz4", .module = fuzz_lz4 } },
+        }),
+        .filters = if (fuzz_filter) |f| b.dupeStrings(&.{b.fmt("fuzz {s}", .{f})}) else &.{},
+    });
+    b.step("fuzz", "Fuzz the input parsers (add --fuzz; -Dfuzz-target=NAME for one)").dependOn(&b.addRunArtifact(fuzz_tests).step);
+
     // Every reused library compiles and is callable on the pinned toolchain.
     const smoke_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("test/deps_smoke.zig"),

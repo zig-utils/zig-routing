@@ -126,6 +126,21 @@ counts per endpoint and costing, and SHA-256, and `--check` proves a regeneratio
 byte-identical (CI runs it). After changing a generator, refresh the oracle-rejected candidates
 with `--validate DATASET=URL` for every dataset with a running oracle, and commit the manifest.
 
+Every parser of untrusted input gets a fuzz target in `test/fuzz.zig` (one byte slice per run,
+seeds included; `zig build test` replays the seeds). Malformed input must return an error, never
+panic or read out of bounds.
+
+```bash
+scripts/fuzz.sh -s 60 lz4
+```
+
+That runs a target for 60 seconds in a ReleaseSafe build (omit the names to run all of them).
+The nightly `Fuzz` workflow runs each target for 10 minutes and uploads crashing inputs. A crasher
+goes into `test/fuzz/crashers/` with a `replayStream` test in `test/fuzz/regressions.zig`,
+committed with the fix. `zig build` exits 0 even when a fuzz test crashes, so use the script,
+which detects the saved input, rather than reading the exit status of
+`zig build fuzz --fuzz=N` yourself.
+
 ## Reference material
 
 - [docs/PLAN.md](docs/PLAN.md): scoreboard, architecture, phases, parity gates, experiments.
