@@ -116,6 +116,12 @@ writes percentiles, throughput and errors with the hardware, dataset and commit;
 the same machine class and platform (an emulated amd64 oracle against a native `zr` is not a
 comparison). `zr diff` does not exist yet.
 
+The corpora live in `bench/corpora/`, written by `bun tools/corpus/generate.ts` (seeded, about 15 s
+with the upstream fetch). Only `manifest.json` is committed. It lists each corpus's dataset,
+counts per endpoint and costing, and SHA-256, and `--check` proves a regeneration is
+byte-identical (CI runs it). After changing a generator, refresh the oracle-rejected candidates
+with `--validate DATASET=URL` for every dataset with a running oracle, and commit the manifest.
+
 ## Reference material
 
 - [docs/PLAN.md](docs/PLAN.md): scoreboard, architecture, phases, parity gates, experiments.

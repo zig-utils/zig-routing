@@ -50,12 +50,35 @@ Run `zr` on Linux for this (for example the Linux build inside the same image): 
 the platform libm, and upstream's numbers come from glibc.
 
 `zr bench` measures throughput and latency against either server. A corpus is one request per
-line, `PATH<TAB>BODY`:
+line, `PATH<TAB>BODY`. The standard corpora come from `tools/corpus/generate.ts` (see
+`bench/corpora/manifest.json` for what each one holds and which dataset it needs):
 
 ```bash
-zig-out/bin/zr bench http://127.0.0.1:8102 --corpus corpus.txt --connections 8 --duration 10s --label valhalla --out valhalla.json
-zig-out/bin/zr bench http://127.0.0.1:18102 --corpus corpus.txt --connections 8 --duration 10s --label zr --out zr.json
+bun tools/corpus/generate.ts
+```
+
+```bash
+zig-out/bin/zr bench http://127.0.0.1:8102 --corpus bench/corpora/route-foot-bike.liechtenstein.tsv --connections 8 --duration 10s --label valhalla --out valhalla.json
+```
+
+```bash
+zig-out/bin/zr bench http://127.0.0.1:18102 --corpus bench/corpora/route-foot-bike.liechtenstein.tsv --connections 8 --duration 10s --label zr --out zr.json
+```
+
+```bash
 zig-out/bin/zr bench --compare valhalla.json zr.json
+```
+
+To replay a corpus exactly once, in order (a parity or acceptance run rather than a load test),
+use one client thread and a request count equal to the line count:
+`--threads 1 --requests $(wc -l < FILE) --warmup 0`.
+
+Generated corpora keep only requests the oracle answers with 200; footpath islands in the test
+extracts make some pedestrian pairs unroutable (Utrecht rejects about 45% of random pedestrian
+candidates). Refresh the recorded rejections against running oracles with:
+
+```bash
+bun tools/corpus/generate.ts --validate liechtenstein=http://127.0.0.1:8102 --validate utrecht=http://127.0.0.1:8103
 ```
 
 For numbers worth quoting, run both servers and the client inside the VM (a Linux `zr` built with
