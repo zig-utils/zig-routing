@@ -201,6 +201,16 @@ pub const File = struct {
     pub fn writeAll(self: File, bytes: []const u8) Error!void {
         try writeAllFd(self.fd, bytes);
     }
+
+    /// Writes all of `bytes` at `offset` without moving the file offset.
+    pub fn pwriteAll(self: File, bytes: []const u8, offset: u64) Error!void {
+        var done: usize = 0;
+        while (done < bytes.len) {
+            const rc = c.pwrite(self.fd, bytes[done..].ptr, bytes.len - done, @intCast(offset + done));
+            if (rc < 0 and c.errno(rc) == .INTR) continue;
+            done += try checkSize(rc);
+        }
+    }
 };
 
 /// Reads a whole file into memory owned by `allocator`.

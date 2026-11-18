@@ -1,6 +1,7 @@
 //! zr: the zig-routing command line.
 //!
-//!   zr serve [--host 0.0.0.0] [--port 8002] [--threads N] [--elevation DIR]
+//!   zr serve [--host 0.0.0.0] [--port 8002] [--threads N] [--elevation DIR|FILE.zdem]
+//!   zr dem pack HGT_DIR OUT.zdem | verify PACK HGT_DIR | info PACK
 //!   zr bench URL --corpus FILE [options]   (zr bench with no arguments lists them)
 //!   zr diff A_URL B_URL --corpus FILE      (zr diff with no arguments lists them)
 //!   zr version
@@ -32,6 +33,14 @@ pub fn main(init: std.process.Init) !void {
         };
         return;
     }
+    if (std.mem.eql(u8, cmd, "dem")) {
+        routing.cli.dem.main(std.heap.c_allocator, args.items[1..]) catch |e| switch (e) {
+            error.InvalidArgument => std.process.exit(2),
+            error.VerifyFailed => std.process.exit(1),
+            else => return e,
+        };
+        return;
+    }
     if (std.mem.eql(u8, cmd, "diff")) {
         const ok = routing.cli.diff.main(std.heap.c_allocator, args.items[1..]) catch |e| switch (e) {
             error.InvalidArgument => std.process.exit(2),
@@ -41,7 +50,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (!std.mem.eql(u8, cmd, "serve")) {
-        std.debug.print("usage: zr serve [--host IP] [--port N] [--threads N] [--elevation DIR]\n       zr bench URL --corpus FILE [options]\n       zr diff A_URL B_URL --corpus FILE [options]\n       zr version\n", .{});
+        std.debug.print("usage: zr serve [--host IP] [--port N] [--threads N] [--elevation DIR|FILE.zdem]\n       zr bench URL --corpus FILE [options]\n       zr diff A_URL B_URL --corpus FILE [options]\n       zr dem pack|verify|info ...\n       zr version\n", .{});
         return;
     }
 
@@ -69,11 +78,22 @@ pub fn main(init: std.process.Init) !void {
     var svc: service.Service = .{};
     var tiles: ?routing.elevation.hgt.Tiles = null;
     defer if (tiles) |*t| t.deinit();
-    if (elevation_dir) |dir| {
-        tiles = try routing.elevation.hgt.Tiles.init(std.heap.c_allocator, dir);
-        svc.state = &tiles.?;
+    var pack: ?routing.elevation.@"packed".Pack = null;
+    defer if (pack) |*p| p.close();
+    var source: routing.elevation.Source = undefined;
+    if (elevation_dir) |path| {
+        // A pack from `zr dem pack`, or a directory of .hgt tiles.
+        if (std.mem.endsWith(u8, path, ".zdem")) {
+            pack = try routing.elevation.@"packed".Pack.open(path);
+            source = .{ .pack = &pack.? };
+            std.debug.print("elevation: {d} tiles in {s}\n", .{ pack.?.header.tile_count, path });
+        } else {
+            tiles = try routing.elevation.hgt.Tiles.init(std.heap.c_allocator, path);
+            source = .{ .tiles = &tiles.? };
+            std.debug.print("elevation: {d} tiles under {s}\n", .{ tiles.?.count, path });
+        }
+        svc.state = &source;
         svc.register(.height, routing.api.height_action.handle);
-        std.debug.print("elevation: {d} tiles under {s}\n", .{ tiles.?.count, dir });
     }
     var server = http.Server.init(std.heap.c_allocator, config, svc.handler());
     try server.start();

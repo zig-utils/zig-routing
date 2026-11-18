@@ -6,7 +6,8 @@
 //!
 //! Targets: `request` (the API request parser), `http` (request head, query
 //! string, percent decoding), `polyline` (polyline 5/6/7 and varint
-//! decoders), `lz4` (block and frame decoders, plus a compress round trip).
+//! decoders), `lz4` (block and frame decoders, plus a compress round trip),
+//! `dem` (the packed elevation block decoder).
 //! The protobuf decoder gets its target with the codec (P1.07).
 //!
 //! The contract for every parser: malformed input returns an error, never
@@ -23,6 +24,7 @@ const lz4 = @import("lz4");
 const http = routing.server.http;
 const request = routing.api.request;
 const polyline = routing.geo.polyline;
+const dem = routing.elevation.@"packed";
 const Smith = std.testing.Smith;
 
 /// Largest input a target draws.
@@ -250,6 +252,49 @@ test "fuzz lz4" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     try std.testing.fuzz({}, fuzzLz4, .{ .corpus = try lz4Seeds(arena_state.allocator()) });
+}
+
+// ---------------------------------------------------------------------------
+// dem: the packed elevation block decoder on arbitrary payloads, at the
+// first byte's block size and predictor. A block that decodes re-encodes to
+// a payload that decodes to the same posts.
+
+pub fn fuzzDem(_: void, s: *Smith) !void {
+    var buf: [max_input]u8 = undefined;
+    const in = draw(s, &buf, 0x6465_6d21);
+    if (in.len == 0) return;
+    const sizes = [_]usize{ 64, 17, 1, 5 };
+    const w = sizes[in[0] & 3];
+    const h = sizes[(in[0] >> 2) & 3];
+    const kind: dem.BlockKind = @fromBackingInt(@intCast((in[0] >> 4) & 3));
+    var posts: [dem.block_dim * dem.block_dim]i16 = undefined;
+    dem.decodeBlock(kind, in[1..], w, h, &posts) catch return;
+    var out: [dem.max_block_payload]u8 = undefined;
+    const len = dem.encodeBlock(.med, posts[0 .. w * h], w, h, &out);
+    var back: [dem.block_dim * dem.block_dim]i16 = undefined;
+    try dem.decodeBlockWith(.med, out[0..len], w, h, &back);
+    try std.testing.expectEqualSlices(i16, posts[0 .. w * h], back[0 .. w * h]);
+}
+
+fn demSeeds(gpa: std.mem.Allocator) ![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    var posts: [dem.block_dim * dem.block_dim]i16 = undefined;
+    for (&posts, 0..) |*p, i| p.* = @intCast(@as(i32, @intCast(i % 64)) * 3 + @as(i32, @intCast(i / 64)) * 2 + 400 + @as(i32, @intCast(i % 7)));
+    var out: [dem.max_block_payload]u8 = undefined;
+    const med = dem.encodeBlock(.med, &posts, 64, 64, &out);
+    try list.append(gpa, try seed(gpa, try std.mem.concat(gpa, u8, &.{ &.{0x10}, out[0..med] })));
+    const plane = dem.encodeBlock(.plane, &posts, 64, 64, &out);
+    try list.append(gpa, try seed(gpa, try std.mem.concat(gpa, u8, &.{ &.{0x20}, out[0..plane] })));
+    const small = dem.encodeBlock(.med, posts[0 .. 17 * 17], 17, 17, &out);
+    try list.append(gpa, try seed(gpa, try std.mem.concat(gpa, u8, &.{ &.{0x15}, out[0..small] })));
+    try list.append(gpa, try seed(gpa, "\x10\xff\xff\xff"));
+    return list.items;
+}
+
+test "fuzz dem" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    try std.testing.fuzz({}, fuzzDem, .{ .corpus = try demSeeds(arena_state.allocator()) });
 }
 
 test {

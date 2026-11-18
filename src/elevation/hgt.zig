@@ -119,6 +119,33 @@ pub const Tiles = struct {
         self.count += 1;
     }
 
+    /// Decodes a tile into `out` (big-endian int16 bytes, `hgt_bytes` long)
+    /// without touching the shared cache, so callers can decode tiles in
+    /// parallel. False when the tile is absent or does not decode.
+    pub fn readTile(self: *const Tiles, index: u32, out: []u8) bool {
+        if (index >= tile_count or out.len != hgt_bytes) return false;
+        const slot = &self.slots[index];
+        return switch (slot.format) {
+            .unknown => false,
+            .raw => blk: {
+                @memcpy(out, slot.map.?.bytes);
+                break :blk true;
+            },
+            .gzip => inflateGzip(slot.map.?.bytes, out),
+            .lz4 => blk: {
+                const r = lz4.decompressFrames(slot.map.?.bytes, out) catch break :blk false;
+                break :blk r.written == hgt_bytes;
+            },
+        };
+    }
+
+    /// Indices of the tiles found, ascending.
+    pub fn indices(self: *const Tiles, gpa: Allocator) Allocator.Error![]u32 {
+        var list: std.ArrayList(u32) = .empty;
+        for (self.slots, 0..) |s, i| if (s.format != .unknown) try list.append(gpa, @intCast(i));
+        return list.toOwnedSlice(gpa);
+    }
+
     /// Samples of a tile as big-endian int16 bytes, or null without data.
     pub fn samples(self: *Tiles, index: u32) ?[]const u8 {
         if (index >= tile_count) return null;
@@ -183,9 +210,14 @@ fn inflateGzip(src: []const u8, dst: []u8) bool {
     return true;
 }
 
-inline fn sample(data: []const u8, i: usize) i16 {
-    return std.mem.readInt(i16, data[i * 2 ..][0..2], .big);
-}
+/// Posts of an unpacked .hgt tile (big-endian int16, row-major from the
+/// north-west corner), as `interpolateWith` reads them.
+pub const BigEndianPosts = struct {
+    data: []const u8,
+    pub inline fn sample(self: BigEndianPosts, i: usize) i16 {
+        return std.mem.readInt(i16, self.data[i * 2 ..][0..2], .big);
+    }
+};
 
 inline fn outOfRange(v: i16) bool {
     return v > no_data_high or v < no_data_low;
@@ -194,6 +226,13 @@ inline fn outOfRange(v: i16) bool {
 /// skadi `tile_data::get(u, v)`: bilinear interpolation over the four
 /// neighbouring samples, dropping no-data samples from the weights.
 pub fn interpolate(data: []const u8, u: f64, v: f64) f64 {
+    return interpolateWith(BigEndianPosts{ .data = data }, u, v);
+}
+
+/// `interpolate` over any post source with `sample(linear_index) i16`, so
+/// the packed reader shares the exact arithmetic. Indices are linear in a
+/// 3601-wide tile, as upstream reads them (x + 1 = 3601 is the next row).
+pub fn interpolateWith(src: anytype, u: f64, v: f64) f64 {
     const x: usize = @intFromFloat(@floor(u));
     const y: usize = @intFromFloat(@floor(v));
     const u_ratio = u - @as(f64, @floatFromInt(x));
@@ -205,15 +244,15 @@ pub fn interpolate(data: []const u8, u: f64, v: f64) f64 {
     var c_coef = u_inv * v_ratio;
     var d_coef = u_ratio * v_ratio;
     var adjust: f64 = 0;
-    const a = sample(data, y * hgt_dim + x);
-    const b = sample(data, y * hgt_dim + x + 1);
+    const a = src.sample(y * hgt_dim + x);
+    const b = src.sample(y * hgt_dim + x + 1);
     if (outOfRange(a)) a_coef = 0;
     if (outOfRange(b)) b_coef = 0;
     var value = @as(f64, @floatFromInt(a)) * a_coef + @as(f64, @floatFromInt(b)) * b_coef;
     adjust += a_coef + b_coef;
     if (y < hgt_dim - 1) {
-        const cc = sample(data, (y + 1) * hgt_dim + x);
-        const d = sample(data, (y + 1) * hgt_dim + x + 1);
+        const cc = src.sample((y + 1) * hgt_dim + x);
+        const d = src.sample((y + 1) * hgt_dim + x + 1);
         if (outOfRange(cc)) c_coef = 0;
         if (outOfRange(d)) d_coef = 0;
         value += @as(f64, @floatFromInt(cc)) * c_coef + @as(f64, @floatFromInt(d)) * d_coef;
@@ -278,7 +317,7 @@ test "tile names and indices" {
 }
 
 /// A synthetic tile: height = row + 2 * column, with a no-data hole.
-fn writeTile(gpa: Allocator, dir: []const u8, name: []const u8, format: Format) !void {
+pub fn writeTile(gpa: Allocator, dir: []const u8, name: []const u8, format: Format) !void {
     const raw = try gpa.alloc(u8, hgt_bytes);
     defer gpa.free(raw);
     for (0..hgt_dim) |r| for (0..hgt_dim) |col| {
@@ -309,14 +348,14 @@ fn writeTile(gpa: Allocator, dir: []const u8, name: []const u8, format: Format) 
     }
 }
 
-fn mkdir(path: []const u8) void {
+pub fn mkdir(path: []const u8) void {
     var buf: [512]u8 = undefined;
     @memcpy(buf[0..path.len], path);
     buf[path.len] = 0;
     _ = std.c.mkdir(@ptrCast(&buf), 0o755);
 }
 
-fn rmTree(path: []const u8) void {
+pub fn rmTree(path: []const u8) void {
     const Del = struct {
         fn visit(_: void, file: []const u8) void {
             var b: [600]u8 = undefined;

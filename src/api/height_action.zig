@@ -12,7 +12,8 @@ const service = @import("service.zig");
 const request = @import("request.zig");
 const errors = @import("errors.zig");
 const json_writer = @import("json_writer.zig");
-const elevation = @import("../elevation/hgt.zig");
+const dem = @import("../elevation/root.zig");
+const elevation = dem.hgt;
 const geo = @import("../geo/root.zig");
 const PointLL = geo.PointLL;
 const Allocator = std.mem.Allocator;
@@ -23,7 +24,7 @@ const coordinate_precision = 6;
 pub fn handle(svc: *service.Service, ctx: *http.Ctx, options: *request.Options, res: *http.Response) Allocator.Error!?errors.Failure {
     _ = ctx;
     const a = res.gpa;
-    const tiles: *elevation.Tiles = @ptrCast(@alignCast(svc.state orelse return .{ .code = 107, .extra = "no elevation data configured" }));
+    const source: *const dem.Source = @ptrCast(@alignCast(svc.state orelse return .{ .code = 107, .extra = "no elevation data configured" }));
 
     if (options.shape.len < 1) return .{ .code = 312 };
     var shape = try a.alloc(PointLL, options.shape.len);
@@ -58,7 +59,7 @@ pub fn handle(svc: *service.Service, ctx: *http.Ctx, options: *request.Options, 
     }
 
     const heights = try a.alloc(f64, shape.len);
-    elevation.getAll(tiles, shape, heights);
+    source.getAll(shape, heights);
 
     var ranges: []f64 = &.{};
     if (options.range) {
