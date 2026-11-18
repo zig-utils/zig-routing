@@ -68,13 +68,19 @@ pub fn fuzzRequest(_: void, s: *Smith) !void {
         .{ .key = "json", .value = doc },
         .{ .key = "id", .value = "fuzz" },
     } else &.{};
-    _ = try request.parseHttp(arena, path, query, if (via_query) "" else doc);
+    const body = if (via_query) "" else doc;
+    const fast = try request.parseHttp(arena, path, query, body);
+    // The /height shape fast path must agree with the general parser.
+    if (std.mem.eql(u8, path, "/height")) {
+        try std.testing.expect(request.resultsEqual(fast, try request.parseHttpReference(arena, path, query, body)));
+    }
 }
 
 const request_seeds = [_][]const u8{
     "\x00{\"locations\":[{\"lat\":47.066161,\"lon\":9.569393},{\"lat\":47.115521,\"lon\":9.63313}],\"costing\":\"pedestrian\",\"costing_options\":{\"pedestrian\":{\"walkway_factor\":0.6,\"sidewalk_factor\":1,\"use_tracks\":0.8,\"max_hiking_difficulty\":3}},\"directions_type\":\"none\"}",
     "\x00{\"locations\":[{\"lat\":52.09,\"lon\":5.1,\"type\":\"via\"},{\"lat\":52.1,\"lon\":5.12,\"heading\":90}],\"costing\":\"bicycle\",\"costing_options\":{\"bicycle\":{\"use_roads\":0.2,\"use_hills\":0.4}},\"units\":\"miles\",\"date_time\":{\"type\":1,\"value\":\"2026-11-17T08:00\"}}",
     "\x01{\"shape\":[{\"lat\":47.1,\"lon\":9.5},{\"lat\":47.2,\"lon\":9.6}],\"range\":true,\"height_precision\":2,\"resample_distance\":30}",
+    "\x01{\"shape\":[{\"lat\":47.242754,\"lon\":9.574113},{\"lat\":47.244662,\"lon\":9.566932},{\"lon\":9.560015,\"lat\":47.246979},{\"lat\":-0,\"lon\":1.5e2},{\"lat\":47.254214, \"lon\" : 9.548967}],\"range\":false}",
     "\x81{\"encoded_polyline\":\"_p~iF~ps|U_ulLnnqC_mqNvxq`@\",\"shape_format\":\"polyline5\",\"range\":false}",
     "\x08{\"verbose\":true}",
     "\x00{\"locations\":[]}",

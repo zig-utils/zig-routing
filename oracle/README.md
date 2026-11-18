@@ -92,6 +92,17 @@ gate must report 100%:
 zig-out/bin/zr diff http://127.0.0.1:8102 http://127.0.0.1:18102 --corpus bench/corpora/route-foot-bike.liechtenstein.tsv --out diff.json --worst worst/
 ```
 
+`oracle/bench-vm.sh DATASET CORPUS [LABEL]` is the comparison to quote: Valhalla and a Linux
+arm64 `zr` as containers on one Docker network inside the VM, with the `zr bench` client in a
+third container, each server given the same worker count, at one connection and at as many as the
+VM has CPUs. It ends with the `/status` round trip at one connection, the floor that bounds any
+single-connection ratio. `ZR_ELEVATION=pack` serves a pack built with `zr dem pack` instead of
+the tiles. Results land in `bench/results/` (gitignored).
+
+```bash
+oracle/bench-vm.sh utrecht bench/corpora/height.utrecht.tsv
+```
+
 ## Not done yet
 
 - The second config with hierarchy pruning disabled (needed for route parity, P3).

@@ -126,6 +126,17 @@ counts per endpoint and costing, and SHA-256, and `--check` proves a regeneratio
 byte-identical (CI runs it). After changing a generator, refresh the oracle-rejected candidates
 with `--validate DATASET=URL` for every dataset with a running oracle, and commit the manifest.
 
+`zig build perf` times /height by stage (parse, sample, serialize per point) on the bulk corpus
+and fails when a stage exceeds `bench/budgets/height.json`. For where the time goes in a running
+server, sample it and render a flamegraph (macOS):
+
+```bash
+bun tools/flamegraph/sample-to-svg.ts sample.txt out.svg --drop-idle --folded
+```
+
+`sample.txt` comes from `sample <pid> 10 -file sample.txt` while `zr bench` drives the server;
+`docs/perf/` keeps the reference profiles.
+
 Every parser of untrusted input gets a fuzz target in `test/fuzz.zig` (one byte slice per run,
 seeds included; `zig build test` replays the seeds). Malformed input must return an error, never
 panic or read out of bounds.

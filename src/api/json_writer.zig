@@ -111,13 +111,21 @@ pub const Writer = struct {
     pub fn int(self: *Writer, v: i64) Allocator.Error!void {
         try self.prefix();
         var buf: [24]u8 = undefined;
-        try self.out.appendSlice(self.gpa, std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable);
+        try self.out.appendSlice(self.gpa, formatInt(v, &buf));
     }
 
     pub fn uint(self: *Writer, v: u64) Allocator.Error!void {
         try self.prefix();
         var buf: [24]u8 = undefined;
-        try self.out.appendSlice(self.gpa, std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable);
+        try self.out.appendSlice(self.gpa, formatUint(v, &buf));
+    }
+
+    /// Opens a value the caller writes straight into `out` (for arrays of
+    /// many small items written in one loop): emits the separator and
+    /// returns the buffer. The caller writes exactly one JSON value.
+    pub fn rawValue(self: *Writer) Allocator.Error!*std.ArrayList(u8) {
+        try self.prefix();
+        return self.out;
     }
 
     pub fn boolean(self: *Writer, v: bool) Allocator.Error!void {
@@ -498,18 +506,23 @@ fn dtoaFixed(value: f64, buffer: []u8, max_decimals: u16) ?[]const u8 {
     // grid decimal can lie in it and Grisu2's digits g satisfy
     // S - spacing < g < S + spacing.
     if (up + down >= 0.9 / p10) return null;
-    // r = value - S, nearly exact via fused multiply-add.
-    const r = -@mulAdd(f64, -mag, p10, qf) / p10;
+    // r = value - S, nearly exact via fused multiply-add, kept scaled by
+    // p10 (rs = r * p10) and compared with the scaled half-spacings: one
+    // rounding either way, far inside the 0.45..0.55 band that sends
+    // anything near the boundary to Grisu2.
+    const rs = -@mulAdd(f64, -mag, p10, qf);
+    const down_s = down * p10;
+    const up_s = up * p10;
     var q: u64 = @intFromFloat(qf);
-    if (r >= 0) {
+    if (rs >= 0) {
         // S at or below value. Inside the interval: g = S. Outside: g > S,
         // so truncation gives S. Near the boundary: let Grisu2 decide.
-        if (r >= 0.45 * down and r <= 0.55 * down) return null;
+        if (rs >= 0.45 * down_s and rs <= 0.55 * down_s) return null;
     } else {
         // S above value. Inside: g = S. Outside: g < S, truncation gives S - spacing.
-        const d = -r;
-        if (d >= 0.45 * up and d <= 0.55 * up) return null;
-        if (d > 0.55 * up) q -= 1;
+        const d = -rs;
+        if (d >= 0.45 * up_s and d <= 0.55 * up_s) return null;
+        if (d > 0.55 * up_s) q -= 1;
     }
 
     const scale: u64 = @intFromFloat(p10);
@@ -520,7 +533,10 @@ fn dtoaFixed(value: f64, buffer: []u8, max_decimals: u16) ?[]const u8 {
     }
     const int_part = q / scale;
     var frac = q % scale;
-    i += (std.fmt.bufPrint(buffer[i..], "{d}", .{int_part}) catch unreachable).len;
+    var int_buf: [24]u8 = undefined;
+    const int_digits = formatUint(int_part, &int_buf);
+    @memcpy(buffer[i..][0..int_digits.len], int_digits);
+    i += int_digits.len;
     buffer[i] = '.';
     i += 1;
     if (frac == 0) {
@@ -533,11 +549,50 @@ fn dtoaFixed(value: f64, buffer: []u8, max_decimals: u16) ?[]const u8 {
         digits -= 1;
     }
     var j = digits;
-    while (j > 0) : (j -= 1) {
-        buffer[i + j - 1] = '0' + @as(u8, @intCast(frac % 10));
-        frac /= 10;
+    while (j >= 2) : (j -= 2) {
+        const pair: usize = @intCast(frac % 100);
+        frac /= 100;
+        buffer[i + j - 2 ..][0..2].* = digit_pairs[2 * pair ..][0..2].*;
     }
+    if (j == 1) buffer[i] = '0' + @as(u8, @intCast(frac % 10));
     return buffer[0 .. i + digits];
+}
+
+const digit_pairs = blk: {
+    var t: [200]u8 = undefined;
+    for (0..100) |i| {
+        t[2 * i] = '0' + @as(u8, @intCast(i / 10));
+        t[2 * i + 1] = '0' + @as(u8, @intCast(i % 10));
+    }
+    break :blk t;
+};
+
+/// Decimal digits of `v`, right-aligned at the end of `buf`; returns them.
+pub fn formatUint(v_in: u64, buf: *[24]u8) []const u8 {
+    var v = v_in;
+    var i: usize = buf.len;
+    while (v >= 100) {
+        const r: usize = @intCast(v % 100);
+        v /= 100;
+        i -= 2;
+        buf[i..][0..2].* = digit_pairs[2 * r ..][0..2].*;
+    }
+    if (v >= 10) {
+        i -= 2;
+        buf[i..][0..2].* = digit_pairs[2 * @as(usize, @intCast(v)) ..][0..2].*;
+    } else {
+        i -= 1;
+        buf[i] = '0' + @as(u8, @intCast(v));
+    }
+    return buf[i..];
+}
+
+pub fn formatInt(v: i64, buf: *[24]u8) []const u8 {
+    if (v >= 0) return formatUint(@intCast(v), buf);
+    const digits = formatUint(@abs(v), buf);
+    const start = buf.len - digits.len - 1;
+    buf[start] = '-';
+    return buf[start..];
 }
 
 /// Full rapidjson Grisu2 + Prettify.
@@ -781,4 +836,18 @@ test "fast fixed-point path is byte-identical to full Grisu2" {
         }
     }
     try testing.expect(fast_hits > 100_000);
+}
+
+test "integer formatting matches std.fmt" {
+    var prng = std.Random.DefaultPrng.init(9);
+    const random = prng.random();
+    var buf: [24]u8 = undefined;
+    var ref: [24]u8 = undefined;
+    const edges = [_]i64{ 0, 1, -1, 9, 10, 99, 100, -100, 999, 1000, std.math.maxInt(i64), std.math.minInt(i64) };
+    for (edges) |v| try std.testing.expectEqualStrings(try std.fmt.bufPrint(&ref, "{d}", .{v}), formatInt(v, &buf));
+    for (0..100_000) |_| {
+        const v = random.int(i64) >> random.int(u6);
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&ref, "{d}", .{v}), formatInt(v, &buf));
+    }
+    try std.testing.expectEqualStrings("18446744073709551615", formatUint(std.math.maxInt(u64), &buf));
 }

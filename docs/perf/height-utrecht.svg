@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="227" font-family="Menlo,monospace" font-size="11">
+<rect width="100%" height="100%" fill="#fbfbf8"/>
+<text x="8" y="20" font-size="14">zr serve /height, height.utrecht corpus, 6 connections, 4 workers, idle removed (M3 Pro, P2.05) (5777 samples)</text>
+<g><title>Thread: 5777 samples (100.00%)</title><rect x="0.0" y="190" width="1199.5" height="16" fill="hsl(210, 45%, 68%)"/><text x="3.0" y="202">Thread</text></g>
+<g><title>thread_start: 5776 samples (99.98%)</title><rect x="0.2" y="173" width="1199.3" height="16" fill="hsl(221, 45%, 71%)"/><text x="3.2" y="185">thread_start</text></g>
+<g><title>_pthread_start: 5776 samples (99.98%)</title><rect x="0.2" y="156" width="1199.3" height="16" fill="hsl(230, 45%, 72%)"/><text x="3.2" y="168">_pthread_start</text></g>
+<g><title>Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn: 5770 samples (99.88%)</title><rect x="1.5" y="139" width="1198.0" height="16" fill="hsl(202, 45%, 68%)"/><text x="4.5" y="151">Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn</text></g>
+<g><title>api.service.Service.handleHttp: 4579 samples (79.26%)</title><rect x="1.9" y="122" width="950.7" height="16" fill="hsl(24, 85%, 59%)"/><text x="4.9" y="134">api.service.Service.handleHttp</text></g>
+<g><title>api.height_action.handle: 2430 samples (42.06%)</title><rect x="1.9" y="105" width="504.3" height="16" fill="hsl(36, 85%, 56%)"/><text x="4.9" y="117">api.height_action.handle</text></g>
+<g><title>_platform_memmove: 128 samples (2.22%)</title><rect x="1.9" y="88" width="26.1" height="16" fill="hsl(209, 45%, 71%)"/></g>
+<g><title>api.height_action.handle: 201 samples (3.48%)</title><rect x="28.5" y="88" width="41.3" height="16" fill="hsl(36, 85%, 56%)"/><text x="31.5" y="100">api.he</text></g>
+<g><title>api.height_action.writeWithPrecision: 136 samples (2.35%)</title><rect x="70.2" y="88" width="27.7" height="16" fill="hsl(25, 85%, 60%)"/></g>
+<g><title>_platform_memmove: 19 samples (0.33%)</title><rect x="70.2" y="71" width="3.4" height="16" fill="hsl(209, 45%, 71%)"/></g>
+<g><title>api.height_action.writeWithPrecision: 69 samples (1.19%)</title><rect x="74.2" y="71" width="13.8" height="16" fill="hsl(25, 85%, 60%)"/></g>
+<g><title>api.json_writer.Writer.prefix: 27 samples (0.47%)</title><rect x="88.5" y="71" width="5.1" height="16" fill="hsl(33, 85%, 68%)"/></g>
+<g><title>api.json_writer.dtoa: 1159 samples (20.06%)</title><rect x="98.5" y="88" width="240.2" height="16" fill="hsl(44, 85%, 64%)"/><text x="101.5" y="100">api.json_writer.dtoa</text></g>
+<g><title>_platform_memmove: 36 samples (0.62%)</title><rect x="98.5" y="71" width="7.0" height="16" fill="hsl(209, 45%, 71%)"/></g>
+<g><title>api.json_writer.Writer.beginArray: 31 samples (0.54%)</title><rect x="339.2" y="88" width="5.9" height="16" fill="hsl(25, 85%, 60%)"/></g>
+<g><title>asin: 19 samples (0.33%)</title><rect x="351.9" y="88" width="3.4" height="16" fill="hsl(207, 45%, 69%)"/></g>
+<g><title>DYLD-STUB$$memcpy: 27 samples (0.47%)</title><rect x="355.8" y="88" width="5.1" height="16" fill="hsl(213, 45%, 67%)"/></g>
+<g><title>elevation.root.Source.getAll: 429 samples (7.43%)</title><rect x="361.4" y="88" width="88.6" height="16" fill="hsl(35, 85%, 55%)"/><text x="364.4" y="100">elevation.roo</text></g>
+<g><title>elevation.hgt.interpolate: 285 samples (4.93%)</title><rect x="361.4" y="71" width="58.7" height="16" fill="hsl(23, 85%, 58%)"/><text x="364.4" y="83">elevatio</text></g>
+<g><title>elevation.root.Source.getAll: 144 samples (2.49%)</title><rect x="420.6" y="71" width="29.4" height="16" fill="hsl(35, 85%, 55%)"/></g>
+<g><title>geo.point.PointLL.distance: 256 samples (4.43%)</title><rect x="453.5" y="88" width="52.7" height="16" fill="hsl(36, 85%, 56%)"/><text x="456.5" y="100">geo.poin</text></g>
+<g><title>cos: 52 samples (0.90%)</title><rect x="453.5" y="71" width="10.3" height="16" fill="hsl(215, 45%, 69%)"/></g>
+<g><title>geo.libm.load: 51 samples (0.88%)</title><rect x="464.3" y="71" width="10.1" height="16" fill="hsl(49, 85%, 69%)"/></g>
+<g><title>geo.point.PointLL.distance: 118 samples (2.04%)</title><rect x="474.8" y="71" width="24.0" height="16" fill="hsl(36, 85%, 56%)"/></g>
+<g><title>[unknown]: 69 samples (1.19%)</title><rect x="474.8" y="54" width="13.8" height="16" fill="hsl(230, 45%, 64%)"/></g>
+<g><title>sin: 23 samples (0.40%)</title><rect x="499.4" y="71" width="4.3" height="16" fill="hsl(200, 45%, 62%)"/></g>
+<g><title>api.json_writer.dtoa: 20 samples (0.35%)</title><rect x="506.6" y="105" width="3.7" height="16" fill="hsl(44, 85%, 64%)"/></g>
+<g><title>api.request.parseHttpWith: 2112 samples (36.56%)</title><rect x="512.0" y="105" width="438.2" height="16" fill="hsl(46, 85%, 66%)"/><text x="515.0" y="117">api.request.parseHttpWith</text></g>
+<g><title>_platform_memmove: 29 samples (0.50%)</title><rect x="512.0" y="88" width="5.5" height="16" fill="hsl(209, 45%, 71%)"/></g>
+<g><title>api.json.parse: 122 samples (2.11%)</title><rect x="523.9" y="88" width="24.8" height="16" fill="hsl(43, 85%, 63%)"/></g>
+<g><title>json.dynamic.handleCompleteValue__anon_54236: 23 samples (0.40%)</title><rect x="524.7" y="71" width="4.3" height="16" fill="hsl(230, 45%, 68%)"/></g>
+<g><title>json.Scanner.nextAllocMax: 88 samples (1.52%)</title><rect x="529.5" y="71" width="17.8" height="16" fill="hsl(216, 45%, 62%)"/></g>
+<g><title>json.Scanner.next: 66 samples (1.14%)</title><rect x="530.9" y="54" width="13.2" height="16" fill="hsl(209, 45%, 63%)"/></g>
+<g><title>api.request.parseHttpWith: 25 samples (0.43%)</title><rect x="552.5" y="88" width="4.7" height="16" fill="hsl(46, 85%, 66%)"/></g>
+<g><title>api.json.pointer: 24 samples (0.42%)</title><rect x="552.5" y="71" width="4.5" height="16" fill="hsl(37, 85%, 57%)"/></g>
+<g><title>geo.polyline.Decoder(.polyline).readVarint: 76 samples (1.32%)</title><rect x="559.8" y="88" width="15.3" height="16" fill="hsl(24, 85%, 59%)"/></g>
+<g><title>read: 388 samples (6.72%)</title><rect x="956.1" y="122" width="80.1" height="16" fill="hsl(222, 45%, 72%)"/><text x="959.1" y="134">read</text></g>
+<g><title>server.http.Worker.queue: 739 samples (12.79%)</title><rect x="1036.7" y="122" width="153.0" height="16" fill="hsl(22, 85%, 57%)"/><text x="1039.7" y="134">server.http.Worker.queu</text></g>
+<g><title>writev: 733 samples (12.69%)</title><rect x="1037.4" y="105" width="151.8" height="16" fill="hsl(223, 45%, 69%)"/><text x="1040.4" y="117">writev</text></g>
+</svg>

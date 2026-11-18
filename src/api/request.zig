@@ -135,12 +135,27 @@ pub const Result = union(enum) {
 /// other query parameter is added as a string member (body keys win, as
 /// upstream appends query members after the body's).
 pub fn parseHttp(arena: Allocator, path: []const u8, query: []const QueryParam, body: []const u8) Allocator.Error!Result {
+    return parseHttpWith(arena, path, query, body, true);
+}
+
+/// `parseHttp` without the /height shape fast path: the reference the fast
+/// path is tested against.
+pub fn parseHttpReference(arena: Allocator, path: []const u8, query: []const QueryParam, body: []const u8) Allocator.Error!Result {
+    return parseHttpWith(arena, path, query, body, false);
+}
+
+fn parseHttpWith(arena: Allocator, path: []const u8, query: []const QueryParam, body: []const u8, allow_fast: bool) Allocator.Error!Result {
     const action = Action.fromPath(path) orelse .no_action;
     var text: []const u8 = body;
     for (query) |q| if (std.mem.eql(u8, q.key, "json") and q.value.len > 0) {
         text = q.value;
         break;
     };
+    // A /height shape is nearly all of a bulk request. When it is a plain
+    // array of {"lat":n,"lon":n}, read it straight from the text and hand the
+    // rest of the document (shape replaced by []) to the general parser.
+    const fast: ?FastShape = if (allow_fast and action == .height and text.len >= 128) try fastShape(arena, text) else null;
+    if (fast) |f| text = f.rest;
     var doc: json.Value = if (text.len == 0) .{ .object = .empty } else json.parse(arena, text) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidJson => return .{ .failure = .{ .code = 100 } },
@@ -151,7 +166,269 @@ pub fn parseHttp(arena: Allocator, path: []const u8, query: []const QueryParam, 
         const gop = try doc.object.getOrPut(arena, q.key);
         if (!gop.found_existing) gop.value_ptr.* = .{ .string = q.value };
     }
-    return fromJson(arena, doc, action);
+    var result = try fromJson(arena, doc, action);
+    if (fast) |f| switch (result) {
+        .ok => |*o| if (o.encoded_polyline == null) {
+            // What parseLocations would have built from the same points.
+            const locs = try arena.alloc(Location, f.points.len);
+            for (locs, f.points, 0..) |*l, p, i| {
+                l.* = defaultLocation(p[0], p[1], o);
+                l.original_index = @intCast(i);
+            }
+            locs[0].type = .@"break";
+            locs[locs.len - 1].type = .@"break";
+            o.shape = locs;
+        },
+        .failure => {},
+    };
+    return result;
+}
+
+const FastShape = struct {
+    /// The document with the shape array replaced by `[]`.
+    rest: []const u8,
+    /// (lat, lon) of each point, lat already range-checked.
+    points: []const [2]f64,
+};
+
+inline fn isWs(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
+}
+
+fn skipWs(t: []const u8, i_in: usize) usize {
+    var i = i_in;
+    while (i < t.len and isWs(t[i])) i += 1;
+    return i;
+}
+
+/// Index after the string starting at `i` (t[i] == '"'), or null.
+fn skipString(t: []const u8, i_in: usize) ?usize {
+    var i = i_in + 1;
+    while (i < t.len) : (i += 1) switch (t[i]) {
+        '\\' => i += 1,
+        '"' => return i + 1,
+        else => {},
+    };
+    return null;
+}
+
+/// Index after the value starting at `i`, without validating it (the
+/// general parser validates the whole document afterwards).
+fn skipValue(t: []const u8, i_in: usize) ?usize {
+    if (i_in >= t.len) return null;
+    var i = i_in;
+    switch (t[i]) {
+        '"' => return skipString(t, i),
+        '{', '[' => {
+            var depth: usize = 0;
+            while (i < t.len) {
+                switch (t[i]) {
+                    '"' => {
+                        i = skipString(t, i) orelse return null;
+                        continue;
+                    },
+                    '{', '[' => depth += 1,
+                    '}', ']' => {
+                        depth -= 1;
+                        if (depth == 0) return i + 1;
+                    },
+                    else => {},
+                }
+                i += 1;
+            }
+            return null;
+        },
+        else => {
+            while (i < t.len and t[i] != ',' and t[i] != '}' and t[i] != ']' and !isWs(t[i])) i += 1;
+            return i;
+        },
+    }
+}
+
+const pow10_u64 = blk: {
+    var t: [20]u64 = undefined;
+    t[0] = 1;
+    for (1..20) |k| t[k] = t[k - 1] * 10;
+    break :blk t;
+};
+
+/// Reads the run of decimal digits at t[i..] into `out` and returns its
+/// length; 16 or more means "too long" (the caller falls back). Eight digits
+/// at a time with SWAR when eight bytes are readable.
+fn digitRun(t: []const u8, i_in: usize, out: *u64) u32 {
+    var i = i_in;
+    var v: u64 = 0;
+    var n: u32 = 0;
+    while (i + 8 <= t.len) {
+        const word = std.mem.readInt(u64, t[i..][0..8], .little);
+        // High bit of each byte set where the byte is not '0'..'9'.
+        const non_digit = ((word +% 0x4646464646464646) | (word -% 0x3030303030303030)) & 0x8080808080808080;
+        const k: u32 = if (non_digit == 0) 8 else @intCast(@ctz(non_digit) / 8);
+        if (k > 0) {
+            // The first k digits, most significant first in byte 0, moved to
+            // the top of the word with zeros below, then combined in pairs.
+            var x = (word -% 0x3030303030303030) << @intCast((8 - k) * 8);
+            if (k == 8) x = word -% 0x3030303030303030;
+            x = ((x & 0x0F0F0F0F0F0F0F0F) *% 2561) >> 8;
+            x = ((x & 0x00FF00FF00FF00FF) *% 6553601) >> 16;
+            x = ((x & 0x0000FFFF0000FFFF) *% 42949672960001) >> 32;
+            v = v *% pow10_u64[k] +% x;
+            n += k;
+            i += k;
+        }
+        if (k < 8 or n >= 16) {
+            out.* = v;
+            return n;
+        }
+    }
+    while (i < t.len and t[i] >= '0' and t[i] <= '9' and n < 16) : (i += 1) {
+        v = v * 10 + (t[i] - '0');
+        n += 1;
+    }
+    out.* = v;
+    return n;
+}
+
+const exact_pow10 = [23]f64{ 1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22 };
+
+/// A strict JSON number at `t[i..]` with at most 15 digits, converted
+/// exactly as the general parser converts it: an integer literal through
+/// i64 (so "-0" is +0), anything else correctly rounded (Clinger's fast
+/// path: mantissa < 2^53 and |exponent| <= 22 make one IEEE operation
+/// exact). Returns the end index, or null to fall back.
+fn parseNumber(t: []const u8, i_in: usize, out: *f64) ?usize {
+    var i = i_in;
+    const neg = i < t.len and t[i] == '-';
+    if (neg) i += 1;
+    if (i >= t.len) return null;
+    var m: u64 = 0;
+    var digits: u32 = 0;
+    if (t[i] == '0') {
+        i += 1;
+        digits = 1;
+    } else if (t[i] >= '1' and t[i] <= '9') {
+        const n = digitRun(t, i, &m);
+        i += n;
+        digits = n;
+    } else return null;
+    var frac_digits: i32 = 0;
+    var is_float = false;
+    if (i < t.len and t[i] == '.') {
+        is_float = true;
+        i += 1;
+        var f: u64 = 0;
+        const n = digitRun(t, i, &f);
+        if (n == 0) return null;
+        if (digits + n > 15) return null;
+        m = m * pow10_u64[n] + f;
+        i += n;
+        digits += n;
+        frac_digits = @intCast(n);
+    }
+    var exp: i32 = 0;
+    if (i < t.len and (t[i] == 'e' or t[i] == 'E')) {
+        is_float = true;
+        i += 1;
+        var exp_neg = false;
+        if (i < t.len and (t[i] == '+' or t[i] == '-')) {
+            exp_neg = t[i] == '-';
+            i += 1;
+        }
+        const start = i;
+        while (i < t.len and t[i] >= '0' and t[i] <= '9') : (i += 1) {
+            if (i - start >= 4) return null;
+            exp = exp * 10 + (t[i] - '0');
+        }
+        if (i == start) return null;
+        if (exp_neg) exp = -exp;
+    }
+    if (digits > 15) return null;
+    if (!is_float) {
+        const v: i64 = @intCast(m);
+        out.* = @floatFromInt(if (neg) -v else v);
+        return i;
+    }
+    const e10 = exp - frac_digits;
+    if (e10 < -22 or e10 > 22) return null;
+    const mf: f64 = @floatFromInt(m);
+    const v = if (e10 >= 0) mf * exact_pow10[@intCast(e10)] else mf / exact_pow10[@intCast(-e10)];
+    out.* = if (neg) -v else v;
+    return i;
+}
+
+/// One `{"lat":n,"lon":n}` (either order, whitespace allowed) at t[i..].
+fn parsePoint(t: []const u8, i_in: usize, out: *[2]f64) ?usize {
+    var i = skipWs(t, i_in);
+    if (i >= t.len or t[i] != '{') return null;
+    var seen: [2]bool = .{ false, false };
+    for (0..2) |k| {
+        i = skipWs(t, i + 1);
+        if (i + 5 > t.len or t[i] != '"') return null;
+        const which: usize = if (std.mem.eql(u8, t[i..][0..5], "\"lat\"")) 0 else if (std.mem.eql(u8, t[i..][0..5], "\"lon\"")) 1 else return null;
+        if (seen[which]) return null;
+        seen[which] = true;
+        i = skipWs(t, i + 5);
+        if (i >= t.len or t[i] != ':') return null;
+        i = parseNumber(t, skipWs(t, i + 1), &out[which]) orelse return null;
+        i = skipWs(t, i);
+        if (i >= t.len or t[i] != (if (k == 0) @as(u8, ',') else '}')) return null;
+    }
+    return i + 1;
+}
+
+/// Finds the document's one top-level "shape" member and parses it when it
+/// is a non-empty array of plain points with valid latitudes; null for
+/// anything else (the general parser then handles the whole document).
+fn fastShape(arena: Allocator, t: []const u8) Allocator.Error!?FastShape {
+    var i = skipWs(t, 0);
+    if (i >= t.len or t[i] != '{') return null;
+    i = skipWs(t, i + 1);
+    var span: ?[2]usize = null;
+    while (i < t.len and t[i] == '"') {
+        const key_end = skipString(t, i) orelse return null;
+        const key = t[i + 1 .. key_end - 1];
+        if (std.mem.indexOfScalar(u8, key, '\\') != null) return null;
+        i = skipWs(t, key_end);
+        if (i >= t.len or t[i] != ':') return null;
+        i = skipWs(t, i + 1);
+        const end = skipValue(t, i) orelse return null;
+        if (std.mem.eql(u8, key, "shape")) {
+            if (span != null) return null; // duplicate keys: the general parser's rule decides
+            span = .{ i, end };
+        }
+        i = skipWs(t, end);
+        if (i < t.len and t[i] == ',') {
+            i = skipWs(t, i + 1);
+            continue;
+        }
+        break;
+    }
+    const s = span orelse return null;
+    if (t[s[0]] != '[') return null;
+
+    var points: std.ArrayList([2]f64) = .empty;
+    try points.ensureTotalCapacity(arena, (s[1] - s[0]) / 24 + 1);
+    var j = skipWs(t, s[0] + 1);
+    if (j < t.len and t[j] == ']') return null; // empty: nothing to gain
+    while (true) {
+        var p: [2]f64 = undefined;
+        j = parsePoint(t, j, &p) orelse return null;
+        if (p[0] < -90.0 or p[0] > 90.0) return null;
+        try points.append(arena, p);
+        j = skipWs(t, j);
+        if (j >= t.len) return null;
+        if (t[j] == ']') break;
+        if (t[j] != ',') return null;
+        j += 1;
+    }
+    if (j + 1 != s[1]) return null;
+
+    const rest = try arena.alloc(u8, t.len - (s[1] - s[0]) + 2);
+    @memcpy(rest[0..s[0]], t[0..s[0]]);
+    rest[s[0]] = '[';
+    rest[s[0] + 1] = ']';
+    @memcpy(rest[s[0] + 2 ..], t[s[1]..]);
+    return .{ .rest = rest, .points = points.items };
 }
 
 pub const QueryParam = struct { key: []const u8, value: []const u8 };
@@ -191,12 +468,21 @@ fn circularClamp(value: f64, lower: f64, upper: f64) f64 {
     const i = upper - lower;
     if (value < lower) {
         var d = lower - value;
-        d -= @as(f64, @floatFromInt(@as(i32, @intFromFloat(d / i)))) * i;
+        d -= @as(f64, @floatFromInt(truncI32(d / i))) * i;
         return upper - d;
     }
     var d = value - upper;
-    d -= @as(f64, @floatFromInt(@as(i32, @intFromFloat(d / i)))) * i;
+    d -= @as(f64, @floatFromInt(truncI32(d / i))) * i;
     return lower + d;
+}
+
+/// `static_cast<int>(x)` as compiled for x86-64 (cvttsd2si): truncation, and
+/// INT_MIN for NaN or anything out of range. In C++ the out-of-range cast is
+/// undefined; this is what production's x86-64 build does with it, so a
+/// request with `"lon": 1e400` gets upstream's answer instead of a crash.
+fn truncI32(x: f64) i32 {
+    if (!(x > -2147483649.0 and x < 2147483648.0)) return std.math.minInt(i32);
+    return @intFromFloat(x);
 }
 
 /// `from_json` for the fields in scope.
@@ -550,4 +836,132 @@ test "longitude wraps like circular_range_clamp" {
     try testing.expectApproxEqAbs(@as(f64, -170), circularClamp(190, -180, 180), 1e-9);
     try testing.expectApproxEqAbs(@as(f64, 170), circularClamp(-190, -180, 180), 1e-9);
     try testing.expectEqual(@as(f64, 10), circularClamp(10, -180, 180));
+}
+
+/// Whether two parse results are the same in every field a handler reads.
+pub fn resultsEqual(x: Result, y: Result) bool {
+    switch (x) {
+        .failure => |f| return y == .failure and y.failure.code == f.code,
+        .ok => |a| {
+            if (y != .ok) return false;
+            const b = y.ok;
+            if (a.action != b.action or a.format != b.format or a.units != b.units or a.directions_type != b.directions_type or
+                a.costing != b.costing or a.shape_format != b.shape_format or a.range != b.range or
+                a.height_precision != b.height_precision or a.verbose != b.verbose) return false;
+            if (!std.meta.eql(a.resample_distance, b.resample_distance)) return false;
+            if ((a.id == null) != (b.id == null) or (a.id != null and !std.mem.eql(u8, a.id.?, b.id.?))) return false;
+            if ((a.encoded_polyline == null) != (b.encoded_polyline == null)) return false;
+            if (!std.mem.eql(u16, a.warnings.items, b.warnings.items)) return false;
+            if (a.shape.len != b.shape.len or a.locations.len != b.locations.len) return false;
+            for (a.shape, b.shape) |p, q| if (!std.meta.eql(p, q)) return false;
+            return true;
+        },
+    }
+}
+
+test "huge and infinite longitudes clamp like upstream's x86-64 build instead of crashing" {
+    try testing.expectEqual(@as(f64, -170), circularClamp(190, -180, 180));
+    try testing.expectEqual(@as(f64, 170), circularClamp(-190, -180, 180));
+    // inf / 360 casts to INT_MIN, and inf - (INT_MIN * 360) stays inf.
+    try testing.expect(std.math.isPositiveInf(circularClamp(std.math.inf(f64), -180, 180)));
+    try testing.expect(std.math.isNegativeInf(circularClamp(-std.math.inf(f64), -180, 180)));
+    try testing.expect(std.math.isNan(circularClamp(std.math.nan(f64), -180, 180)));
+    _ = circularClamp(1e300, -180, 180);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    _ = try parseHttp(arena_state.allocator(), "/height", &.{}, "{\"shape\":[{\"lat\":1,\"lon\":1e400}]}");
+}
+
+test "the /height shape fast path parses exactly like the general parser" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var prng = std.Random.DefaultPrng.init(17);
+    const random = prng.random();
+    var fast_taken: usize = 0;
+    var doc: std.ArrayList(u8) = .empty;
+    for (0..4000) |round| {
+        _ = arena_state.reset(.retain_capacity);
+        doc = .empty;
+        const ws = [_][]const u8{ "", " ", "\n\t", "  \r\n" };
+        const sp = ws[random.uintLessThan(usize, ws.len)];
+        try doc.print(a, "{{{s}", .{sp});
+        // Optional members before the shape.
+        if (random.boolean()) try doc.print(a, "\"range\":{s},{s}", .{ if (random.boolean()) "true" else "false", sp });
+        if (random.uintLessThan(u8, 8) == 0) try doc.print(a, "\"encoded_polyline\":\"_p~iF~ps|U\",", .{});
+        if (random.uintLessThan(u8, 10) == 0) try doc.print(a, "\"shape\":[{{\"lat\":1,\"lon\":2}}],", .{}); // duplicate key
+        if (random.uintLessThan(u8, 12) == 0) try doc.print(a, "\"sh\\u0061pe\":[],", .{}); // escaped key
+        try doc.print(a, "\"shape\"{s}:{s}[", .{ sp, sp });
+        const n = 1 + random.uintLessThan(usize, 40);
+        for (0..n) |k| {
+            if (k > 0) try doc.print(a, ",{s}", .{sp});
+            const lat = random.float(f64) * 180 - 90;
+            const lon = random.float(f64) * 400 - 200; // some wrap
+            var lat_s: []const u8 = try std.fmt.allocPrint(a, "{d:.6}", .{lat});
+            var lon_s: []const u8 = try std.fmt.allocPrint(a, "{d:.5}", .{lon});
+            switch (random.uintLessThan(u16, 600)) {
+                0 => lat_s = "-0",
+                1 => lat_s = "-0.0",
+                2 => lon_s = "1.5e2",
+                3 => lon_s = "-12E-1",
+                4 => lat_s = "91",
+                5 => lat_s = "\"45.5\"", // numeric string: general parser only
+                6 => lon_s = "0.12345678901234567", // too many digits
+                7 => lat_s = "01", // not JSON
+                8 => lon_s = "1e400",
+                9 => lat_s = "45",
+                10 => lon_s = "-180.000000",
+                else => {},
+            }
+            if (random.uintLessThan(u8, 30) == 0) {
+                try doc.print(a, "{{\"lat\":{s},\"lon\":{s},\"type\":\"via\"}}", .{ lat_s, lon_s });
+            } else if (random.boolean()) {
+                try doc.print(a, "{{{s}\"lat\"{s}:{s}{s}{s},\"lon\":{s}{s}}}", .{ sp, sp, sp, lat_s, sp, lon_s, sp });
+            } else {
+                try doc.print(a, "{{\"lon\":{s},{s}\"lat\":{s}}}", .{ lon_s, sp, lat_s });
+            }
+        }
+        try doc.print(a, "]{s}", .{sp});
+        if (random.boolean()) try doc.print(a, ",\"height_precision\":{d},\"id\":\"r{d}\"", .{ random.uintLessThan(u8, 4), round });
+        if (random.uintLessThan(u8, 6) == 0) try doc.print(a, ",\"resample_distance\":{d}", .{random.uintLessThan(u16, 100)});
+        try doc.print(a, "}}{s}", .{sp});
+        if (random.uintLessThan(u8, 20) == 0) doc.items.len -= 3; // truncated document
+        const padded = try std.fmt.allocPrint(a, "{s}{s}", .{ doc.items, &@as([128]u8, @splat(' ')) }); // over the fast path's size floor
+        const via_query = random.uintLessThan(u8, 5) == 0;
+        const q: []const QueryParam = if (via_query) &.{.{ .key = "json", .value = padded }} else &.{};
+        const body = if (via_query) "" else padded;
+        const fast = try parseHttp(a, "/height", q, body);
+        const ref = try parseHttpReference(a, "/height", q, body);
+        if (!resultsEqual(fast, ref)) {
+            std.debug.print("differs on: {s}\n", .{padded});
+            return error.TestUnexpectedResult;
+        }
+        if (fastShape(a, padded) catch null) |_| fast_taken += 1;
+    }
+    // The generator mostly produces plain shapes, so the fast path is exercised.
+    try testing.expect(fast_taken > 1000);
+}
+
+test "digit runs: SWAR and byte-at-a-time agree" {
+    var prng = std.Random.DefaultPrng.init(8);
+    const random = prng.random();
+    var buf: [40]u8 = undefined;
+    for (0..200_000) |_| {
+        const len = random.uintLessThan(usize, 24);
+        for (buf[0..len]) |*c| c.* = '0' + random.uintLessThan(u8, 10);
+        const tail = [_]u8{ '.', 'e', ',', '}', ' ', '/', ':', 0, 0xff };
+        const extra = random.uintLessThan(usize, 12);
+        for (buf[len..][0..extra]) |*c| c.* = tail[random.uintLessThan(usize, tail.len)];
+        const text = buf[0 .. len + extra];
+        var got: u64 = 0;
+        const n = digitRun(text, 0, &got);
+        // Reference: count digits up to 16 and value of the first min(len,16)... runs past 15 are rejected by callers.
+        var want: u64 = 0;
+        var k: u32 = 0;
+        while (k < len and k < 16) : (k += 1) want = want *% 10 +% (text[k] - '0');
+        if (len < 16) {
+            try testing.expectEqual(@as(u32, @intCast(len)), n);
+            try testing.expectEqual(want, got);
+        } else try testing.expect(n >= 16);
+    }
 }

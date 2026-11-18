@@ -1,0 +1,109 @@
+Thread;start;main;main.main;main.main 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn 18
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp 5
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.json_writer.dtoa 1107
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.json_writer.dtoa;_platform_memmove 36
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.json_writer.dtoa;DYLD-STUB$$memcpy 16
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.height_action.handle 185
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.height_action.handle;elevation.root.Source.getAll 6
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.height_action.handle;geo.point.PointLL.distance 10
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;elevation.root.Source.getAll;elevation.hgt.interpolate 285
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;elevation.root.Source.getAll;elevation.root.Source.getAll 144
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;geo.point.PointLL.distance 12
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;geo.point.PointLL.distance;cos 52
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;geo.point.PointLL.distance;geo.point.PointLL.distance 49
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;geo.point.PointLL.distance;geo.point.PointLL.distance;[unknown] 69
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;geo.point.PointLL.distance;sin 23
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;geo.point.PointLL.distance;geo.libm.load 51
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;asin 19
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;geo.libm.load 14
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;_platform_memmove 128
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;DYLD-STUB$$memcpy 27
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.height_action.writeWithPrecision 16
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.height_action.writeWithPrecision;api.height_action.writeWithPrecision 56
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.height_action.writeWithPrecision;api.height_action.writeWithPrecision;api.json_writer.Writer.prefix 13
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.height_action.writeWithPrecision;api.json_writer.Writer.prefix 27
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.height_action.writeWithPrecision;_platform_memmove 19
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.height_action.writeWithPrecision;DYLD-STUB$$memcpy 5
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.json_writer.Writer.beginArray 9
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.json_writer.Writer.beginArray;api.json_writer.Writer.beginArray;api.json_writer.Writer.prefix 8
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.json_writer.Writer.beginArray;api.json_writer.Writer.prefix 14
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.json_writer.writeString 12
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.json_writer.writeString;_platform_memmove 2
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.json_writer.Writer.key 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.json_writer.Writer.key;api.json_writer.writeString 2
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.json_writer.Writer.key;api.json_writer.writeString;_platform_memmove 4
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.json_writer.Writer.key;api.json_writer.Writer.prefix 3
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.json_writer.Writer.beginObject 3
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.json_writer.Writer.beginObject;api.json_writer.Writer.prefix 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.json_writer.Writer.beginObject;infra.arena.Arena.vAlloc 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.height_action.handle;api.json_writer.Writer.prefix 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.json_writer.dtoa 20
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.service.Service.handleHttp;api.height_action.handle 4
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.json_writer.Writer.beginArray 3
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;infra.arena.Arena.vAlloc 2
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith 1802
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.parse 7
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.parse;json.Scanner.nextAllocMax 15
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.parse;json.Scanner.nextAllocMax;json.Scanner.next 64
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.parse;json.Scanner.nextAllocMax;json.Scanner.next;BitStack.push 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.parse;json.Scanner.nextAllocMax;json.Scanner.next;BitStack.push;_platform_memmove 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.parse;json.Scanner.nextAllocMax;_platform_memmove 6
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.parse;json.Scanner.nextAllocMax;infra.arena.Arena.vRemap 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.parse;infra.arena.Arena.vAlloc 2
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.parse;json.dynamic.handleCompleteValue__anon_54236 3
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.parse;json.dynamic.handleCompleteValue__anon_54236;array_hash_map.Custom([]const u8,json.dynamic.Value,array_hash_map.StringContext,true).getOrPutContext 3
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.parse;json.dynamic.handleCompleteValue__anon_54236;array_hash_map.Custom([]const u8,json.dynamic.Value,array_hash_map.StringContext,true).getOrPutContext;multi_array_list.MultiArrayList(array_hash_map.Custom([]const u8,json.dynamic.Value,array_hash_map.StringContext,true).Data).ensureTotalCapacity;infra.arena.Arena.vAlloc 2
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.parse;json.dynamic.handleCompleteValue__anon_54236;array_hash_map.Custom([]const u8,json.dynamic.Value,array_hash_map.StringContext,true).getOrPutContext;hash.wyhash.Wyhash.hash 3
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.parse;json.dynamic.handleCompleteValue__anon_54236;json.Scanner.nextAllocMax 3
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.parse;json.dynamic.handleCompleteValue__anon_54236;json.Scanner.nextAllocMax;infra.arena.Arena.vRemap 2
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.parse;json.dynamic.handleCompleteValue__anon_54236;json.Scanner.nextAllocMax;DYLD-STUB$$memcpy 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.parse;json.dynamic.handleCompleteValue__anon_54236;json.Scanner.nextAllocMax;json.Scanner.next 5
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.parse;json.dynamic.handleCompleteValue__anon_54236;json.Scanner.next 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.parse;fmt.parse_float.parseFloat__anon_3155 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.parse;infra.arena.Arena.vFree 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;fmt.parse_float.parseFloat__anon_3155 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;geo.polyline.Decoder(.polyline).readVarint 76
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;_platform_memmove 29
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.getOptional__anon_25456 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.getOptional__anon_25456;api.json.getOptional__anon_25456;api.json.pointer 9
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.getOptional__anon_25456;api.json.pointer 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.getOptional__anon_25456;api.json.pointer;array_hash_map.Custom([]const u8,json.dynamic.Value,array_hash_map.StringContext,true).getIndexAdapted__anon_25691 4
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.getOptional__anon_25456;api.json.pointer;array_hash_map.Custom([]const u8,json.dynamic.Value,array_hash_map.StringContext,true).getIndexAdapted__anon_25691;hash.wyhash.Wyhash.hash 2
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.pointer;array_hash_map.Custom([]const u8,json.dynamic.Value,array_hash_map.StringContext,true).getIndexAdapted__anon_25691 6
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.pointer;array_hash_map.Custom([]const u8,json.dynamic.Value,array_hash_map.StringContext,true).getIndexAdapted__anon_25691;hash.wyhash.Wyhash.hash 7
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.pointer;api.json.pointer 3
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.request.parseHttpWith;api.json.pointer 24
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.request.parseHttpWith;mem.eql__anon_2664 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;array_hash_map.Custom([]const u8,json.dynamic.Value,array_hash_map.StringContext,true).getIndexAdapted__anon_25691 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.request.parseLocations;api.json.pointer;array_hash_map.Custom([]const u8,json.dynamic.Value,array_hash_map.StringContext,true).getIndexAdapted__anon_25691 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.request.parseLocations;api.json.pointer;array_hash_map.Custom([]const u8,json.dynamic.Value,array_hash_map.StringContext,true).getIndexAdapted__anon_25691;hash.wyhash.Wyhash.hash 3
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.request.parseLocations;api.request.parseLocations 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.request.parseLocations;api.request.parseLocations;api.json.pointer 2
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.getOptional__anon_25203;api.json.getOptional__anon_25203;api.json.pointer 2
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.getOptional__anon_25203;api.json.pointer;array_hash_map.Custom([]const u8,json.dynamic.Value,array_hash_map.StringContext,true).getIndexAdapted__anon_25691 2
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.getOptional__anon_25516;api.json.getOptional__anon_25516;api.json.pointer 5
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.getOptional__anon_25516;api.json.pointer;array_hash_map.Custom([]const u8,json.dynamic.Value,array_hash_map.StringContext,true).getIndexAdapted__anon_25691 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;api.json.getOptional__anon_25516;api.json.pointer;array_hash_map.Custom([]const u8,json.dynamic.Value,array_hash_map.StringContext,true).getIndexAdapted__anon_25691;hash.wyhash.Wyhash.hash 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;mem.Allocator.alloc__anon_4022 3
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;DYLD-STUB$$memcpy 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.request.parseHttpWith;infra.arena.Arena.vAlloc 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;api.service.Service.handleHttp;api.json.getOptional__anon_25456 3
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn 16
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;server.http.Worker.queue 3
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;server.http.Worker.queue;writev 733
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;server.http.Worker.queue;DYLD-STUB$$writev 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;server.http.Worker.queue;infra.io.checkSize 2
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;read 388
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;server.http.writeHead 8
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;server.http.writeHead;_platform_memmove 4
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;server.http.writeHead;DYLD-STUB$$memcpy 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;_platform_memmove 2
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;DYLD-STUB$$memcpy 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;clock_gettime 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;clock_gettime;clock_gettime_nsec_np;mach_absolute_time 8
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;clock_gettime;clock_gettime_nsec_np;mach_timebase_info 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;DYLD-STUB$$clock_gettime 1
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;fmt.parseInt__anon_3136 2
+Thread;thread_start;_pthread_start;Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn;infra.arena.Arena.vAlloc 1
+Thread;thread_start;_pthread_start;[unknown];Thread.PosixThreadImpl.spawn__anon_23212.Instance.entryFn 6

@@ -1,0 +1,10 @@
+{
+  "corpus": "bench/corpora/height.utrecht.tsv",
+  "elevation": "oracle/data/utrecht/elevation",
+  "unit": "ns per point, ReleaseFast, Apple M3 Pro class",
+  "note": "zig build perf fails when a stage exceeds its budget. Before P2.05 the corpus cost parse 157, sample 13, serialize 57 (227 total); budgets leave room for a loaded machine, not for a regression to that.",
+  "parse": 90,
+  "sample": 40,
+  "serialize": 75,
+  "total": 180
+}

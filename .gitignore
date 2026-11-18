@@ -45,3 +45,6 @@ bench/corpora/.upstream/
 
 # Inputs saved by scripts/fuzz.sh
 fuzz-crashers/
+
+# Benchmark runs (zr bench output)
+bench/results/

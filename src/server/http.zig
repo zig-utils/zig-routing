@@ -456,6 +456,9 @@ const Worker = struct {
             if (n == 0) return false;
             conn.in.items.len += n;
             if (conn.in.items.len > cap) return true;
+            // A short read drained the socket: skip the read that would only
+            // return EAGAIN. Anything arriving later wakes the re-armed poller.
+            if (n < room.len) return true;
         }
     }
 
