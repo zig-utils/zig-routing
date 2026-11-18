@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A hand-written fixture covering every construct the reader handles, in osmium order
+     (negative ids first by absolute value). -->
+<osm version="0.6" generator="zig-routing fixture">
+  <bounds minlat="47.0" minlon="9.0" maxlat="47.2" maxlon="9.6"/>
+  <node id="-1" lat="47.1" lon="9.5"/>
+  <node id="-3" lat="47.1000001" lon="-0.12345675" version="2" timestamp="2026-01-01T00:00:00Z"/>
+  <node id="5" lat="-33.8688197" lon="151.2092955">
+    <tag k="name" v="Caf&#xE9; &amp; &quot;Bar&quot; &lt;1&gt; &#8364;"/>
+    <tag k="amenity" v="yes"/>
+  </node>
+  <node id="6" lat="0" lon="0" visible="true"></node>
+  <way id="10">
+    <nd ref="-3"/>
+    <nd ref="-1"/>
+    <nd ref="5"/>
+    <nd ref="-3"/>
+    <tag k="highway" v="footway"/>
+  </way>
+  <way id="11"/>
+  <relation id="20">
+    <member type="way" ref="10" role="from"/>
+    <member type="node" ref="5" role="via"/>
+    <member type="way" ref="11"/>
+    <tag k="type" v="restriction"/>
+    <tag k="restriction" v="no_left_turn"/>
+  </relation>
+</osm>
