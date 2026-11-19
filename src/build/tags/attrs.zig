@@ -1,7 +1,7 @@
 // Ported from valhalla/mjolnir/osmway.h and valhalla/mjolnir/osmnode.h
 // (Valhalla 3.9.3). Name and sign refs borrow source strings until interning.
 
-const attr = @import("../../graph/attributes.zig");
+const attr = @import("../../graph/constants.zig");
 
 pub const Names = struct {
     name: ?[]const u8 = null,
@@ -34,11 +34,21 @@ pub const WayAttrs = struct {
     flags: Flags = .{},
     names: Names = .{},
 
+    /// Ferry flags override the parsed use when constructing directed edges.
+    pub fn edgeUse(self: WayAttrs) attr.Use {
+        if (self.use != .construction) {
+            if (self.flags.rail) return .rail_ferry;
+            if (self.flags.ferry) return .ferry;
+        }
+        return self.use;
+    }
+
     pub const Flags = packed struct(u32) {
         oneway: bool = false,
         oneway_reverse: bool = false,
         roundabout: bool = false,
         link: bool = false,
+        /// Explicit candidate before graph-level turn channel inference.
         turn_channel: bool = false,
         ferry: bool = false,
         rail: bool = false,
@@ -62,7 +72,8 @@ pub const WayAttrs = struct {
         shoulder_left: bool = false,
         shoulder_right: bool = false,
         tagged_internal_intersection: bool = false,
-        reserved: u5 = 0,
+        destination_only_hgv: bool = false,
+        reserved: u4 = 0,
     };
 };
 

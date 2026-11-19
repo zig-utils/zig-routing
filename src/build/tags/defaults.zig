@@ -1,7 +1,7 @@
 // Ported from lua/graph.lua, lines 5-396 and 699-790 (Valhalla 3.9.3).
 
 const std = @import("std");
-const attr = @import("../../graph/attributes.zig");
+const attr = @import("../../graph/constants.zig");
 const io = @import("../../infra/io.zig");
 const table = @import("table.zig");
 const Value = table.Value;
@@ -70,6 +70,8 @@ pub const Boolean = enum {
     cycleway,
     moped,
     oneway,
+    private,
+    no_thru_traffic,
 };
 
 fn known(value: Value, comptime yes: []const Value, comptime no: []const Value) ?bool {
@@ -98,6 +100,8 @@ pub fn single(kind: Boolean, value: ?Value) ?bool {
         .cycleway => known(v, &(bike_allowed ++ .{ .cyclestreet, .crossing }), &.{}),
         .moped => known(v, &.{ .yes, .designated, .private, .permissive, .destination, .delivery, .dismount, .permit, .residents }, &.{ .no, .unknown, .agricultural }),
         .oneway => known(v, &.{ .@"-1", .yes, .true, .@"1" }, &.{ .no, .false, .reversible, .alternating }),
+        .private => known(v, &.{ .private, .destination, .customers, .delivery, .permit, .residents }, &.{}),
+        .no_thru_traffic => known(v, &.{ .destination, .customers, .delivery, .permit, .residents }, &.{}),
     };
 }
 

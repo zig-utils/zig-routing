@@ -3,7 +3,7 @@
 // The rule families that follow the filter refine output attributes.
 
 const std = @import("std");
-const attr = @import("../../graph/attributes.zig");
+const attr = @import("../../graph/constants.zig");
 const io = @import("../../infra/io.zig");
 const defaults = @import("defaults.zig");
 const table = @import("table.zig");
@@ -75,6 +75,11 @@ const Flags = struct {
         }
         return false;
     }
+
+    fn otherModesDenied(self: Flags) bool {
+        return self.auto == .deny and self.truck == .deny and self.bus == .deny and
+            self.bicycle == .deny and self.moped == .deny and self.motorcycle == .deny;
+    }
 };
 
 pub const Selection = struct {
@@ -87,6 +92,8 @@ pub const Selection = struct {
     oneway_reverse: bool,
     roundabout: bool,
     pedestrian_area: bool,
+    bicycle_only: bool,
+    other_modes_denied: bool,
 };
 
 fn any(tags: *const Scratch, kind: defaults.Boolean, key: Key, deadline: io.Deadline) !?bool {
@@ -359,10 +366,13 @@ pub fn select(tags: *const Scratch, deadline: io.Deadline) !?Selection {
         .forward = forward.mask(),
         .backward = backward.mask(),
         .ferry = ferry,
-        .rail = rail,
+        .rail = forward.auto == .allow and (rail or tags.id(.railway) == .rail),
         .oneway = is_oneway,
         .oneway_reverse = reverse,
         .roundabout = roundabout,
         .pedestrian_area = area,
+        .bicycle_only = forward.pedestrian == .deny and forward.auto == .deny and
+            backward.auto == .deny and (forward.bicycle == .allow or backward.bicycle == .allow),
+        .other_modes_denied = forward.otherModesDenied() and backward.otherModesDenied(),
     };
 }

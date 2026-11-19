@@ -2,7 +2,7 @@
 
 const std = @import("std");
 
-pub const attributes = @import("attributes.zig");
+pub const constants = @import("constants.zig");
 
 test {
     std.testing.refAllDecls(@This());

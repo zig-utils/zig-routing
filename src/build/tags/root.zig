@@ -5,6 +5,7 @@ const io = @import("../../infra/io.zig");
 const pbf = @import("../pbf/root.zig");
 const osm = @import("../osm.zig");
 const attrs = @import("attrs.zig");
+const highway = @import("highway.zig");
 const selection = @import("selection.zig");
 
 pub const table = @import("table.zig");
@@ -19,7 +20,7 @@ pub fn transformWay(scratch: *Scratch, tags: anytype, deadline: io.Deadline) !?W
     try scratch.load(tags, deadline);
     const selected = try selection.select(scratch, deadline) orelse return null;
     const base_speed = defaults.speed(selected.road_class);
-    return .{
+    var result: WayAttrs = .{
         .road_class = selected.road_class,
         .forward_access = selected.forward,
         .backward_access = selected.backward,
@@ -31,7 +32,6 @@ pub fn transformWay(scratch: *Scratch, tags: anytype, deadline: io.Deadline) !?W
             .ferry = selected.ferry,
             .rail = selected.rail,
             .pedestrian_area = selected.pedestrian_area,
-            .tagged_internal_intersection = scratch.id(.junction) == .intersection,
         },
         .names = .{
             .name = scratch.text(.name),
@@ -48,6 +48,8 @@ pub fn transformWay(scratch: *Scratch, tags: anytype, deadline: io.Deadline) !?W
             .junction_name = scratch.text(.junction_name),
         },
     };
+    try highway.classify(scratch, selected, deadline, &result);
+    return result;
 }
 
 /// nodes_proc returns keep even for untagged nodes. The node usage pass
@@ -134,4 +136,141 @@ test "tag scratch reuse, name refs, duplicate keys and node retention" {
     try testing.expectEqual(.street_intersection, untagged.type);
     try testing.expect(untagged.access.pedestrian);
     try testing.expectError(error.DeadlineExceeded, transformWay(&scratch, way, .{ .at_ns = 0 }));
+}
+
+test "classification covers every highway in the Valhalla default table" {
+    const testing = std.testing;
+    const constants = @import("../../graph/constants.zig");
+    const cases = [_]struct {
+        highway: []const u8,
+        class: ?constants.RoadClass = .service_other,
+        use: constants.Use = .road,
+        surface: constants.Surface = .paved_smooth,
+        link: bool = false,
+    }{
+        .{ .highway = "motorway", .class = .motorway },
+        .{ .highway = "motorway_link", .class = .motorway, .link = true },
+        .{ .highway = "trunk", .class = .trunk },
+        .{ .highway = "trunk_link", .class = .trunk, .link = true },
+        .{ .highway = "primary", .class = .primary },
+        .{ .highway = "primary_link", .class = .primary, .link = true },
+        .{ .highway = "secondary", .class = .secondary },
+        .{ .highway = "secondary_link", .class = .secondary, .link = true },
+        .{ .highway = "tertiary", .class = .tertiary },
+        .{ .highway = "tertiary_link", .class = .tertiary, .link = true },
+        .{ .highway = "residential", .class = .residential },
+        .{ .highway = "residential_link", .class = .residential, .link = true },
+        .{ .highway = "unclassified", .class = .unclassified },
+        .{ .highway = "road" },
+        .{ .highway = "service", .use = .service_road },
+        .{ .highway = "track", .use = .track, .surface = .dirt },
+        .{ .highway = "living_street", .use = .living_street },
+        .{ .highway = "undefined", .class = null },
+        .{ .highway = "unknown", .class = null },
+        .{ .highway = "ladder", .use = .ladder, .surface = .paved },
+        .{ .highway = "footway", .use = .footway, .surface = .compacted },
+        .{ .highway = "pedestrian", .use = .pedestrian, .surface = .compacted },
+        .{ .highway = "steps", .use = .steps, .surface = .paved },
+        .{ .highway = "bridleway", .use = .bridleway, .surface = .compacted },
+        .{ .highway = "cycleway", .use = .cycleway, .surface = .paved },
+        .{ .highway = "path", .use = .path, .surface = .compacted },
+        .{ .highway = "bus_guideway" },
+        .{ .highway = "busway" },
+        .{ .highway = "corridor", .use = .pedestrian, .surface = .compacted },
+        .{ .highway = "elevator", .use = .elevator, .surface = .paved },
+        .{ .highway = "platform", .use = .platform, .surface = .paved },
+        .{ .highway = "via_ferrata", .use = .pedestrian, .surface = .path },
+    };
+    var scratch: Scratch = .{};
+    for (cases) |case| {
+        const input: []const osm.Tag = &.{.{ .key = "highway", .value = case.highway }};
+        const result = try transformWay(&scratch, input, .none);
+        if (case.class) |class| {
+            const way = result orelse return error.UnexpectedWayDrop;
+            try testing.expectEqual(class, way.road_class);
+            try testing.expectEqual(case.use, way.use);
+            try testing.expectEqual(case.surface, way.surface);
+            try testing.expectEqual(case.link, way.flags.link);
+        } else {
+            try testing.expectEqual(null, result);
+        }
+    }
+}
+
+test "way surfaces preserve precedence, case folding and defaults" {
+    const testing = std.testing;
+    const constants = @import("../../graph/constants.zig");
+    const cases = [_]struct { tags: []const osm.Tag, surface: constants.Surface }{
+        .{ .tags = &.{.{ .key = "surface", .value = "AsPhaLt;UnPaved" }}, .surface = .gravel },
+        .{ .tags = &.{.{ .key = "surface", .value = "CONCRETE:PLATES" }}, .surface = .paved_smooth },
+        .{ .tags = &.{.{ .key = "surface", .value = "grass_paver" }}, .surface = .paved },
+        .{ .tags = &.{.{ .key = "surface", .value = "Stone" }}, .surface = .paved_rough },
+        .{ .tags = &.{.{ .key = "surface", .value = "pebblestone" }}, .surface = .gravel },
+        .{ .tags = &.{.{ .key = "surface", .value = "boardwalk" }}, .surface = .compacted },
+        .{ .tags = &.{.{ .key = "surface", .value = "laterite" }}, .surface = .dirt },
+        .{ .tags = &.{.{ .key = "surface", .value = "stepping_stones" }}, .surface = .path },
+        .{ .tags = &.{ .{ .key = "surface", .value = "unknown" }, .{ .key = "tracktype", .value = "grade1" } }, .surface = .compacted },
+        .{ .tags = &.{ .{ .key = "tracktype", .value = "foo" }, .{ .key = "smoothness", .value = "good" } }, .surface = .compacted },
+        .{ .tags = &.{ .{ .key = "tracktype", .value = "grade1" }, .{ .key = "smoothness", .value = "good" } }, .surface = .paved_rough },
+        .{ .tags = &.{.{ .key = "tracktype", .value = "grade2" }}, .surface = .compacted },
+        .{ .tags = &.{.{ .key = "tracktype", .value = "grade3" }}, .surface = .dirt },
+        .{ .tags = &.{.{ .key = "tracktype", .value = "grade4" }}, .surface = .gravel },
+        .{ .tags = &.{.{ .key = "tracktype", .value = "grade5" }}, .surface = .path },
+        .{ .tags = &.{.{ .key = "smoothness", .value = "impassable" }}, .surface = .impassable },
+        .{ .tags = &.{.{ .key = "sac_scale", .value = "hiking" }}, .surface = .path },
+        .{ .tags = &.{ .{ .key = "surface", .value = "cobblestone" }, .{ .key = "mtb:scale", .value = "+1+" } }, .surface = .gravel },
+        .{ .tags = &.{ .{ .key = "mtb:scale", .value = "-1" }, .{ .key = "mtb:scale:uphill", .value = "5" } }, .surface = .compacted },
+        .{ .tags = &.{.{ .key = "mtb:scale:uphill", .value = "5" }}, .surface = .path },
+    };
+    var scratch: Scratch = .{};
+    for (cases) |case| {
+        var input: [4]osm.Tag = undefined;
+        input[0] = .{ .key = "highway", .value = "path" };
+        @memcpy(input[1..][0..case.tags.len], case.tags);
+        const way = (try transformWay(&scratch, input[0 .. case.tags.len + 1], .none)).?;
+        try testing.expectEqual(case.surface, way.surface);
+    }
+}
+
+test "transport uses, service priorities and classification flags" {
+    const testing = std.testing;
+    var scratch: Scratch = .{};
+    const service: []const osm.Tag = &.{
+        .{ .key = "highway", .value = "service" },
+        .{ .key = "service", .value = "drive-through" },
+        .{ .key = "bridge", .value = "1" },
+        .{ .key = "tunnel", .value = "building_passage" },
+        .{ .key = "junction", .value = "intersection" },
+        .{ .key = "turn_channel", .value = "true" },
+    };
+    const way = (try transformWay(&scratch, service, .none)).?;
+    try testing.expectEqual(.drive_through, way.use);
+    try testing.expect(way.flags.destination_only and way.flags.destination_only_hgv);
+    try testing.expect(way.flags.bridge and way.flags.tunnel);
+    try testing.expect(way.flags.tagged_internal_intersection and way.flags.turn_channel);
+    try testing.expect(!way.flags.no_thru_traffic);
+
+    const thru: []const osm.Tag = &.{
+        .{ .key = "highway", .value = "residential" },
+        .{ .key = "junction", .value = "roundabout" },
+        .{ .key = "access", .value = "permissive;customers" },
+    };
+    const restricted = (try transformWay(&scratch, thru, .none)).?;
+    try testing.expect(restricted.flags.roundabout and restricted.flags.no_thru_traffic);
+    try testing.expect(restricted.flags.destination_only and restricted.flags.destination_only_hgv);
+
+    const ferry: []const osm.Tag = &.{.{ .key = "route", .value = "ferry" }};
+    const rail: []const osm.Tag = &.{.{ .key = "route", .value = "shuttle_train" }};
+    try testing.expectEqual(.ferry, (try transformWay(&scratch, ferry, .none)).?.edgeUse());
+    try testing.expectEqual(.rail_ferry, (try transformWay(&scratch, rail, .none)).?.edgeUse());
+
+    const construction: []const osm.Tag = &.{
+        .{ .key = "highway", .value = "construction" },
+        .{ .key = "construction", .value = "tertiary_link" },
+        .{ .key = "route", .value = "ferry" },
+    };
+    const work = (try transformWay(&scratch, construction, .none)).?;
+    try testing.expectEqual(.primary, work.road_class);
+    try testing.expectEqual(.construction, work.edgeUse());
+    try testing.expect(work.flags.link);
 }
