@@ -22,6 +22,7 @@ comptime {
 pub const Error = error{
     AccessDenied,
     FileNotFound,
+    PathAlreadyExists,
     AddressInUse,
     ConnectionRefused,
     ConnectionReset,
@@ -36,9 +37,14 @@ pub const Error = error{
 };
 
 fn fail(rc: anytype) Error {
-    return switch (c.errno(rc)) {
+    return failErrno(c.errno(rc));
+}
+
+fn failErrno(code: c.E) Error {
+    return switch (code) {
         .ACCES, .PERM => error.AccessDenied,
         .NOENT => error.FileNotFound,
+        .EXIST => error.PathAlreadyExists,
         .ADDRINUSE => error.AddressInUse,
         .CONNREFUSED => error.ConnectionRefused,
         .CONNRESET => error.ConnectionReset,
@@ -187,6 +193,10 @@ pub const File = struct {
         _ = c.close(self.fd);
     }
 
+    pub fn sync(self: File) Error!void {
+        try syncFd(self.fd);
+    }
+
     /// File size via lseek (portable: glibc does not export fstat as a
     /// plain symbol). Leaves the file offset at the end; reads use pread.
     pub fn size(self: File) Error!u64 {
@@ -245,6 +255,129 @@ pub const File = struct {
         }
     }
 };
+
+fn syncFd(fd: c.fd_t) Error!void {
+    while (true) {
+        const rc = c.fsync(fd);
+        if (rc < 0 and c.errno(rc) == .INTR) continue;
+        _ = try checkInt(rc);
+        return;
+    }
+}
+
+/// Directory descriptor used for creating, verifying and publishing a bundle
+/// under the same parent even if its path is renamed elsewhere.
+pub const Directory = struct {
+    fd: c.fd_t,
+
+    pub const TempName = [36:0]u8;
+
+    pub fn open(path: []const u8) Error!Directory {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (path.len >= buf.len or std.mem.indexOfScalar(u8, path, 0) != null)
+            return error.InvalidArgument;
+        @memcpy(buf[0..path.len], path);
+        buf[path.len] = 0;
+        return .{ .fd = try checkInt(c.open(@ptrCast(&buf), directory_flags)) };
+    }
+
+    pub fn close(self: Directory) void {
+        _ = c.close(self.fd);
+    }
+
+    pub fn child(self: Directory, name: [:0]const u8) Error!Directory {
+        try checkChildName(name);
+        var flags = directory_flags;
+        flags.NOFOLLOW = true;
+        return .{ .fd = try checkInt(c.openat(self.fd, name, flags)) };
+    }
+
+    pub fn temporaryChild(self: Directory) Error!struct { dir: Directory, name: TempName } {
+        var name: TempName = undefined;
+        name[0..4].* = ".zr-".*;
+        name[name.len] = 0;
+        // A collision cannot replace an existing directory. Retry with
+        // fresh randomness if a name is already present.
+        for (0..16) |_| {
+            var nonce: [16]u8 = undefined;
+            try fillRandom(&nonce);
+            @memcpy(name[4..name.len], &std.fmt.bytesToHex(nonce, .lower));
+            const rc = c.mkdirat(self.fd, &name, 0o755);
+            if (rc < 0 and c.errno(rc) == .EXIST) continue;
+            _ = try checkInt(rc);
+            errdefer self.deleteDir(&name) catch {};
+            return .{ .dir = try self.child(&name), .name = name };
+        }
+        return error.PathAlreadyExists;
+    }
+
+    pub fn createFile(self: Directory, name: [:0]const u8) Error!File {
+        try checkChildName(name);
+        const flags: c.O = .{ .CLOEXEC = true, .ACCMODE = .RDWR, .CREAT = true, .EXCL = true };
+        return .{ .fd = try checkInt(c.openat(self.fd, name, flags, @as(c.mode_t, 0o644))) };
+    }
+
+    pub fn readFile(self: Directory, name: [:0]const u8) Error!File {
+        try checkChildName(name);
+        const flags: c.O = .{ .CLOEXEC = true, .ACCMODE = .RDONLY, .NOFOLLOW = true };
+        return .{ .fd = try checkInt(c.openat(self.fd, name, flags)) };
+    }
+
+    pub fn deleteFile(self: Directory, name: [:0]const u8) Error!void {
+        try checkChildName(name);
+        _ = try checkInt(c.unlinkat(self.fd, name, 0));
+    }
+
+    pub fn deleteDir(self: Directory, name: [:0]const u8) Error!void {
+        try checkChildName(name);
+        _ = try checkInt(c.unlinkat(self.fd, name, c.AT.REMOVEDIR));
+    }
+
+    pub fn sync(self: Directory) Error!void {
+        try syncFd(self.fd);
+    }
+
+    /// Atomically publish a sibling name. Existing paths stay intact.
+    pub fn renameExclusive(self: Directory, old: [:0]const u8, new: [:0]const u8) Error!void {
+        try checkChildName(old);
+        try checkChildName(new);
+        if (is_linux) {
+            const linux = std.os.linux;
+            const rc = linux.renameat2(self.fd, old, self.fd, new, .{ .NOREPLACE = true });
+            const code = linux.errno(rc);
+            if (code != .SUCCESS) return failErrno(code);
+        } else {
+            _ = try checkInt(c.renameatx_np(self.fd, old, self.fd, new, .{ .EXCL = true }));
+        }
+    }
+
+    const directory_flags: c.O = .{ .DIRECTORY = true, .CLOEXEC = true, .ACCMODE = .RDONLY };
+};
+
+fn checkChildName(name: []const u8) Error!void {
+    if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..") or
+        std.mem.indexOfAny(u8, name, "/\x00") != null) return error.InvalidArgument;
+}
+
+fn fillRandom(bytes: []u8) Error!void {
+    if (is_linux) {
+        const linux = std.os.linux;
+        var filled: usize = 0;
+        while (filled < bytes.len) {
+            const rc = linux.getrandom(bytes[filled..].ptr, bytes.len - filled, 0);
+            switch (linux.errno(rc)) {
+                .SUCCESS => {
+                    if (rc == 0) return error.Unexpected;
+                    filled += rc;
+                },
+                .INTR => continue,
+                else => |code| return failErrno(code),
+            }
+        }
+    } else {
+        c.arc4random_buf(bytes.ptr, bytes.len);
+    }
+}
 
 /// Reads a whole file into memory owned by `allocator`.
 pub fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) (Error || error{FileTooBig})![]u8 {

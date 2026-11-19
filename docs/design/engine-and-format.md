@@ -85,7 +85,7 @@ Potential setup is about 0.2 ms: an elimination-tree climb of roughly 1,000-1,30
 
 - **Ids.** Node and directed-edge ids are u32 behind opaque `enum(u32)` types, so widening is a recompile plus a format bump.
 - **Updates.** Full rebuild per bundle. The server loads several bundles and dispatches by location, so DACH can be rebuilt without touching the US.
-- **File header (64 B).** Magic, format version, 16-byte dataset UUID, section kind, record size, count and xxh3 of the payload. Startup checks headers, UUIDs and sizes only; `verify` checks payload hashes offline. Sections are aligned to 64 KiB.
+- **File header (64 B).** Magic, format version, 16-byte dataset UUID, section kind, record size, count and xxh3 of the payload. Startup checks headers, UUIDs and sizes. The `verify` command checks payload hashes offline. The header begins at file offset 0 and the payload begins at 64 KiB, with zero bytes between. The checksum is seedless XXH3-64 over the payload. Bundle creation stages `nodes.bin`, `edges.bin`, `first_edge.bin` and `turns.bin` in a sibling directory and publishes all four in one exclusive rename.
 
 ```zig
 const EdgeHot = extern struct {            // 16 B, indexed by directed edge id
@@ -234,7 +234,7 @@ Top risks, in order:
 
 Nothing exists yet. These are proposed paths in the new repository, plus the upstream files that define the semantics to port.
 
-- `zig-routing/src/graph/format.zig` (proposed): extern structs, section headers and comptime layout assertions
+- [`src/graph/format.zig`](../../src/graph/format.zig): extern structs, section headers, writer and comptime layout assertions
 - `zig-routing/src/sif/compiled.zig` (proposed): options to compiled POD, metric key, and the I1-I5 lower-bound interface
 - `zig-routing/src/thor/search.zig` (proposed): `Search(K, Q)`, labels, paged status and queues
 - `zig-routing/src/accel/cch.zig` (proposed): ordering, customisation, lazy potentials and the metric cache
