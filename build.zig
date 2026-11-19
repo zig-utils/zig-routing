@@ -28,6 +28,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tls", .module = tls },
             .{ .name = "xml", .module = xml },
             .{ .name = "lz4", .module = lz4 },
+            .{ .name = "protobuf", .module = protobuf },
             .{ .name = "perf_counters", .module = perf_counters },
         },
     });
@@ -111,6 +112,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tls", .module = b.dependency("tls", .{ .target = target, .optimize = fuzz_opt }).module("tls") },
             .{ .name = "xml", .module = b.dependency("xml", .{ .target = target, .optimize = fuzz_opt }).module("xml") },
             .{ .name = "lz4", .module = fuzz_lz4 },
+            .{ .name = "protobuf", .module = fuzz_protobuf },
             .{ .name = "perf_counters", .module = perf_counters },
         },
     });

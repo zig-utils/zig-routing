@@ -40,6 +40,19 @@ jobs:
       - run: zig build
       - run: zig build test --summary all
       - run: zig build -Doptimize=ReleaseFast
+      - uses: actions/checkout@v6
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          repository: valhalla/valhalla
+          ref: 5c7f918e61306521d79cc4496d40c19c5305fa4b
+          path: zig-out/valhalla-schema-source
+          sparse-checkout: proto/descriptors
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        if: matrix.os == 'ubuntu-latest'
+      - name: Valhalla Protobuf schema parity
+        if: matrix.os == 'ubuntu-latest'
+        run: bun tools/proto/valhalla.ts --check zig-out/valhalla-schema-source
 
   corpus:
     name: Corpora regenerate byte-identical

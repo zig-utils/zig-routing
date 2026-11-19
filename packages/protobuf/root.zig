@@ -50,12 +50,16 @@ pub const Field = struct {
     presence: Presence = .implicit,
     packed_encoding: bool = false,
     message: type = void,
+    enum_type: type = i32,
     default_value: ?Default = null,
+    // Protobuf map entries explicitly write scalar keys and values.
+    encode_default: bool = false,
 };
 
 fn native(comptime field: Field, comptime encoding: bool) type {
     return switch (field.kind) {
-        .int32, .sint32, .sfixed32, .enumeration => i32,
+        .int32, .sint32, .sfixed32 => i32,
+        .enumeration => field.enum_type,
         .int64, .sint64, .sfixed64 => i64,
         .uint32, .fixed32 => u32,
         .uint64, .fixed64 => u64,
@@ -67,6 +71,14 @@ fn native(comptime field: Field, comptime encoding: bool) type {
     };
 }
 
+fn enumValue(comptime T: type, number: i32) T {
+    return if (T == i32) number else @fromBackingInt(number);
+}
+
+fn enumNumber(value: anytype) i32 {
+    return if (@TypeOf(value) == i32) value else @backingInt(value);
+}
+
 fn defaultValue(comptime field: Field) native(field, true) {
     if (field.default_value) |value| {
         return switch (field.kind) {
@@ -74,6 +86,7 @@ fn defaultValue(comptime field: Field) native(field, true) {
             .float => @floatCast(value.floating),
             .double => value.floating,
             .string, .bytes => value.bytes,
+            .enumeration => enumValue(field.enum_type, @intCast(value.integer)),
             .message => @compileError("an embedded message cannot have a scalar default"),
             else => @intCast(value.integer),
         };
@@ -81,6 +94,7 @@ fn defaultValue(comptime field: Field) native(field, true) {
     return switch (field.kind) {
         .bool => false,
         .string, .bytes => "",
+        .enumeration => enumValue(field.enum_type, 0),
         .message => @compileError("message fields must have explicit presence"),
         else => 0,
     };
@@ -91,6 +105,7 @@ fn defaultPtr(comptime T: type, comptime value: T) *const anyopaque {
 }
 
 fn valuesType(comptime fields: []const Field) type {
+    @setEvalBranchQuota(1_000_000);
     var names: [fields.len][:0]const u8 = undefined;
     var types: [fields.len]type = undefined;
     var attrs: [fields.len]std.lang.Type.Struct.FieldAttributes = @splat(.{});
@@ -122,6 +137,16 @@ fn canonical(comptime description: []const Field) [description.len]Field {
             @compileError("message field must name its schema");
         if (field.kind == .message and field.presence == .implicit)
             @compileError("message field must have explicit presence");
+        if (field.enum_type != i32) {
+            if (field.kind != .enumeration)
+                @compileError("an enum type is only valid for an enumeration field");
+            if (@typeInfo(field.enum_type) != .@"enum" or
+                @typeInfo(field.enum_type).@"enum".tag_type != i32 or
+                @typeInfo(field.enum_type).@"enum".mode != .nonexhaustive)
+                @compileError("a Protobuf enumeration needs a nonexhaustive enum(i32)");
+        }
+        if (field.encode_default and field.presence != .implicit)
+            @compileError("encode_default requires implicit presence");
         if (field.default_value != null) {
             if (field.presence != .optional or field.kind == .message)
                 @compileError("a Protobuf default is only used for an optional scalar, string, or bytes");
@@ -216,7 +241,8 @@ const Occurrence = struct {
 
 fn scalar(comptime field: Field, value: wire.Value) native(field, false) {
     return switch (field.kind) {
-        .int32, .enumeration => @bitCast(@as(u32, @truncate(value.varint))),
+        .int32 => @bitCast(@as(u32, @truncate(value.varint))),
+        .enumeration => enumValue(field.enum_type, @bitCast(@as(u32, @truncate(value.varint)))),
         .int64 => @bitCast(value.varint),
         .uint32 => @truncate(value.varint),
         .uint64 => value.varint,
@@ -297,7 +323,8 @@ fn getType(comptime field: Field) type {
 
 fn varintValue(comptime field: Field, value: native(field, true)) u64 {
     return switch (field.kind) {
-        .int32, .int64, .enumeration => @bitCast(@as(i64, value)),
+        .int32, .int64 => @bitCast(@as(i64, value)),
+        .enumeration => @bitCast(@as(i64, enumNumber(value))),
         .uint32, .uint64 => value,
         .sint32 => wire.zigzagEncode(i32, value),
         .sint64 => wire.zigzagEncode(i64, value),
@@ -312,6 +339,7 @@ fn isDefault(comptime field: Field, value: native(field, true)) bool {
         .float => @as(u32, @bitCast(value)) == 0,
         .double => @as(u64, @bitCast(value)) == 0,
         .bytes, .string => value.len == 0,
+        .enumeration => enumNumber(value) == 0,
         else => value == 0,
     };
 }
@@ -378,13 +406,12 @@ fn writeRecord(comptime field: Field, writer: anytype, value: native(field, true
 pub fn Message(comptime description: []const Field) type {
     const fields = comptime canonical(description);
     return struct {
+        pub const schema = fields;
         pub const Values = valuesType(&fields);
+        const FieldName = std.meta.FieldEnum(Values);
 
         fn fieldNamed(comptime name: []const u8) Field {
-            for (fields) |field| {
-                if (std.mem.eql(u8, field.name, name)) return field;
-            }
-            @compileError("unknown Protobuf field " ++ name);
+            return fields[@backingInt(@field(FieldName, name))];
         }
 
         /// A validated borrow of the encoded message. Keep the input alive
@@ -469,7 +496,7 @@ pub fn Message(comptime description: []const Field) type {
                 const value = @field(input, field.name);
                 switch (field.presence) {
                     .required => size = try addSize(size, try recordSize(field, value, deadline)),
-                    .implicit => if (!isDefault(field, value)) {
+                    .implicit => if (field.encode_default or !isDefault(field, value)) {
                         size = try addSize(size, try recordSize(field, value, deadline));
                     },
                     .optional => if (value) |item| {
@@ -497,7 +524,7 @@ pub fn Message(comptime description: []const Field) type {
                 const value = @field(input, field.name);
                 switch (field.presence) {
                     .required => try writeRecord(field, writer, value, deadline),
-                    .implicit => if (!isDefault(field, value)) {
+                    .implicit => if (field.encode_default or !isDefault(field, value)) {
                         try writeRecord(field, writer, value, deadline);
                     },
                     .optional => if (value) |item| {
