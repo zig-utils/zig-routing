@@ -312,6 +312,37 @@ the permutation.
 | Utrecht | 21 | 3 | 1.43 |
 | Luxembourg 2026-01-01 | 19 | 2 | 2.32 |
 
+### Snap candidates
+
+Candidate search reads the native spatial index in order of the projection metric's
+lower bound. It projects batches of shape segments at the oracle's E6 precision,
+retains candidates within the requested radius or the nearest eligible edge, then
+expands node snaps to admissible entering and leaving arcs. The optional cold-record
+trailer stores the OSM layer and level ranges used by the search filters. The
+request arena retains its capacity between requests.
+
+Build each bundle from the pinned extract and compare the generated pedestrian and
+bicycle route corpus locations against the running Valhalla 3.9.3 oracle:
+
+```bash
+dataset=liechtenstein
+corpus="bench/corpora/route-foot-bike.$dataset.tsv"
+zig build check-snap -- "$bundle" "$corpus" > "$results"
+bun oracle/check-snap.ts "$oracle_url" "$corpus" "$results"
+```
+
+The score checks the first candidate's OSM way, complete E6 shape, direction,
+projected coordinate within 2 microdegrees and fraction along within 0.001. The
+oracle receives `minimum_reachability=0` to isolate candidate search. Native
+timings cover the snap call after parsing on an Apple M3 Pro (macOS arm64,
+ReleaseFast). Utrecht's 15 differences involve `motorroad=yes` access, covered by
+[#121](https://github.com/zig-utils/zig-routing/issues/121).
+
+| Extract | Same first candidate | Agreement | Native median | Native p95 | Native p99 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Liechtenstein | 2,404 / 2,404 | 100.00% | 8.291 µs | 41.584 µs | 89.125 µs |
+| Utrecht | 2,406 / 2,421 | 99.38% | 9.083 µs | 22.292 µs | 34.500 µs |
+
 ### HTTP and route checks
 
 `compare-height.ts` sends the same random `/height` requests (shapes, encoded polylines at

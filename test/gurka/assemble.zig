@@ -302,6 +302,11 @@ test "high-degree node aliases reserve both directions and preserve connectivity
     try testing.expectEqual(3, aliases);
     try testing.expectEqual(leaves, real);
     try testing.expectEqual(4, connectors);
+    const snap = routing.snap.candidates;
+    const access: snap.Access = .{ .mask = .{ .auto = true } };
+    const correlated = try snap.search(view, a, .{ .lat = 0, .lng = 0 }, .{}, access, .none);
+    try testing.expectEqual(2 * leaves, correlated.edges.len);
+    for (correlated.edges) |edge| try testing.expect(edge.node != .none);
 }
 
 test "enhancer marks dead-end approaches and directed not-thru branches" {
@@ -550,4 +555,187 @@ fn fixtureRoute(arena: std.mem.Allocator, view: *const graph.reader.View, source
     }
     std.mem.reverse(u64, way_ids.items);
     return try way_ids.toOwnedSlice(arena);
+}
+
+// Ported from test/gurka/test_locate.cc and test/gurka/test_search_side_of_street.cc.
+test "locate correlates junctions, projects mid-edge, and preserves heading and side fallbacks" {
+    var backing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var arena: std.heap.ArenaAllocator = .init(backing.allocator());
+    defer arena.deinit();
+    const a = arena.allocator();
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "living_street" }};
+    // AD crosses a local tile boundary and spans several native snap cells.
+    const layout = try gurka.mapToCoordinatesAt("B      \n|  4   \nA--3--D\n|     /\nC----/ ", 100, .{ .lng = 9.495, .lat = 47.1 });
+    const fixture = try gurka.Map.init(a, layout, &.{
+        .{ .label = "AB", .tags = road },
+        .{ .label = "AC", .tags = road },
+        .{ .label = "AD", .tags = road },
+        .{ .label = "CD", .tags = road },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const snap = routing.snap.candidates;
+    const auto: snap.Access = .{ .mask = .{ .auto = true } };
+    const node_a = fixture.findNode("A").?.location;
+    const node_d = fixture.findNode("D").?.location;
+    const midpoint = layout.points['3'].?;
+
+    var location: routing.api.request.Location = .{ .lat = node_a.lat, .lng = node_a.lng };
+    const at_node = try snap.search(view, a, location, .{}, auto, .none);
+    try testing.expectEqual(6, at_node.edges.len);
+    for (at_node.edges) |edge| {
+        try testing.expect(edge.node != .none);
+        try testing.expect(edge.projected.distance(node_a) < 0.02);
+        try testing.expectEqual(snap.Side.none, edge.side);
+        try testing.expectEqual(@as(f32, if (edge.node == .begin) 0 else 1), edge.percent_along);
+    }
+    location.heading = 180;
+    location.type = .through;
+    const through = try snap.search(view, a, location, .{}, auto, .none);
+    try testing.expectEqual(1, through.edges.len);
+    try testing.expectEqual(.begin, through.edges[0].node);
+    try testing.expectEqual(5, through.filtered_edges.len);
+    try testing.expectEqual(.end, through.filtered_edges[through.filtered_edges.len - 1].node);
+
+    location = .{ .lat = node_a.lat + 0.0004, .lng = node_a.lng + 0.00008, .search_cutoff = 20, .node_snap_tolerance = 80 };
+    const near_a = try snap.search(view, a, location, .{}, auto, .none);
+    try testing.expectEqual(6, near_a.edges.len);
+    try testing.expect(near_a.edges[0].distance > 20);
+    location.search_cutoff = 1;
+    try testing.expectEqual(0, (try snap.search(view, a, location, .{}, auto, .none)).edges.len);
+
+    location = .{ .lat = midpoint.lat, .lng = midpoint.lng, .heading = 90, .skip_ranking_candidates = true };
+    const east = try snap.search(view, a, location, .{}, auto, .none);
+    try testing.expectEqual(1, east.edges.len);
+    try testing.expectEqual(1, east.filtered_edges.len);
+    try testing.expect(!east.rank_candidates);
+    try testing.expectEqual(.none, east.edges[0].node);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), east.edges[0].percent_along, 0.002);
+    try testing.expectApproxEqAbs(@as(f32, 90), east.edges[0].heading, 0.01);
+    try testing.expectEqual(try view.oppEdge(east.edges[0].id), east.filtered_edges[0].id);
+    location.heading = 270;
+    const west = try snap.search(view, a, location, .{}, auto, .none);
+    try testing.expectEqual(east.filtered_edges[0].id, west.edges[0].id);
+
+    location.heading = null;
+    location.display_lat = midpoint.lat - 0.0001;
+    location.display_lng = midpoint.lng;
+    location.preferred_side = .same;
+    const same = try snap.search(view, a, location, .{}, auto, .none);
+    try testing.expectEqual(east.edges[0].id, same.edges[0].id);
+    try testing.expectEqual(.right, same.edges[0].side);
+    location.preferred_side = .opposite;
+    const opposite = try snap.search(view, a, location, .{}, auto, .none);
+    try testing.expectEqual(west.edges[0].id, opposite.edges[0].id);
+    try testing.expectEqual(.left, opposite.edges[0].side);
+    location.street_side_max_distance = 3;
+    try testing.expectEqual(2, (try snap.search(view, a, location, .{}, auto, .none)).edges.len);
+
+    location = .{ .lat = node_d.lat, .lng = node_d.lng + 0.0001 };
+    const past_d = try snap.search(view, a, location, .{}, auto, .none);
+    try testing.expectEqual(4, past_d.edges.len);
+    for (past_d.edges) |edge| try testing.expect(edge.projected.distance(node_d) < 0.02);
+
+    location = .{ .lat = midpoint.lat, .lng = midpoint.lng, .radius = 5000 };
+    const normal = try snap.search(view, a, location, .{}, auto, .none);
+    const wide: snap.Defaults = .{ .max_radius = 5000 };
+    const radius = try snap.search(view, a, location, wide, auto, .none);
+    try testing.expect(radius.edges.len > normal.edges.len);
+    try testing.expectEqual(8, radius.edges.len);
+    try testing.expectError(error.DeadlineExceeded, snap.search(view, a, location, .{}, auto, .{ .at_ns = 0 }));
+
+    try testing.expect(arena.reset(.retain_capacity));
+    _ = try snap.search(view, a, location, wide, auto, .none);
+    const allocations = backing.allocations;
+    const resizes = backing.resize_index;
+    for (0..64) |_| {
+        try testing.expect(arena.reset(.retain_capacity));
+        _ = try snap.search(view, a, location, wide, auto, .none);
+    }
+    try testing.expectEqual(allocations, backing.allocations);
+    try testing.expectEqual(resizes, backing.resize_index);
+}
+
+// Ported from test/gurka/test_search_filter.cc.
+test "location search filters levels, classes, steps and mode access and honors preferred layer" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const layout = try gurka.mapToCoordinatesAt("A----B\nC----D\nE----F", 30, .{ .lng = 9.6, .lat = 47.1 });
+    const fixture = try gurka.Map.init(a, layout, &.{
+        .{ .label = "AB", .tags = &.{
+            .{ .key = "highway", .value = "steps" },
+            .{ .key = "level", .value = "-2;-1;0.5;2-4" },
+            .{ .key = "layer", .value = "-1" },
+        } },
+        .{ .label = "CD", .tags = &.{
+            .{ .key = "highway", .value = "residential" },
+            .{ .key = "level", .value = "0" },
+        } },
+        .{ .label = "EF", .tags = &.{
+            .{ .key = "highway", .value = "primary" },
+            .{ .key = "bridge", .value = "yes" },
+            .{ .key = "layer", .value = "1" },
+            .{ .key = "level", .value = "1" },
+        } },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const snap = routing.snap.candidates;
+    const foot: snap.Access = .{ .mask = .{ .pedestrian = true } };
+    const auto: snap.Access = .{ .mask = .{ .auto = true } };
+    const point = fixture.findNode("A").?.location;
+    var location: routing.api.request.Location = .{ .lat = point.lat, .lng = point.lng + 0.001, .radius = 100 };
+    const all = try snap.search(view, a, location, .{}, foot, .none);
+    try testing.expectEqual(6, all.edges.len);
+    try testing.expectEqual(4, (try snap.search(view, a, location, .{}, auto, .none)).edges.len);
+
+    const TimedCost = struct {
+        access: snap.Access,
+        blocked_way: u64,
+
+        pub fn allowed(self: @This(), edge: snap.DirectedEdge) bool {
+            return self.access.allowed(edge);
+        }
+
+        pub fn closed(self: @This(), edge: snap.DirectedEdge) bool {
+            return (edge.graph_view.wayId(edge.id) catch unreachable) == self.blocked_way;
+        }
+
+        pub fn meetsAccessRestrictions(self: @This(), edge: snap.DirectedEdge) bool {
+            return !self.closed(edge);
+        }
+    };
+    const timed: TimedCost = .{ .access = foot, .blocked_way = try view.wayId(all.edges[0].id) };
+    try testing.expectEqual(4, (try snap.search(view, a, location, .{}, timed, .none)).edges.len);
+    location.search_filter.exclude_closures = false;
+    try testing.expectEqual(6, (try snap.search(view, a, location, .{}, timed, .none)).edges.len);
+    location.search_filter.exclude_restricted = true;
+    try testing.expectEqual(4, (try snap.search(view, a, location, .{}, timed, .none)).edges.len);
+    location.search_filter = .{};
+
+    location.preferred_layer = 1;
+    const layer = try snap.search(view, a, location, .{}, foot, .none);
+    try testing.expectEqual(2, layer.edges.len);
+    try testing.expectEqual(4, layer.filtered_edges.len);
+    const way = try view.wayId(layer.edges[0].id);
+    try testing.expectEqual(try view.wayId(all.edges[4].id), way);
+
+    location.preferred_layer = null;
+    location.search_filter.exclude_steps = true;
+    location.search_filter.exclude_bridge = true;
+    try testing.expectEqual(2, (try snap.search(view, a, location, .{}, foot, .none)).edges.len);
+    location.search_filter.max_road_class = .service_other;
+    try testing.expectEqual(0, (try snap.search(view, a, location, .{ .search_cutoff = 100 }, foot, .none)).edges.len);
+
+    location.search_filter = .{ .level = -1 };
+    const level = try snap.search(view, a, location, .{}, foot, .none);
+    try testing.expectEqual(2, level.edges.len);
+    try testing.expectEqual(try view.wayId(all.edges[0].id), try view.wayId(level.edges[0].id));
+    location.search_filter.level = 3.5;
+    try testing.expectEqual(2, (try snap.search(view, a, location, .{}, foot, .none)).edges.len);
+    location.search_filter.level = 1.5;
+    try testing.expectEqual(0, (try snap.search(view, a, location, .{}, foot, .none)).edges.len);
 }

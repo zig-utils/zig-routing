@@ -212,75 +212,105 @@ pub const Tiles = struct {
         }
     }
 
-    fn setPixel(self: Tiles, gpa: Allocator, out: *std.ArrayList(Cell), x: i32, y: i32) Allocator.Error!bool {
+    fn setPixel(self: Tiles, sink: anytype, x: i32, y: i32) !bool {
         const subs: i32 = self.nsubdivisions;
         if (x < 0 or y < 0 or x >= subs * self.ncolumns or y >= subs * self.nrows) return true;
-        try out.append(gpa, .{
+        try sink.emit(Cell{
             .tile = @divTrunc(y, subs) * self.ncolumns + @divTrunc(x, subs),
             .bin = @intCast(@rem(y, subs) * subs + @rem(x, subs)),
         });
         return false;
     }
 
-    fn bresenham(self: Tiles, gpa: Allocator, out: *std.ArrayList(Cell), x0: f64, y0: f64, x1: f64, y1: f64) Allocator.Error!void {
-        var outside = try self.setPixel(gpa, out, @intFromFloat(@floor(x0)), @intFromFloat(@floor(y0)));
+    fn bresenham(self: Tiles, sink: anytype, deadline: io.Deadline, x0: f64, y0: f64, x1: f64, y1: f64) !void {
+        var outside = try self.setPixel(sink, @intFromFloat(@floor(x0)), @intFromFloat(@floor(y0)));
         const sx: f64 = if (x0 < x1) 1 else -1;
         const dx = x1 - x0;
         var x = @floor(x0) + 0.5;
         const sy: f64 = if (y0 < y1) 1 else -1;
         const dy = y1 - y0;
         var y = @floor(y0) + 0.5;
-        while (@floor(x) != @floor(x1) or @floor(y) != @floor(y1)) {
+        var i: usize = 0;
+        while (@floor(x) != @floor(x1) or @floor(y) != @floor(y1)) : (i += 1) {
+            if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
             const tx = @abs(dx * (y - y0) - dy * ((x + sx) - x0));
             const ty = @abs(dx * ((y + sy) - y0) - dy * (x - x0));
             if (tx < ty or (tx == ty and y0 == y1)) x += sx else y += sy;
-            const o = try self.setPixel(gpa, out, @intFromFloat(@floor(x)), @intFromFloat(@floor(y)));
+            const o = try self.setPixel(sink, @intFromFloat(@floor(x)), @intFromFloat(@floor(y)));
             if (!outside and o) return;
             outside = o;
         }
     }
 
-    /// Every bin a polyline passes through, sorted and deduplicated
-    /// (upstream Intersect(linestring), including its resampling so long
-    /// segments follow the great circle).
+    /// Every bin a polyline passes through, sorted and deduplicated.
     pub fn intersectLine(self: Tiles, gpa: Allocator, linestring: []const PointLL, out: *std.ArrayList(Cell)) Allocator.Error!void {
-        if (linestring.len == 0) return;
         const start = out.items.len;
-        var resampled: std.ArrayList(PointLL) = .empty;
-        defer resampled.deinit(gpa);
-        const max_meters = @max(1.0, @as(f64, self.subdivision_size) * 0.25 * DistanceApproximator.metersPerLngDegree(linestring[0].lat));
-        if (line_ops.length(linestring) > max_meters) try line_ops.resampleSpherical(gpa, linestring, max_meters, true, &resampled);
-        const pts = if (resampled.items.len > 0) resampled.items else linestring;
-        const xs: f64 = @floatFromInt(self.ncolumns * self.nsubdivisions);
-        const ys: f64 = @floatFromInt(self.nrows * self.nsubdivisions);
-        var i: usize = 0;
-        while (i < pts.len) : (i += 1) {
-            const u = pts[i];
-            var v = u;
-            if (i + 1 < pts.len) {
-                v = pts[i + 1];
-            } else if (pts.len > 1) break;
-            const x0 = (u.lng - self.bounds.minx) / self.bounds.width() * xs;
-            const y0 = (u.lat - self.bounds.miny) / self.bounds.height() * ys;
-            const x1 = (v.lng - self.bounds.minx) / self.bounds.width() * xs;
-            const y1 = (v.lat - self.bounds.miny) / self.bounds.height() * ys;
-            const ix0: i32 = @intFromFloat(@floor(x0));
-            const ix1: i32 = @intFromFloat(@floor(x1));
-            const iy0: i32 = @intFromFloat(@floor(y0));
-            const iy1: i32 = @intFromFloat(@floor(y1));
-            const ddx = ix0 - ix1;
-            const ddy = iy0 - iy1;
-            const ds = ddx * ddx + ddy * ddy;
-            if (ds == 0) {
-                _ = try self.setPixel(gpa, out, ix0, iy0);
-            } else if (ds == 1) {
-                _ = try self.setPixel(gpa, out, ix0, iy0);
-                _ = try self.setPixel(gpa, out, ix1, iy1);
-            } else {
-                try self.bresenham(gpa, out, x0, y0, x1, y1);
+        const Sink = struct {
+            allocator: Allocator,
+            output: *std.ArrayList(Cell),
+
+            pub fn emit(sink: *@This(), cell: Cell) Allocator.Error!void {
+                try sink.output.append(sink.allocator, cell);
             }
-        }
+        };
+        var sink: Sink = .{ .allocator = gpa, .output = out };
+        self.visitIntersectLine(linestring, &sink, .none) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.DeadlineExceeded, error.InvalidResolution => unreachable,
+        };
         dedupe(out, start);
+    }
+
+    /// Upstream Intersect(linestring), including its spherical resampling.
+    /// Emits bins in shape order and may emit a bin more than once.
+    pub fn visitIntersectLine(self: Tiles, linestring: []const PointLL, sink: anytype, deadline: io.Deadline) !void {
+        if (linestring.len == 0) return;
+        const Walk = struct {
+            tiles: Tiles,
+            sink: @TypeOf(sink),
+            deadline: io.Deadline,
+            previous: ?PointLL = null,
+
+            pub fn check(walk: *const @This()) !void {
+                if (walk.deadline.expired()) return error.DeadlineExceeded;
+            }
+
+            pub fn emit(walk: *@This(), v: PointLL) !void {
+                try walk.check();
+                const t = walk.tiles;
+                const u = walk.previous orelse v;
+                walk.previous = v;
+                const xs: f64 = @floatFromInt(t.ncolumns * t.nsubdivisions);
+                const ys: f64 = @floatFromInt(t.nrows * t.nsubdivisions);
+                const x0 = (u.lng - t.bounds.minx) / t.bounds.width() * xs;
+                const y0 = (u.lat - t.bounds.miny) / t.bounds.height() * ys;
+                const x1 = (v.lng - t.bounds.minx) / t.bounds.width() * xs;
+                const y1 = (v.lat - t.bounds.miny) / t.bounds.height() * ys;
+                const ix0: i32 = @intFromFloat(@floor(x0));
+                const ix1: i32 = @intFromFloat(@floor(x1));
+                const iy0: i32 = @intFromFloat(@floor(y0));
+                const iy1: i32 = @intFromFloat(@floor(y1));
+                const dx: i64 = @as(i64, ix0) - ix1;
+                const dy: i64 = @as(i64, iy0) - iy1;
+                switch (dx * dx + dy * dy) {
+                    0 => _ = try t.setPixel(walk.sink, ix0, iy0),
+                    1 => {
+                        _ = try t.setPixel(walk.sink, ix0, iy0);
+                        _ = try t.setPixel(walk.sink, ix1, iy1);
+                    },
+                    else => try t.bresenham(walk.sink, walk.deadline, x0, y0, x1, y1),
+                }
+            }
+        };
+        var walk: Walk = .{ .tiles = self, .sink = sink, .deadline = deadline };
+        const resolution = @max(1.0, @as(f64, self.subdivision_size) * 0.25 * DistanceApproximator.metersPerLngDegree(linestring[0].lat));
+        var length: f64 = 0;
+        for (linestring[0 .. linestring.len - 1], linestring[1..], 0..) |a, b, i| {
+            if (i % 256 == 0) try walk.check();
+            length += a.distance(b);
+            if (length > resolution) return line_ops.visitResampledSpherical(linestring, resolution, true, &walk);
+        }
+        for (linestring) |point| try walk.emit(point);
     }
 
     /// Every bin a box covers, clamped to the grid (upstream Intersect(box)).
@@ -306,6 +336,44 @@ pub const Tiles = struct {
                 .bin = @intCast(@rem(y, subs) * subs + @rem(x, subs)),
             });
         }
+    }
+
+    pub fn subdivision(self: Tiles, cell: Cell) i32 {
+        const tile = self.rowColumn(cell.tile);
+        const subs: i32 = self.nsubdivisions;
+        const column = tile.col * subs + @rem(cell.bin, self.nsubdivisions);
+        const row_index = tile.row * subs + @divTrunc(cell.bin, self.nsubdivisions);
+        return row_index * self.ncolumns * subs + column;
+    }
+
+    fn seedSubdivision(self: Tiles, seed: PointLL) i32 {
+        const columns = self.ncolumns * self.nsubdivisions;
+        const rows = self.nrows * self.nsubdivisions;
+        const x = (seed.lng - self.bounds.minx) / self.bounds.width() * @as(f64, @floatFromInt(columns));
+        const y = (seed.lat - self.bounds.miny) / self.bounds.height() * @as(f64, @floatFromInt(rows));
+        const column: i32 = @intFromFloat(std.math.clamp(x, 0, @as(f64, @floatFromInt(columns - 1))));
+        const row_index: i32 = @intFromFloat(std.math.clamp(y, 0, @as(f64, @floatFromInt(rows - 1))));
+        return row_index * columns + column;
+    }
+
+    pub fn binOrderDistance(self: Tiles, seed: PointLL, sub: i32) f64 {
+        if (sub == self.seedSubdivision(seed)) return 0;
+        const ss = self.subdivision_size;
+        const cols = self.ncolumns * self.nsubdivisions;
+        const x: f32 = @floatFromInt(@rem(sub, cols));
+        const y: f32 = @floatFromInt(@divTrunc(sub, cols));
+        // Upstream multiplies integral subdivision numbers by the f32 bin
+        // size before adding the f64 origin.
+        const x0 = self.bounds.minx + @as(f64, x * ss);
+        const x1 = self.bounds.minx + @as(f64, (x + 1) * ss);
+        const y0 = self.bounds.miny + @as(f64, y * ss);
+        const y1 = self.bounds.miny + @as(f64, (y + 1) * ss);
+        var best = @min(seed.distance(.init(x0, y0)), seed.distance(.init(x1, y0)), seed.distance(.init(x0, y1)), seed.distance(.init(x1, y1)));
+        if (x0 < seed.lng and seed.lng < x1)
+            best = @min(best, seed.distance(.init(seed.lng, y0)), seed.distance(.init(seed.lng, y1)));
+        if (y0 < seed.lat and seed.lat < y1)
+            best = @min(best, seed.distance(.init(x0, seed.lat)), seed.distance(.init(x1, seed.lat)));
+        return best;
     }
 
     pub fn binBBox(self: Tiles, tile: i32, bin: u16) AABB {
@@ -363,9 +431,7 @@ pub const ClosestFirst = struct {
             .queue = .initContext({}),
             .gpa = gpa,
         };
-        const x = (seed.lng - tiles.bounds.minx) / tiles.bounds.width() * @as(f64, @floatFromInt(self.subcols));
-        const y = (seed.lat - tiles.bounds.miny) / tiles.bounds.height() * @as(f64, @floatFromInt(self.subrows));
-        const sub = @as(i32, @intFromFloat(y)) * self.subcols + @as(i32, @intFromFloat(x));
+        const sub = tiles.seedSubdivision(seed);
         try self.queued.put(gpa, sub, {});
         try self.queue.push(gpa, .{ .dist = 0, .sub = sub });
         try self.neighbors(sub);
@@ -375,36 +441,6 @@ pub const ClosestFirst = struct {
     pub fn deinit(self: *ClosestFirst) void {
         self.queued.deinit(self.gpa);
         self.queue.deinit(self.gpa);
-    }
-
-    fn dist(self: *const ClosestFirst, sub: i32) f64 {
-        const ss: f64 = self.tiles.subdivision_size;
-        const x: f64 = @floatFromInt(@rem(sub, self.subcols));
-        const y: f64 = @floatFromInt(@divTrunc(sub, self.subcols));
-        const x0 = self.tiles.bounds.minx + x * ss;
-        const x1 = self.tiles.bounds.minx + (x + 1) * ss;
-        const y0 = self.tiles.bounds.miny + y * ss;
-        const y1 = self.tiles.bounds.miny + (y + 1) * ss;
-        var corners: [8]PointLL = undefined;
-        var n: usize = 4;
-        corners[0] = .{ .lng = x0, .lat = y0 };
-        corners[1] = .{ .lng = x1, .lat = y0 };
-        corners[2] = .{ .lng = x0, .lat = y1 };
-        corners[3] = .{ .lng = x1, .lat = y1 };
-        const s = self.seed;
-        if (x0 < s.lng and x1 > s.lng) {
-            corners[n] = .{ .lng = s.lng, .lat = y0 };
-            corners[n + 1] = .{ .lng = s.lng, .lat = y1 };
-            n += 2;
-        }
-        if (y0 < s.lat and y1 > s.lat) {
-            corners[n] = .{ .lng = x0, .lat = s.lat };
-            corners[n + 1] = .{ .lng = x1, .lat = s.lat };
-            n += 2;
-        }
-        var best = std.math.floatMax(f64);
-        for (corners[0..n]) |c| best = @min(best, s.distance(c));
-        return best;
     }
 
     fn neighbors(self: *ClosestFirst, s: i32) Allocator.Error!void {
@@ -418,7 +454,7 @@ pub const ClosestFirst = struct {
             if (nx == -1 or nx == self.subcols) nx = @mod(nx + self.subcols, self.subcols); // geographic: wrap
             const nb = ny * self.subcols + nx;
             const gop = try self.queued.getOrPut(self.gpa, nb);
-            if (!gop.found_existing) try self.queue.push(self.gpa, .{ .dist = self.dist(nb), .sub = nb });
+            if (!gop.found_existing) try self.queue.push(self.gpa, .{ .dist = self.tiles.binOrderDistance(self.seed, nb), .sub = nb });
         }
     }
 

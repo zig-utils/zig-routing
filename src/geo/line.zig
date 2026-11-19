@@ -12,6 +12,7 @@ const k = @import("constants.zig");
 const point = @import("point.zig");
 const Deadline = @import("../infra/io.zig").Deadline;
 const PointLL = point.PointLL;
+const Deadline = @import("../infra/io.zig").Deadline;
 const Allocator = std.mem.Allocator;
 
 const rad_per_meter: f64 = 1.0 / 6378160.187;
@@ -473,6 +474,46 @@ fn triangleContains(a: PointLL, b: PointLL, c: PointLL, candidate: PointLL) bool
     const u = (d11 * d02 - d01 * d12) / denominator;
     const v = (d00 * d12 - d01 * d02) / denominator;
     return u >= 1e-16 and v >= 1e-16 and u + v < 1;
+}
+
+/// Bearing over a sampled distance along a shape, starting behind the
+/// projection and consuming any remaining distance ahead of it.
+pub fn tangentAngle(shape: []const PointLL, index: usize, projected: PointLL, sample_distance: f32, forward: bool, deadline: Deadline) !f32 {
+    std.debug.assert(index + 1 < shape.len);
+    const last = shape.len - 1;
+    var remaining = sample_distance;
+    var start = projected;
+    var i = if (forward) index else last - index - 1;
+    var step: usize = 0;
+    while (remaining > 0) : (step += 1) {
+        if (step % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+        const next = shape[if (forward) i else last - i];
+        const d = start.distance(next);
+        if (remaining <= d) {
+            start = start.pointAlongSegment(next, remaining / d);
+            return @floatCast(start.heading(projected));
+        }
+        start = next;
+        remaining = @floatCast(@as(f64, remaining) - d);
+        if (i == 0) break;
+        i -= 1;
+    }
+    i = if (forward) index + 1 else last - index;
+    var end = projected;
+    while (remaining > 0) : (step += 1) {
+        if (step % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+        const next = shape[if (forward) i else last - i];
+        const d = end.distance(next);
+        if (remaining <= d) {
+            end = end.pointAlongSegment(next, remaining / d);
+            break;
+        }
+        end = next;
+        remaining = @floatCast(@as(f64, remaining) - d);
+        if (i == last) break;
+        i += 1;
+    }
+    return @floatCast(start.heading(end));
 }
 
 /// Squared planar distances (degrees, longitude scaled by `lon_scale`) from

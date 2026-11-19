@@ -99,6 +99,26 @@ pub const Use = enum(u8) {
     transit_connection = 54,
 };
 
+pub fn headingOffset(rc: u3, use_code: u6) f32 {
+    var offset: f32 = 15;
+    if (rc < 2) {
+        offset *= 1.6;
+    } else if (rc < 5) {
+        offset *= 1.4;
+    }
+    const use = @import("std").enums.fromInt(Use, use_code) orelse return offset;
+    return switch (use) {
+        .cycleway, .mountain_bike, .footway, .steps, .ladder, .path, .pedestrian, .bridleway => offset * 0.5,
+        else => offset,
+    };
+}
+
+/// The graph builder orders a node's arcs by directional auto access,
+/// importance and name presence before breaking ties by shape encounter.
+pub fn incidentEdgeRank(auto: bool, road_class: u3, named: bool) u5 {
+    return @as(u5, @intFromBool(!auto)) * 16 + @as(u5, road_class) * 2 + @intFromBool(!named);
+}
+
 pub const Surface = enum(u3) {
     paved_smooth,
     paved,

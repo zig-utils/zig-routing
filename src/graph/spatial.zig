@@ -104,12 +104,24 @@ pub const View = struct {
     }
 
     pub fn rings(self: View, arena: Allocator, point: geo.PointLL, radius_m: f64, deadline: io.Deadline) !Rings {
+        return self.scan(arena, point, radius_m, null, deadline);
+    }
+
+    /// Range traversal in the same metric as Loki's projection ranking.
+    pub fn projectionRings(self: View, arena: Allocator, approx: geo.DistanceApproximator, radius_m: f64, deadline: io.Deadline) !Rings {
+        return self.scan(arena, .{ .lng = approx.center_lng, .lat = approx.center_lat }, radius_m, approx, deadline);
+    }
+
+    fn scan(self: View, arena: Allocator, point: geo.PointLL, radius_m: f64, approx: ?geo.DistanceApproximator, deadline: io.Deadline) !Rings {
         if (!point.inRange()) return error.InvalidCoordinate;
         if (!std.math.isFinite(radius_m) or radius_m < 0) return error.InvalidRadius;
         if (deadline.expired()) return error.DeadlineExceeded;
         var result: Rings = .{ .arena = arena, .queue = .initContext({}) };
         errdefer result.deinit();
-        const bounds = ScanBounds.init(point, radius_m);
+        const bounds = if (approx) |plane|
+            ScanBounds.fromSpans(point, radius_m / constants.meters_per_degree_lat, @min(180, radius_m / @abs(plane.m_per_lng_degree)))
+        else
+            ScanBounds.spherical(point, radius_m);
         for (bounds.south..bounds.north + 1) |row| {
             if (deadline.expired()) return error.DeadlineExceeded;
             for (bounds.longitude[0..bounds.range_count]) |range| {
@@ -118,7 +130,8 @@ pub const View = struct {
                 var i = self.lowerBound(start);
                 while (i < self.directory.len and self.directory[i].id < end) : (i += 1) {
                     if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
-                    const d = distanceToCell(point, self.directory[i].id);
+                    const id = self.directory[i].id;
+                    const d = if (approx) |plane| planeDistanceToCell(plane, id) else distanceToCell(point, id);
                     if (d <= radius_m) try result.queue.push(arena, .{ .distance = d, .cell = try self.at(i) });
                 }
             }
@@ -176,22 +189,23 @@ const ScanBounds = struct {
     longitude: [2]struct { first: u32, end: u32 },
     range_count: usize,
 
-    fn init(point: geo.PointLL, radius_m: f64) ScanBounds {
-        const angle = @min(std.math.pi, radius_m / constants.rad_earth_meters_d);
-        const span = angle * constants.deg_per_rad_d;
-        const south = (point.lat - span + 90) * grid.snap_cells_per_degree;
-        const north = (point.lat + span + 90) * grid.snap_cells_per_degree;
+    fn spherical(point: geo.PointLL, radius_m: f64) ScanBounds {
+        const span = sphereSpans(point, radius_m);
+        return fromSpans(point, span.lat, span.lng);
+    }
+
+    fn fromSpans(point: geo.PointLL, lat_span: f64, lon_span: f64) ScanBounds {
+        const south = (point.lat - lat_span + 90) * grid.snap_cells_per_degree;
+        const north = (point.lat + lat_span + 90) * grid.snap_cells_per_degree;
         var bounds: ScanBounds = .{
             .south = @intFromFloat(std.math.clamp(@floor(south) - 1, 0, grid.snap_rows - 1)),
             .north = @intFromFloat(std.math.clamp(@floor(north) + 1, 0, grid.snap_rows - 1)),
             .longitude = .{ .{ .first = 0, .end = grid.snap_columns }, undefined },
             .range_count = 1,
         };
-        const latitude = point.lat * constants.rad_per_deg_d;
-        if (@abs(point.lat) == 90 or angle >= std.math.pi / 2.0 - @abs(latitude)) return bounds;
-        const dlon = math.asinF(@min(1, math.sinF(angle) / math.cosF(latitude))) * constants.deg_per_rad_d;
+        if (lon_span >= 180) return bounds;
         const x = (point.lng + 180) * grid.snap_cells_per_degree;
-        const extent = dlon * grid.snap_cells_per_degree;
+        const extent = lon_span * grid.snap_cells_per_degree;
         const lo: i32 = @intFromFloat(@floor(x - extent) - 1);
         const hi: i32 = @intFromFloat(@floor(x + extent) + 2);
         if (hi - lo >= grid.snap_columns) return bounds;
@@ -206,6 +220,34 @@ const ScanBounds = struct {
         return bounds;
     }
 };
+
+fn sphereSpans(point: geo.PointLL, radius_m: f64) geo.PointLL {
+    const angle = @min(std.math.pi, radius_m / constants.rad_earth_meters_d);
+    const latitude = point.lat * constants.rad_per_deg_d;
+    return .{
+        .lat = angle * constants.deg_per_rad_d,
+        .lng = if (angle >= std.math.pi / 2.0 - @abs(latitude)) 180 else math.asinF(@min(1, math.sinF(angle) / math.cosF(latitude))) * constants.deg_per_rad_d,
+    };
+}
+
+/// Upper bound in the ranking metric for any point within a great-circle cutoff.
+pub fn projectionLimit(point: geo.PointLL, approx: geo.DistanceApproximator, cutoff: f64) f64 {
+    const span = sphereSpans(point, cutoff);
+    const lat_m = span.lat * constants.meters_per_degree_lat;
+    const lon_m = span.lng * approx.m_per_lng_degree;
+    return @sqrt(lat_m * lat_m + lon_m * lon_m);
+}
+
+fn planeDistanceToCell(approx: geo.DistanceApproximator, id: u32) f64 {
+    const west = @as(f64, @floatFromInt(id % grid.snap_columns)) * cell_width - 180;
+    const south = @as(f64, @floatFromInt(id / grid.snap_columns)) * cell_width - 90;
+    const center = west + cell_width * 0.5;
+    const longitude = approx.center_lng + geo.wrappedLongitudeDelta(center, approx.center_lng);
+    return @sqrt(approx.distanceSquared(.{
+        .lng = std.math.clamp(approx.center_lng, longitude - cell_width * 0.5, longitude + cell_width * 0.5),
+        .lat = std.math.clamp(approx.center_lat, south, south + cell_width),
+    }));
+}
 
 /// Distance to the closed spherical rectangle, in metres.
 fn distanceToCell(point: geo.PointLL, id: u32) f64 {

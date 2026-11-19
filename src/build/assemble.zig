@@ -157,6 +157,9 @@ const Way = struct {
     oneway: bool,
     importance: u3,
     has_names: bool,
+    layer: i8,
+    level_start: u32,
+    level_count: u24,
     name_start: u32,
     ref_start: u32,
     ref_end: u32,
@@ -170,6 +173,7 @@ const Metadata = struct {
     deadline: io.Deadline,
     strings: tags.names.StringTable,
     name_ids: std.ArrayList(tags.names.Id) = .empty,
+    levels: std.ArrayList(graph.cold.LevelRange) = .empty,
     nodes: std.AutoHashMapUnmanaged(i64, format.NodeHot) = .empty,
     ways: Ways = .empty,
 
@@ -177,6 +181,7 @@ const Metadata = struct {
         self.nodes.deinit(self.gpa);
         self.ways.deinit(self.gpa);
         self.name_ids.deinit(self.gpa);
+        self.levels.deinit(self.gpa);
         self.strings.deinit();
     }
 
@@ -224,6 +229,8 @@ const Metadata = struct {
         if (indexed.official_name.text != indexed.name.text and indexed.official_name.text != indexed.alt_name.text)
             try self.appendNames(indexed.official_name.text);
         const name_end = try self.nameOffset();
+        const level_start = std.math.cast(u32, self.levels.items.len) orelse return error.TooManyLevels;
+        if (attrs.level) |level| try appendLevels(&self.levels, self.gpa, level, self.deadline);
         entry.value_ptr.* = .{
             .by_direction = pair,
             .speeds = .{
@@ -235,6 +242,9 @@ const Metadata = struct {
             .oneway = attrs.flags.oneway,
             .importance = @intCast(@backingInt(attrs.road_class)),
             .has_names = name_start != name_end,
+            .layer = attrs.layer,
+            .level_start = level_start,
+            .level_count = std.math.cast(u24, self.levels.items.len - level_start) orelse return error.TooManyLevels,
             .name_start = name_start,
             .ref_start = ref_start,
             .ref_end = ref_end,
@@ -811,8 +821,7 @@ fn orderWalks(shared: *const Shared, plan: *const Layout, base: []const classes.
             } else {
                 const segment = shared.segments[topo.slot_refs.data[slot] / 2];
                 const way = shared.ways.get(segment.way_id) orelse return error.MissingWayAttributes;
-                const no_auto: u8 = @intFromBool(!class.forwardAccess().auto);
-                rank.* = no_auto * 16 + @as(u8, way.importance) * 2 + @intFromBool(!way.has_names);
+                rank.* = graph.constants.incidentEdgeRank(class.forwardAccess().auto, way.importance, way.has_names);
             }
             positions[rank.*] += 1;
         }
@@ -985,6 +994,25 @@ fn buildTurns(shared: *const Shared, edge_classes: []const classes.EdgeClass, na
     }
 }
 
+// Ported from src/mjolnir/osmway.cc GetTaggedValues. Level tags hold
+// individual floors or inclusive ranges separated by semicolons.
+fn appendLevels(out: *std.ArrayList(graph.cold.LevelRange), gpa: Allocator, source: []const u8, deadline: io.Deadline) !void {
+    var tokens = std.mem.tokenizeScalar(u8, source, ';');
+    while (tokens.next()) |raw| {
+        if (deadline.expired()) return error.DeadlineExceeded;
+        const token = std.mem.trim(u8, raw, &std.ascii.whitespace);
+        if (token.len == 0) continue;
+        const split = if (token[0] == '-') null else std.mem.indexOfScalar(u8, token, '-');
+        const first = std.fmt.parseFloat(f32, token[0 .. split orelse token.len]) catch continue;
+        const last = if (split) |sep|
+            std.fmt.parseFloat(f32, token[sep + 1 ..]) catch continue
+        else
+            first;
+        if (std.math.isFinite(first) and std.math.isFinite(last) and first <= last)
+            try out.append(gpa, .init(first, last));
+    }
+}
+
 fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *const Metadata, writer: *format.BundleWriter, scratch_dir: []const u8, means: []const i16) !u64 {
     const topo = shared.topology;
     const index = try Scratch(u32).init(topo.output.data.len, scratch_dir);
@@ -1010,8 +1038,12 @@ fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *const Metadata, w
                 }
                 reverse = ref & 1 != 0;
                 const mean = if (means.len == 0) graph.cold.no_elevation else means[ref / 2];
-                break :blk try builder.append(@bitCast(seg.way_id), way.speed_limit, mean, try segmentShape(shared.shape_points, seg), active);
-            } else try builder.append(0, 0, graph.cold.no_elevation, &.{ topo.coordinates[node], topo.coordinates[edge.head] }, &.{});
+                const indoor: graph.cold.Indoor = .{
+                    .layer = way.layer,
+                    .levels = metadata.levels.items[way.level_start..][0..way.level_count],
+                };
+                break :blk try builder.append(@bitCast(seg.way_id), way.speed_limit, mean, try segmentShape(shared.shape_points, seg), active, indoor);
+            } else try builder.append(0, 0, graph.cold.no_elevation, &.{ topo.coordinates[node], topo.coordinates[edge.head] }, &.{}, .{});
             index.data[slot] = graph.cold.directedIndex(record, reverse);
             index.data[opposite] = graph.cold.directedIndex(record, !reverse);
         }

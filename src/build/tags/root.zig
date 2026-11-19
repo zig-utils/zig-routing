@@ -36,6 +36,8 @@ pub fn transformWay(scratch: *Scratch, tags: anytype, deadline: io.Deadline) !?W
             .rail = selected.rail,
             .pedestrian_area = selected.pedestrian_area,
         },
+        .layer = @truncate(if (scratch.text(.layer)) |layer| std.fmt.parseInt(i32, layer, 10) catch 0 else @as(i32, 0)),
+        .level = scratch.text(.level),
         .names = names.read(scratch),
     };
     try highway.classify(scratch, selected, deadline, &result);

@@ -146,7 +146,7 @@ pub const Work = struct {
         self.heights.clearRetainingCapacity();
         for (shape, self.points.items, 0..) |fixed, *point, i| {
             if (i % 256 == 0) try self.check();
-            point.* = tilePoint(fixed);
+            point.* = fixed.toTilePoint();
         }
 
         const Sink = struct {
@@ -197,19 +197,8 @@ pub const Work = struct {
     }
 };
 
-// The oracle measures a decoded E6 EdgeInfo shape. Reproduce the upstream
-// unsigned OSMNode coordinate conversion followed by encode7/decode7.
-fn tilePoint(fixed: geo.FixedLL) geo.PointLL {
-    const lon: f64 = @floatFromInt(@as(i64, fixed.lng) + 1_800_000_000);
-    const lat: f64 = @floatFromInt(@as(i64, fixed.lat) + 900_000_000);
-    return .{
-        .lng = @round((lon * 1e-7 - 180) * 1e6) * 1e-6,
-        .lat = @round((lat * 1e-7 - 90) * 1e6) * 1e-6,
-    };
-}
-
 pub fn tileKey(first: geo.FixedLL) u32 {
-    return @min(dem.hgt.tile_count, dem.hgt.tileIndex(tilePoint(first)));
+    return @min(dem.hgt.tile_count, dem.hgt.tileIndex(first.toTilePoint()));
 }
 
 test "Valhalla energy weighting and mean elevation ignore voids" {

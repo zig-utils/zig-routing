@@ -41,7 +41,7 @@ pub fn encode(kind: Type, stop: u3, consistent: bool) u8 {
 /// quantization, even though the bundle only retains the resulting turn.
 pub fn heading(points: []const geo.FixedLL, forward: bool, class: *const EdgeClass, deadline: io.Deadline) !u16 {
     if (points.len < 2) return error.InvalidSegmentShape;
-    const dist = headingOffset(class);
+    const dist = constants.headingOffset(class.category.road_class, class.category.use);
     const start = points[if (forward) 0 else points.len - 1].toPoint();
     var target = points[if (forward) points.len - 1 else 0].toPoint();
     var previous = start;
@@ -67,21 +67,6 @@ pub fn heading(points: []const geo.FixedLL, forward: bool, class: *const EdgeCla
     const expand: f32 = 359.0 / 255.0;
     const stored: f32 = @round(@as(f32, @floatFromInt(rounded)) * shrink);
     return @intFromFloat(@round(stored * expand));
-}
-
-fn headingOffset(class: *const EdgeClass) f64 {
-    const rc = class.category.road_class;
-    var offset: f32 = 15;
-    if (rc < 2) {
-        offset *= 1.6;
-    } else if (rc < 5) {
-        offset *= 1.4;
-    }
-    const use = std.enums.fromInt(constants.Use, class.category.use) orelse return offset;
-    return switch (use) {
-        .cycleway, .mountain_bike, .footway, .steps, .ladder, .path, .pedestrian, .bridleway => offset * 0.5,
-        else => offset,
-    };
 }
 
 pub const Approach = struct {

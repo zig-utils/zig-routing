@@ -13,6 +13,12 @@ const k = @import("constants.zig");
 /// upstream INVALID_LL: (double)0xBADBADBAD.
 pub const invalid_ll: f64 = @floatFromInt(0xBADBADBAD);
 
+/// Short signed longitude displacement from origin to longitude.
+pub fn wrappedLongitudeDelta(longitude: f64, origin: f64) f64 {
+    const delta = longitude - origin;
+    return if (delta > 180) delta - 360 else if (delta < -180) delta + 360 else delta;
+}
+
 /// Longitude, latitude in degrees (longitude first, as upstream).
 pub const PointLL = struct {
     lng: f64,
@@ -274,6 +280,19 @@ pub const PointLL = struct {
 pub const FixedLL = extern struct {
     lng: i32,
     lat: i32,
+
+    /// Coordinates after the unsigned upstream OSMNode conversion.
+    pub fn toOsmPoint(fixed: FixedLL) PointLL {
+        const lon: f64 = @floatFromInt(@as(i64, fixed.lng) + 1_800_000_000);
+        const lat: f64 = @floatFromInt(@as(i64, fixed.lat) + 900_000_000);
+        return .{ .lng = lon * 1e-7 - 180, .lat = lat * 1e-7 - 90 };
+    }
+
+    /// Valhalla E6 EdgeInfo point after shape encoding and decoding.
+    pub fn toTilePoint(fixed: FixedLL) PointLL {
+        const p = fixed.toOsmPoint();
+        return .{ .lng = @round(p.lng * 1e6) * 1e-6, .lat = @round(p.lat * 1e6) * 1e-6 };
+    }
 
     pub fn toPoint(self: FixedLL) PointLL {
         return .{ .lng = @as(f64, @floatFromInt(self.lng)) * 1e-7, .lat = @as(f64, @floatFromInt(self.lat)) * 1e-7 };

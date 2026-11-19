@@ -33,8 +33,45 @@ const RecordHeader = extern struct {
     },
 };
 
+/// Optional trailer after name references. The signed layer and range count
+/// share one little-endian word. Each level range stores two f32 endpoints.
+const IndoorHeader = extern struct {
+    attributes: packed struct(u32) {
+        layer: i8,
+        count: u24,
+    },
+};
+
+pub const LevelRange = extern struct {
+    bounds: packed struct(u64) {
+        first: f32,
+        last: f32,
+    },
+
+    pub fn init(first: f32, last: f32) LevelRange {
+        return .{ .bounds = .{ .first = first, .last = last } };
+    }
+};
+
+pub const Indoor = struct {
+    layer: i8 = 0,
+    levels: []align(1) const LevelRange = &.{},
+
+    pub fn includes(self: Indoor, level: f32, deadline: io.Deadline) !bool {
+        for (self.levels, 0..) |range, i| {
+            if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+            if (range.bounds.first <= level and level <= range.bounds.last) return true;
+        }
+        return false;
+    }
+};
+
 comptime {
     std.debug.assert(@import("builtin").target.cpu.arch.endian() == .little);
+    std.debug.assert(@sizeOf(IndoorHeader) == 4);
+    std.debug.assert(@offsetOf(IndoorHeader, "attributes") == 0);
+    std.debug.assert(@sizeOf(LevelRange) == 8);
+    std.debug.assert(@offsetOf(LevelRange, "bounds") == 0);
     std.debug.assert(@sizeOf(Header) == 16);
     std.debug.assert(@offsetOf(Header, "record_count") == 0);
     std.debug.assert(@offsetOf(Header, "name_count") == 4);
@@ -154,16 +191,26 @@ pub const Record = struct {
     reverse: bool,
     encoded: []const u8,
     references: []const u8,
+    indoor: Indoor,
 
     fn parse(bytes: []const u8, reverse: bool) !Record {
         if (bytes.len < @sizeOf(RecordHeader)) return error.TruncatedColdRecord;
         const header = std.mem.bytesToValue(RecordHeader, bytes[0..@sizeOf(RecordHeader)]);
         const data = bytes[@sizeOf(RecordHeader)..];
         const ref_bytes = @as(usize, header.attributes.name_count) * @sizeOf(u32);
-        if (ref_bytes > data.len or header.shape_bytes != data.len - ref_bytes or
+        if (header.shape_bytes > data.len or ref_bytes > data.len - header.shape_bytes or
             header.point_count < 2 or header.point_count > header.shape_bytes / 2)
             return error.InvalidColdRecord;
-        return .{ .header = header, .reverse = reverse, .encoded = data[0..header.shape_bytes], .references = data[header.shape_bytes..] };
+        const end = @as(usize, header.shape_bytes) + ref_bytes;
+        const trailer = data[end..];
+        const indoor: Indoor = if (trailer.len == 0) .{} else blk: {
+            if (trailer.len < @sizeOf(IndoorHeader)) return error.InvalidColdIndoorData;
+            const info = std.mem.bytesToValue(IndoorHeader, trailer[0..@sizeOf(IndoorHeader)]).attributes;
+            const levels = trailer[@sizeOf(IndoorHeader)..];
+            if (levels.len != @as(usize, info.count) * @sizeOf(LevelRange)) return error.InvalidColdIndoorData;
+            break :blk .{ .layer = info.layer, .levels = std.mem.bytesAsSlice(LevelRange, levels) };
+        };
+        return .{ .header = header, .reverse = reverse, .encoded = data[0..header.shape_bytes], .references = data[header.shape_bytes..end], .indoor = indoor };
     }
 
     pub fn wayId(self: Record) u64 {
@@ -183,9 +230,15 @@ pub const Record = struct {
     }
 
     pub fn shape(self: Record, arena: Allocator, deadline: io.Deadline) ![]point.FixedLL {
-        if (deadline.expired()) return error.DeadlineExceeded;
         const vertices = try arena.alloc(point.FixedLL, self.header.point_count);
         errdefer arena.free(vertices);
+        try self.decodeShape(vertices, deadline);
+        return vertices;
+    }
+
+    pub fn decodeShape(self: Record, vertices: []point.FixedLL, deadline: io.Deadline) !void {
+        if (deadline.expired()) return error.DeadlineExceeded;
+        if (vertices.len != self.header.point_count) return error.InvalidShapeBuffer;
         var decoder = polyline.Decoder(.varint).init(self.encoded, 7);
         for (0..vertices.len) |i| {
             if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
@@ -195,11 +248,10 @@ pub const Record = struct {
             vertices[if (self.reverse) vertices.len - 1 - i else i] = vertex;
         }
         if (!decoder.empty()) return error.TrailingShapeBytes;
-        return vertices;
     }
 };
 
-pub fn appendRecord(out: *std.ArrayList(u8), allocator: Allocator, way_id: u64, speed_limit: u8, mean_elevation: i16, vertices: []const point.FixedLL, refs: []const u32, deadline: io.Deadline) !void {
+pub fn appendRecord(out: *std.ArrayList(u8), allocator: Allocator, way_id: u64, speed_limit: u8, mean_elevation: i16, vertices: []const point.FixedLL, refs: []const u32, indoor: Indoor, deadline: io.Deadline) !void {
     if (vertices.len < 2) return error.IncompleteShape;
     const point_count = std.math.cast(u32, vertices.len) orelse return error.ShapeTooLarge;
     const name_count = std.math.cast(u8, refs.len) orelse return error.TooManyEdgeNames;
@@ -215,6 +267,15 @@ pub fn appendRecord(out: *std.ArrayList(u8), allocator: Allocator, way_id: u64, 
     }
     const shape_bytes = std.math.cast(u32, out.items.len - start - @sizeOf(RecordHeader)) orelse return error.ShapeTooLarge;
     try out.appendSlice(allocator, std.mem.sliceAsBytes(refs));
+    if (indoor.layer != 0 or indoor.levels.len != 0) {
+        const count = std.math.cast(u24, indoor.levels.len) orelse return error.TooManyLevels;
+        const indoor_header: IndoorHeader = .{ .attributes = .{ .layer = indoor.layer, .count = count } };
+        try out.appendSlice(allocator, std.mem.asBytes(&indoor_header));
+        for (indoor.levels, 0..) |*range, i| {
+            if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+            try out.appendSlice(allocator, std.mem.asBytes(range));
+        }
+    }
     const header: RecordHeader = .{
         .way_low = @truncate(way_id),
         .way_high = @intCast(way_id >> 32),
@@ -238,9 +299,9 @@ test "cold record preserves an E7 shape over 64 KiB and 255 name references" {
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(arena);
     const refs: [max_names]u32 = @splat(0);
-    try testing.expectError(error.DeadlineExceeded, appendRecord(&bytes, arena, 0, 0, no_elevation, vertices, &.{}, .{ .at_ns = 0 }));
+    try testing.expectError(error.DeadlineExceeded, appendRecord(&bytes, arena, 0, 0, no_elevation, vertices, &.{}, .{}, .{ .at_ns = 0 }));
     try testing.expectEqual(0, bytes.items.len);
-    try appendRecord(&bytes, arena, 0x0123_4567_89ab_cdef, 255, no_elevation, vertices, &refs, .none);
+    try appendRecord(&bytes, arena, 0x0123_4567_89ab_cdef, 255, no_elevation, vertices, &refs, .{}, .none);
     const forward = try Record.parse(bytes.items, false);
     const backward = try Record.parse(bytes.items, true);
     try testing.expect(forward.encoded.len > std.math.maxInt(u16));
@@ -277,12 +338,30 @@ test "cold directory locates the last record in a full chunk and the following c
     var records: [chunk_size + 1]u64 = undefined;
     for (&records, 0..) |*offset, i| offset.* = i * record_bytes;
     try data.appendSlice(gpa, std.mem.sliceAsBytes(&records));
-    for (0..chunk_size) |i| try appendRecord(&data, gpa, i + 1, 0, no_elevation, &vertices, &.{}, .none);
+    for (0..chunk_size) |i| try appendRecord(&data, gpa, i + 1, 0, no_elevation, &vertices, &.{}, .{}, .none);
     try data.appendSlice(gpa, std.mem.asBytes(&[2]u64{ 0, record_bytes }));
-    try appendRecord(&data, gpa, chunk_size + 1, 0, no_elevation, &vertices, &.{}, .none);
+    try appendRecord(&data, gpa, chunk_size + 1, 0, no_elevation, &vertices, &.{}, .{}, .none);
     try data.appendSlice(gpa, std.mem.asBytes(&@as(u64, 0)));
 
     const view = try View.parse(data.items);
     try testing.expectEqual(chunk_size, (try view.record(directedIndex(chunk_size - 1, false))).wayId());
     try testing.expectEqual(chunk_size + 1, (try view.record(directedIndex(chunk_size, true))).wayId());
+}
+
+test "cold indoor metadata is optional and validates its range count" {
+    const testing = std.testing;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(testing.allocator);
+    const shape = [_]point.FixedLL{ .{ .lng = 0, .lat = 0 }, .{ .lng = 100, .lat = 200 } };
+    const ranges = [_]LevelRange{ .init(-2, -1), .init(1.5, 1.5), .init(3, 6) };
+    try appendRecord(&bytes, testing.allocator, 42, 10, no_elevation, &shape, &.{}, .{ .layer = -1, .levels = &ranges }, .none);
+    const record = try Record.parse(bytes.items, true);
+    try testing.expectEqual(-1, record.indoor.layer);
+    try testing.expect(try record.indoor.includes(5, .none));
+    try testing.expect(try record.indoor.includes(-1, .none));
+    try testing.expect(!try record.indoor.includes(0, .none));
+    try testing.expectError(error.InvalidColdIndoorData, Record.parse(bytes.items[0 .. bytes.items.len - 1], false));
+    const old = try Record.parse(bytes.items[0 .. bytes.items.len - @sizeOf(IndoorHeader) - @sizeOf(@TypeOf(ranges))], false);
+    try testing.expectEqual(0, old.indoor.layer);
+    try testing.expectEqual(0, old.indoor.levels.len);
 }

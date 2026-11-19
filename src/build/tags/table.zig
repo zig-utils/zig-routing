@@ -135,6 +135,7 @@ pub const Key = enum(u8) {
     indoor,
     wheelchair,
     barrier,
+    layer,
     level,
     level_ref,
     footway,
