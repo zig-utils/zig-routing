@@ -3,22 +3,14 @@
 
 const std = @import("std");
 const protobuf = @import("protobuf");
+const schema = @import("routing").build.pbf.schema;
 const gurka = @import("gurka.zig");
 const Allocator = std.mem.Allocator;
 const none = protobuf.no_deadline;
 
-const BlobHeader = protobuf.Message(&.{
-    .{ .name = "type", .number = 1, .kind = .string, .presence = .required },
-    .{ .name = "datasize", .number = 3, .kind = .int32, .presence = .required },
-});
-const Blob = protobuf.Message(&.{
-    .{ .name = "raw", .number = 1, .kind = .bytes, .presence = .optional },
-});
-const HeaderBlock = protobuf.Message(&.{
-    .{ .name = "required_features", .number = 4, .kind = .string, .presence = .repeated },
-    .{ .name = "optional_features", .number = 5, .kind = .string, .presence = .repeated },
-    .{ .name = "writingprogram", .number = 16, .kind = .string, .presence = .optional },
-});
+const BlobHeader = schema.BlobHeader;
+const Blob = schema.Blob;
+const HeaderBlock = schema.HeaderBlock;
 const StringTable = protobuf.Message(&.{
     .{ .name = "s", .number = 1, .kind = .bytes, .presence = .repeated },
 });

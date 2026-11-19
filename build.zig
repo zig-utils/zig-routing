@@ -176,9 +176,19 @@ pub fn build(b: *std.Build) void {
     run_bench_lz4.addPassthruArgs();
     b.step("bench-lz4", "LZ4 throughput").dependOn(&run_bench_lz4.step);
 
+    const bench_osm_pbf = b.addExecutable(.{ .name = "bench-osm-pbf", .root_module = b.createModule(.{
+        .root_source_file = b.path("test/bench_osm_pbf.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{.{ .name = "routing", .module = lib_mod }},
+    }) });
+    const run_bench_osm_pbf = b.addRunArtifact(bench_osm_pbf);
+    run_bench_osm_pbf.addPassthruArgs();
+    b.step("bench-osm-pbf", "OSM PBF index and inflate throughput").dependOn(&run_bench_osm_pbf.step);
+
     // Fuzz targets (test/fuzz.zig). `zig build test` replays their seeds; `zig build fuzz
     // --fuzz` fuzzes, ReleaseSafe by default so bounds and overflow checks stay on.
-    const fuzz_filter = b.option([]const u8, "fuzz-target", "Fuzz one target: request, http, polyline, lz4, dem, protobuf, config");
+    const fuzz_filter = b.option([]const u8, "fuzz-target", "Fuzz one target: request, http, polyline, lz4, dem, protobuf, config, osm-pbf");
     const fuzz_opt: @TypeOf(optimize) = .ReleaseSafe;
     const seed_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("test/fuzz.zig"),

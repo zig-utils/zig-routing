@@ -111,6 +111,15 @@ printf '/echo\t{"message":"hello"}\n' > bench/results/echo.tsv
 zig-out/bin/zr bench "http://127.0.0.1:$PORT" --corpus bench/results/echo.tsv --connections "$WORKERS" --warmup 2s --duration 10s --label zig-routing-echo --commit "$(git rev-parse HEAD)" --out bench/results/echo.json
 ```
 
+### OSM PBF inflation benchmark
+
+Pass a fetched extract, worker count, and number of passes. The report gives
+indexing time, block counts, inflate throughput, and peak RSS.
+
+```bash
+zig build bench-osm-pbf -Doptimize=ReleaseFast -- oracle/data/liechtenstein/extract.osm.pbf 4 100
+```
+
 ## License
 
 MIT. See [LICENSE](LICENSE) and [NOTICE](NOTICE) for the Valhalla attribution.

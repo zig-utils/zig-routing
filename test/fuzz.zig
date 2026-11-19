@@ -8,7 +8,8 @@
 //! string, percent decoding), `polyline` (polyline 5/6/7 and varint
 //! decoders), `lz4` (block and frame decoders, plus a compress round trip),
 //! `dem` (the packed elevation block decoder), and `protobuf` (wire records
-//! and generated message views), and `config` (Valhalla JSON settings).
+//! and generated message views), `config` (Valhalla JSON settings), and
+//! `osm-pbf` (file framing and block inflation).
 //!
 //! The contract for every parser: malformed input returns an error, never
 //! panics, overflows or reads out of bounds. The fuzz step builds ReleaseSafe
@@ -47,6 +48,39 @@ fn seeds(gpa: std.mem.Allocator, raw: []const []const u8) ![]const []const u8 {
     const out = try gpa.alloc([]const u8, raw.len);
     for (out, raw) |*o, r| o.* = try seed(gpa, r);
     return out;
+}
+
+fn fuzzOsmPbf(_: void, s: *Smith) !void {
+    var buf: [max_input]u8 = undefined;
+    const input = draw(s, &buf, 0x6f73_6d70);
+    var memory: [256 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&memory);
+    var index = routing.build.pbf.file.Index.init(fixed.allocator(), input, .none) catch return;
+    defer index.deinit();
+    var scratch: [max_input]u8 = undefined;
+    for (index.blobs, 0..) |blob, i| {
+        const decoded = index.inflateInto(i, &scratch, .none) catch continue;
+        try std.testing.expectEqual(blob.raw_size, decoded.len);
+        try expectBorrowed(if (blob.compression == .raw) input else &scratch, decoded);
+    }
+}
+
+test "fuzz osm-pbf" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const header = "\x00\x00\x00\x0d\x0a\x09OSMHeader\x18\x12\x0a\x10\x22\x0eOsmSchema-V0.6";
+    const raw = "\x00\x00\x00\x0b\x0a\x07OSMData\x18\x06\x0a\x04\x0a\x02\x0a\x00";
+    const zlib = "\x00\x00\x00\x0b\x0a\x07OSMData\x18\x10\x1a\x0cx\x9c\xe3b\xe2b\x00\x00\x00F\x00\x17\x10\x04";
+    const lz4_blob = "\x00\x00\x00\x0b\x0a\x07OSMData\x18\x09\x32\x05\x40\x0a\x02\x0a\x00\x10\x04";
+    try std.testing.fuzz({}, fuzzOsmPbf, .{ .corpus = try seeds(state.allocator(), &.{
+        "",
+        header,
+        header ++ raw,
+        header ++ zlib,
+        header ++ lz4_blob,
+        header ++ raw ++ zlib ++ lz4_blob,
+        header ++ "\x00\x01\x00\x00",
+    }) });
 }
 
 fn fuzzConfig(_: void, s: *Smith) !void {

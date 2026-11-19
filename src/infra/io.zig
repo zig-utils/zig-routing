@@ -368,6 +368,59 @@ pub fn stderrWriter(system: std.Io, buffer: []u8) std.Io.File.Writer {
     return std.Io.File.stderr().writerStreaming(system, buffer);
 }
 
+pub const Mutex = struct {
+    inner: std.Io.Mutex = .init,
+
+    pub fn lock(self: *Mutex) void {
+        self.inner.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+    }
+
+    pub fn unlock(self: *Mutex) void {
+        self.inner.unlock(std.Io.Threaded.global_single_threaded.io());
+    }
+};
+
+pub const Condition = struct {
+    inner: std.Io.Condition = .init,
+
+    pub fn wait(self: *Condition, mutex: *Mutex) void {
+        self.inner.waitUncancelable(std.Io.Threaded.global_single_threaded.io(), &mutex.inner);
+    }
+
+    pub fn broadcast(self: *Condition) void {
+        self.inner.broadcast(std.Io.Threaded.global_single_threaded.io());
+    }
+};
+
+pub const InflateError = error{ CorruptZlib, InflateSizeMismatch, DeadlineExceeded };
+
+/// Inflate a single zlib stream into caller-owned memory and verify its length,
+/// checksum and end of input. The output buffer also serves as match history.
+pub fn inflateZlibExact(src: []const u8, dst: []u8, deadline: Deadline) InflateError!void {
+    var input: std.Io.Reader = .fixed(src);
+    var output: std.Io.Writer = .fixed(dst);
+    var stream: std.compress.flate.Decompress = .init(&input, .zlib, &.{});
+    var checksum: std.hash.Adler32 = .{};
+    while (true) {
+        if (deadline.expired()) return error.DeadlineExceeded;
+        const begin = output.end;
+        _ = stream.reader.stream(&output, .limited(256 * 1024)) catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.WriteFailed => return error.InflateSizeMismatch,
+            error.ReadFailed => return error.CorruptZlib,
+        };
+        checksum.update(dst[begin..output.end]);
+    }
+    if (output.end != dst.len) return error.InflateSizeMismatch;
+    if (input.seek != src.len or checksum.adler != stream.container_metadata.zlib.adler) return error.CorruptZlib;
+}
+
+pub fn peakRssBytes() Error!u64 {
+    var usage: c.rusage = undefined;
+    _ = try checkInt(c.getrusage(c.rusage.SELF, &usage));
+    return @as(u64, @intCast(usage.maxrss)) * (if (is_linux) @as(u64, 1024) else 1);
+}
+
 pub const Address = struct {
     /// IPv4 address in network byte order as four octets.
     ip: [4]u8,

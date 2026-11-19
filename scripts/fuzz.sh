@@ -16,7 +16,7 @@ set -uo pipefail
 seconds=600
 if [ "${1:-}" = "-s" ]; then seconds="$2"; shift 2; fi
 targets=("$@")
-[ ${#targets[@]} -eq 0 ] && targets=(request http polyline lz4 dem protobuf config)
+[ ${#targets[@]} -eq 0 ] && targets=(request http polyline lz4 dem protobuf config osm-pbf)
 
 ZIG="${ZIG:-zig}"
 if ! command -v "$ZIG" >/dev/null 2>&1 && [ -x "$HOME/.local/share/zig-0.17-master/zig" ]; then
