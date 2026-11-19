@@ -9,6 +9,8 @@ pub const libm = @import("libm.zig");
 pub const polyline = @import("polyline.zig");
 pub const line = @import("line.zig");
 pub const grid = @import("grid.zig");
+pub const polygon = @import("polygon.zig");
+pub const PolygonIndex = @import("polygon_index.zig").Index;
 
 pub const PointLL = point.PointLL;
 pub const FixedLL = point.FixedLL;

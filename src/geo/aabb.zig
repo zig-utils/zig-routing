@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const PointLL = @import("point.zig").PointLL;
+const Deadline = @import("../infra/io.zig").Deadline;
 
 pub const AABB = struct {
     minx: f64 = 0,
@@ -55,6 +56,10 @@ pub const AABB = struct {
     /// Half-open: points on the min edges are inside, on the max edges outside.
     pub fn contains(self: AABB, pt: PointLL) bool {
         return pt.lng >= self.minx and pt.lat >= self.miny and pt.lng < self.maxx and pt.lat < self.maxy;
+    }
+
+    pub fn covers(self: AABB, pt: PointLL) bool {
+        return pt.lng >= self.minx and pt.lat >= self.miny and pt.lng <= self.maxx and pt.lat <= self.maxy;
     }
 
     pub fn containsBox(self: AABB, r2: AABB) bool {
@@ -147,14 +152,21 @@ pub const AABB = struct {
             .bottom => (self.miny - in.lat) / dy,
             .top => (self.maxy - in.lat) / dy,
         };
-        return .{ .lng = in.lng + t * dx, .lat = in.lat + t * dy };
+        // Keep the clipped coordinate exactly on its boundary for adjoining
+        // shapes, including when interpolation rounds outside the box.
+        return switch (edge) {
+            .left => .{ .lng = self.minx, .lat = in.lat + t * dy },
+            .right => .{ .lng = self.maxx, .lat = in.lat + t * dy },
+            .bottom => .{ .lng = in.lng + t * dx, .lat = self.miny },
+            .top => .{ .lng = in.lng + t * dx, .lat = self.maxy },
+        };
     }
 
     fn add(list: *std.ArrayList(PointLL), gpa: std.mem.Allocator, pt: PointLL) !void {
         if (list.items.len == 0 or !list.items[list.items.len - 1].eql(pt)) try list.append(gpa, pt);
     }
 
-    fn clipEdge(self: AABB, gpa: std.mem.Allocator, edge: Edge, closed: bool, vin: []const PointLL, vout: *std.ArrayList(PointLL)) !usize {
+    fn clipEdge(self: AABB, gpa: std.mem.Allocator, edge: Edge, closed: bool, vin: []const PointLL, vout: *std.ArrayList(PointLL), deadline: Deadline) !usize {
         vout.clearRetainingCapacity();
         const n = vin.len;
         if (n == 0) return 0;
@@ -164,6 +176,7 @@ pub const AABB = struct {
             v1 = v2;
             v2 += 1;
         }) {
+            if (v2 % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
             const v1in = self.inside(edge, vin[v1]);
             const v2in = self.inside(edge, vin[v2]);
             if (v1in and v2in) {
@@ -181,12 +194,16 @@ pub const AABB = struct {
     /// Sutherland-Hodgman clip of a polyline or polygon to the box, in place.
     /// Returns the number of vertices left (0 when nothing is inside).
     pub fn clip(self: AABB, gpa: std.mem.Allocator, pts: *std.ArrayList(PointLL), closed: bool) !usize {
+        return self.clipWithDeadline(gpa, pts, closed, .none);
+    }
+
+    pub fn clipWithDeadline(self: AABB, gpa: std.mem.Allocator, pts: *std.ArrayList(PointLL), closed: bool, deadline: Deadline) !usize {
         var tmp: std.ArrayList(PointLL) = .empty;
         defer tmp.deinit(gpa);
-        if (try self.clipEdge(gpa, .left, closed, pts.items, &tmp) == 0) return clear(pts);
-        if (try self.clipEdge(gpa, .right, closed, tmp.items, pts) == 0) return clear(pts);
-        if (try self.clipEdge(gpa, .bottom, closed, pts.items, &tmp) == 0) return clear(pts);
-        if (try self.clipEdge(gpa, .top, closed, tmp.items, pts) == 0) return clear(pts);
+        if (try self.clipEdge(gpa, .left, closed, pts.items, &tmp, deadline) == 0) return clear(pts);
+        if (try self.clipEdge(gpa, .right, closed, tmp.items, pts, deadline) == 0) return clear(pts);
+        if (try self.clipEdge(gpa, .bottom, closed, pts.items, &tmp, deadline) == 0) return clear(pts);
+        if (try self.clipEdge(gpa, .top, closed, tmp.items, pts, deadline) == 0) return clear(pts);
         return pts.items.len;
     }
 
