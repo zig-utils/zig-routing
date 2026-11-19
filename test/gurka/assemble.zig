@@ -879,3 +879,49 @@ test "location correlation counts one-way reach and reports unconnected and unsn
     const missing = try snap.location.route(view, a, &.{start_input}, .{}, auto, .none);
     try testing.expectEqual(120, missing.failure.code);
 }
+
+test "leased compiled classes drive graph-based snapping and the cold permission hook" {
+    const costing = routing.costing.compiled;
+    const snap = routing.snap;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const layout = try gurka.mapToCoordinatesAt("A--B--C", 50, .{ .lng = 9.6, .lat = 47.1 });
+    const fixture = try gurka.Map.init(a, layout, &.{
+        .{ .label = "AB", .tags = &.{.{ .key = "highway", .value = "residential" }} },
+        .{ .label = "BC", .tags = &.{.{ .key = "highway", .value = "footway" }} },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const Driver = struct {
+        pub const Options = void;
+        pub const Canonical = void;
+        pub fn canonicalize(_: Options) !Canonical {}
+        pub fn rules(_: Canonical) !costing.Rules {
+            return .{ .node_access_mask = @bitCast(graph.constants.AccessMask{ .auto = true }) };
+        }
+        pub fn classFactor(_: Canonical, class: graph.class_table.EdgeClass) !f32 {
+            return if (class.forwardAccess().auto) 1 else std.math.inf(f32);
+        }
+    };
+    var cache = try costing.Cache(Driver).init(a, view.classes.?, 1);
+    defer cache.deinit();
+    var lease = try cache.acquire({}, .none);
+    defer lease.release();
+    const coordinate = fixture.findNode("B").?.location;
+    const location: routing.api.request.Location = .{ .lat = coordinate.lat, .lng = coordinate.lng, .search_cutoff = 10 };
+    const result = try snap.candidates.search(view, a, location, .{}, lease.tables(), .none);
+    try testing.expectEqual(2, result.edges.len);
+    const ab = try directedBetween(view, &fixture, "A", "B");
+    const bc = try directedBetween(view, &fixture, "B", "C");
+    const Cold = struct {
+        blocked: ?format.EdgeId = null,
+        pub fn allowed(self: @This(), _: *const graph.reader.View, id: format.EdgeId, _: *const format.EdgeHot) bool {
+            return self.blocked != id;
+        }
+    };
+    try testing.expect(costing.Kernel.slowAllowed(lease.tables(), view, ab, Cold{}));
+    try testing.expect(!costing.Kernel.slowAllowed(lease.tables(), view, ab, Cold{ .blocked = ab }));
+    try testing.expect(!costing.Kernel.slowAllowed(lease.tables(), view, bc, Cold{}));
+}

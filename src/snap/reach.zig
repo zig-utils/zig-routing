@@ -130,17 +130,17 @@ pub const Finder = struct {
             if (departure.hot.cls.local >= row.len) return error.InvalidLocalEdge;
             if (row[departure.hot.cls.local] & 0x80 != 0) return false;
         }
-        if (@hasDecl(@TypeOf(costing), "allowedTransition")) return costing.allowedTransition(arrival, departure);
+        if (comptime @import("edge.zig").hasPolicy(@TypeOf(costing), "allowedTransition")) return costing.allowedTransition(arrival, departure);
         return true;
     }
 };
 
 fn nodeAllowed(costing: anytype, node: *const graph.format.NodeHot) bool {
-    if (@hasDecl(@TypeOf(costing), "allowedNode")) return costing.allowedNode(node);
+    if (comptime @import("edge.zig").hasPolicy(@TypeOf(costing), "allowedNode")) return costing.allowedNode(node);
     return true;
 }
 
 fn isClosed(costing: anytype, arc: Arc) bool {
-    if (@hasDecl(@TypeOf(costing), "closed")) return costing.closed(arc);
+    if (comptime @import("edge.zig").hasPolicy(@TypeOf(costing), "closed")) return costing.closed(arc);
     return false;
 }

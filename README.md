@@ -130,6 +130,26 @@ Use an output path ending in `.svg` for an SVG or `.folded` for folded stacks. L
 user-space `perf` sampling of the process. On macOS, the command needs to run long enough for
 `sample` to attach.
 
+### Compiled costing
+
+```bash
+zig build bench-costing -Doptimize=ReleaseFast -- "$bundle" 100000
+```
+
+The benchmark runs 1,024 distinct option compilations against the bundle's
+actual class table. It measures cache hits in batches of 64 and enforces the
+optional median miss limit in nanoseconds. CI uses a 100 µs limit on Utrecht.
+
+| Extract | Classes | Median compile | p95 compile |
+| --- | ---: | ---: | ---: |
+| Liechtenstein | 931 | 6.0 µs | 6.1 µs |
+| Utrecht | 5,159 | 26.6 µs | 30.7 µs |
+| Luxembourg 2026-01-01 | 16,153 | 81.2 µs | 90.5 µs |
+
+These ReleaseFast timings were measured on an Apple M3 Pro. Cache storage is
+reserved at startup. Equal compiled tables share a 128-bit key, and the
+integer lower bounds account for declared cost and speed floors.
+
 ### HTTP echo benchmark
 
 Build the client and the standalone loopback echo server in ReleaseFast:

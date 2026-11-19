@@ -257,8 +257,12 @@ const Query = struct {
             (filter.exclude_toll and flags.toll) or (filter.exclude_ramp and class.category.use == @backingInt(Use.ramp)) or
             (filter.exclude_ferry and (class.category.use == @backingInt(Use.ferry) or class.category.use == @backingInt(Use.rail_ferry))) or
             (filter.exclude_steps and class.category.use == @backingInt(Use.steps)) or !costing.allowed(edge)) return false;
-        if (@hasDecl(@TypeOf(costing), "closed") and filter.exclude_closures and costing.closed(edge)) return false;
-        if (@hasDecl(@TypeOf(costing), "meetsAccessRestrictions") and filter.exclude_restricted and !costing.meetsAccessRestrictions(edge)) return false;
+        if (comptime @import("edge.zig").hasPolicy(@TypeOf(costing), "closed")) {
+            if (filter.exclude_closures and costing.closed(edge)) return false;
+        }
+        if (comptime @import("edge.zig").hasPolicy(@TypeOf(costing), "meetsAccessRestrictions")) {
+            if (filter.exclude_restricted and !costing.meetsAccessRestrictions(edge)) return false;
+        }
         if (filter.level != request.max_level) {
             const record = try edge.graph_view.coldRecord(edge.id);
             return record.indoor.includes(filter.level, self.deadline);

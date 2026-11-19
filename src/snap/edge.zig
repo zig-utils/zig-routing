@@ -19,3 +19,12 @@ pub const DirectedEdge = struct {
         };
     }
 };
+
+/// Costing models may pass a small value or a reference to an immutable POD.
+pub fn hasPolicy(comptime T: type, comptime name: []const u8) bool {
+    const model = switch (@typeInfo(T)) {
+        .pointer => |pointer| pointer.child,
+        else => T,
+    };
+    return @hasDecl(model, name);
+}

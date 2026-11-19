@@ -59,6 +59,7 @@ jobs:
             zig-out/bin/zr build --work-dir "$work/$dataset-split-work" --from elevation --output "$work/$dataset-resumed" --threads 4
             diff -qr "$work/$dataset-full" "$work/$dataset-resumed"
           done
+          zig build bench-costing -Doptimize=ReleaseFast -- "$work/utrecht-full" 100000
           oracle/fetch.sh liechtenstein
           zig build check-assembly -Doptimize=ReleaseFast -- "$ORACLE_DATA/liechtenstein/extract.osm.pbf" "$work/liechtenstein-dem" "$work" 4 right --dem "$ORACLE_DATA/liechtenstein/elevation"
           fetch_checked \
