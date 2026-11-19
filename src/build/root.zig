@@ -11,6 +11,7 @@ pub const edge_class = @import("edge_class.zig");
 pub const assemble = @import("assemble.zig");
 pub const turns = @import("turns.zig");
 pub const elevation = @import("elevation.zig");
+pub const enhance = @import("enhance.zig");
 pub const tags = @import("tags/root.zig");
 
 test {

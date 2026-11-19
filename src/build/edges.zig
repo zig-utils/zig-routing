@@ -8,6 +8,7 @@ const pbf = @import("pbf/root.zig");
 const tags = @import("tags/root.zig");
 const usage = @import("node_store/usage.zig");
 const way_shape = @import("way_shape.zig");
+const culdesac = @import("culdesac.zig");
 
 const Allocator = std.mem.Allocator;
 const Point = geo.FixedLL;
@@ -118,6 +119,20 @@ pub fn buildObserved(
     comptime consumeWay: fn (@TypeOf(context), i64, tags.WayAttrs, pbf.block.TagIterator) anyerror!void,
     comptime observeNode: ?fn (@TypeOf(context), i64, tags.NodeAttrs) anyerror!void,
 ) !Stats {
+    return buildWithGeometry(gpa, source, out, options, context, consumeWay, observeNode, null);
+}
+
+/// Also report loop roads classified by the geometry-dependent parser pass.
+pub fn buildWithGeometry(
+    gpa: Allocator,
+    source: pbf.file.Stream,
+    out: Output,
+    options: Options,
+    context: anytype,
+    comptime consumeWay: fn (@TypeOf(context), i64, tags.WayAttrs, pbf.block.TagIterator) anyerror!void,
+    comptime observeNode: ?fn (@TypeOf(context), i64, tags.NodeAttrs) anyerror!void,
+    comptime observeCuldesac: ?fn (@TypeOf(context), i64) anyerror!void,
+) !Stats {
     if (out.edges.fd == out.shapes.fd) return error.InvalidEdgeOutput;
     const store_file = try io.File.temporary(options.scratch_dir);
     defer store_file.close();
@@ -125,6 +140,7 @@ pub fn buildObserved(
         .gpa = gpa,
         .options = options,
         .cuts = try usage.Usage.init(options.scratch_dir),
+        .track_culdesacs = observeCuldesac != null,
     };
     defer prep.deinit();
     const Observe = struct {
@@ -169,12 +185,14 @@ pub fn buildObserved(
         .context = context,
         .out = out,
         .workers = workers,
-        .shared = .{ .store = store, .controls = &prep.controls, .options = options },
+        .shared = .{ .store = store, .controls = &prep.controls, .options = options, .culdesacs = &prep.culdesacs },
         .used = &used,
+        .culdesacs = &prep.culdesacs,
         .stats = .{ .too_short_ways = prep.too_short_ways },
     };
     defer pass.deinit();
     try source.forEach(gpa, options.deadline, &pass, Pass.visit);
+    if (observeCuldesac) |observe| try prep.culdesacs.finish(context, observe, options.deadline);
     return pass.stats;
 }
 
@@ -213,6 +231,8 @@ const Preparation = struct {
     scratch: tags.Scratch = .{},
     refs: Refs = .empty,
     last: Occurrences = .empty,
+    track_culdesacs: bool,
+    culdesacs: culdesac.Tracker = .{},
     too_short_ways: u64 = 0,
 
     fn deinit(self: *Preparation) void {
@@ -220,10 +240,11 @@ const Preparation = struct {
         self.controls.deinit(self.gpa);
         self.refs.deinit(self.gpa);
         self.last.deinit(self.gpa);
+        self.culdesacs.deinit(self.gpa);
     }
 
     fn include(self: *Preparation, way: *const pbf.block.Way) !bool {
-        _ = try transform(&self.scratch, way.*, self.options) orelse return false;
+        const attrs = try transform(&self.scratch, way.*, self.options) orelse return false;
         try loadRefs(self.gpa, &self.refs, way.*);
         const refs = self.refs.items;
         const shape = shapeOf(refs);
@@ -235,16 +256,21 @@ const Preparation = struct {
         _ = try self.cuts.insert(usage.keyFor(refs[0]));
         _ = try self.cuts.insert(usage.keyFor(refs[refs.len - 1]));
         self.last.clearRetainingCapacity();
+        var repeated = false;
         for (refs, 0..) |id, i| {
             try checkDeadline(self.options.deadline, i);
             const seen = try self.last.getOrPut(self.gpa, id);
             if (seen.found_existing) {
+                repeated = true;
                 const prev = seen.value_ptr.*;
                 const midpoint = refs[prev + (i - prev) / 2];
                 _ = try self.cuts.insert(usage.keyFor(midpoint));
             }
             seen.value_ptr.* = i;
         }
+        if (self.track_culdesacs and repeated and !attrs.flags.roundabout and attrs.use == .road and
+            @backingInt(attrs.road_class) > @backingInt(@TypeOf(attrs.road_class).tertiary))
+            try self.culdesacs.candidate(self.gpa, way.id, refs, &self.last, self.options.deadline);
         return true;
     }
 
@@ -278,6 +304,7 @@ const Shared = struct {
     store: node_store.Store,
     controls: *const Controls,
     options: Options,
+    culdesacs: *const culdesac.Tracker,
 };
 
 const WayRecord = struct {
@@ -304,6 +331,7 @@ const Worker = struct {
     edges: std.ArrayList(Edge) = .empty,
     shapes: std.ArrayList(Point) = .empty,
     candidates: std.ArrayList(Candidate) = .empty,
+    road_occurrences: std.ArrayList(culdesac.Occurrence) = .empty,
     stats: Stats = .{},
     result: anyerror!void = {},
 
@@ -316,6 +344,7 @@ const Worker = struct {
         self.edges.deinit(gpa);
         self.shapes.deinit(gpa);
         self.candidates.deinit(gpa);
+        self.road_occurrences.deinit(gpa);
     }
 
     fn run(self: *Worker, gpa: Allocator, shared: *const Shared, ways: []const pbf.block.Way) void {
@@ -323,6 +352,7 @@ const Worker = struct {
         self.edges.clearRetainingCapacity();
         self.shapes.clearRetainingCapacity();
         self.candidates.clearRetainingCapacity();
+        self.road_occurrences.clearRetainingCapacity();
         self.stats = .{};
         self.result = self.process(gpa, shared, ways);
     }
@@ -339,9 +369,13 @@ const Worker = struct {
             const deadline = shared.options.deadline;
             try self.cursor.lookupBatch(shared.store, refs, locations, deadline);
             var missing: usize = 0;
-            for (locations, 0..) |loc, i| {
+            const track = attrs.use == .road and shared.culdesacs.owners.count() != 0;
+            for (locations, refs, 0..) |loc, id, i| {
                 try checkDeadline(deadline, i);
                 missing += @intFromBool(loc == null);
+                if (track and shared.culdesacs.track(id)) {
+                    try self.road_occurrences.append(gpa, .{ .node_id = id, .way_id = way.id });
+                }
             }
             if (missing > 0) {
                 self.stats.missing_node_refs += missing;
@@ -531,6 +565,7 @@ fn StreamPass(comptime Context: type, comptime consumeWay: anytype) type {
         workers: []Worker,
         shared: Shared,
         used: *usage.Usage,
+        culdesacs: *culdesac.Tracker,
         duplicates: DuplicateIndex = .{},
         stats: Stats,
         scratch: pbf.block.Scratch = .{},
@@ -579,9 +614,13 @@ fn StreamPass(comptime Context: type, comptime consumeWay: anytype) type {
             self.stats.unresolved_ways += worker.stats.unresolved_ways;
             self.stats.self_edges += worker.stats.self_edges;
             self.stats.zero_length_edges += worker.stats.zero_length_edges;
+            const deadline = self.options.deadline;
+            for (worker.road_occurrences.items, 0..) |occurrence, i| {
+                try checkDeadline(deadline, i);
+                self.culdesacs.observe(occurrence);
+            }
             if (worker.edges.items.len == 0) return;
 
-            const deadline = self.options.deadline;
             const base = self.stats.shape_points;
             const shape_bytes = std.mem.sliceAsBytes(worker.shapes.items);
             try self.out.shapes.pwriteAll(shape_bytes, base * @sizeOf(Point));

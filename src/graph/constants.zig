@@ -128,6 +128,13 @@ pub const NodeType = enum(u4) {
     elevator,
 };
 
+pub const IntersectionType = enum(u2) {
+    regular = 0,
+    false_intersection = 1,
+    dead_end = 2,
+    fork = 3,
+};
+
 pub const AccessMask = packed struct(u16) {
     auto: bool = false,
     pedestrian: bool = false,

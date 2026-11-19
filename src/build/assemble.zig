@@ -14,6 +14,7 @@ const turns = @import("turns.zig");
 const ColdBuilder = @import("cold_builder.zig").Builder;
 const elevation = @import("elevation.zig");
 const dem = @import("../elevation/root.zig");
+const enhance = @import("enhance.zig");
 
 const Allocator = std.mem.Allocator;
 const max_degree = turns.max_degree;
@@ -26,6 +27,7 @@ pub const Options = struct {
     include_construction: bool = false,
     include_platforms: bool = false,
     dem_source: ?elevation.Source = null,
+    admin_drive_side: ?enhance.AdminDriveSide = null,
     deadline: io.Deadline = .none,
 };
 
@@ -46,7 +48,7 @@ pub const Stats = struct {
 
 /// Build the topology, validate it, and write it to the caller's staging
 /// bundle. The caller commits the writer after all build stages succeed.
-/// Parallel builds require an allocator that supports concurrent use.
+/// Parallel builds require an allocator and admin resolver that support concurrent use.
 pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWriter, options: Options) !Stats {
     const edge_file = try io.File.temporary(options.scratch_dir);
     defer edge_file.close();
@@ -60,13 +62,13 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
         .strings = .init(gpa),
     };
     defer metadata.deinit();
-    const source_stats = try edges.buildObserved(gpa, source, .{ .edges = edge_file, .shapes = shape_file }, .{
+    const source_stats = try edges.buildWithGeometry(gpa, source, .{ .edges = edge_file, .shapes = shape_file }, .{
         .scratch_dir = options.scratch_dir,
         .workers = options.workers,
         .include_construction = options.include_construction,
         .include_platforms = options.include_platforms,
         .deadline = options.deadline,
-    }, &metadata, Metadata.way, Metadata.node);
+    }, &metadata, Metadata.way, Metadata.node, Metadata.culdesac);
 
     const timer = io.Timer.start();
     if (source_stats.edges > std.math.maxInt(u32) / 2) return error.TooManyDirectedEdges;
@@ -90,9 +92,13 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
         .ways = &metadata.ways,
         .deadline = options.deadline,
     };
-    var table = try populate(gpa, &shared, options.workers);
+    var table = blk: {
+        var base = try populate(gpa, &shared, options.workers);
+        defer base.deinit();
+        try validate(topology.first_edge, topology.output.data, topology.coordinates, base.classes, options.deadline);
+        break :blk try enhanceGraph(gpa, &shared, &plan, base.classes, options);
+    };
     defer table.deinit();
-    try validate(topology.first_edge, topology.output.data, topology.coordinates, table.classes, options.deadline);
     var terrain = if (options.dem_source) |source_dem|
         try stampElevation(gpa, &shared, options.scratch_dir, options.workers, source_dem)
     else
@@ -100,7 +106,7 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     defer if (terrain) |*present| present.deinit();
     var turn_pool = turns.Pool.init(gpa);
     defer turn_pool.deinit();
-    try buildTurns(&shared, table.classes, metadata.name_ids.items, options.drive_side, &turn_pool);
+    try buildTurns(&shared, table.classes, metadata.name_ids.items, &turn_pool);
 
     try writer.write(.nodes, topology.nodes);
     try writer.write(.edges, topology.output.data);
@@ -139,6 +145,8 @@ const Way = struct {
     truck_speed: u8,
     speed_limit: u8,
     oneway: bool,
+    importance: u3,
+    has_names: bool,
     name_start: u32,
     ref_start: u32,
     ref_end: u32,
@@ -205,6 +213,7 @@ const Metadata = struct {
         if (indexed.alt_name.text != indexed.name.text) try self.appendNames(indexed.alt_name.text);
         if (indexed.official_name.text != indexed.name.text and indexed.official_name.text != indexed.alt_name.text)
             try self.appendNames(indexed.official_name.text);
+        const name_end = try self.nameOffset();
         entry.value_ptr.* = .{
             .by_direction = pair,
             .speeds = .{
@@ -214,10 +223,12 @@ const Metadata = struct {
             .truck_speed = attrs.truck_speed,
             .speed_limit = attrs.speed_limit,
             .oneway = attrs.flags.oneway,
+            .importance = @intCast(@backingInt(attrs.road_class)),
+            .has_names = name_start != name_end,
             .name_start = name_start,
             .ref_start = ref_start,
             .ref_end = ref_end,
-            .name_end = @min(try self.nameOffset(), name_start +| graph.cold.max_names),
+            .name_end = @min(name_end, name_start +| graph.cold.max_names),
         };
     }
 
@@ -230,6 +241,14 @@ const Metadata = struct {
         while (tokens.next()) |token| {
             if (self.deadline.expired()) return error.DeadlineExceeded;
             try self.name_ids.append(self.gpa, try self.strings.intern(token));
+        }
+    }
+
+    fn culdesac(self: *Metadata, id: i64) !void {
+        const way_attrs = self.ways.getPtr(id) orelse return;
+        for (&way_attrs.by_direction) |*class| {
+            if (class.category.use == @backingInt(graph.constants.Use.road))
+                class.category.use = @backingInt(graph.constants.Use.culdesac);
         }
     }
 };
@@ -577,6 +596,196 @@ fn runJobs(jobs: anytype) !void {
     for (jobs) |job| try job.result;
 }
 
+const NodeEnhanceJob = struct {
+    gpa: Allocator,
+    network: enhance.Network,
+    tiles: enhance.TileIndex,
+    active: []const u32,
+    nodes: []format.NodeHot,
+    options: Options,
+    result: anyerror!void = {},
+
+    fn run(self: *NodeEnhanceJob) void {
+        self.result = self.emit();
+    }
+
+    fn emit(self: *NodeEnhanceJob) !void {
+        var density: enhance.Density = .{};
+        defer density.deinit(self.gpa);
+        const deadline = self.options.deadline;
+        for (self.active, 0..) |tile, i| {
+            try checkDeadline(deadline, i);
+            try density.apply(self.gpa, self.network, self.tiles, tile, self.nodes, deadline);
+            for (self.tiles.nodes(tile), 0..) |id, j| {
+                try checkDeadline(deadline, j);
+                const node = &self.nodes[id];
+                const override = if (self.options.admin_drive_side) |admin|
+                    admin.resolve(admin.context, self.network.coordinates[id])
+                else
+                    null;
+                node.attr.drive_on_left = (override orelse self.options.drive_side) == .left;
+                node.attr.intersection = try enhance.intersection(self.network, id, deadline);
+            }
+        }
+    }
+};
+
+const EdgeEnhanceJob = struct {
+    gpa: Allocator,
+    network: enhance.Network,
+    flags: []u8,
+    start: usize,
+    end: usize,
+    deadline: io.Deadline,
+    result: anyerror!void = {},
+
+    fn run(self: *EdgeEnhanceJob) void {
+        self.result = self.emit();
+    }
+
+    fn emit(self: *EdgeEnhanceJob) !void {
+        var search = try enhance.Search.init(self.gpa);
+        defer search.deinit(self.gpa);
+        for (self.start..self.end) |id| {
+            try checkDeadline(self.deadline, id - self.start);
+            const first = self.network.first_edge[id];
+            const end = self.network.first_edge[id + 1];
+            for (self.network.edges[first..end], self.flags[first..end]) |edge, *flag| {
+                flag.* = @intFromBool(try search.notThru(self.network, @intCast(id), edge, self.deadline));
+            }
+        }
+    }
+};
+
+fn enhanceGraph(gpa: Allocator, shared: *const Shared, plan: *const Layout, base: []const classes.EdgeClass, options: Options) !classes.Table {
+    const topo = shared.topology;
+    const deadline = options.deadline;
+    const aliases = try Scratch(u32).init(if (plan.split_nodes == 0) 0 else topo.nodes.len, options.scratch_dir);
+    defer aliases.deinit();
+    if (aliases.data.len != 0) {
+        for (plan.nodes.items, 0..) |node, i| {
+            try checkDeadline(deadline, i);
+            const count = aliasCount(node.degree);
+            var remaining = aliases.data[node.first_alias..][0..count];
+            while (remaining.len != 0) {
+                if (deadline.expired()) return error.DeadlineExceeded;
+                const n = @min(remaining.len, 1024);
+                @memset(remaining[0..n], node.first_alias);
+                remaining = remaining[n..];
+            }
+        }
+    }
+    const order = try Scratch(u32).init(topo.output.data.len, options.scratch_dir);
+    defer order.deinit();
+    const flags = try Scratch(u8).init(topo.output.data.len, options.scratch_dir);
+    defer flags.deinit();
+    try orderWalks(shared, plan, base, order.data, flags.data);
+    const network: enhance.Network = .{
+        .nodes = topo.nodes,
+        .coordinates = topo.coordinates,
+        .first_edge = topo.first_edge,
+        .edges = topo.output.data,
+        .classes = base,
+        .walk_order = order.data,
+        .aliases = aliases.data,
+    };
+    const workers = if (options.workers == 0) std.Thread.getCpuCount() catch 1 else options.workers;
+    {
+        const tile_order = try Scratch(u32).init(topo.nodes.len, options.scratch_dir);
+        defer tile_order.deinit();
+        var tiles = try enhance.TileIndex.init(gpa, topo.coordinates, tile_order.data, deadline);
+        defer tiles.deinit(gpa);
+        const active = tiles.active.items;
+        const count = @max(1, @min(workers, max_workers, active.len));
+        var jobs: [max_workers]NodeEnhanceJob = undefined;
+        for (jobs[0..count], 0..) |*job, i| {
+            job.* = .{
+                .gpa = gpa,
+                .network = network,
+                .tiles = tiles,
+                .active = active[active.len * i / count .. active.len * (i + 1) / count],
+                .nodes = topo.nodes,
+                .options = options,
+            };
+        }
+        try runJobs(jobs[0..count]);
+    }
+    const count = @max(1, @min(workers, max_workers, (topo.nodes.len + 255) / 256));
+    var jobs: [max_workers]EdgeEnhanceJob = undefined;
+    for (jobs[0..count], 0..) |*job, i| {
+        job.* = .{
+            .gpa = gpa,
+            .network = network,
+            .flags = flags.data,
+            .start = topo.nodes.len * i / count,
+            .end = topo.nodes.len * (i + 1) / count,
+            .deadline = deadline,
+        };
+    }
+    try runJobs(jobs[0..count]);
+
+    var interner = classes.Interner.init(gpa);
+    defer interner.deinit();
+    for (topo.nodes, 0..) |node, i| {
+        try checkDeadline(deadline, i);
+        const first = topo.first_edge[i];
+        const end = topo.first_edge[i + 1];
+        for (topo.output.data[first..end], flags.data[first..end]) |*edge, not_thru| {
+            var class = base[edge.cls.class_id];
+            const target = topo.nodes[edge.head];
+            class.category.density = @intCast((@as(u8, node.attr.density) + target.attr.density) / 2);
+            if (!class.flags.node_connector) {
+                class.flags.not_thru = not_thru != 0;
+                class.flags.dead_end = target.attr.intersection == .dead_end;
+            }
+            const interned = @backingInt(try interner.intern(class));
+            edge.cls.class_id = std.math.cast(classes.ClassId, interned) orelse return error.TooManyClasses;
+        }
+    }
+    var final = try interner.finish(deadline);
+    errdefer final.deinit();
+    try remapEdges(topo.output.data, final.remap, deadline);
+    return final;
+}
+
+/// Valhalla visits outbound arcs by auto driveability, raw way class, names
+/// and then segment encounter order. The expansion cap depends on that order,
+/// so keep a separate ordering for the walk and preserve CSR local indices.
+fn orderWalks(shared: *const Shared, plan: *const Layout, base: []const classes.EdgeClass, order: []u32, ranks: []u8) !void {
+    const topo = shared.topology;
+    const connector_rank = 32;
+    for (plan.nodes.items, 0..) |node, i| {
+        try checkDeadline(shared.deadline, i);
+        const first = topo.first_edge[node.first_alias];
+        const end = topo.first_edge[node.first_alias + aliasCount(node.degree)];
+        var positions: [connector_rank + 1]u32 = @splat(0);
+        for (topo.output.data[first..end], ranks[first..end], first..end) |edge, *rank, slot| {
+            try checkDeadline(shared.deadline, slot - first);
+            const class = base[edge.cls.class_id];
+            if (class.flags.node_connector) {
+                rank.* = connector_rank;
+            } else {
+                const segment = shared.segments[topo.slot_refs.data[slot] / 2];
+                const way = shared.ways.get(segment.way_id) orelse return error.MissingWayAttributes;
+                const no_auto: u8 = @intFromBool(!class.forwardAccess().auto);
+                rank.* = no_auto * 16 + @as(u8, way.importance) * 2 + @intFromBool(!way.has_names);
+            }
+            positions[rank.*] += 1;
+        }
+        var offset = first;
+        for (&positions) |*position| {
+            const count = position.*;
+            position.* = offset;
+            offset += count;
+        }
+        for (ranks[first..end], first..end) |rank, slot| {
+            try checkDeadline(shared.deadline, slot - first);
+            order[positions[rank]] = @intCast(slot);
+            positions[rank] += 1;
+        }
+    }
+}
+
 const Terrain = struct {
     means: Scratch(i16),
     slopes: Scratch(u16),
@@ -707,7 +916,7 @@ fn remapEdges(rows: []format.EdgeHot, ids: []const classes.ClassId, deadline: io
     }
 }
 
-fn buildTurns(shared: *const Shared, edge_classes: []const classes.EdgeClass, name_ids: []const tags.names.Id, side: edge_class.DriveSide, pool: *turns.Pool) !void {
+fn buildTurns(shared: *const Shared, edge_classes: []const classes.EdgeClass, name_ids: []const tags.names.Id, pool: *turns.Pool) !void {
     const topo = shared.topology;
     var approaches: [max_degree]turns.Approach = undefined;
     var entries: [turns.max_matrix_size]u8 = undefined;
@@ -726,6 +935,7 @@ fn buildTurns(shared: *const Shared, edge_classes: []const classes.EdgeClass, na
             approach.names = name_ids[way.name_start..way.name_end];
         }
         const matrix = entries[0 .. degree * degree];
+        const side: edge_class.DriveSide = if (node.attr.drive_on_left) .left else .right;
         try turns.matrix(approaches[0..degree], node.attr.signal != 0, side, matrix, shared.deadline);
         node.turn_off = try pool.intern(matrix);
     }

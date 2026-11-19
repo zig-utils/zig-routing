@@ -2,6 +2,7 @@
 const std = @import("std");
 const io = @import("../infra/io.zig");
 const class_table = @import("class_table.zig");
+const constants = @import("constants.zig");
 
 pub const magic = "ZRGRAPH\x00".*;
 pub const version: u32 = 1;
@@ -37,7 +38,9 @@ pub const NodeHot = extern struct {
         type: u4,
         density: u4,
         signal: u1,
-        _pad: u7 = 0,
+        intersection: constants.IntersectionType = .regular,
+        drive_on_left: bool = false,
+        _pad: u4 = 0,
     },
 };
 

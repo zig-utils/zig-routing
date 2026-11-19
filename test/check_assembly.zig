@@ -60,6 +60,7 @@ pub fn main(init: std.process.Init) !void {
         try validateTurns(&warm.view, stats.turn_pool_bytes);
         try validateCold(init.gpa, &warm.view, stats.cold_records, stats.cold_payload_bytes);
         try validateElevation(&warm.view, stats.elevation);
+        try validateEnhancement(&warm.view, drive_side);
     }
 
     var times: [32]u64 = undefined;
@@ -139,6 +140,21 @@ fn validateElevation(view: *const graph.reader.View, coverage: build.elevation.C
         const slopes = try view.edgeSlopes(id);
         if (!coverage.dem_configured and (edge.geom.grade != 6 or slopes.code != 0 or
             (try view.coldRecord(id)).meanElevation() != graph.cold.no_elevation)) return error.UnexpectedElevation;
+    }
+}
+
+fn validateEnhancement(view: *const graph.reader.View, drive_side: build.edge_class.DriveSide) !void {
+    for (view.nodes, 0..) |node, i| {
+        if (node.attr.drive_on_left != (drive_side == .left)) return error.InvalidDrivingSide;
+        const id: graph.format.NodeId = @fromBackingInt(@as(u32, @intCast(i)));
+        for (try view.outEdges(id)) |edge| {
+            const class = try view.class(edge.cls.class_id);
+            const target = try view.node(@fromBackingInt(edge.head));
+            if (class.category.density != (@as(u8, node.attr.density) + target.attr.density) / 2) return error.InvalidEdgeDensity;
+            if (class.flags.node_connector) continue;
+            if (class.flags.dead_end != (target.attr.intersection == .dead_end)) return error.InvalidDeadEnd;
+            if (class.flags.not_thru and class.category.road_class <= @backingInt(graph.constants.RoadClass.tertiary)) return error.InvalidNotThru;
+        }
     }
 }
 

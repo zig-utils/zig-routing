@@ -244,6 +244,29 @@ An empty DEM directory reported 7,880 missing edges and kept the same grades and
 mean-elevation slots. In a partial tile, grade intervals with a missing endpoint
 contribute zero. For an interpolated edge, either missing endpoint keeps the grade flat.
 
+### Graph enhancement
+
+The build computes node density in Valhalla's quarter-degree tile frames, with a
+2 km reference radius, E7 grid cells, latitude scaling and a 4-bit result. Each edge
+gets the integer average of its endpoints' densities. Geometry-dependent cul-de-sac
+classification happens before the road lengths go into the density grid. The tag
+goldens continue to cover the preceding tag transform.
+
+Nodes store regular, false, dead-end or fork intersection types. Real edges inherit
+the dead-end flag from their destination. Low-class edges use Valhalla's not-thru
+walk with its 256-expansion limit and local order. The walk uses a scratch ordering
+and the CSR edge indices stay in segment encounter order. Co-located aliases contribute
+to their logical junction and synthetic connectors carry no dead-end or not-thru flag.
+The per-node driving side defaults to the build option and can be overridden through
+the admin resolver hook.
+
+Against pinned Valhalla 3.9.3 tiles stopped after Enhance, all 6,280 Liechtenstein
+node densities and road-length inputs matched. With the full oracle, 1,600 seeded
+`/locate` queries matched 1,372 nodes and 6,850 directed edges. Every matched node
+density and intersection type agreed. Edge density, dead-end and not-thru also agreed
+on every matched edge, including 862 edges entering dead ends. Edge matches use the
+way ID and full travel-direction shape at E6 precision.
+
 ### HTTP and route checks
 
 `compare-height.ts` sends the same random `/height` requests (shapes, encoded polylines at

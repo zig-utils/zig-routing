@@ -17,6 +17,10 @@ const Built = struct {
     stats: build.assemble.Stats,
 
     fn assemble(dataset: gurka.Dataset, workers: usize) !Built {
+        return assembleWithOptions(dataset, .{ .scratch_dir = "", .workers = workers });
+    }
+
+    fn assembleWithOptions(dataset: gurka.Dataset, options: build.assemble.Options) !Built {
         const parent = try io.Directory.open(".");
         errdefer parent.close();
         const root = try parent.temporaryChild();
@@ -33,10 +37,9 @@ const Built = struct {
         try file.pwriteAll(try pbf.encode(scratch.allocator(), dataset), 0);
         var writer = try format.BundleWriter.init(output, @splat(42), .none);
         defer writer.deinit();
-        const stats = try build.assemble.build(testing.allocator, try build.pbf.file.Stream.init(file), &writer, .{
-            .scratch_dir = &root.name,
-            .workers = workers,
-        });
+        var input = options;
+        input.scratch_dir = &root.name;
+        const stats = try build.assemble.build(testing.allocator, try build.pbf.file.Stream.init(file), &writer, input);
         try writer.commit();
         errdefer deleteBundle(root.dir);
         const bundle = try graph.reader.Bundle.open(output);
@@ -299,4 +302,108 @@ test "high-degree node aliases reserve both directions and preserve connectivity
     try testing.expectEqual(3, aliases);
     try testing.expectEqual(leaves, real);
     try testing.expectEqual(4, connectors);
+}
+
+test "enhancer marks dead-end approaches and directed not-thru branches" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const main: gurka.Tags = &.{.{ .key = "highway", .value = "primary" }};
+    const local: gurka.Tags = &.{.{ .key = "highway", .value = "residential" }};
+    const layout = try gurka.mapToCoordinatesAt("A---B---C---D\n    |\n    E---F", 25, .{ .lng = 9.6, .lat = 47.1 });
+    const fixture = try gurka.Map.init(arena.allocator(), layout, &.{
+        .{ .label = "AB", .tags = main },
+        .{ .label = "BC", .tags = main },
+        .{ .label = "CD", .tags = main },
+        .{ .label = "BE", .tags = local },
+        .{ .label = "EF", .tags = local },
+    }, &.{}, &.{});
+    var result = try Built.assemble(fixture.osm, 4);
+    defer result.deinit();
+    const view = &result.bundle.view;
+    const b = try at(view, fixture.findNode("B").?.location.toFixed());
+    const e = try at(view, fixture.findNode("E").?.location.toFixed());
+    const f = try at(view, fixture.findNode("F").?.location.toFixed());
+    try testing.expectEqual(graph.constants.IntersectionType.regular, (try view.node(b)).attr.intersection);
+    try testing.expectEqual(graph.constants.IntersectionType.false_intersection, (try view.node(e)).attr.intersection);
+    try testing.expectEqual(graph.constants.IntersectionType.dead_end, (try view.node(f)).attr.intersection);
+
+    const cases = [_]struct { tail: format.NodeId, head: format.NodeId, not_thru: bool, dead_end: bool }{
+        .{ .tail = b, .head = e, .not_thru = true, .dead_end = false },
+        .{ .tail = e, .head = b, .not_thru = false, .dead_end = false },
+        .{ .tail = e, .head = f, .not_thru = true, .dead_end = true },
+        .{ .tail = f, .head = e, .not_thru = false, .dead_end = false },
+    };
+    for (cases) |case| {
+        for (try view.outEdges(case.tail)) |edge| {
+            if (edge.head != @backingInt(case.head)) continue;
+            const class = try view.class(edge.cls.class_id);
+            try testing.expectEqual(case.not_thru, class.flags.not_thru);
+            try testing.expectEqual(case.dead_end, class.flags.dead_end);
+            const tail_density = (try view.node(case.tail)).attr.density;
+            const head_density = (try view.node(case.head)).attr.density;
+            try testing.expectEqual((@as(u8, tail_density) + head_density) / 2, class.category.density);
+            break;
+        } else return error.MissingTestEdge;
+    }
+}
+
+test "enhancer recognizes a motorway-link fork and resolves node driving side" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const link: gurka.Tags = &.{
+        .{ .key = "highway", .value = "motorway_link" },
+        .{ .key = "oneway", .value = "yes" },
+    };
+    const fixture = try gurka.Map.init(arena.allocator(), try gurka.mapToCoordinates("A---B---C\n    |\n    D", 30), &.{
+        .{ .label = "AB", .tags = link },
+        .{ .label = "BC", .tags = link },
+        .{ .label = "BD", .tags = link },
+    }, &.{}, &.{});
+    const junction = fixture.findNode("B").?.location.toFixed();
+    const Hook = struct {
+        fn driveSide(context: *const anyopaque, point: format.Coordinate) ?build.edge_class.DriveSide {
+            const left: *const format.Coordinate = @ptrCast(@alignCast(context));
+            return if (std.meta.eql(left.*, point)) .left else null;
+        }
+    };
+    var result = try Built.assembleWithOptions(fixture.osm, .{
+        .scratch_dir = "",
+        .workers = 2,
+        .admin_drive_side = .{ .context = &junction, .resolve = Hook.driveSide },
+    });
+    defer result.deinit();
+    const view = &result.bundle.view;
+    const b = try at(view, junction);
+    const a = try at(view, fixture.findNode("A").?.location.toFixed());
+    try testing.expectEqual(graph.constants.IntersectionType.fork, (try view.node(b)).attr.intersection);
+    try testing.expect((try view.node(b)).attr.drive_on_left);
+    try testing.expect(!(try view.node(a)).attr.drive_on_left);
+}
+
+test "cul-de-sac loop classification counts only contacts with other roads" {
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "residential" }};
+    const cycleway: gurka.Tags = &.{.{ .key = "highway", .value = "cycleway" }};
+    for ([_]bool{ false, true }) |second_road| {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        const layout = try gurka.mapToCoordinatesAt("A---B---C---D\n    |   |\n    E---F", 25, .{ .lng = 9.6, .lat = 47.1 });
+        const fixture = try gurka.Map.init(arena.allocator(), layout, &.{
+            .{ .label = "AB", .tags = road },
+            .{ .label = "BCFEB", .tags = road },
+            .{ .label = "CD", .tags = if (second_road) road else cycleway },
+        }, &.{}, &.{});
+        var result = try Built.assemble(fixture.osm, 1);
+        defer result.deinit();
+        const view = &result.bundle.view;
+        const loop_id: u64 = @intCast(fixture.findWay("BCFEB").?.id);
+        const expected: graph.constants.Use = if (second_road) .road else .culdesac;
+        var count: usize = 0;
+        for (view.edges, 0..) |edge, i| {
+            const id: format.EdgeId = @fromBackingInt(@as(u32, @intCast(i)));
+            if (try view.wayId(id) != loop_id) continue;
+            count += 1;
+            try testing.expectEqual(@backingInt(expected), (try view.class(edge.cls.class_id)).category.use);
+        }
+        try testing.expect(count >= 4);
+    }
 }
