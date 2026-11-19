@@ -218,6 +218,32 @@ PBF decoding and all writes through bundle commit.
 | Utrecht | 42,668 | 2,390,111 | 28.01 |
 | Luxembourg 2026-01-01 | 237,668 | 15,006,731 | 31.57 |
 
+### Edge elevation
+
+`check-assembly` takes `--dem DIR` for Valhalla-layout HGT tiles or `--dem-pack FILE`
+for a `zr dem pack` archive. The builder groups undirected edges by their starting DEM
+tile and processes ranges in parallel. Each worker keeps a local sampler. Grading uses
+Valhalla's stored E6 shape precision, 60 m spherical postings and final endpoint. The
+bundle's cold shapes retain all E7 coordinates. Weighted grades are directional and
+the mean elevation uses Valhalla's 2 m bins. Max slopes are stored in `slopes.bin`
+as two 5-bit values per directed edge. Edges shorter than 10 m keep flat grades and
+slopes and still get a mean elevation. Bridges, tunnels and ferries use endpoint
+interpolation with Valhalla's grade and slope clamps.
+
+The pinned Liechtenstein DEM covered all 7,880 edges and 31,013 grade postings.
+With both builds running on Linux x86-64, the Valhalla 3.9.3 `/locate` comparison
+matched weighted grade, both max slopes and mean elevation on all 2,864 distinct
+directed edges returned for 1,200 queries at middle-segment midpoints, with seed 64.
+The match keys use the OSM way ID
+and the complete travel-direction shape at oracle precision. The sample covers
+1,957 non-flat grades and 66 bridge or tunnel directions.
+
+The build reports `elevation.dem_configured` and per-edge and per-posting coverage.
+With no DEM configured, Liechtenstein had 7,880 flat edges and zero postings.
+An empty DEM directory reported 7,880 missing edges and kept the same grades and
+mean-elevation slots. In a partial tile, grade intervals with a missing endpoint
+contribute zero. For an interpolated edge, either missing endpoint keeps the grade flat.
+
 ### HTTP and route checks
 
 `compare-height.ts` sends the same random `/height` requests (shapes, encoded polylines at

@@ -42,11 +42,11 @@ pub const Builder = struct {
         return cold.nameRef(index, route);
     }
 
-    pub fn append(self: *Builder, way_id: u64, speed_limit: u8, shape: []const format.Coordinate, refs: []const u32) !u31 {
+    pub fn append(self: *Builder, way_id: u64, speed_limit: u8, mean_elevation: i16, shape: []const format.Coordinate, refs: []const u32) !u31 {
         const id = std.math.cast(u31, self.record_count) orelse return error.TooManyColdRecords;
         if (self.chunk_records == cold.chunk_size) try self.flushChunk();
         const offset = self.chunk_bytes.items.len;
-        try cold.appendRecord(&self.chunk_bytes, self.gpa, way_id, speed_limit, shape, refs, self.deadline);
+        try cold.appendRecord(&self.chunk_bytes, self.gpa, way_id, speed_limit, mean_elevation, shape, refs, self.deadline);
         self.record_offsets[self.chunk_records] = offset;
         self.chunk_records += 1;
         self.record_count += 1;

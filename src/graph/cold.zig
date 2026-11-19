@@ -199,7 +199,7 @@ pub const Record = struct {
     }
 };
 
-pub fn appendRecord(out: *std.ArrayList(u8), allocator: Allocator, way_id: u64, speed_limit: u8, vertices: []const point.FixedLL, refs: []const u32, deadline: io.Deadline) !void {
+pub fn appendRecord(out: *std.ArrayList(u8), allocator: Allocator, way_id: u64, speed_limit: u8, mean_elevation: i16, vertices: []const point.FixedLL, refs: []const u32, deadline: io.Deadline) !void {
     if (vertices.len < 2) return error.IncompleteShape;
     const point_count = std.math.cast(u32, vertices.len) orelse return error.ShapeTooLarge;
     const name_count = std.math.cast(u8, refs.len) orelse return error.TooManyEdgeNames;
@@ -220,7 +220,7 @@ pub fn appendRecord(out: *std.ArrayList(u8), allocator: Allocator, way_id: u64, 
         .way_high = @intCast(way_id >> 32),
         .shape_bytes = shape_bytes,
         .point_count = point_count,
-        .attributes = .{ .mean_elevation = no_elevation, .speed_limit = speed_limit, .name_count = name_count },
+        .attributes = .{ .mean_elevation = mean_elevation, .speed_limit = speed_limit, .name_count = name_count },
     };
     @memcpy(out.items[start..][0..@sizeOf(RecordHeader)], std.mem.asBytes(&header));
 }
@@ -238,9 +238,9 @@ test "cold record preserves an E7 shape over 64 KiB and 255 name references" {
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(arena);
     const refs: [max_names]u32 = @splat(0);
-    try testing.expectError(error.DeadlineExceeded, appendRecord(&bytes, arena, 0, 0, vertices, &.{}, .{ .at_ns = 0 }));
+    try testing.expectError(error.DeadlineExceeded, appendRecord(&bytes, arena, 0, 0, no_elevation, vertices, &.{}, .{ .at_ns = 0 }));
     try testing.expectEqual(0, bytes.items.len);
-    try appendRecord(&bytes, arena, 0x0123_4567_89ab_cdef, 255, vertices, &refs, .none);
+    try appendRecord(&bytes, arena, 0x0123_4567_89ab_cdef, 255, no_elevation, vertices, &refs, .none);
     const forward = try Record.parse(bytes.items, false);
     const backward = try Record.parse(bytes.items, true);
     try testing.expect(forward.encoded.len > std.math.maxInt(u16));
@@ -277,9 +277,9 @@ test "cold directory locates the last record in a full chunk and the following c
     var records: [chunk_size + 1]u64 = undefined;
     for (&records, 0..) |*offset, i| offset.* = i * record_bytes;
     try data.appendSlice(gpa, std.mem.sliceAsBytes(&records));
-    for (0..chunk_size) |i| try appendRecord(&data, gpa, i + 1, 0, &vertices, &.{}, .none);
+    for (0..chunk_size) |i| try appendRecord(&data, gpa, i + 1, 0, no_elevation, &vertices, &.{}, .none);
     try data.appendSlice(gpa, std.mem.asBytes(&[2]u64{ 0, record_bytes }));
-    try appendRecord(&data, gpa, chunk_size + 1, 0, &vertices, &.{}, .none);
+    try appendRecord(&data, gpa, chunk_size + 1, 0, no_elevation, &vertices, &.{}, .none);
     try data.appendSlice(gpa, std.mem.asBytes(&@as(u64, 0)));
 
     const view = try View.parse(data.items);

@@ -69,6 +69,9 @@ test "mapped records have checked typed accessors and offline checksums" {
     try testing.expectEqual(3, (try view.class(edges[0].cls.class_id)).access.forward);
     try testing.expectEqual(7, (try view.class(edges[1].cls.class_id)).access.forward);
     try testing.expectError(error.InvalidClassId, view.class(2));
+    const slopes = try view.edgeSlopes(@fromBackingInt(@as(u32, 1)));
+    try testing.expectEqual(15, slopes.maxUp());
+    try testing.expectEqual(-24, slopes.maxDown());
 
     const dir = try fixture.root.child("bundle");
     defer dir.close();

@@ -221,6 +221,11 @@ test "cold records share names and round trip exact E7 shapes in either directio
     try testing.expectEqual(@backingInt(c), (try view.edge(dc)).head);
     try testing.expectEqual(2, view.cold_data.?.header.record_count);
     try testing.expectEqual(3, view.cold_data.?.header.name_count);
+    try testing.expect(!result.stats.elevation.dem_configured);
+    try testing.expectEqual(2, result.stats.elevation.total_edges);
+    try testing.expectEqual(6, (try view.edge(ac)).geom.grade);
+    try testing.expectEqual(format.Slopes.flat, try view.edgeSlopes(ac));
+    try testing.expectEqual(graph.cold.no_elevation, (try view.coldRecord(ac)).meanElevation());
     try testing.expectEqual(@as(u64, @intCast(way_id)), try view.wayId(ac));
     try testing.expectEqual(try view.wayId(ac), try view.wayId(ca));
     try testing.expectEqual(35, (try view.coldRecord(ca)).speedLimit());

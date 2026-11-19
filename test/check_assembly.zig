@@ -3,6 +3,7 @@ const routing = @import("routing");
 const io = routing.infra.io;
 const build = routing.build;
 const graph = routing.graph;
+const dem = routing.elevation;
 const open_budget_ns = 50 * std.time.ns_per_ms;
 
 pub fn main(init: std.process.Init) !void {
@@ -16,15 +17,29 @@ pub fn main(init: std.process.Init) !void {
         std.meta.stringToEnum(build.edge_class.DriveSide, text) orelse return usage()
     else
         .right;
-    const require_sub_byte_turns = if (args.next()) |flag|
-        if (std.mem.eql(u8, flag, "--sub-byte-turns")) true else return usage()
+    var require_sub_byte_turns = false;
+    var dem_dir: ?[]const u8 = null;
+    var pack: ?dem.@"packed".Pack = null;
+    defer if (pack) |*present| present.close();
+    while (args.next()) |flag| {
+        if (std.mem.eql(u8, flag, "--sub-byte-turns")) {
+            require_sub_byte_turns = true;
+        } else if (std.mem.eql(u8, flag, "--dem") and dem_dir == null and pack == null) {
+            dem_dir = args.next() orelse return usage();
+        } else if (std.mem.eql(u8, flag, "--dem-pack") and dem_dir == null and pack == null) {
+            pack = try dem.@"packed".Pack.open(args.next() orelse return usage());
+        } else return usage();
+    }
+    const dem_source: ?build.elevation.Source = if (pack) |*present|
+        .{ .pack = present }
+    else if (dem_dir) |dir|
+        .{ .tiles = dir }
     else
-        false;
-    if (args.next() != null) return usage();
+        null;
 
     const file = try io.File.open(input, .read_only);
     defer file.close();
-    const uuid = try datasetId(file, drive_side);
+    const uuid = try datasetId(file, drive_side, dem_source != null);
     var writer = try graph.format.BundleWriter.init(output, uuid, .none);
     defer writer.deinit();
 
@@ -33,6 +48,7 @@ pub fn main(init: std.process.Init) !void {
         .scratch_dir = scratch,
         .drive_side = drive_side,
         .workers = workers,
+        .dem_source = dem_source,
     });
     try writer.commit();
     const elapsed_ns = timer.read();
@@ -43,6 +59,7 @@ pub fn main(init: std.process.Init) !void {
         try build.assemble.validate(warm.view.first_edge, warm.view.edges, warm.view.coordinates.?, warm.view.classes.?, .none);
         try validateTurns(&warm.view, stats.turn_pool_bytes);
         try validateCold(init.gpa, &warm.view, stats.cold_records, stats.cold_payload_bytes);
+        try validateElevation(&warm.view, stats.elevation);
     }
 
     var times: [32]u64 = undefined;
@@ -113,11 +130,24 @@ fn validateCold(allocator: std.mem.Allocator, view: *const graph.reader.View, re
     }
 }
 
-fn datasetId(file: io.File, side: build.edge_class.DriveSide) !graph.format.DatasetUuid {
+fn validateElevation(view: *const graph.reader.View, coverage: build.elevation.Coverage) !void {
+    if (coverage.dem_configured != (view.slopes != null)) return error.ElevationSectionMismatch;
+    if (coverage.dem_configured and coverage.fully_covered + coverage.partially_covered + coverage.missing != coverage.total_edges)
+        return error.InvalidElevationCoverage;
+    for (view.edges, 0..) |edge, i| {
+        const id: graph.format.EdgeId = @fromBackingInt(@as(u32, @intCast(i)));
+        const slopes = try view.edgeSlopes(id);
+        if (!coverage.dem_configured and (edge.geom.grade != 6 or slopes.code != 0 or
+            (try view.coldRecord(id)).meanElevation() != graph.cold.no_elevation)) return error.UnexpectedElevation;
+    }
+}
+
+fn datasetId(file: io.File, side: build.edge_class.DriveSide, has_dem: bool) !graph.format.DatasetUuid {
     const mapped = try io.Mapping.mapFd(file, .read_only);
     defer mapped.unmap();
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update(@tagName(side));
+    if (has_dem) hash.update("\x00elevation");
     hash.update(mapped.bytes);
     var digest: [32]u8 = undefined;
     hash.final(&digest);
@@ -132,6 +162,6 @@ fn rate(count: u32, ns: u64) f64 {
 }
 
 fn usage() error{InvalidArguments} {
-    std.debug.print("usage: zig build check-assembly -- INPUT.osm.pbf OUTPUT_BUNDLE SCRATCH_DIR [WORKERS] [right|left] [--sub-byte-turns]\n", .{});
+    std.debug.print("usage: zig build check-assembly -- INPUT.osm.pbf OUTPUT_BUNDLE SCRATCH_DIR [WORKERS] [right|left] [--sub-byte-turns] [--dem DIR | --dem-pack FILE]\n", .{});
     return error.InvalidArguments;
 }

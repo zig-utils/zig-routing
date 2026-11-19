@@ -67,6 +67,7 @@ pub const View = struct {
     cold_idx: ?[]const u32,
     cold: ?[]const u8,
     cold_data: ?cold.View,
+    slopes: ?[]const u16,
 
     pub fn parse(files: Files, diagnostic: ?*Diagnostic) !View {
         var headers: Headers = .initFill(null);
@@ -122,6 +123,12 @@ pub const View = struct {
                 return error.InvalidColdIndexCount;
             }
         }
+        if (headers.get(.slopes)) |slopes| {
+            if (slopes.count != edge_count) {
+                note(diagnostic, .slopes);
+                return error.InvalidSlopeCount;
+            }
+        }
 
         var graph: View = .{
             .headers = headers,
@@ -135,6 +142,7 @@ pub const View = struct {
             .cold_idx = null,
             .cold = null,
             .cold_data = null,
+            .slopes = null,
         };
         inline for (kinds) |kind| {
             if (headers.get(kind)) |present| {
@@ -229,6 +237,14 @@ pub const View = struct {
         return table.record(self.cold_idx.?[@backingInt(id)]);
     }
 
+    pub fn edgeSlopes(self: *const View, id: format.EdgeId) !format.Slopes {
+        _ = try self.edge(id);
+        const slopes = self.slopes orelse return format.Slopes.flat;
+        const value = slopes[@backingInt(id)];
+        if (value >> 10 != 0) return error.InvalidSlopes;
+        return .{ .code = value };
+    }
+
     pub fn wayId(self: *const View, id: format.EdgeId) !u64 {
         return (try self.coldRecord(id)).wayId();
     }
@@ -251,7 +267,7 @@ pub const View = struct {
             note(diagnostic, kind);
             if (deadline.expired()) return error.DeadlineExceeded;
             const bytes: []const u8 = switch (kind) {
-                inline .classes, .coordinates, .cold_idx, .cold => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
+                inline .classes, .coordinates, .cold_idx, .cold, .slopes => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
                 inline else => |section| std.mem.sliceAsBytes(@field(self, @tagName(section))),
             };
             var hash = std.hash.XxHash3.init(0);

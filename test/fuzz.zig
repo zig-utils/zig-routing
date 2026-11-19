@@ -85,6 +85,7 @@ fn fuzzGraphBundle(baseline: *const graph.reader.Files, s: *Smith) !void {
         _ = view.class(@truncate(id)) catch null;
         const edge: graph.format.EdgeId = @fromBackingInt(id);
         _ = view.wayId(edge) catch null;
+        _ = view.edgeSlopes(edge) catch null;
         if (view.shape(edge, gpa)) |shape| gpa.free(shape) else |_| {}
         if (view.names(edge)) |names| {
             for (0..names.count()) |i| _ = names.at(i) catch null;

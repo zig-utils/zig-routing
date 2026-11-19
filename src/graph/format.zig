@@ -47,6 +47,29 @@ pub const FirstEdge = u32;
 /// Low to high: turn type (3), stop impact (3), name consistent (1), restricted (1).
 pub const TurnEntry = u8;
 
+/// Two Valhalla 5-bit quantized slopes in low-to-high up/down order.
+pub const Slopes = struct {
+    code: u16,
+
+    pub const flat: Slopes = .{ .code = 0 };
+
+    pub fn init(up: u5, down: u5) Slopes {
+        return .{ .code = @as(u16, up) | (@as(u16, down) << 5) };
+    }
+
+    pub fn maxUp(self: Slopes) i8 {
+        return expand(@truncate(self.code));
+    }
+
+    pub fn maxDown(self: Slopes) i8 {
+        return -expand(@truncate(self.code >> 5));
+    }
+
+    fn expand(code: u5) i8 {
+        return if (code < 16) @intCast(code) else 16 + @as(i8, @intCast(code & 0xf)) * 4;
+    }
+};
+
 pub const SectionKind = enum(u32) {
     nodes = 1,
     edges = 2,
@@ -56,6 +79,7 @@ pub const SectionKind = enum(u32) {
     coordinates = 6,
     cold_idx = 7,
     cold = 8,
+    slopes = 9,
 
     pub fn filename(self: SectionKind) [:0]const u8 {
         return switch (self) {
@@ -67,6 +91,7 @@ pub const SectionKind = enum(u32) {
             .coordinates => "coordinates.bin",
             .cold_idx => "cold_idx.bin",
             .cold => "cold.bin",
+            .slopes => "slopes.bin",
         };
     }
 
@@ -80,6 +105,7 @@ pub const SectionKind = enum(u32) {
             .coordinates => Coordinate,
             .cold_idx => u32,
             .cold => u8,
+            .slopes => u16,
         };
     }
 
@@ -130,6 +156,7 @@ comptime {
     std.debug.assert(@sizeOf(Coordinate) == 8);
     std.debug.assert(@offsetOf(Coordinate, "lng") == 0 and @offsetOf(Coordinate, "lat") == 4);
     std.debug.assert(@sizeOf(FirstEdge) == 4 and @sizeOf(TurnEntry) == 1);
+    std.debug.assert(@sizeOf(SectionKind.slopes.Record()) == 2);
     std.debug.assert(payload_offset % @alignOf(EdgeHot) == 0);
     std.debug.assert(payload_offset % @alignOf(NodeHot) == 0);
 }

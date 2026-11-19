@@ -51,6 +51,8 @@ jobs:
           for dataset in liechtenstein utrecht; do
             zig build check-assembly -- "oracle/data/$dataset/extract.osm.pbf" "$work/$dataset" "$work" 4 right
           done
+          oracle/fetch.sh liechtenstein
+          zig build check-assembly -Doptimize=ReleaseFast -- "$ORACLE_DATA/liechtenstein/extract.osm.pbf" "$work/liechtenstein-dem" "$work" 4 right --dem "$ORACLE_DATA/liechtenstein/elevation"
           fetch_checked \
             https://download.geofabrik.de/europe/luxembourg-260101.osm.pbf \
             "$work/luxembourg.osm.pbf" \

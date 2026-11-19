@@ -12,6 +12,8 @@ const pbf = @import("pbf/root.zig");
 const edge_class = @import("edge_class.zig");
 const turns = @import("turns.zig");
 const ColdBuilder = @import("cold_builder.zig").Builder;
+const elevation = @import("elevation.zig");
+const dem = @import("../elevation/root.zig");
 
 const Allocator = std.mem.Allocator;
 const max_degree = turns.max_degree;
@@ -23,6 +25,7 @@ pub const Options = struct {
     workers: usize = 0,
     include_construction: bool = false,
     include_platforms: bool = false,
+    dem_source: ?elevation.Source = null,
     deadline: io.Deadline = .none,
 };
 
@@ -37,6 +40,7 @@ pub const Stats = struct {
     distinct_turn_matrices: usize,
     cold_records: u32,
     cold_payload_bytes: u64,
+    elevation: elevation.Coverage,
     assembly_ns: u64,
 };
 
@@ -89,6 +93,11 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     var table = try populate(gpa, &shared, options.workers);
     defer table.deinit();
     try validate(topology.first_edge, topology.output.data, topology.coordinates, table.classes, options.deadline);
+    var terrain = if (options.dem_source) |source_dem|
+        try stampElevation(gpa, &shared, options.scratch_dir, options.workers, source_dem)
+    else
+        null;
+    defer if (terrain) |*present| present.deinit();
     var turn_pool = turns.Pool.init(gpa);
     defer turn_pool.deinit();
     try buildTurns(&shared, table.classes, metadata.name_ids.items, options.drive_side, &turn_pool);
@@ -99,8 +108,10 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     try writer.write(.classes, table.classes);
     try writer.write(.coordinates, topology.coordinates);
     try writer.write(.turns, turn_pool.bytes.items);
+    if (terrain) |*present| try writer.write(.slopes, present.slopes.data);
     const topology_ns = timer.read();
-    const cold_bytes = try buildCold(gpa, &shared, &metadata, writer, options.scratch_dir);
+    const means: []const i16 = if (terrain) |*present| present.means.data else &.{};
+    const cold_bytes = try buildCold(gpa, &shared, &metadata, writer, options.scratch_dir, means);
     return .{
         .source = source_stats,
         .nodes = @intCast(topology.nodes.len),
@@ -112,6 +123,7 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
         .distinct_turn_matrices = turn_pool.indices.count(),
         .cold_records = @intCast(topology.output.data.len / 2),
         .cold_payload_bytes = cold_bytes,
+        .elevation = if (terrain) |present| present.coverage else .{ .total_edges = segments.len },
         .assembly_ns = topology_ns,
     };
 }
@@ -513,17 +525,7 @@ fn populate(gpa: Allocator, shared: *const Shared, requested: usize) !classes.Ta
     }
     defer for (active) |*job| job.interner.deinit();
 
-    var threads: [max_workers - 1]std.Thread = undefined;
-    var started: usize = 0;
-    errdefer for (threads[0..started]) |thread| thread.join();
-    for (active[0 .. count - 1]) |*job| {
-        threads[started] = try std.Thread.spawn(.{}, Job.run, .{job});
-        started += 1;
-    }
-    active[count - 1].run();
-    for (threads[0..started]) |thread| thread.join();
-    started = 0;
-    for (active) |job| try job.result;
+    try runJobs(active);
 
     if (count == 1) {
         var table = try active[0].interner.finish(shared.deadline);
@@ -561,6 +563,143 @@ fn populate(gpa: Allocator, shared: *const Shared, requested: usize) !classes.Ta
     return table;
 }
 
+fn runJobs(jobs: anytype) !void {
+    var threads: [max_workers - 1]std.Thread = undefined;
+    var started: usize = 0;
+    errdefer for (threads[0..started]) |thread| thread.join();
+    for (jobs[0 .. jobs.len - 1]) |*job| {
+        threads[started] = try std.Thread.spawn(.{}, @TypeOf(job.*).run, .{job});
+        started += 1;
+    }
+    jobs[jobs.len - 1].run();
+    for (threads[0..started]) |thread| thread.join();
+    started = 0;
+    for (jobs) |job| try job.result;
+}
+
+const Terrain = struct {
+    means: Scratch(i16),
+    slopes: Scratch(u16),
+    coverage: elevation.Coverage = .{ .dem_configured = true },
+
+    fn deinit(self: *Terrain) void {
+        self.slopes.deinit();
+        self.means.deinit();
+    }
+};
+
+const ElevationJob = struct {
+    gpa: Allocator,
+    shared: *const Shared,
+    means: []i16,
+    slopes: []u16,
+    order: []const u32,
+    source: elevation.Source,
+    coverage: elevation.Coverage = .{},
+    result: anyerror!void = {},
+
+    fn run(self: *ElevationJob) void {
+        self.result = self.sample();
+    }
+
+    fn sample(self: *ElevationJob) !void {
+        switch (self.source) {
+            .tiles => |dir| {
+                // The loose tile cache may evict decoded buffers. Each job
+                // owns its cache and keeps its current tile local.
+                var tiles = try dem.hgt.Tiles.init(self.gpa, dir);
+                defer tiles.deinit();
+                var sampler: dem.hgt.Sampler = .{ .tiles = &tiles };
+                try self.emit(&sampler);
+            },
+            .pack => |pack| {
+                var sampler: dem.@"packed".Sampler = .{ .pack = pack };
+                try self.emit(&sampler);
+            },
+        }
+    }
+
+    fn emit(self: *ElevationJob, sampler: anytype) !void {
+        const shared = self.shared;
+        const topo = shared.topology;
+        var work: elevation.Work = .{ .allocator = self.gpa, .deadline = shared.deadline };
+        defer work.deinit();
+        for (self.order, 0..) |id, i| {
+            try checkDeadline(shared.deadline, i);
+            const segment = shared.segments[id];
+            const way = shared.ways.get(segment.way_id) orelse return error.MissingWayAttributes;
+            const class = way.by_direction[0];
+            const interpolate = class.flags.bridge or class.flags.tunnel or
+                class.category.use == @backingInt(graph.constants.Use.ferry) or
+                class.category.use == @backingInt(graph.constants.Use.rail_ferry);
+            const first = topo.placements.data[2 * @as(usize, id)].slot;
+            const length = topo.output.data[first].geom.len_m;
+            const stamp = try work.measure(try segmentShape(shared.shape_points, segment), length, interpolate, sampler);
+            self.means[id] = stamp.mean;
+            for (stamp.directed, 0..) |direction, d| {
+                const slot = topo.placements.data[2 * @as(usize, id) + d].slot;
+                topo.output.data[slot].geom.grade = direction.grade;
+                self.slopes[slot] = direction.slopes.code;
+            }
+            self.coverage.add(stamp);
+        }
+    }
+};
+
+fn stampElevation(gpa: Allocator, shared: *const Shared, scratch_dir: []const u8, requested: usize, source: elevation.Source) !Terrain {
+    const means = try Scratch(i16).init(shared.segments.len, scratch_dir);
+    errdefer means.deinit();
+    const slopes = try Scratch(u16).init(shared.topology.output.data.len, scratch_dir);
+    errdefer slopes.deinit();
+    // Connector slots stay zero in the new scratch file.
+    var output: Terrain = .{ .means = means, .slopes = slopes };
+    if (shared.segments.len == 0) return output;
+
+    const order = try Scratch(u32).init(shared.segments.len, scratch_dir);
+    defer order.deinit();
+    try orderByTile(gpa, shared, order.data);
+    const workers = if (requested == 0) std.Thread.getCpuCount() catch 1 else requested;
+    const count = @max(1, @min(workers, max_workers, (order.data.len + 255) / 256));
+    var jobs: [max_workers]ElevationJob = undefined;
+    const active = jobs[0..count];
+    for (active, 0..) |*job, i| {
+        job.* = .{
+            .gpa = gpa,
+            .shared = shared,
+            .means = means.data,
+            .slopes = slopes.data,
+            .order = order.data[(order.data.len * i) / count .. (order.data.len * (i + 1)) / count],
+            .source = source,
+        };
+    }
+    try runJobs(active);
+    for (active) |job| output.coverage.merge(job.coverage);
+    return output;
+}
+
+fn orderByTile(gpa: Allocator, shared: *const Shared, order: []u32) !void {
+    // The extra bucket keeps points outside the DEM grid at the end.
+    const buckets = try gpa.alloc(u32, dem.hgt.tile_count + 2);
+    defer gpa.free(buckets);
+    @memset(buckets, 0);
+    for (shared.segments, 0..) |segment, i| {
+        try checkDeadline(shared.deadline, i);
+        const first = (try segmentShape(shared.shape_points, segment))[0];
+        const tile = elevation.tileKey(first);
+        buckets[tile + 1] += 1;
+    }
+    for (1..buckets.len) |i| {
+        try checkDeadline(shared.deadline, i);
+        buckets[i] += buckets[i - 1];
+    }
+    for (shared.segments, 0..) |segment, i| {
+        try checkDeadline(shared.deadline, i);
+        const tile = elevation.tileKey(shared.shape_points[@intCast(segment.shape_offset)]);
+        order[buckets[tile]] = @intCast(i);
+        buckets[tile] += 1;
+    }
+}
+
 fn remapEdges(rows: []format.EdgeHot, ids: []const classes.ClassId, deadline: io.Deadline) !void {
     for (rows, 0..) |*row, i| {
         try checkDeadline(deadline, i);
@@ -592,7 +731,7 @@ fn buildTurns(shared: *const Shared, edge_classes: []const classes.EdgeClass, na
     }
 }
 
-fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *const Metadata, writer: *format.BundleWriter, scratch_dir: []const u8) !u64 {
+fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *const Metadata, writer: *format.BundleWriter, scratch_dir: []const u8, means: []const i16) !u64 {
     const topo = shared.topology;
     const index = try Scratch(u32).init(topo.output.data.len, scratch_dir);
     defer index.deinit();
@@ -616,8 +755,9 @@ fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *const Metadata, w
                     name.* = try builder.nameRef(metadata.name_ids.items[i], i >= way.ref_start and i < way.ref_end);
                 }
                 reverse = ref & 1 != 0;
-                break :blk try builder.append(@bitCast(seg.way_id), way.speed_limit, try segmentShape(shared.shape_points, seg), active);
-            } else try builder.append(0, 0, &.{ topo.coordinates[node], topo.coordinates[edge.head] }, &.{});
+                const mean = if (means.len == 0) graph.cold.no_elevation else means[ref / 2];
+                break :blk try builder.append(@bitCast(seg.way_id), way.speed_limit, mean, try segmentShape(shared.shape_points, seg), active);
+            } else try builder.append(0, 0, graph.cold.no_elevation, &.{ topo.coordinates[node], topo.coordinates[edge.head] }, &.{});
             index.data[slot] = graph.cold.directedIndex(record, reverse);
             index.data[opposite] = graph.cold.directedIndex(record, !reverse);
         }

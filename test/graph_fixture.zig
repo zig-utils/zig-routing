@@ -31,6 +31,7 @@ const classes = [_]routing.graph.class_table.EdgeClass{
 };
 const coordinates = [_]format.Coordinate{ .{ .lng = 0, .lat = 0 }, .{ .lng = 100000, .lat = 0 } };
 const cold_idx = [_]u32{ 0, 0x8000_0000 };
+const slopes = [_]u16{ 0, 0x024f };
 // One chunk, one record, one name. The shape encodes both coordinates above.
 const cold_bytes =
     "\x01\x00\x00\x00\x01\x00\x00\x00\x4e\x00\x00\x00\x00\x00\x00\x00" ++
@@ -50,6 +51,7 @@ pub fn records(comptime kind: format.SectionKind) []const kind.Record() {
         .coordinates => &coordinates,
         .cold_idx => &cold_idx,
         .cold => cold_bytes,
+        .slopes => &slopes,
     };
 }
 
