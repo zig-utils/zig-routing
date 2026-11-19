@@ -1077,6 +1077,24 @@
     ]
   },
   {
+    "key": "P2.09",
+    "goal": "Keep compressed HGT tile samples stable for every reader under concurrent cache traffic.",
+    "scope": [
+      "Give readers a scoped lease on decompressed HGT data and evict only buffers without readers",
+      "Handle concurrent cold misses and a fully leased cache within request deadlines",
+      "Preserve raw mmap lookups, upstream interpolation, and the steady-state allocation budget"
+    ],
+    "notes": [
+      "Found while implementing batch sampling in P2.05",
+      "The Phase 2 gate covers concurrent sampling across datasets that exceed the compressed tile cache"
+    ],
+    "accept": [
+      "A concurrent eviction test verifies exact heights while another reader holds a lease",
+      "Cache capacity stays bounded when every slot is leased",
+      "Warm batches require zero backing allocator calls and meet the existing stage budget"
+    ]
+  },
+  {
     "key": "P2.06",
     "goal": "Phase 2 is closed: /height is proven identical to Valhalla's and at least ten times faster, with the evidence committed.",
     "upstream": [],
