@@ -8,6 +8,7 @@ const memory = @import("../infra/arena.zig");
 const costing = @import("../costing/compiled.zig");
 const paged = @import("paged.zig");
 const queue = @import("queue.zig");
+const endpoints = @import("endpoints.zig");
 const EdgeId = graph.format.EdgeId;
 const EdgeHot = graph.format.EdgeHot;
 const NodeId = graph.format.NodeId;
@@ -27,6 +28,7 @@ pub const Label = extern struct {
     ctx: u32 = 0,
 
     pub const target: u32 = 1;
+    const partial_target: u32 = 2;
 
     pub fn edgeId(self: Label) EdgeId {
         return @fromBackingInt(self.edge);
@@ -47,6 +49,23 @@ pub const Request = struct {
     origin: NodeId,
     destination: NodeId,
     direction: Direction = .forward,
+};
+
+pub const PartialRequest = struct {
+    starts: []const endpoints.Candidate,
+    targets: *const endpoints.Targets,
+    direction: Direction = .forward,
+};
+
+const NodeQuery = struct {
+    start: NodeId,
+    target: ?NodeId = null,
+    limit: usize = std.math.maxInt(usize),
+};
+
+pub const Cut = struct {
+    begin: f32 = 0,
+    end: f32 = 1,
 };
 
 pub const Control = struct {
@@ -77,6 +96,7 @@ pub const Result = struct {
     index: u32,
     popped: usize,
     settled: usize,
+    cuts: []const Cut = &.{},
 
     pub fn best(self: Result) *const Label {
         return &self.labels[self.index];
@@ -168,8 +188,19 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             _ = try self.view.node(request.destination);
             defer self.status.clear();
             return switch (request.direction) {
-                .forward => self.runDirection(.forward, arena, kernel, request.origin, request.destination, std.math.maxInt(usize), potential, control),
-                .reverse => self.runDirection(.reverse, arena, kernel, request.destination, request.origin, std.math.maxInt(usize), potential, control),
+                .forward => self.runDirection(.forward, arena, kernel, NodeQuery{ .start = request.origin, .target = request.destination }, potential, control),
+                .reverse => self.runDirection(.reverse, arena, kernel, NodeQuery{ .start = request.destination, .target = request.origin }, potential, control),
+            };
+        }
+
+        /// The potential must bound the remaining cost to every usable
+        /// destination edge, including a stop before the edge's far node.
+        pub fn runPartial(self: *Self, arena: *memory.Arena, kernel: K, request: PartialRequest, potential: anytype, control: Control) !Result {
+            try control.check();
+            defer self.status.clear();
+            return switch (request.direction) {
+                .forward => self.runDirection(.forward, arena, kernel, request, potential, control),
+                .reverse => self.runDirection(.reverse, arena, kernel, request, potential, control),
             };
         }
 
@@ -181,38 +212,29 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             if (limit == 0) return .{};
             defer self.status.clear();
             const result = try switch (direction) {
-                .forward => self.runDirection(.forward, arena, kernel, source, null, limit, Zero{}, control),
-                .reverse => self.runDirection(.reverse, arena, kernel, source, null, limit, Zero{}, control),
+                .forward => self.runDirection(.forward, arena, kernel, NodeQuery{ .start = source, .limit = limit }, Zero{}, control),
+                .reverse => self.runDirection(.reverse, arena, kernel, NodeQuery{ .start = source, .limit = limit }, Zero{}, control),
             };
             return .{ .popped = result.popped, .settled = result.settled };
         }
 
-        fn runDirection(self: *Self, comptime direction: Direction, arena: *memory.Arena, kernel: K, start: NodeId, target: ?NodeId, limit: usize, potential: anytype, control: Control) !Result {
+        fn runDirection(self: *Self, comptime direction: Direction, arena: *memory.Arena, kernel: K, query: anytype, potential: anytype, control: Control) !Result {
+            const partial = @TypeOf(query) == PartialRequest;
+            const target = if (partial) null else query.target;
+            const limit = if (partial) std.math.maxInt(usize) else query.limit;
             const a = arena.allocator();
             var pool: Pool = .init(arena);
             var labels: std.ArrayList(Label) = .empty;
+            var cuts: std.ArrayList(Cut) = .empty;
             var pending: Q = .{};
-            if (target != null and start == target.?) {
-                try labels.append(a, .{ .flags = Label.target });
-                return .{ .labels = labels.items, .index = 0, .popped = 0, .settled = 0 };
-            }
-            const seeds = try self.view.outEdgeRange(start);
-            for (self.view.edges[seeds.first..seeds.end], seeds.first..) |*outward, index| {
-                const geometry_id: EdgeId = @fromBackingInt(@as(u32, @intCast(index)));
-                const id = if (direction == .forward) geometry_id else try self.view.oppEdge(geometry_id);
-                const edge = if (direction == .forward) outward else try self.view.edge(id);
-                if (comptime @hasDecl(K, "slowAllowed")) {
-                    if (edge.cls.cold_checks != 0 and !try Self.slowAllowed(kernel, self.view, id, edge, null, direction)) continue;
+            if (partial) {
+                try self.seedPartials(direction, &pool, kernel, query, &labels, &cuts, &pending, potential, control);
+            } else {
+                if (target != null and query.start == target.?) {
+                    try labels.append(a, .{ .flags = Label.target });
+                    return .{ .labels = labels.items, .index = 0, .popped = 0, .settled = 0 };
                 }
-                const edge_cost = try kernel.edgeCost(self.view, id, edge, direction);
-                if (edge_cost.cost == std.math.inf(f32)) continue;
-                const here: NodeId = @fromBackingInt(outward.head);
-                try self.offer(&pool, &labels, &pending, potential, target, here, self.status.get(@backingInt(id)), .{
-                    .edge = @backingInt(id),
-                    .cost = edge_cost.cost,
-                    .secs = edge_cost.secs,
-                    .dist_m = edge.geom.len_m,
-                });
+                try self.seedNode(direction, &pool, kernel, query.start, target, &labels, &pending, potential);
             }
 
             var popped: usize = 0;
@@ -221,11 +243,11 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 popped += 1;
                 if ((popped & 1023) == 0) try control.check();
                 const last = labels.items[top.label];
-                if (self.status.get(last.edge).label_plus_one != top.label + 1) continue;
+                if (last.flags & Label.partial_target == 0 and self.status.get(last.edge).label_plus_one != top.label + 1) continue;
                 settled += 1;
                 if (last.flags & Label.target != 0 or settled == limit) {
                     try control.check();
-                    return .{ .labels = labels.items, .index = top.label, .popped = popped, .settled = settled };
+                    return .{ .labels = labels.items, .index = top.label, .popped = popped, .settled = settled, .cuts = cuts.items };
                 }
 
                 const previous_id = last.edgeId();
@@ -238,7 +260,9 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     const local_id: EdgeId = @fromBackingInt(@as(u32, @intCast(index)));
                     const next_id = if (direction == .forward) local_id else try self.view.oppEdge(local_id);
                     const prior = self.status.get(@backingInt(next_id));
-                    if (prior.label_plus_one != 0 and labels.items[prior.label_plus_one - 1].cost <= last.cost) continue;
+                    const dominated = prior.label_plus_one != 0 and labels.items[prior.label_plus_one - 1].cost <= last.cost;
+                    var targets = if (partial) query.targets.on(next_id) else {};
+                    if (dominated and (!partial or targets.index == 0)) continue;
                     const next = if (direction == .forward) outward else try self.view.edge(next_id);
                     const row = if (direction == .forward)
                         forward_row[local]
@@ -264,7 +288,27 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     const edge_cost = try kernel.edgeCost(self.view, next_id, next, direction);
                     if (edge_cost.cost == std.math.inf(f32)) continue;
                     const delay = try kernel.turnCost(self.view, movement, last, direction);
-                    const total = (costing.Cost{ .cost = last.cost, .secs = last.secs }).add(edge_cost.add(delay));
+                    if (delay.cost == std.math.inf(f32)) continue;
+                    const previous: costing.Cost = .{ .cost = last.cost, .secs = last.secs };
+                    if (partial) {
+                        var count: usize = 0;
+                        while (targets.next()) |candidate| : (count += 1) {
+                            if (count % 64 == 0) try control.check();
+                            const cut: Cut = if (direction == .forward) .{ .end = candidate.fraction } else .{ .begin = candidate.fraction };
+                            const step = scale(edge_cost, cut.end - cut.begin, 0);
+                            const ending = previous.add(delay).add(step).add(.{ .cost = candidate.score });
+                            try addTerminal(a, &labels, &cuts, &pending, cut, .{
+                                .edge = @backingInt(next_id),
+                                .pred = top.label,
+                                .cost = ending.cost,
+                                .secs = ending.secs,
+                                .dist_m = last.dist_m +| fractionalLength(next.geom.len_m, cut),
+                                .tcost = delay.cost,
+                            });
+                        }
+                    }
+                    if (dominated) continue;
+                    const total = if (partial) previous.add(delay).add(edge_cost) else previous.add(edge_cost.add(delay));
                     if (total.cost == std.math.inf(f32)) continue;
                     const head: NodeId = @fromBackingInt(outward.head);
                     try self.offer(&pool, &labels, &pending, potential, target, head, prior, .{
@@ -278,8 +322,84 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 }
             }
             try control.check();
-            if (target == null) return .{ .labels = labels.items, .index = no_index, .popped = popped, .settled = settled };
+            if (!partial and target == null) return .{ .labels = labels.items, .index = no_index, .popped = popped, .settled = settled };
             return error.NoPath;
+        }
+
+        fn seedNode(self: *Self, comptime direction: Direction, pool: *Pool, kernel: K, start: NodeId, target: ?NodeId, labels: *std.ArrayList(Label), pending: *Q, potential: anytype) !void {
+            const seeds = try self.view.outEdgeRange(start);
+            for (self.view.edges[seeds.first..seeds.end], seeds.first..) |*outward, index| {
+                const geometry_id: EdgeId = @fromBackingInt(@as(u32, @intCast(index)));
+                const id = if (direction == .forward) geometry_id else try self.view.oppEdge(geometry_id);
+                const edge = if (direction == .forward) outward else try self.view.edge(id);
+                if (comptime @hasDecl(K, "slowAllowed")) {
+                    if (edge.cls.cold_checks != 0 and !try Self.slowAllowed(kernel, self.view, id, edge, null, direction)) continue;
+                }
+                const edge_cost = try kernel.edgeCost(self.view, id, edge, direction);
+                if (edge_cost.cost == std.math.inf(f32)) continue;
+                const here: NodeId = @fromBackingInt(outward.head);
+                try self.offer(pool, labels, pending, potential, target, here, self.status.get(@backingInt(id)), .{
+                    .edge = @backingInt(id),
+                    .cost = edge_cost.cost,
+                    .secs = edge_cost.secs,
+                    .dist_m = edge.geom.len_m,
+                });
+            }
+        }
+
+        fn seedPartials(self: *Self, comptime direction: Direction, pool: *Pool, kernel: K, query: PartialRequest, labels: *std.ArrayList(Label), cuts: *std.ArrayList(Cut), pending: *Q, potential: anytype, control: Control) !void {
+            const a = pool.arena.allocator();
+            for (query.starts, 0..) |candidate, index| {
+                if (index % 64 == 0) try control.check();
+                if (!candidate.valid()) return error.InvalidCandidate;
+                const id = candidate.edge;
+                const edge = try self.view.edge(id);
+                const full = if (comptime @hasDecl(K, "endpointCost"))
+                    try kernel.endpointCost(self.view, id, edge, direction)
+                else
+                    try kernel.edgeCost(self.view, id, edge, direction);
+                if (full.cost == std.math.inf(f32)) continue;
+                const geometry = if (direction == .forward) edge else try self.view.edge(try self.view.oppEdge(id));
+                const node: NodeId = @fromBackingInt(geometry.head);
+                const portion: Cut = if (direction == .forward) .{ .begin = candidate.fraction } else .{ .end = candidate.fraction };
+                const cost = scale(full, @max(portion.end - portion.begin, std.math.floatEps(f32)), candidate.score);
+                try cuts.append(a, portion);
+                try self.offer(pool, labels, pending, potential, null, node, self.status.get(@backingInt(id)), .{
+                    .edge = @backingInt(id),
+                    .cost = cost.cost,
+                    .secs = cost.secs,
+                    .dist_m = fractionalLength(edge.geom.len_m, portion),
+                    .ctx = std.math.cast(u32, cuts.items.len) orelse return error.TooManySearchLabels,
+                });
+                var dest = query.targets.on(id);
+                var count: usize = 0;
+                while (dest.next()) |match| : (count += 1) {
+                    if (count % 64 == 0) try control.check();
+                    const cut: Cut = if (direction == .forward)
+                        .{ .begin = candidate.fraction, .end = match.fraction }
+                    else
+                        .{ .begin = match.fraction, .end = candidate.fraction };
+                    if (cut.end < cut.begin) continue;
+                    const direct = scale(full, @max(cut.end - cut.begin, std.math.floatEps(f32)), candidate.score + match.score);
+                    try addTerminal(a, labels, cuts, pending, cut, .{
+                        .edge = @backingInt(id),
+                        .cost = direct.cost,
+                        .secs = direct.secs,
+                        .dist_m = fractionalLength(edge.geom.len_m, cut),
+                    });
+                }
+            }
+        }
+
+        fn addTerminal(a: std.mem.Allocator, labels: *std.ArrayList(Label), cuts: *std.ArrayList(Cut), pending: *Q, cut: Cut, label: Label) !void {
+            const index = std.math.cast(u32, labels.items.len) orelse return error.TooManySearchLabels;
+            if (index == no_index) return error.TooManySearchLabels;
+            try cuts.append(a, cut);
+            var terminal = label;
+            terminal.flags = Label.target | Label.partial_target;
+            terminal.ctx = std.math.cast(u32, cuts.items.len) orelse return error.TooManySearchLabels;
+            try labels.append(a, terminal);
+            try pending.push(a, queue.Entry.init(label.cost, index));
         }
 
         noinline fn slowAllowed(kernel: K, view: *const View, id: EdgeId, edge: *const EdgeHot, predecessor: ?Label, comptime direction: Direction) !bool {
@@ -309,6 +429,15 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             @prefetch(&self.view.first_edge[@backingInt(head)], .{});
         }
     };
+}
+
+fn scale(cost: costing.Cost, portion: f32, score: f32) costing.Cost {
+    return (costing.Cost{ .cost = cost.cost * portion, .secs = cost.secs * portion }).add(.{ .cost = score });
+}
+
+fn fractionalLength(metres: u24, cut: Cut) u32 {
+    const length: f32 = @floatFromInt(metres);
+    return @intFromFloat(length * (cut.end - cut.begin) + 0.5);
 }
 
 fn roundedDown(value: f64) f32 {

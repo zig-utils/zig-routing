@@ -1233,3 +1233,119 @@ test "edge search reuses worker request memory and observes cancellation" {
     try testing.expectError(error.Cancelled, engine.run(&arena, .{ .seed = 42 }, request, potential, .{ .cancel = &cancel }));
     try testing.expectError(error.Cancelled, engine.run(&arena, .{ .seed = 42 }, request, potential, .{ .deadline = .{ .at_ns = 0 } }));
 }
+
+fn snapEdge(edge: format.EdgeId, fraction: f32, distance: f64) routing.snap.candidates.PathEdge {
+    return .{
+        .id = edge,
+        .percent_along = fraction,
+        .projected = .init(0, 0),
+        .distance = distance,
+        .heading = 0,
+        .node = if (fraction == 0) .begin else if (fraction == 1) .end else .none,
+    };
+}
+
+fn snapLocation(edges: []const routing.snap.candidates.PathEdge, filtered: []const routing.snap.candidates.PathEdge) routing.snap.candidates.PathLocation {
+    return .{ .edges = edges, .filtered_edges = filtered, .rank_candidates = true };
+}
+
+test "partial routes retain the travel fractions for direct and out-and-back paths" {
+    const endpoints = routing.search.endpoints;
+    var fixture_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer fixture_arena.deinit();
+    const a = fixture_arena.allocator();
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "residential" }};
+    const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates("A---B", 20), &.{
+        .{ .label = "AB", .tags = road },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const ab = try directedBetween(view, &fixture, "A", "B");
+    const ba = try view.oppEdge(ab);
+    var searcher = try SearchTest.init(testing.allocator, view);
+    defer searcher.deinit();
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    const kernel: SearchTestCost = .{ .seed = 47 };
+    const start = snapLocation(&.{snapEdge(ab, 0.25, 0)}, &.{});
+    const stop = snapLocation(&.{snapEdge(ab, 0.75, 0)}, &.{});
+    const len: f32 = @floatFromInt((try view.edge(ab)).geom.len_m);
+    for ([_]search.Direction{ .forward, .reverse }) |direction| {
+        const options: endpoints.Options = .{ .costing = .pedestrian, .direction = direction };
+        const direct = try endpoints.route(&searcher, &arena, kernel, start, stop, options, search.Zero{}, .{});
+        try testing.expectEqualSlices(endpoints.Segment, &.{.{ .edge = ab, .begin = 0.25, .end = 0.75 }}, direct.segments);
+        try testing.expectEqual(len * 0.5, direct.secs);
+        arena.reset();
+
+        const alternatives = snapLocation(&.{ snapEdge(ab, 0.75, 6), snapEdge(ab, 0.5, 0) }, &.{});
+        const ranked = try endpoints.route(&searcher, &arena, kernel, start, alternatives, options, search.Zero{}, .{});
+        try testing.expectEqualSlices(endpoints.Segment, &.{.{ .edge = ab, .begin = 0.25, .end = 0.5 }}, ranked.segments);
+        arena.reset();
+
+        const back = try endpoints.route(&searcher, &arena, kernel, stop, start, options, search.Zero{}, .{});
+        try testing.expectEqualSlices(endpoints.Segment, &.{
+            .{ .edge = ab, .begin = 0.75, .end = 1 },
+            .{ .edge = ba, .begin = 0, .end = 1 },
+            .{ .edge = ab, .begin = 0, .end = 0.25 },
+        }, back.segments);
+        arena.reset();
+
+        const begin_node = snapLocation(&.{ snapEdge(ba, 1, 0), snapEdge(ab, 0, 0) }, &.{});
+        const end_node = snapLocation(&.{ snapEdge(ba, 0, 0), snapEdge(ab, 1, 0) }, &.{});
+        const whole = try endpoints.route(&searcher, &arena, kernel, begin_node, end_node, options, search.Zero{}, .{});
+        try testing.expectEqualSlices(endpoints.Segment, &.{.{ .edge = ab, .begin = 0, .end = 1 }}, whole.segments);
+        arena.reset();
+        const still = try endpoints.route(&searcher, &arena, kernel, end_node, end_node, options, search.Zero{}, .{});
+        try testing.expectEqual(1, still.segments.len);
+        try testing.expectEqual(still.segments[0].begin, still.segments[0].end);
+        try testing.expectEqual(0, still.distance);
+        arena.reset();
+    }
+}
+
+test "ranked endpoint candidates choose between connected alternatives and filtered retries" {
+    const endpoints = routing.search.endpoints;
+    var fixture_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer fixture_arena.deinit();
+    const a = fixture_arena.allocator();
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "residential" }};
+    const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates("A---B   C---D---E", 20), &.{
+        .{ .label = "AB", .tags = road },
+        .{ .label = "CD", .tags = road },
+        .{ .label = "DE", .tags = road },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const ab = try directedBetween(view, &fixture, "A", "B");
+    const cd = try directedBetween(view, &fixture, "C", "D");
+    const de = try directedBetween(view, &fixture, "D", "E");
+    var searcher = try SearchTest.init(testing.allocator, view);
+    defer searcher.deinit();
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    const kernel: SearchTestCost = .{ .seed = 47 };
+    const end = snapLocation(&.{snapEdge(de, 0.75, 0)}, &.{});
+    const starts = [_]routing.snap.candidates.PathEdge{ snapEdge(ab, 0, 0), snapEdge(cd, 0.5, 0), snapEdge(de, 0.5, 100) };
+    const path = try endpoints.route(&searcher, &arena, kernel, snapLocation(&starts, &.{}), end, .{ .costing = .pedestrian }, search.Zero{}, .{});
+    try testing.expectEqualSlices(endpoints.Segment, &.{
+        .{ .edge = cd, .begin = 0.5, .end = 1 },
+        .{ .edge = de, .begin = 0, .end = 0.75 },
+    }, path.segments);
+    try testing.expect(!path.retried);
+    arena.reset();
+
+    const filtered = snapLocation(starts[0..1], starts[2..3]);
+    const relaxed = try endpoints.route(&searcher, &arena, kernel, filtered, end, .{ .costing = .pedestrian }, search.Zero{}, .{});
+    try testing.expectEqualSlices(endpoints.Segment, &.{.{ .edge = de, .begin = 0.5, .end = 0.75 }}, relaxed.segments);
+    try testing.expect(relaxed.retried);
+    const full = kernel.lengthCost(de, (try view.edge(de)).geom.len_m);
+    try testing.expectApproxEqAbs(full.cost * 0.25 + 7200, relaxed.cost, 1e-3);
+    arena.reset();
+    try testing.expectError(error.NoPath, endpoints.route(&searcher, &arena, kernel, filtered, end, .{ .costing = .bicycle }, search.Zero{}, .{}));
+    arena.reset();
+    const promoted = try endpoints.route(&searcher, &arena, kernel, snapLocation(&.{}, starts[2..3]), end, .{ .costing = .bicycle }, search.Zero{}, .{});
+    try testing.expectEqualDeep([2]bool{ true, false }, promoted.ignored_filter);
+    try testing.expectApproxEqAbs(full.cost * 0.25, promoted.cost, 1e-5);
+}

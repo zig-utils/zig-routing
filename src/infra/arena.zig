@@ -29,6 +29,13 @@ pub const ArenaOptions = struct {
 };
 
 pub const Arena = struct {
+    pub const Mark = struct {
+        current: usize,
+        offset: usize,
+        used: usize,
+        cap_exceeded: bool,
+    };
+
     backing: Allocator,
     options: ArenaOptions,
     chunks: std.ArrayList([]align(16) u8) = .empty,
@@ -66,6 +73,22 @@ pub const Arena = struct {
         self.offset = 0;
         self.used = 0;
         self.cap_exceeded = false;
+    }
+
+    pub fn mark(self: *const Arena) Mark {
+        return .{ .current = self.current, .offset = self.offset, .used = self.used, .cap_exceeded = self.cap_exceeded };
+    }
+
+    /// Discards allocations made since this mark while retaining storage.
+    /// Callers must drop references into the discarded portion first.
+    pub fn rewind(self: *Arena, point: Mark) void {
+        std.debug.assert(point.used <= self.used and point.current <= self.current);
+        std.debug.assert(point.current < self.current or point.offset <= self.offset);
+        self.high_water = @max(self.high_water, self.used);
+        self.current = point.current;
+        self.offset = point.offset;
+        self.used = point.used;
+        self.cap_exceeded = point.cap_exceeded;
     }
 
     /// Returns `error.RequestTooLarge` if any allocation since the last reset
@@ -456,4 +479,21 @@ test "expectNoSteadyStateAlloc ignores allocators other than the arena's backing
     // The helper only sees the arena's backing allocator; code that bypasses
     // the arena is caught by review and by the per-endpoint helper tests.
     try expectNoSteadyStateAlloc(Workload, .{ .n = 16 }, leakyRequest);
+}
+
+test "rewind retains earlier request data and reuses later chunks" {
+    var counting = CountingAllocator.init(testing.allocator);
+    var arena = Arena.init(counting.allocator(), .{ .first_chunk_bytes = 64 });
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const kept = try allocator.dupe(u8, "ranked locations");
+    const mark_point = arena.mark();
+    const discarded = try allocator.alloc(u8, 300);
+    arena.rewind(mark_point);
+    try testing.expectEqual(kept.len, arena.used);
+    try testing.expectEqualStrings("ranked locations", kept);
+    counting.resetCounts();
+    const reuse = try allocator.alloc(u8, 300);
+    try testing.expectEqual(@intFromPtr(discarded.ptr), @intFromPtr(reuse.ptr));
+    try testing.expectEqual(0, counting.calls());
 }
