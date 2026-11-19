@@ -191,6 +191,7 @@ pub const Record = struct {
     reverse: bool,
     encoded: []const u8,
     references: []const u8,
+    reverse_references: ?[]const u8 = null,
     indoor: Indoor,
 
     fn parse(bytes: []const u8, reverse: bool) !Record {
@@ -203,14 +204,30 @@ pub const Record = struct {
             return error.InvalidColdRecord;
         const end = @as(usize, header.shape_bytes) + ref_bytes;
         const trailer = data[end..];
+        var reverse_references: ?[]const u8 = null;
         const indoor: Indoor = if (trailer.len == 0) .{} else blk: {
             if (trailer.len < @sizeOf(IndoorHeader)) return error.InvalidColdIndoorData;
             const info = std.mem.bytesToValue(IndoorHeader, trailer[0..@sizeOf(IndoorHeader)]).attributes;
-            const levels = trailer[@sizeOf(IndoorHeader)..];
-            if (levels.len != @as(usize, info.count) * @sizeOf(LevelRange)) return error.InvalidColdIndoorData;
-            break :blk .{ .layer = info.layer, .levels = std.mem.bytesAsSlice(LevelRange, levels) };
+            const payload = trailer[@sizeOf(IndoorHeader)..];
+            const size = @as(usize, info.count) * @sizeOf(LevelRange);
+            if (size > payload.len) return error.InvalidColdIndoorData;
+            const reverse_names = payload[size..];
+            if (reverse_names.len != 0) {
+                if (reverse_names.len < @sizeOf(u32)) return error.InvalidColdReverseNames;
+                const count = readInt(u32, reverse_names, 0);
+                if (count > max_names or reverse_names.len != (@as(usize, count) + 1) * @sizeOf(u32)) return error.InvalidColdReverseNames;
+                reverse_references = reverse_names[@sizeOf(u32)..];
+            }
+            break :blk .{ .layer = info.layer, .levels = std.mem.bytesAsSlice(LevelRange, payload[0..size]) };
         };
-        return .{ .header = header, .reverse = reverse, .encoded = data[0..header.shape_bytes], .references = data[header.shape_bytes..end], .indoor = indoor };
+        return .{
+            .header = header,
+            .reverse = reverse,
+            .encoded = data[0..header.shape_bytes],
+            .references = data[header.shape_bytes..end],
+            .reverse_references = reverse_references,
+            .indoor = indoor,
+        };
     }
 
     pub fn wayId(self: Record) u64 {
@@ -226,7 +243,7 @@ pub const Record = struct {
     }
 
     pub fn names(self: Record, table: View) Names {
-        return .{ .table = table, .references = self.references };
+        return .{ .table = table, .references = if (self.reverse) self.reverse_references orelse self.references else self.references };
     }
 
     pub fn shape(self: Record, arena: Allocator, deadline: io.Deadline) ![]point.FixedLL {
@@ -252,6 +269,13 @@ pub const Record = struct {
 };
 
 pub fn appendRecord(out: *std.ArrayList(u8), allocator: Allocator, way_id: u64, speed_limit: u8, mean_elevation: i16, vertices: []const point.FixedLL, refs: []const u32, indoor: Indoor, deadline: io.Deadline) !void {
+    return appendDirectionalRecord(out, allocator, way_id, speed_limit, mean_elevation, vertices, refs, null, indoor, deadline);
+}
+
+/// A record can override the name list used when traversing against the
+/// encoded shape. Such records store a count and references after the
+/// indoor data, including an indoor header when there are no levels.
+pub fn appendDirectionalRecord(out: *std.ArrayList(u8), allocator: Allocator, way_id: u64, speed_limit: u8, mean_elevation: i16, vertices: []const point.FixedLL, refs: []const u32, reverse_refs: ?[]const u32, indoor: Indoor, deadline: io.Deadline) !void {
     if (vertices.len < 2) return error.IncompleteShape;
     const point_count = std.math.cast(u32, vertices.len) orelse return error.ShapeTooLarge;
     const name_count = std.math.cast(u8, refs.len) orelse return error.TooManyEdgeNames;
@@ -267,7 +291,7 @@ pub fn appendRecord(out: *std.ArrayList(u8), allocator: Allocator, way_id: u64, 
     }
     const shape_bytes = std.math.cast(u32, out.items.len - start - @sizeOf(RecordHeader)) orelse return error.ShapeTooLarge;
     try out.appendSlice(allocator, std.mem.sliceAsBytes(refs));
-    if (indoor.layer != 0 or indoor.levels.len != 0) {
+    if (indoor.layer != 0 or indoor.levels.len != 0 or reverse_refs != null) {
         const count = std.math.cast(u24, indoor.levels.len) orelse return error.TooManyLevels;
         const indoor_header: IndoorHeader = .{ .attributes = .{ .layer = indoor.layer, .count = count } };
         try out.appendSlice(allocator, std.mem.asBytes(&indoor_header));
@@ -275,6 +299,12 @@ pub fn appendRecord(out: *std.ArrayList(u8), allocator: Allocator, way_id: u64, 
             if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
             try out.appendSlice(allocator, std.mem.asBytes(range));
         }
+    }
+    if (reverse_refs) |names| {
+        if (names.len > max_names) return error.TooManyEdgeNames;
+        const count: u32 = @intCast(names.len);
+        try out.appendSlice(allocator, std.mem.asBytes(&count));
+        try out.appendSlice(allocator, std.mem.sliceAsBytes(names));
     }
     const header: RecordHeader = .{
         .way_low = @truncate(way_id),

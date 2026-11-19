@@ -149,7 +149,9 @@ fn createCommands(a: Allocator) !*Command {
         option("samples", "Random samples per tile (default 1000)", .int),
     }, &.{ arg("PACK", "Packed DEM"), arg("HGT_DIR", "Source tile directory") });
     _ = try command(elevation, "info", "Describe a packed DEM", infoDem, &.{}, &.{arg("PACK", "Packed DEM")});
-    _ = try command(root, "import-valhalla", "Import existing Valhalla graph tiles", stub, &.{}, &.{});
+    _ = try command(root, "import-valhalla", "Import local Valhalla tiles into a test graph bundle", importValhalla, &.{
+        option("output", "Publish the graph bundle at this path", .string).withRequired(true),
+    }, &.{arg("TILES", "Valhalla tile directory, .gph file or indexed tiles.tar").withVariadic(true)});
     _ = try command(root, "version", "Show version, commit, toolchain and CPU features", version, &.{}, &.{});
     return root;
 }
@@ -192,12 +194,6 @@ fn unsigned(ctx: *Context, comptime T: type, comptime name: []const u8) !?T {
 fn duration(ctx: *Context, comptime name: []const u8) !?u64 {
     const value = ctx.getOption(name) orelse return null;
     return bench.parseDuration(value) catch return badOption(ctx, "--" ++ name ++ " expects a duration such as 30s");
-}
-
-fn stub(ctx: *Context) !u8 {
-    const message = try std.fmt.allocPrint(ctx.allocator, "command '{s}' is not implemented", .{ctx.command_name});
-    ctx.setDiagnostic(message);
-    return error.NotImplemented;
 }
 
 fn version(ctx: *Context) !u8 {
@@ -465,6 +461,24 @@ fn inspectGraph(ctx: *Context) !u8 {
     if (verify) bundle.view.verify(.none, &diagnostic) catch |err|
         return graphDiagnostic(ctx, "verify", diagnostic, err);
     try routing.cli.inspect.write(&bundle.view, ctx.out.?, ctx.wantsJson(), verify, edge_id, node_id);
+    return 0;
+}
+
+fn importValhalla(ctx: *Context) !u8 {
+    const paths = try ctx.allocator.alloc([]const u8, ctx.getArgumentCount());
+    for (paths, 0..) |*path, i| path.* = ctx.getArgument(i).?;
+    const stats = routing.cli.import_valhalla.run(std.heap.c_allocator, paths, ctx.getOption("output").?, .none) catch |err| {
+        ctx.setDiagnostic(try std.fmt.allocPrint(ctx.allocator, "could not import Valhalla tiles ({t})", .{err}));
+        return err;
+    };
+    if (stats.version_mismatches != 0) {
+        try App.from(ctx).stderr.print("warning: {d} Valhalla tiles have a major version other than 3\n", .{stats.version_mismatches});
+    }
+    if (ctx.wantsJson()) {
+        try ctx.writeJson(stats);
+    } else {
+        try ctx.out.?.print("imported {d} nodes and {d} directed edges from {d} local Valhalla tiles\n", .{ stats.nodes, stats.edges, stats.tiles });
+    }
     return 0;
 }
 

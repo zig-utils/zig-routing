@@ -317,6 +317,12 @@ pub fn IntDecoder(comptime T: type) type {
         }
 
         pub fn next(self: *Self) Error!?T {
+            const delta = (try self.nextDelta()) orelse return null;
+            self.value +%= delta;
+            return self.value;
+        }
+
+        pub fn nextDelta(self: *Self) Error!?T {
             if (self.pos >= self.bytes.len) return null;
             var result: U = 0;
             var shift: u32 = 0;
@@ -324,13 +330,13 @@ pub fn IntDecoder(comptime T: type) type {
                 if (self.pos >= self.bytes.len) return error.Truncated;
                 const byte = self.bytes[self.pos];
                 self.pos += 1;
-                if (shift >= @bitSizeOf(U)) return error.Overflow;
-                result |= @as(U, byte & 0x7f) << @intCast(shift);
+                const group = std.math.cast(U, byte & 0x7f) orelse return error.Overflow;
+                if (shift >= @bitSizeOf(U) or group > @as(U, std.math.maxInt(U)) >> @intCast(shift)) return error.Overflow;
+                result |= group << @intCast(shift);
                 shift += 7;
                 if (byte & 0x80 == 0) break;
             }
-            self.value +%= @bitCast(zigzagDecode(U, result));
-            return self.value;
+            return @bitCast(zigzagDecode(U, result));
         }
     };
 }

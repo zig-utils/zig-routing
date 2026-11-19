@@ -43,10 +43,14 @@ pub const Builder = struct {
     }
 
     pub fn append(self: *Builder, way_id: u64, speed_limit: u8, mean_elevation: i16, shape: []const format.Coordinate, refs: []const u32, indoor: cold.Indoor) !u31 {
+        return self.appendDirectional(way_id, speed_limit, mean_elevation, shape, refs, null, indoor);
+    }
+
+    pub fn appendDirectional(self: *Builder, way_id: u64, speed_limit: u8, mean_elevation: i16, shape: []const format.Coordinate, refs: []const u32, reverse_refs: ?[]const u32, indoor: cold.Indoor) !u31 {
         const id = std.math.cast(u31, self.record_count) orelse return error.TooManyColdRecords;
         if (self.chunk_records == cold.chunk_size) try self.flushChunk();
         const offset = self.chunk_bytes.items.len;
-        try cold.appendRecord(&self.chunk_bytes, self.gpa, way_id, speed_limit, mean_elevation, shape, refs, indoor, self.deadline);
+        try cold.appendDirectionalRecord(&self.chunk_bytes, self.gpa, way_id, speed_limit, mean_elevation, shape, refs, reverse_refs, indoor, self.deadline);
         self.record_offsets[self.chunk_records] = offset;
         self.chunk_records += 1;
         self.record_count += 1;

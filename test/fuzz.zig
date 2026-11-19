@@ -12,7 +12,7 @@
 //! `osm-pbf` (file framing, block inflation and OSM primitives), and
 //! `node-store` (the build-time coordinate index format) and `graph-bundle`
 //! (section headers, checksums and typed topology access), and
-//! `build-checkpoint` (restart manifests).
+//! `build-checkpoint` (restart manifests) and `valhalla-tile` (offline tile import).
 //!
 //! The contract for every parser: malformed input returns an error, never
 //! panics, overflows or reads out of bounds. The fuzz step builds ReleaseSafe
@@ -134,6 +134,102 @@ test "fuzz graph-bundle" {
         candidates[i + 1] = raw;
     }
     try std.testing.fuzz(&baseline, fuzzGraphBundle, .{ .corpus = try seeds(a, &candidates) });
+}
+
+const valhalla_import = routing.cli.import_valhalla;
+const valhalla_fixture = @import("valhalla_fixture.zig");
+
+fn checkValhallaTile(tile: valhalla_import.tile_format.Tile) !void {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const a = state.allocator();
+    var points: std.ArrayList(routing.geo.FixedLL) = .empty;
+    var levels: std.ArrayList(graph.cold.LevelRange) = .empty;
+    for (tile.nodes) |node| _ = node.coordinate(tile.header.base_ll) catch continue;
+    for (tile.edges) |edge| {
+        const info = tile.info(edge.attributes.info_offset) catch continue;
+        info.decodeShape(a, &points, .none) catch {};
+        _ = info.indoor(a, &levels, .none) catch continue;
+        for (0..info.names.len) |index| _ = info.name(index) catch continue;
+    }
+}
+
+fn fuzzValhallaTile(_: void, s: *Smith) !void {
+    const source = valhalla_import.tile_format;
+    var buf: [max_input]u8 = undefined;
+    const input = draw(s, &buf, 0x7661_6c68);
+    if (source.Tile.parse(input)) |tile| {
+        try checkValhallaTile(tile);
+    } else |_| {
+        const entries = source.archiveIndex(input, .none) catch return;
+        for (entries) |entry| {
+            const tile = source.archiveTile(input, entry) catch continue;
+            try checkValhallaTile(tile);
+        }
+    }
+}
+
+test "fuzz valhalla-tile" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const raw = valhalla_fixture.tile(false);
+    const tar = valhalla_fixture.archive();
+    try std.testing.fuzz({}, fuzzValhallaTile, .{ .corpus = try seeds(state.allocator(), &.{ &.{}, &raw, &tar, raw[0 .. raw.len - 1] }) });
+}
+
+test "Valhalla importer preserves cross-tile edge pairs and cold data" {
+    const io = routing.infra.io;
+    const test_alloc = std.testing.allocator;
+    const fixture = valhalla_fixture;
+    const parent = try io.Directory.open(".");
+    defer parent.close();
+    const root = try parent.temporaryChild();
+    defer parent.deleteDir(&root.name) catch {};
+    defer root.dir.close();
+    const raw = fixture.archive();
+    try root.dir.writeAtomic("tiles.tar", &raw);
+    defer root.dir.deleteFile("tiles.tar") catch {};
+    var source_buf: [128]u8 = undefined;
+    var bundle_buf: [128]u8 = undefined;
+    const archive = try std.fmt.bufPrint(&source_buf, "{s}/tiles.tar", .{root.name});
+    const output = try std.fmt.bufPrint(&bundle_buf, "{s}/native", .{root.name});
+    const stats = try valhalla_import.run(test_alloc, &.{archive}, output, .none);
+    defer {
+        if (root.dir.child("native")) |dir| {
+            for (std.enums.values(graph.format.SectionKind)) |kind| dir.deleteFile(kind.filename()) catch {};
+            dir.close();
+            root.dir.deleteDir("native") catch {};
+        } else |_| {}
+    }
+    try std.testing.expectEqual(valhalla_import.Stats{ .tiles = 2, .nodes = 2, .edges = 2, .source_edges = 2 }, stats);
+    var b = try graph.reader.Bundle.open(output);
+    defer b.close();
+    try b.view.verify(.none, null);
+    try std.testing.expectEqual(fixture.left, try b.view.coordinate(@fromBackingInt(0)));
+    try std.testing.expectEqual(fixture.right, try b.view.coordinate(@fromBackingInt(1)));
+    const first: graph.format.EdgeId = @fromBackingInt(0);
+    const other: graph.format.EdgeId = @fromBackingInt(1);
+    try std.testing.expectEqual(other, try b.view.oppEdge(first));
+    try std.testing.expectEqual(first, try b.view.oppEdge(other));
+    var points: [2]routing.geo.FixedLL = undefined;
+    const record = try b.view.coldRecord(other);
+    try record.decodeShape(&points, .none);
+    try std.testing.expectEqualSlices(routing.geo.FixedLL, &.{ fixture.right, fixture.left }, &points);
+    try std.testing.expectEqual(fixture.way, record.wayId());
+    try std.testing.expectEqual(@as(u8, 42), record.speedLimit());
+    try std.testing.expectEqual(@as(i16, 120), record.meanElevation());
+    const name = try (try b.view.names(first)).at(0);
+    try std.testing.expectEqualStrings(fixture.name, name.text);
+    try std.testing.expect(name.route);
+    const reverse_name = try (try b.view.names(other)).at(0);
+    try std.testing.expectEqualStrings(fixture.reverse_name, reverse_name.text);
+    try std.testing.expect(reverse_name.route);
+    try std.testing.expectEqual(@as(i8, 2), record.indoor.layer);
+    try std.testing.expect(try record.indoor.includes(2.5, .none));
+    try std.testing.expectEqual(@as(u8, 4 | (3 << 3) | (1 << 6)), (try b.view.turnRow(@fromBackingInt(0), 0))[0]);
+    try std.testing.expectEqual(graph.turn_sides.Sides{ .right = true }, try b.view.turnSides(@fromBackingInt(0), 0, 0));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.indexOfScalar(u32, b.view.components.?, 0).?);
+    try std.testing.expectEqual(@as(u32, 0), try b.view.component(@fromBackingInt(1)));
 }
 
 fn fuzzBuildCheckpoint(_: void, smith: *Smith) !void {

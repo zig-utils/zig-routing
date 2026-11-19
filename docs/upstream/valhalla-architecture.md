@@ -129,9 +129,10 @@ Sizes are `sizeof` the struct, so layout is x86-64 ABI bitfield packing. A Zig p
 | 1 | `graphid_:46`, `density_:4`, `name_quality_:4`, `speed_quality_:4`, `exit_quality_:4`, `has_elevation_:1`, `has_ext_directededge_:1` |
 | — | `std::array<float,2> base_ll_`; `char version_[16]`; `uint64_t dataset_id_` |
 | counts | `nodecount_:21`, `directededgecount_:21`, `predictedspeeds_count_:21`, `spare1_:1` |
-| counts | `uint32 transitioncount_:22`, `spare3_:10`; `uint32 turnlane_count_:21`, `spare4_:11`; `uint64 transfercount_:16`, `spare2_:7` (an intentional padding quirk to keep x86/x64 identical) |
-| transit | `departurecount_:24`, `stopcount_:16`, `spare5_:1`, `routecount_:12`, `schedulecount_:12` |
-| counts | `signcount_:24`, `spare6_:16`, `access_restriction_count_:24`, `admincount_:16`, `spare7_:24` |
+| Counts at byte 48 | `uint32 transitioncount_:22`, `spare3_:10`; `uint32 turnlane_count_:21`, `spare4_:11` |
+| Counts at byte 56 | `transfercount_:16`, `spare2_:7`, `departurecount_:24`, `stopcount_:16`, `spare5_:1` (the first spare preserves the x86/x64 layout) |
+| Counts at byte 64 | `routecount_:12`, `schedulecount_:12`, `signcount_:24`, `spare6_:16` |
+| Counts at byte 72 | `access_restriction_count_:24`, `admincount_:16`, `spare7_:24` |
 | — | `uint64 spareword0_`; `uint64 checksum_` (build_id<<48 \| 48-bit data hash, `kTileHashBits`=48) |
 | offsets (uint32) | `complex_restriction_forward_offset_`, `complex_restriction_reverse_offset_`, `edgeinfo_offset_`, `textlist_offset_`, `date_created_`, `bin_offsets_[25]`, `lane_connectivity_offset_`, `predictedspeeds_offset_`, `tile_size_`, `boundingcircles_offset_`, `empty_slots_[10]` |
 
@@ -185,9 +186,9 @@ The CHANGELOG says `date_created_` was removed (#6115) and the `json` query para
   - Word 1: `wayid_:32`.
   - Word 2: `mean_elevation_:12`, `bike_network_:4`, `speed_limit_:8`, `extended_wayid0_:8`.
   - Word 3: `name_count_:4`, `encoded_shape_size_:16`, `extended_wayid1_:8`, `extended_wayid_size_:2`, `has_elevation_:1`, `spare0_:1`.
-- Then optional extended way-id bytes 2 and 3, then `NameInfo[name_count]`, then the encoded shape, then optional encoded elevation.
+- Then `NameInfo[name_count]`, the encoded shape, optional extended way-id bytes 2 and 3, and optional encoded elevation.
 - `NameInfo` is `name_offset_:24`, `additional_fields_:4`, `is_route_num_:1`, `tagged_:1`, `spare_:2`.
-- Shape is **7-digit precision** polyline (`Shape7Decoder`). API output uses polyline6.
+- Shape7 uses seven bits per varint group. The default coordinate precision in 3.9.3 is six decimal places, as in polyline6 API output.
 - Tagged values are stored in the text list with a 1-byte `TaggedValue` prefix: `kLayer`=1, `kLinguistic`=2, `kBssInfo`=3, `kLevel`=4, `kLevelRef`=5, `kLandmark`=6, `kConditionalSpeedLimits`=7, `kLevels`=8, `kOSMNodeIds`=9, `kTunnel`='1', `kBridge`='2'.
 - Linguistic header: `language_:8`, `length_:8`, `phonetic_alphabet_:3`, `name_index_:4`, `spare_:1`.
 - `kMaxNamesPerEdge`=15, `kMaxEncodedShapeSize`=65535.

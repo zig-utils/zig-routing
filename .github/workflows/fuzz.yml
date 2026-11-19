@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        target: [request, http, polyline, lz4, dem, protobuf, config, osm-pbf, node-store, graph-bundle, build-checkpoint]
+        target: [request, http, polyline, lz4, dem, protobuf, config, osm-pbf, node-store, graph-bundle, build-checkpoint, valhalla-tile]
       fail-fast: false
     steps:
       - uses: actions/checkout@v6
