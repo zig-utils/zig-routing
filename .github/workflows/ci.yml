@@ -150,6 +150,32 @@ jobs:
           PY
           fi
 
+  binary-size:
+    name: Binary size and instantiations
+    runs-on: ubuntu-latest
+    env:
+      BASE_REV: ${{ github.event.pull_request.base.sha || github.event.before }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: binary-size-${{ hashFiles('build.zig.zon') }}
+      - name: Measure the candidate and base release binaries
+        run: |
+          target=(-Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast)
+          zig build "${target[@]}" --prefix "$RUNNER_TEMP/size-candidate"
+          base_source="$RUNNER_TEMP/size-base-source"
+          mkdir -p "$base_source"
+          git archive "$BASE_REV" | tar -x -C "$base_source"
+          (
+            cd "$base_source"
+            zig build "${target[@]}" -Dcommit="$BASE_REV" --prefix "$RUNNER_TEMP/size-base"
+          )
+          python3 scripts/size-budget.py "$RUNNER_TEMP/size-candidate/bin/zr" --base "$RUNNER_TEMP/size-base/bin/zr"
+
   corpus:
     name: Corpora regenerate byte-identical
     runs-on: ubuntu-latest

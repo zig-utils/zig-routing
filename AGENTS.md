@@ -99,6 +99,20 @@ zig fmt --check build.zig build.zig.zon src test packages
 zig build -Doptimize=ReleaseFast
 ```
 
+The binary budget in [bench/budgets/binary.json](bench/budgets/binary.json) covers the installed
+Linux x86-64 baseline ReleaseFast executable, including its symbols. CI builds the candidate and
+base with the pinned toolchain, then reports the file size and distinct emitted search and costing
+types. Run the same check with:
+
+```bash
+zig build -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseFast
+python3 scripts/size-budget.py zig-out/bin/zr --base /path/to/base/bin/zr
+```
+
+When a feature needs a higher limit, include the before and after counts, binary sizes, and reason
+in the issue and change the relevant budget entry in the same commit. Check the reported type names
+for accidental instantiations first.
+
 Before pushing from macOS, cross-compile for Linux: production runs there, and OS-specific code
 (epoll, glibc symbols) otherwise only fails in CI.
 
