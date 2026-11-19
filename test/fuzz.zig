@@ -927,3 +927,24 @@ test "fuzz http-range" {
     const corpus = try seeds(running.allocator(), &.{ good, chunked, "" });
     try std.testing.fuzz({}, fuzzRangeResponse, .{ .corpus = corpus });
 }
+
+fn fuzzUsageDirectory(_: void, s: *Smith) !void {
+    const directory = routing.build.node_store.usage_directory;
+    var buf: [max_input]u8 = undefined;
+    const bytes = draw(s, &buf, 0x7573_6167);
+    var reader = directory.DirectoryReader.init(bytes) catch return;
+    const branches = reader.remaining;
+    var count: usize = 0;
+    var branch: directory.Branch = undefined;
+    while (reader.next(&branch) catch return) count += 1;
+    try std.testing.expectEqual(branches, count);
+}
+
+test "fuzz usage-directory" {
+    var running: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer running.deinit();
+    const good = "ZRUDIR01\x02\x00\x00\x00\x00\x00\x00\x00" ++
+        "\x01\x01\x02" ++ "\x02\x80\x01\x01\x7e\x82\x01";
+    const corpus = try seeds(running.allocator(), &.{ good, good[0..16], "" });
+    try std.testing.fuzz({}, fuzzUsageDirectory, .{ .corpus = corpus });
+}

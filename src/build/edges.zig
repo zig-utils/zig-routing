@@ -235,23 +235,27 @@ const SelectionStats = struct {
 
 pub fn saveUsage(tx: *checkpoint.Transaction, store: *usage.Usage, directory: checkpoint.Artifact, leaves: checkpoint.Artifact) !void {
     const frozen = try store.freeze(tx.deadline);
-    try tx.stash(directory, frozen.dir);
+    const compact = try tx.create(directory);
+    defer compact.close();
+    try usage.directory.write(frozen.dir, compact, tx.deadline);
+    try compact.sync();
     try tx.stash(leaves, frozen.leaves);
 }
 
 pub fn loadUsage(saved: checkpoint.Existing, scratch: []const u8, directory: checkpoint.Artifact, leaves: checkpoint.Artifact, deadline: io.Deadline) !usage.Usage {
-    const dir = try loadUsageFile(saved, scratch, directory, deadline);
-    errdefer dir.close();
-    const leaf = try loadUsageFile(saved, scratch, leaves, deadline);
+    const leaf = try loadUsageFile(saved, scratch, leaves, null, deadline);
     errdefer leaf.close();
+    const dir = try loadUsageFile(saved, scratch, directory, try usage.Usage.maxDirectoryBranches(leaf), deadline);
+    errdefer dir.close();
     return usage.Usage.reopen(dir, leaf);
 }
 
-fn loadUsageFile(saved: checkpoint.Existing, scratch: []const u8, key: checkpoint.Artifact, deadline: io.Deadline) !io.File {
+fn loadUsageFile(saved: checkpoint.Existing, scratch: []const u8, key: checkpoint.Artifact, max_branches: ?u64, deadline: io.Deadline) !io.File {
     const source = try saved.read(key, deadline);
     defer source.close();
     const target = try io.File.temporary(scratch);
     errdefer target.close();
+    if (max_branches) |max| if (try usage.directory.restore(source, target, max, deadline)) return target;
     _ = try checkpoint.transfer(source, target, deadline);
     return target;
 }

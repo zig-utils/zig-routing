@@ -22,8 +22,10 @@ const Leaf = extern struct {
     located: [leaf_size / 64]u64 = @splat(0),
 };
 
-const Branch = [radix]u64;
+pub const directory = @import("usage_directory.zig");
+const Branch = directory.Branch;
 const empty_branch: Branch = @splat(0);
+const CachedBranch = struct { prefix: u64 = 0, child: u64 = 0 };
 
 comptime {
     std.debug.assert(@import("builtin").target.cpu.arch.endian() == .little);
@@ -66,6 +68,7 @@ pub const Usage = struct {
     branches: u64 = 1,
     pages: u64 = 0,
     cache: [cache_size]Slot = @splat(.{}),
+    path: [levels - 1]CachedBranch = @splat(.{}),
 
     pub fn init(scratch_dir: []const u8) !Usage {
         const dir = try io.File.temporary(scratch_dir);
@@ -83,6 +86,12 @@ pub const Usage = struct {
         if (dir_bytes < @sizeOf(Branch) or dir_bytes % @sizeOf(Branch) != 0 or leaf_bytes % @sizeOf(Leaf) != 0)
             return error.InvalidUsageStore;
         return .{ .dir = dir, .leaves = leaves, .branches = dir_bytes / @sizeOf(Branch), .pages = leaf_bytes / @sizeOf(Leaf) };
+    }
+
+    pub fn maxDirectoryBranches(leaves: io.File) !u64 {
+        const size = try leaves.size();
+        if (size % @sizeOf(Leaf) != 0) return error.InvalidUsageStore;
+        return 1 +| (size / @sizeOf(Leaf)) *| (levels - 1);
     }
 
     pub fn deinit(self: *Usage) void {
@@ -231,7 +240,15 @@ pub const Usage = struct {
         var remaining: usize = levels;
         while (remaining != 0) {
             remaining -= 1;
-            const index: u8 = @truncate(key >> @as(u6, @intCast(remaining * 8)));
+            const prefix = key >> @as(u6, @intCast(remaining * 8));
+            const cached = if (remaining > 0) &self.path[remaining - 1] else null;
+            if (cached) |entry| {
+                if (entry.child != 0 and entry.prefix == prefix) {
+                    branch = entry.child - 1;
+                    continue;
+                }
+            }
+            const index: u8 = @truncate(prefix);
             const offset = branch * @sizeOf(Branch) + @as(u64, index) * @sizeOf(u64);
             var child: u64 = undefined;
             try self.dir.preadAll(std.mem.asBytes(&child), offset);
@@ -251,6 +268,7 @@ pub const Usage = struct {
                 }
                 try self.dir.pwriteAll(std.mem.asBytes(&child), offset);
             }
+            if (cached) |entry| entry.* = .{ .prefix = prefix, .child = child };
             branch = child - 1;
         }
         return branch + 1;

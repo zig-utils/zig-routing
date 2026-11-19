@@ -308,7 +308,7 @@ pub fn build(b: *std.Build) void {
 
     // Fuzz targets (test/fuzz.zig). `zig build test` replays their seeds; `zig build fuzz
     // --fuzz` fuzzes, ReleaseSafe by default so bounds and overflow checks stay on.
-    const fuzz_filter = b.option([]const u8, "fuzz-target", "Fuzz one target: request, http, polyline, lz4, dem, protobuf, config, osm-pbf, osm-primitives, osm-dense, node-store, graph-bundle, build-checkpoint, valhalla-tile, costing-reference, range-manifest, http-range");
+    const fuzz_filter = b.option([]const u8, "fuzz-target", "Fuzz one target: request, http, polyline, lz4, dem, protobuf, config, osm-pbf, osm-primitives, osm-dense, node-store, graph-bundle, build-checkpoint, valhalla-tile, costing-reference, range-manifest, http-range, usage-directory");
     const fuzz_opt: @TypeOf(optimize) = .ReleaseSafe;
     const seed_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("test/fuzz.zig"),

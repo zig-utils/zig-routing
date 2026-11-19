@@ -67,7 +67,13 @@ pub const File = struct {
     index: Index,
 
     pub fn open(gpa: Allocator, path: []const u8, deadline: io.Deadline) !File {
-        const mapping = try io.Mapping.mapFile(path, .read_only);
+        const file = try io.File.open(path, .read_only);
+        defer file.close();
+        return openFd(gpa, file, deadline);
+    }
+
+    pub fn openFd(gpa: Allocator, file: io.File, deadline: io.Deadline) !File {
+        const mapping = try io.Mapping.mapFd(file, .read_only);
         errdefer mapping.unmap();
         mapping.adviseAll(.sequential) catch {};
         return .{ .mapping = mapping, .index = try Index.init(gpa, mapping.bytes, deadline) };
@@ -77,6 +83,11 @@ pub const File = struct {
         self.index.deinit();
         self.mapping.unmap();
     }
+};
+
+pub const DecodeOptions = struct {
+    workers: usize = 0,
+    buffer_bytes: usize = std.math.maxInt(usize),
 };
 
 /// An immutable index of the OSMData blocks in file order. The input bytes
@@ -141,9 +152,15 @@ pub const Index = struct {
     /// block view is valid until its callback returns. Zero workers chooses
     /// the host CPU count. Each buffer is allocated once for the whole pass.
     pub fn forEach(self: *const Index, gpa: Allocator, workers: usize, deadline: io.Deadline, context: anytype, comptime consume: anytype) !void {
+        return self.forEachBounded(gpa, .{ .workers = workers }, deadline, context, consume);
+    }
+
+    pub fn forEachBounded(self: *const Index, gpa: Allocator, options: DecodeOptions, deadline: io.Deadline, context: anytype, comptime consume: anytype) !void {
         if (self.blobs.len == 0) return;
-        const requested = if (workers == 0) std.Thread.getCpuCount() catch 1 else workers;
-        const thread_count = @min(requested, self.blobs.len);
+        const requested = if (options.workers == 0) std.Thread.getCpuCount() catch 1 else options.workers;
+        const slots_available = if (self.inflate_capacity == 0) self.blobs.len else @min(self.blobs.len, options.buffer_bytes / self.inflate_capacity);
+        if (slots_available == 0) return error.PbfDecodeBudgetExceeded;
+        const thread_count = @min(requested, slots_available);
         if (thread_count == 1) {
             const scratch = try gpa.alloc(u8, self.inflate_capacity);
             defer gpa.free(scratch);
@@ -151,7 +168,7 @@ pub const Index = struct {
             return;
         }
 
-        const slot_count = @min(self.blobs.len, thread_count *| 2);
+        const slot_count = @min(slots_available, thread_count *| 2);
         const scratch = try gpa.alloc(u8, std.math.mul(usize, slot_count, self.inflate_capacity) catch return error.OutOfMemory);
         defer gpa.free(scratch);
         const slots = try gpa.alloc(Slot, slot_count);
@@ -174,6 +191,33 @@ pub const Index = struct {
         for (0..self.blobs.len) |i| {
             try consume(context, i, try pool.result(i));
             pool.release(i);
+        }
+    }
+};
+
+fn OrderedConsumer(comptime Target: type, comptime consume: anytype) type {
+    return struct {
+        target: Target,
+        next: usize = 0,
+
+        fn emit(forward: *@This(), _: usize, bytes: []const u8) !void {
+            try consume(forward.target, forward.next, bytes);
+            forward.next += 1;
+        }
+    };
+}
+
+/// Reuse mapped indexes across the build passes while keeping their callbacks
+/// in input order. Only one input's decode buffers are live at a time.
+pub const IndexedStreams = struct {
+    files: []const File,
+    decode: DecodeOptions,
+
+    pub fn forEach(self: IndexedStreams, gpa: Allocator, deadline: io.Deadline, context: anytype, comptime consume: anytype) !void {
+        var forward: OrderedConsumer(@TypeOf(context), consume) = .{ .target = context };
+        for (self.files) |*file| {
+            if (deadline.expired()) return error.DeadlineExceeded;
+            try file.index.forEachBounded(gpa, self.decode, deadline, &forward, @TypeOf(forward).emit);
         }
     }
 };
@@ -279,19 +323,10 @@ pub const Streams = struct {
     files: []const Stream,
 
     pub fn forEach(self: Streams, gpa: Allocator, deadline: io.Deadline, context: anytype, comptime consume: anytype) !void {
-        const Forward = struct {
-            target: @TypeOf(context),
-            next: usize = 0,
-
-            fn emit(forward: *@This(), _: usize, bytes: []const u8) !void {
-                try consume(forward.target, forward.next, bytes);
-                forward.next += 1;
-            }
-        };
-        var forward: Forward = .{ .target = context };
+        var forward: OrderedConsumer(@TypeOf(context), consume) = .{ .target = context };
         for (self.files) |file| {
             if (deadline.expired()) return error.DeadlineExceeded;
-            try file.forEach(gpa, deadline, &forward, Forward.emit);
+            try file.forEach(gpa, deadline, &forward, @TypeOf(forward).emit);
         }
     }
 };
@@ -557,6 +592,14 @@ test "OSM PBF header, formats and ordered pool reuse" {
         try index.forEach(count.allocator(), workers, .none, &check, Check.consume);
         try testing.expectEqual(index.blobs.len, check.next);
     }
+    for ([_]usize{ 3, 6 }) |bytes_limit| {
+        var check: Check = .{ .allocator = &count };
+        try index.forEachBounded(count.allocator(), .{ .workers = 4, .buffer_bytes = bytes_limit }, .none, &check, Check.consume);
+        try testing.expectEqual(index.blobs.len, check.next);
+    }
+    var too_small: Check = .{};
+    try testing.expectError(error.PbfDecodeBudgetExceeded, index.forEachBounded(a, .{ .workers = 4, .buffer_bytes = 2 }, .none, &too_small, Check.consume));
+    try testing.expectEqual(@as(usize, 0), too_small.next);
     const input = try io.File.temporary(".");
     defer input.close();
     try input.writeAll(bytes.items);

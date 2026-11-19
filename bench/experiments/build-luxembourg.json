@@ -1,0 +1,722 @@
+{
+  "dataset": "Luxembourg 2026-01-01",
+  "pbf_sha256": "d8f3e1dabb4d9d5489500c35432eb393089c32222cfff8cf50706852f0696a80",
+  "hardware": "Apple M3 Pro",
+  "os": "macOS arm64",
+  "zig": "0.17.0-dev.1857+3c46da14d",
+  "workers": 4,
+  "baseline_commit": "0ba8962",
+  "dataset_uuid": [
+    243,
+    46,
+    155,
+    23,
+    127,
+    155,
+    130,
+    195,
+    129,
+    86,
+    230,
+    30,
+    175,
+    81,
+    139,
+    156
+  ],
+  "bundle_sections_sha256": {
+    "classes.bin": "a5d4ac3fa27a8d36a79bc0b9e3d56c456c54627ecc5cdf2fd28bd28501984e8d",
+    "cold.bin": "4063f205b3dd6fd73146dcaa50a41f72955b6181dd1a38c1048ab292483183fb",
+    "cold_idx.bin": "160c48cffb657098d8523b515609bfc0ece5369313bab27a3c601c4460921d44",
+    "components.bin": "eaa2f5e4132135a765849d43652d7aa98a4d7d1f78789e46bbb24929db3c0759",
+    "coordinates.bin": "f6579d41f78e2f85c961aec0be0fea4caf285e494483eee0a0a2c0d09c10a0f5",
+    "coverage.bin": "0fdbc40d8d95db9422cfa38c92a74ec2116159f42ee21aa81e7a4fa699f5e994",
+    "edges.bin": "457e87069c412fadebbec1e1d808faa7b2962648cb4c96167c600df099a65c3c",
+    "first_edge.bin": "874bbddd2658973fc0c511739bdd52e2386538939041f2cadc39cbbe9ef95e71",
+    "metadata.bin": "e873f9e12aae31930689fa5d40b0a007105c9c3d12c29cd553b58240416d27ca",
+    "nodes.bin": "21cf74328bc07901e848a9681ab58f5c33d71fcb6b1a2666da148cba5212a6fc",
+    "spatial.bin": "15289505d830f9c3ba994b9a1deebdac691a61bf40766c2667f4f106b24a18bd",
+    "turn_sides.bin": "0154ee3eac5271c763d63d6325695320f0e55083ee213a9b3d0c54bfa36f09c2",
+    "turns.bin": "846440fefd536a224812446aac213d1a74b149664747e6443b778914e063dc55"
+  },
+  "samples": [
+    {
+      "version": "baseline",
+      "trial": 1,
+      "wall_ns": 10118481375,
+      "retained_scratch_bytes": 343781376,
+      "tag_directory_bytes": 126795776,
+      "stage_metrics": [
+        {
+          "stage": "read",
+          "elapsed_ns": 49783250,
+          "rows": 1,
+          "bytes": 214,
+          "peak_rss_bytes": 2834432,
+          "rows_per_second": 20.087077480879614
+        },
+        {
+          "stage": "tags",
+          "elapsed_ns": 3966173209,
+          "rows": 134770,
+          "bytes": 140606667,
+          "peak_rss_bytes": 10534912,
+          "rows_per_second": 33979.8573834802
+        },
+        {
+          "stage": "node_store",
+          "elapsed_ns": 1700580500,
+          "rows": 892201,
+          "bytes": 67063172,
+          "peak_rss_bytes": 12042240,
+          "rows_per_second": 524644.9668216235
+        },
+        {
+          "stage": "edges",
+          "elapsed_ns": 3234800042,
+          "rows": 237668,
+          "bytes": 31176357,
+          "peak_rss_bytes": 143589376,
+          "rows_per_second": 73472.23844261345
+        },
+        {
+          "stage": "order",
+          "elapsed_ns": 56773708,
+          "rows": 187650,
+          "bytes": 7506086,
+          "peak_rss_bytes": 170770432,
+          "rows_per_second": 3305227.130840212
+        },
+        {
+          "stage": "assemble",
+          "elapsed_ns": 100864500,
+          "rows": 475336,
+          "bytes": 17364202,
+          "peak_rss_bytes": 182255616,
+          "rows_per_second": 4712619.405241686
+        },
+        {
+          "stage": "enhance",
+          "elapsed_ns": 160831875,
+          "rows": 475336,
+          "bytes": 9429696,
+          "peak_rss_bytes": 187891712,
+          "rows_per_second": 2955483.79324683
+        },
+        {
+          "stage": "elevation",
+          "elapsed_ns": 12405625,
+          "rows": 0,
+          "bytes": 7605505,
+          "peak_rss_bytes": 187891712,
+          "rows_per_second": 0
+        },
+        {
+          "stage": "turns",
+          "elapsed_ns": 112049959,
+          "rows": 187650,
+          "bytes": 2151564,
+          "peak_rss_bytes": 187891712,
+          "rows_per_second": 1674699.4079667623
+        },
+        {
+          "stage": "cold",
+          "elapsed_ns": 256059167,
+          "rows": 237668,
+          "bytes": 28900898,
+          "peak_rss_bytes": 187891712,
+          "rows_per_second": 928176.1039236685
+        },
+        {
+          "stage": "spatial",
+          "elapsed_ns": 11576166,
+          "rows": 22258,
+          "bytes": 616573,
+          "peak_rss_bytes": 190349312,
+          "rows_per_second": 1922743.6786929283
+        },
+        {
+          "stage": "validate",
+          "elapsed_ns": 167549417,
+          "rows": 475336,
+          "bytes": 29517425,
+          "peak_rss_bytes": 190349312,
+          "rows_per_second": 2836989.8774401583
+        },
+        {
+          "stage": "finalize",
+          "elapsed_ns": 69343209,
+          "rows": 475336,
+          "bytes": 29517425,
+          "peak_rss_bytes": 190349312,
+          "rows_per_second": 6854831.307273363
+        }
+      ]
+    },
+    {
+      "version": "candidate",
+      "trial": 1,
+      "wall_ns": 7754415500,
+      "retained_scratch_bytes": 162488320,
+      "tag_directory_bytes": 845781,
+      "stage_metrics": [
+        {
+          "stage": "read",
+          "elapsed_ns": 43482417,
+          "rows": 1,
+          "bytes": 214,
+          "peak_rss_bytes": 2834432,
+          "rows_per_second": 22.997801617145615
+        },
+        {
+          "stage": "tags",
+          "elapsed_ns": 2823508375,
+          "rows": 134770,
+          "bytes": 14656672,
+          "peak_rss_bytes": 58425344,
+          "rows_per_second": 47731.39729043658
+        },
+        {
+          "stage": "node_store",
+          "elapsed_ns": 872139500,
+          "rows": 892201,
+          "bytes": 11604595,
+          "peak_rss_bytes": 69255168,
+          "rows_per_second": 1023002.6274466413
+        },
+        {
+          "stage": "edges",
+          "elapsed_ns": 2908181042,
+          "rows": 237668,
+          "bytes": 31176357,
+          "peak_rss_bytes": 188268544,
+          "rows_per_second": 81723.93553482219
+        },
+        {
+          "stage": "order",
+          "elapsed_ns": 57565666,
+          "rows": 187650,
+          "bytes": 7506086,
+          "peak_rss_bytes": 188301312,
+          "rows_per_second": 3259755.5633248473
+        },
+        {
+          "stage": "assemble",
+          "elapsed_ns": 114564333,
+          "rows": 475336,
+          "bytes": 17364202,
+          "peak_rss_bytes": 188301312,
+          "rows_per_second": 4149074.913219283
+        },
+        {
+          "stage": "enhance",
+          "elapsed_ns": 177179625,
+          "rows": 475336,
+          "bytes": 9429696,
+          "peak_rss_bytes": 188301312,
+          "rows_per_second": 2682791.5455854475
+        },
+        {
+          "stage": "elevation",
+          "elapsed_ns": 17959584,
+          "rows": 0,
+          "bytes": 7605505,
+          "peak_rss_bytes": 188301312,
+          "rows_per_second": 0
+        },
+        {
+          "stage": "turns",
+          "elapsed_ns": 112538292,
+          "rows": 187650,
+          "bytes": 2151564,
+          "peak_rss_bytes": 188301312,
+          "rows_per_second": 1667432.4504587292
+        },
+        {
+          "stage": "cold",
+          "elapsed_ns": 185355417,
+          "rows": 237668,
+          "bytes": 28900898,
+          "peak_rss_bytes": 188301312,
+          "rows_per_second": 1282228.5091349664
+        },
+        {
+          "stage": "spatial",
+          "elapsed_ns": 12676125,
+          "rows": 22258,
+          "bytes": 616573,
+          "peak_rss_bytes": 188301312,
+          "rows_per_second": 1755899.3777672593
+        },
+        {
+          "stage": "validate",
+          "elapsed_ns": 182316708,
+          "rows": 475336,
+          "bytes": 29517425,
+          "peak_rss_bytes": 188301312,
+          "rows_per_second": 2607199.3357844087
+        },
+        {
+          "stage": "finalize",
+          "elapsed_ns": 67114167,
+          "rows": 475336,
+          "bytes": 29517425,
+          "peak_rss_bytes": 188301312,
+          "rows_per_second": 7082498.692116673
+        }
+      ]
+    },
+    {
+      "version": "candidate",
+      "trial": 2,
+      "wall_ns": 7705510875,
+      "retained_scratch_bytes": 161734656,
+      "tag_directory_bytes": 845781,
+      "stage_metrics": [
+        {
+          "stage": "read",
+          "elapsed_ns": 43475125,
+          "rows": 1,
+          "bytes": 214,
+          "peak_rss_bytes": 2834432,
+          "rows_per_second": 23.00165899465499
+        },
+        {
+          "stage": "tags",
+          "elapsed_ns": 2796228708,
+          "rows": 134770,
+          "bytes": 14656672,
+          "peak_rss_bytes": 58392576,
+          "rows_per_second": 48197.05899393119
+        },
+        {
+          "stage": "node_store",
+          "elapsed_ns": 870642125,
+          "rows": 892201,
+          "bytes": 11604595,
+          "peak_rss_bytes": 69206016,
+          "rows_per_second": 1024762.0398565024
+        },
+        {
+          "stage": "edges",
+          "elapsed_ns": 2872197250,
+          "rows": 237668,
+          "bytes": 31176357,
+          "peak_rss_bytes": 191889408,
+          "rows_per_second": 82747.7987453682
+        },
+        {
+          "stage": "order",
+          "elapsed_ns": 55395917,
+          "rows": 187650,
+          "bytes": 7506086,
+          "peak_rss_bytes": 191889408,
+          "rows_per_second": 3387433.77061526
+        },
+        {
+          "stage": "assemble",
+          "elapsed_ns": 96014958,
+          "rows": 475336,
+          "bytes": 17364202,
+          "peak_rss_bytes": 191889408,
+          "rows_per_second": 4950645.2942467565
+        },
+        {
+          "stage": "enhance",
+          "elapsed_ns": 173802875,
+          "rows": 475336,
+          "bytes": 9429696,
+          "peak_rss_bytes": 191889408,
+          "rows_per_second": 2734914.4828588134
+        },
+        {
+          "stage": "elevation",
+          "elapsed_ns": 23702500,
+          "rows": 0,
+          "bytes": 7605505,
+          "peak_rss_bytes": 191889408,
+          "rows_per_second": 0
+        },
+        {
+          "stage": "turns",
+          "elapsed_ns": 114052792,
+          "rows": 187650,
+          "bytes": 2151564,
+          "peak_rss_bytes": 191889408,
+          "rows_per_second": 1645290.717652927
+        },
+        {
+          "stage": "cold",
+          "elapsed_ns": 187476166,
+          "rows": 237668,
+          "bytes": 28900898,
+          "peak_rss_bytes": 191889408,
+          "rows_per_second": 1267723.812956576
+        },
+        {
+          "stage": "spatial",
+          "elapsed_ns": 13517833,
+          "rows": 22258,
+          "bytes": 616573,
+          "peak_rss_bytes": 191889408,
+          "rows_per_second": 1646565.6884502124
+        },
+        {
+          "stage": "validate",
+          "elapsed_ns": 168085459,
+          "rows": 475336,
+          "bytes": 29517425,
+          "peak_rss_bytes": 191889408,
+          "rows_per_second": 2827942.4218367394
+        },
+        {
+          "stage": "finalize",
+          "elapsed_ns": 97487167,
+          "rows": 475336,
+          "bytes": 29517425,
+          "peak_rss_bytes": 191889408,
+          "rows_per_second": 4875882.79183454
+        }
+      ]
+    },
+    {
+      "version": "baseline",
+      "trial": 2,
+      "wall_ns": 10435668000,
+      "retained_scratch_bytes": 343580672,
+      "tag_directory_bytes": 126795776,
+      "stage_metrics": [
+        {
+          "stage": "read",
+          "elapsed_ns": 43649917,
+          "rows": 1,
+          "bytes": 214,
+          "peak_rss_bytes": 2818048,
+          "rows_per_second": 22.90955100785186
+        },
+        {
+          "stage": "tags",
+          "elapsed_ns": 4088752500,
+          "rows": 134770,
+          "bytes": 140606667,
+          "peak_rss_bytes": 10518528,
+          "rows_per_second": 32961.15379935567
+        },
+        {
+          "stage": "node_store",
+          "elapsed_ns": 1762979166,
+          "rows": 892201,
+          "bytes": 67063172,
+          "peak_rss_bytes": 12058624,
+          "rows_per_second": 506075.74791953043
+        },
+        {
+          "stage": "edges",
+          "elapsed_ns": 3319831333,
+          "rows": 237668,
+          "bytes": 31176357,
+          "peak_rss_bytes": 143409152,
+          "rows_per_second": 71590.38401665691
+        },
+        {
+          "stage": "order",
+          "elapsed_ns": 60052333,
+          "rows": 187650,
+          "bytes": 7506086,
+          "peak_rss_bytes": 170573824,
+          "rows_per_second": 3124774.519584443
+        },
+        {
+          "stage": "assemble",
+          "elapsed_ns": 105053500,
+          "rows": 475336,
+          "bytes": 17364202,
+          "peak_rss_bytes": 182042624,
+          "rows_per_second": 4524704.079350046
+        },
+        {
+          "stage": "enhance",
+          "elapsed_ns": 169685667,
+          "rows": 475336,
+          "bytes": 9429696,
+          "peak_rss_bytes": 187727872,
+          "rows_per_second": 2801273.722193637
+        },
+        {
+          "stage": "elevation",
+          "elapsed_ns": 12910250,
+          "rows": 0,
+          "bytes": 7605505,
+          "peak_rss_bytes": 187727872,
+          "rows_per_second": 0
+        },
+        {
+          "stage": "turns",
+          "elapsed_ns": 109119916,
+          "rows": 187650,
+          "bytes": 2151564,
+          "peak_rss_bytes": 187727872,
+          "rows_per_second": 1719667.7460785436
+        },
+        {
+          "stage": "cold",
+          "elapsed_ns": 186335334,
+          "rows": 237668,
+          "bytes": 28900898,
+          "peak_rss_bytes": 187727872,
+          "rows_per_second": 1275485.410619974
+        },
+        {
+          "stage": "spatial",
+          "elapsed_ns": 12048833,
+          "rows": 22258,
+          "bytes": 616573,
+          "peak_rss_bytes": 189972480,
+          "rows_per_second": 1847315.8354838183
+        },
+        {
+          "stage": "validate",
+          "elapsed_ns": 210710583,
+          "rows": 475336,
+          "bytes": 29517425,
+          "peak_rss_bytes": 189972480,
+          "rows_per_second": 2255871.5050396877
+        },
+        {
+          "stage": "finalize",
+          "elapsed_ns": 96163667,
+          "rows": 475336,
+          "bytes": 29517425,
+          "peak_rss_bytes": 189972480,
+          "rows_per_second": 4942989.538866066
+        }
+      ]
+    },
+    {
+      "version": "baseline",
+      "trial": 3,
+      "wall_ns": 10260830834,
+      "retained_scratch_bytes": 343957504,
+      "tag_directory_bytes": 126795776,
+      "stage_metrics": [
+        {
+          "stage": "read",
+          "elapsed_ns": 44228167,
+          "rows": 1,
+          "bytes": 214,
+          "peak_rss_bytes": 2834432,
+          "rows_per_second": 22.610025868808897
+        },
+        {
+          "stage": "tags",
+          "elapsed_ns": 3993269792,
+          "rows": 134770,
+          "bytes": 140606667,
+          "peak_rss_bytes": 10534912,
+          "rows_per_second": 33749.28492685225
+        },
+        {
+          "stage": "node_store",
+          "elapsed_ns": 1724225333,
+          "rows": 892201,
+          "bytes": 67063172,
+          "peak_rss_bytes": 12075008,
+          "rows_per_second": 517450.3488170244
+        },
+        {
+          "stage": "edges",
+          "elapsed_ns": 3351415792,
+          "rows": 237668,
+          "bytes": 31176357,
+          "peak_rss_bytes": 141574144,
+          "rows_per_second": 70915.70093073072
+        },
+        {
+          "stage": "order",
+          "elapsed_ns": 57876625,
+          "rows": 187650,
+          "bytes": 7506086,
+          "peak_rss_bytes": 168755200,
+          "rows_per_second": 3242241.5785301924
+        },
+        {
+          "stage": "assemble",
+          "elapsed_ns": 100265125,
+          "rows": 475336,
+          "bytes": 17364202,
+          "peak_rss_bytes": 180224000,
+          "rows_per_second": 4740790.97791979
+        },
+        {
+          "stage": "enhance",
+          "elapsed_ns": 169108708,
+          "rows": 475336,
+          "bytes": 9429696,
+          "peak_rss_bytes": 186073088,
+          "rows_per_second": 2810831.0069993557
+        },
+        {
+          "stage": "elevation",
+          "elapsed_ns": 23788792,
+          "rows": 0,
+          "bytes": 7605505,
+          "peak_rss_bytes": 186073088,
+          "rows_per_second": 0
+        },
+        {
+          "stage": "turns",
+          "elapsed_ns": 107267667,
+          "rows": 187650,
+          "bytes": 2151564,
+          "peak_rss_bytes": 186073088,
+          "rows_per_second": 1749362.1819890984
+        },
+        {
+          "stage": "cold",
+          "elapsed_ns": 167980625,
+          "rows": 237668,
+          "bytes": 28900898,
+          "peak_rss_bytes": 186073088,
+          "rows_per_second": 1414853.6475560798
+        },
+        {
+          "stage": "spatial",
+          "elapsed_ns": 13553000,
+          "rows": 22258,
+          "bytes": 616573,
+          "peak_rss_bytes": 188268544,
+          "rows_per_second": 1642293.2192134582
+        },
+        {
+          "stage": "validate",
+          "elapsed_ns": 182983500,
+          "rows": 475336,
+          "bytes": 29517425,
+          "peak_rss_bytes": 188268544,
+          "rows_per_second": 2597698.699609528
+        },
+        {
+          "stage": "finalize",
+          "elapsed_ns": 66971875,
+          "rows": 475336,
+          "bytes": 29517425,
+          "peak_rss_bytes": 188268544,
+          "rows_per_second": 7097546.544724931
+        }
+      ]
+    },
+    {
+      "version": "candidate",
+      "trial": 3,
+      "wall_ns": 7790900375,
+      "retained_scratch_bytes": 161734656,
+      "tag_directory_bytes": 845781,
+      "stage_metrics": [
+        {
+          "stage": "read",
+          "elapsed_ns": 43509250,
+          "rows": 1,
+          "bytes": 214,
+          "peak_rss_bytes": 2834432,
+          "rows_per_second": 22.983618425966892
+        },
+        {
+          "stage": "tags",
+          "elapsed_ns": 2919387250,
+          "rows": 134770,
+          "bytes": 14656672,
+          "peak_rss_bytes": 58392576,
+          "rows_per_second": 46163.79687210047
+        },
+        {
+          "stage": "node_store",
+          "elapsed_ns": 880113292,
+          "rows": 892201,
+          "bytes": 11604595,
+          "peak_rss_bytes": 69222400,
+          "rows_per_second": 1013734.2636565929
+        },
+        {
+          "stage": "edges",
+          "elapsed_ns": 2742428833,
+          "rows": 237668,
+          "bytes": 31176357,
+          "peak_rss_bytes": 188055552,
+          "rows_per_second": 86663.32454651523
+        },
+        {
+          "stage": "order",
+          "elapsed_ns": 53744583,
+          "rows": 187650,
+          "bytes": 7506086,
+          "peak_rss_bytes": 188088320,
+          "rows_per_second": 3491514.67041804
+        },
+        {
+          "stage": "assemble",
+          "elapsed_ns": 100398834,
+          "rows": 475336,
+          "bytes": 17364202,
+          "peak_rss_bytes": 188088320,
+          "rows_per_second": 4734477.294825953
+        },
+        {
+          "stage": "enhance",
+          "elapsed_ns": 169225708,
+          "rows": 475336,
+          "bytes": 9429696,
+          "peak_rss_bytes": 188088320,
+          "rows_per_second": 2808887.6425324217
+        },
+        {
+          "stage": "elevation",
+          "elapsed_ns": 10947208,
+          "rows": 0,
+          "bytes": 7605505,
+          "peak_rss_bytes": 188088320,
+          "rows_per_second": 0
+        },
+        {
+          "stage": "turns",
+          "elapsed_ns": 115770334,
+          "rows": 187650,
+          "bytes": 2151564,
+          "peak_rss_bytes": 188088320,
+          "rows_per_second": 1620881.5636655241
+        },
+        {
+          "stage": "cold",
+          "elapsed_ns": 217719958,
+          "rows": 237668,
+          "bytes": 28900898,
+          "peak_rss_bytes": 188088320,
+          "rows_per_second": 1091622.4777151574
+        },
+        {
+          "stage": "spatial",
+          "elapsed_ns": 14202875,
+          "rows": 22258,
+          "bytes": 616573,
+          "peak_rss_bytes": 188088320,
+          "rows_per_second": 1567147.4965455937
+        },
+        {
+          "stage": "validate",
+          "elapsed_ns": 219848458,
+          "rows": 475336,
+          "bytes": 29517425,
+          "peak_rss_bytes": 188088320,
+          "rows_per_second": 2162107.500431047
+        },
+        {
+          "stage": "finalize",
+          "elapsed_ns": 83189833,
+          "rows": 475336,
+          "bytes": 29517425,
+          "peak_rss_bytes": 188088320,
+          "rows_per_second": 5713871.309250014
+        }
+      ]
+    }
+  ]
+}

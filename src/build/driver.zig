@@ -11,6 +11,8 @@ const pbf = @import("pbf/root.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Stage = checkpoint.Stage;
+pub const default_pbf_buffer_bytes = 512 * 1024 * 1024;
+
 pub const Options = struct {
     inputs: []const []const u8 = &.{},
     output: ?[]const u8 = null,
@@ -19,6 +21,7 @@ pub const Options = struct {
     drive_side: ?@import("edge_class.zig").DriveSide = null,
     order: ?graph.format.OrderingKind = null,
     workers: usize = 0,
+    pbf_buffer_bytes: usize = default_pbf_buffer_bytes,
     from: Stage = .read,
     to: Stage = .finalize,
     deadline: io.Deadline = .none,
@@ -141,7 +144,7 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
         var metadata = assemble.Metadata.init(gpa, graph_options);
         defer metadata.deinit();
         if (@backingInt(options.from) <= @backingInt(Stage.edges)) {
-            try buildSegments(&session, &metadata, inputs, graph_options, diagnostic);
+            try buildSegments(&session, &metadata, inputs, graph_options, options.pbf_buffer_bytes, diagnostic);
         }
         if (@backingInt(options.to) >= @backingInt(Stage.order)) {
             const prior = try session.open(.edges);
@@ -203,23 +206,27 @@ fn checkOptions(a: Allocator, inputs: *Inputs, options: Options, diagnostic: *Di
     }
 }
 
-fn buildSegments(session: *checkpoint.Session, metadata: *assemble.Metadata, inputs: Inputs, graph_options: assemble.Options, diagnostic: *Diagnostic) !void {
+fn buildSegments(session: *checkpoint.Session, metadata: *assemble.Metadata, inputs: Inputs, graph_options: assemble.Options, pbf_buffer_bytes: usize, diagnostic: *Diagnostic) !void {
     const gpa = session.gpa;
     const deadline = session.deadline;
-    const streams = try gpa.alloc(pbf.file.Stream, inputs.sources.len);
+    const indexed_at = io.Timer.start();
+    const streams = try gpa.alloc(pbf.file.File, inputs.sources.len);
     defer gpa.free(streams);
     var opened: usize = 0;
-    defer for (streams[0..opened]) |stream| stream.file.close();
+    defer for (streams[0..opened]) |*stream| stream.close();
     for (inputs.sources, streams) |input, *stream| {
         diagnostic.input = input.path;
         const file = try io.File.open(input.path, .read_only);
-        errdefer file.close();
+        defer file.close();
         if (!std.meta.eql(input.digest, try checkpoint.Fingerprint.read(file, deadline))) return error.CheckpointInputMismatch;
-        stream.* = try pbf.file.Stream.init(file);
+        stream.* = try pbf.file.File.openFd(gpa, file, deadline);
         opened += 1;
     }
     diagnostic.input = null;
-    const source: pbf.file.Streams = .{ .files = streams };
+    const source: pbf.file.IndexedStreams = .{
+        .files = streams,
+        .decode = .{ .workers = graph_options.workers, .buffer_bytes = pbf_buffer_bytes },
+    };
     const options: edges.Options = .{ .scratch_dir = session.path, .workers = graph_options.workers, .deadline = deadline };
     var prep = try edges.Preparation.init(gpa, options, true);
     defer prep.deinit();
@@ -227,7 +234,7 @@ fn buildSegments(session: *checkpoint.Session, metadata: *assemble.Metadata, inp
     var referenced: ?usage.Usage = null;
     defer if (referenced) |*store| store.deinit();
     if (session.runs(.tags)) {
-        const start = io.Timer.start();
+        const start = indexed_at;
         var tx = try session.begin(.tags);
         defer tx.deinit();
         referenced = try usage.Usage.init(session.path);
@@ -247,7 +254,7 @@ fn buildSegments(session: *checkpoint.Session, metadata: *assemble.Metadata, inp
     if (session.endsAt(.tags)) return;
 
     if (session.runs(.node_store)) {
-        const start = io.Timer.start();
+        const start = if (session.from == .node_store) indexed_at else io.Timer.start();
         var tx = try session.begin(.node_store);
         defer tx.deinit();
         const node_file = try tx.create(.node_index);
@@ -267,7 +274,7 @@ fn buildSegments(session: *checkpoint.Session, metadata: *assemble.Metadata, inp
     if (session.endsAt(.node_store)) return;
 
     if (session.runs(.edges)) {
-        const start = io.Timer.start();
+        const start = if (session.from == .edges) indexed_at else io.Timer.start();
         var tx = try session.begin(.edges);
         defer tx.deinit();
         const saved = try session.open(.node_store);
@@ -279,7 +286,11 @@ fn buildSegments(session: *checkpoint.Session, metadata: *assemble.Metadata, inp
         defer edge_file.close();
         const shape_file = try tx.create(.shape_points);
         defer shape_file.close();
-        const stats = try edges.generate(gpa, source, .{ .edges = edge_file, .shapes = shape_file }, options, &prep, store, metadata, assemble.Metadata.way, assemble.Metadata.culdesac);
+        // Edge batches already use the worker pool. Decode inline between
+        // batches so the two phases do not start competing worker pools.
+        var edge_source = source;
+        edge_source.decode.workers = 1;
+        const stats = try edges.generate(gpa, edge_source, .{ .edges = edge_file, .shapes = shape_file }, options, &prep, store, metadata, assemble.Metadata.way, assemble.Metadata.culdesac);
         try edge_file.sync();
         try shape_file.sync();
         try metadata.saveWays(&tx);

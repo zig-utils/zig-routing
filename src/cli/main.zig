@@ -96,6 +96,7 @@ fn createCommands(a: Allocator) !*Command {
         option("output", "Publish the graph bundle at this path", .string),
         option("work-dir", "Directory for stage checkpoints and build-stats.json", .string),
         option("dem", "Directory of HGT elevation tiles", .string),
+        option("pbf-buffer-bytes", "Cap decoded PBF buffers (default 512 MiB)", .int),
         option("from", "First stage to run (default read)", .string),
         option("to", "Last stage to run (default finalize)", .string),
         option("order", "Dense node ordering (hilbert or encounter)", .string),
@@ -454,6 +455,7 @@ fn buildGraph(ctx: *Context) !u8 {
         .drive_side = side,
         .order = order,
         .workers = (try unsigned(ctx, usize, "threads")) orelse settings.threads orelse configured.threads,
+        .pbf_buffer_bytes = (try unsigned(ctx, usize, "pbf-buffer-bytes")) orelse settings.pbf_buffer_bytes orelse driver.default_pbf_buffer_bytes,
         .from = from,
         .to = to,
     };
@@ -467,6 +469,7 @@ fn buildGraph(ctx: *Context) !u8 {
             error.MissingOsmInput => "provide at least one OSM PBF input",
             error.MissingBundlePath => "provide --output to finalize the bundle",
             error.InvalidStageRange => "--from must precede or equal --to",
+            error.PbfDecodeBudgetExceeded => "PBF decode buffer budget cannot fit the largest compressed block",
             error.BuildWorkDirectoryBusy => "another build is using this work directory",
             error.MissingCheckpoint => try std.fmt.allocPrint(ctx.allocator, "build checkpoint for {s} is missing", .{stage}),
             error.StaleCheckpoint => try std.fmt.allocPrint(ctx.allocator, "build checkpoint for {s} is stale, restart from {s}", .{ stage, stage }),

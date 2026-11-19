@@ -35,6 +35,7 @@ pub const Config = struct {
         work_dir: ?[]const u8 = null,
         bundle_path: ?[]const u8 = null,
         threads: ?usize = null,
+        pbf_buffer_bytes: ?usize = null,
     };
 
     pub const ZigRouting = struct {

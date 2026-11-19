@@ -8,6 +8,7 @@ const io = @import("../infra/io.zig");
 const osm = @import("osm.zig");
 const pbf = @import("pbf/root.zig");
 const usage = @import("node_store/usage.zig");
+pub const usage_directory = usage.directory;
 
 const Coordinates = usage.Coordinates;
 const keyFor = usage.keyFor;
