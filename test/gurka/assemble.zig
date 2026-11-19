@@ -1425,6 +1425,91 @@ test "multi-location route types split legs and preserve through direction" {
     }
 }
 
+test "route leg recost preserves the intersection turn at a stitched node" {
+    const multi = routing.search.multi;
+    const legs = routing.search.legs;
+    const point = routing.geo.PointLL;
+    var fixture_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer fixture_arena.deinit();
+    const a = fixture_arena.allocator();
+    const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates("A   B\n  X |\n    C", 20), &.{
+        .{ .label = "AXB", .tags = &.{ .{ .key = "highway", .value = "motorway" }, .{ .key = "toll", .value = "yes" } } },
+        .{ .label = "BC", .tags = &.{.{ .key = "route", .value = "ferry" }} },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const ab = try directedBetween(view, &fixture, "A", "B");
+    const bc = try directedBetween(view, &fixture, "B", "C");
+    const first = fixture.findNode("A").?.location.toFixed().toTilePoint();
+    const bend = fixture.findNode("X").?.location.toFixed().toTilePoint();
+    const joint = fixture.findNode("B").?.location.toFixed().toTilePoint();
+    const last = fixture.findNode("C").?.location.toFixed().toTilePoint();
+    var origin = snapEdge(ab, 0.25, 0);
+    origin.projected = first.pointAlongSegment(bend, 0.5);
+    var destination = snapEdge(bc, 0.75, 0);
+    destination.projected = joint.pointAlongSegment(last, 0.75);
+    const correlations = [_]routing.snap.candidates.PathLocation{
+        snapLocation(&.{origin}, &.{}),
+        snapLocation(&.{ snapEdge(ab, 1, 0), snapEdge(bc, 0, 0) }, &.{}),
+        snapLocation(&.{destination}, &.{}),
+    };
+    const locations = [_]routing.api.request.Location{
+        .{ .lng = origin.projected.lng, .lat = origin.projected.lat },
+        .{ .lng = joint.lng, .lat = joint.lat, .type = .through },
+        .{ .lng = destination.projected.lng, .lat = destination.projected.lat },
+    };
+
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    var engine = try SearchTest.init(testing.allocator, view);
+    defer engine.deinit();
+    const kernel: SearchTestCost = .{ .seed = 47 };
+    const ab_hot = try view.edge(ab);
+    const bc_hot = try view.edge(bc);
+    const row = try view.turnRow(@fromBackingInt(ab_hot.head), ab_hot.cls.opp_local);
+    const delay = kernel.transitionCost(ab, bc, row[bc_hot.cls.local]);
+    const first_cost = kernel.lengthCost(ab, ab_hot.geom.len_m);
+    const last_cost = kernel.lengthCost(bc, bc_hot.geom.len_m);
+    try testing.expect(delay.cost > 0);
+    for ([_]search.Direction{ .forward, .reverse }) |direction| {
+        const found = try multi.route(&engine, &arena, kernel, &locations, &correlations, .{
+            .search = .{ .costing = .pedestrian, .direction = direction },
+        }, .{});
+        const trip = try legs.build(arena.allocator(), view, kernel, found, &correlations, .{});
+        try testing.expectEqual(@as(usize, 1), trip.legs.len);
+        const leg = trip.legs[0];
+        const expected: []const point = &.{ origin.projected, bend, joint, destination.projected };
+        try testing.expectEqualSlices(point, expected, leg.shape);
+        const encoded = try routing.geo.polyline.encodeAlloc(arena.allocator(), .polyline, 6, expected);
+        try testing.expectEqualStrings(encoded, leg.encoded_shape);
+        try testing.expectEqual(routing.geo.AABB.of(expected), trip.summary.bounds);
+        try testing.expect(trip.summary.has_toll and trip.summary.has_highway and trip.summary.has_ferry);
+        try testing.expectEqual(@as(usize, 2), leg.edges.len);
+        try testing.expectEqual(leg.edges[0].shape_end, leg.edges[1].shape_begin);
+        try testing.expectEqual(delay, leg.edges[1].transition);
+        try testing.expectEqual(first_cost.secs * 0.75, leg.edges[0].elapsed.secs);
+        try testing.expectApproxEqAbs(@as(f64, (first_cost.secs + last_cost.secs) * 0.75), trip.summary.length_m, 1e-4);
+        try testing.expectEqual(@as(f64, first_cost.secs * 0.75 + (last_cost.secs * 0.75 + delay.secs)), trip.summary.time);
+        try testing.expectEqual(@as(f64, first_cost.cost * 0.75 + (last_cost.cost * 0.75 + delay.cost)), trip.summary.cost);
+        try testing.expectError(error.Cancelled, legs.build(arena.allocator(), view, kernel, found, &correlations, .{ .deadline = .{ .at_ns = 0 } }));
+        arena.reset();
+    }
+
+    const ba = try view.oppEdge(ab);
+    const opposing = [_]routing.snap.candidates.PathLocation{
+        snapLocation(&.{snapEdge(ba, 0, 0)}, &.{}),
+        snapLocation(&.{snapEdge(ba, 1, 0)}, &.{}),
+    };
+    const from_b: routing.api.request.Location = .{ .lng = joint.lng, .lat = joint.lat };
+    const to_a: routing.api.request.Location = .{ .lng = first.lng, .lat = first.lat };
+    const reversed = try multi.route(&engine, &arena, kernel, &.{ from_b, to_a }, &opposing, .{
+        .search = .{ .costing = .pedestrian },
+    }, .{});
+    const trip = try legs.build(arena.allocator(), view, kernel, reversed, &opposing, .{});
+    try testing.expectEqualSlices(point, &.{ joint, bend, first }, trip.legs[0].shape);
+}
+
 test "multi-location continuation retries the route with reachable waypoint candidates" {
     const multi = routing.search.multi;
     var fixture_arena: std.heap.ArenaAllocator = .init(testing.allocator);

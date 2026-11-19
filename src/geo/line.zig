@@ -99,13 +99,18 @@ pub fn trimFront(gpa: Allocator, pts: *std.ArrayList(PointLL), dist: f32, out: *
 /// the shape in place at distances along it, replacing the boundary
 /// vertices with the given points (skipped when a point is invalid).
 pub fn trimShape(start: f32, start_vertex: PointLL, end: f32, end_vertex: PointLL, shape: *std.ArrayList(PointLL)) void {
+    trimShapeWithDeadline(start, start_vertex, end, end_vertex, shape, .none) catch unreachable;
+}
+
+pub fn trimShapeWithDeadline(start: f32, start_vertex: PointLL, end: f32, end_vertex: PointLL, shape: *std.ArrayList(PointLL), deadline: Deadline) error{DeadlineExceeded}!void {
     var along: f32 = 0;
-    if (start_vertex.isValid() and shape.items.len > 0) {
+    if (start_vertex.isValid() and shape.items.len >= 2) {
         var current: usize = 0;
         while (current != shape.items.len - 1 and along <= start) : (current += 1) {
+            if (current % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
             along += @floatCast(shape.items[current + 1].distance(shape.items[current]));
         }
-        current -= 1;
+        current -|= 1;
         shape.items[current] = start_vertex;
         std.mem.copyForwards(PointLL, shape.items[0 .. shape.items.len - current], shape.items[current..]);
         shape.shrinkRetainingCapacity(shape.items.len - current);
@@ -114,6 +119,7 @@ pub fn trimShape(start: f32, start_vertex: PointLL, end: f32, end_vertex: PointL
     if (end_vertex.isValid() and shape.items.len > 0) {
         var current: usize = 0;
         while (current != shape.items.len - 1 and along <= end) : (current += 1) {
+            if (current % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
             along += @floatCast(shape.items[current + 1].distance(shape.items[current]));
         }
         shape.items[current] = end_vertex;

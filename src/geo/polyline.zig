@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const point = @import("point.zig");
+const Deadline = @import("../infra/io.zig").Deadline;
 const PointLL = point.PointLL;
 const FixedLL = point.FixedLL;
 
@@ -123,6 +124,14 @@ pub fn encodeScalar(comptime format: Format, comptime digits: u8, points: []cons
 /// Encodes points into `out`; returns the bytes written. Rounds and deltas
 /// in SIMD batches, then emits groups; output equals `encodeScalar`.
 pub fn encode(comptime format: Format, comptime digits: u8, points: []const PointLL, out: []u8) Error!usize {
+    return encodeWithDeadline(format, digits, points, out, .none) catch |err| switch (err) {
+        error.DeadlineExceeded => unreachable,
+        else => |other| return other,
+    };
+}
+
+pub fn encodeWithDeadline(comptime format: Format, comptime digits: u8, points: []const PointLL, out: []u8, deadline: Deadline) (Error || error{DeadlineExceeded})!usize {
+    if (deadline.expired()) return error.DeadlineExceeded;
     const lanes = 8;
     const V = @Vector(lanes, f64);
     const f: V = @splat(factor(digits));
@@ -133,6 +142,7 @@ pub fn encode(comptime format: Format, comptime digits: u8, points: []const Poin
     var last_lat: i32 = 0;
     var i: usize = 0;
     while (i + lanes <= points.len) : (i += lanes) {
+        if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
         var lngs: V = undefined;
         var lats: V = undefined;
         inline for (0..lanes) |j| {

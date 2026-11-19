@@ -20,10 +20,16 @@ pub const Waypoint = struct {
     ignored_filter: bool,
 };
 
+pub const SegmentContext = struct {
+    pair: usize,
+    starts_pair: bool,
+};
+
 pub const Leg = struct {
     origin: usize,
     destination: usize,
     segments: []const endpoints.Segment,
+    segment_contexts: []const SegmentContext,
     length_km: f32,
     cost: Cost,
 };
@@ -149,6 +155,7 @@ fn assemble(a: std.mem.Allocator, view: *const graph.reader.View, locations: []c
     }
     const legs = try a.alloc(Leg, leg_count);
     const segments = try a.alloc(endpoints.Segment, segment_count);
+    const segment_contexts = try a.alloc(SegmentContext, segment_count);
     const waypoints = try a.alloc(Waypoint, locations.len);
 
     var total: Cost = .{};
@@ -172,11 +179,18 @@ fn assemble(a: std.mem.Allocator, view: *const graph.reader.View, locations: []c
         // search may represent continuity with a repeated zero-length cut.
         for (path.segments, 0..) |segment, j| {
             if (j % 1024 == 0) try control.check();
+            var starts_pair = j == 0;
             if (j == 0 and end > leg_start and segment.edge == segments[end - 1].edge) {
                 if (atNode(segment)) continue;
-                if (atNode(segments[end - 1])) end -= 1;
+                if (atNode(segments[end - 1])) {
+                    // The previous search entered this edge at the node.
+                    // Its transition still belongs to the stitched path.
+                    starts_pair = segment_contexts[end - 1].starts_pair;
+                    end -= 1;
+                }
             }
             segments[end] = segment;
+            segment_contexts[end] = .{ .pair = i, .starts_pair = starts_pair };
             end += 1;
             // TripLegBuilder stores the edge's fractional kilometres as
             // f32 and EnhancedTripLeg::GetLength sums those in path order.
@@ -188,6 +202,7 @@ fn assemble(a: std.mem.Allocator, view: *const graph.reader.View, locations: []c
                 .origin = leg_origin,
                 .destination = i + 1,
                 .segments = segments[leg_start..end],
+                .segment_contexts = segment_contexts[leg_start..end],
                 .length_km = length_km,
                 .cost = leg_cost,
             };
