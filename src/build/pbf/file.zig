@@ -177,22 +177,90 @@ pub const Index = struct {
 
 const Frame = struct { kind: []const u8, blob: []const u8 };
 
+fn frameHeaderSize(prefix: *const [4]u8) Error!u32 {
+    const size = std.mem.readInt(u32, prefix, .big);
+    if (size == 0 or size >= max_header_bytes) return error.InvalidBlobHeaderSize;
+    return size;
+}
+
+fn frameHeader(bytes: []const u8, deadline: io.Deadline) Error!struct { kind: []const u8, size: usize } {
+    const header = try schema.BlobHeader.decode(bytes, deadline);
+    const size = try header.get("datasize", deadline);
+    if (size <= 0 or size >= max_blob_bytes) return error.InvalidBlobSize;
+    return .{ .kind = try header.get("type", deadline), .size = @intCast(size) };
+}
+
 fn nextFrame(input: []const u8, offset: *usize, deadline: io.Deadline) Error!Frame {
     var rest = input[offset.*..];
     if (rest.len < 4) return error.Truncated;
-    const header_size = std.mem.readInt(u32, rest[0..4], .big);
+    const header_size = try frameHeaderSize(rest[0..4]);
     rest = rest[4..];
-    if (header_size == 0 or header_size >= max_header_bytes) return error.InvalidBlobHeaderSize;
     if (header_size > rest.len) return error.Truncated;
-    const header = try schema.BlobHeader.decode(rest[0..header_size], deadline);
+    const header = try frameHeader(rest[0..header_size], deadline);
     rest = rest[header_size..];
-    const size = try header.get("datasize", deadline);
-    if (size <= 0 or size >= max_blob_bytes) return error.InvalidBlobSize;
-    const blob_size: usize = @intCast(size);
-    if (blob_size > rest.len) return error.Truncated;
-    offset.* += 4 + @as(usize, header_size) + blob_size;
-    return .{ .kind = try header.get("type", deadline), .blob = rest[0..blob_size] };
+    if (header.size > rest.len) return error.Truncated;
+    offset.* += 4 + @as(usize, header_size) + header.size;
+    return .{ .kind = header.kind, .blob = rest[0..header.size] };
 }
+
+/// Ordered sequential scans with memory bounded by the largest blob, for
+/// build passes that can repeat from the beginning. The caller owns the
+/// immutable input file. Callback bytes are valid only during that call.
+pub const Stream = struct {
+    file: io.File,
+    size: u64,
+
+    pub fn init(file: io.File) io.Error!Stream {
+        return .{ .file = file, .size = try file.size() };
+    }
+
+    pub fn forEach(self: Stream, gpa: Allocator, deadline: io.Deadline, context: anytype, comptime consume: anytype) !void {
+        var encoded: std.ArrayList(u8) = .empty;
+        defer encoded.deinit(gpa);
+        var decoded: std.ArrayList(u8) = .empty;
+        defer decoded.deinit(gpa);
+        var header_bytes: [max_header_bytes]u8 = undefined;
+        var seen_header = false;
+        var offset: u64 = 0;
+        var index: usize = 0;
+        while (offset < self.size) {
+            if (deadline.expired()) return error.DeadlineExceeded;
+            if (self.size - offset < 4) return error.Truncated;
+            try self.file.preadAll(header_bytes[0..4], offset);
+            const header_size = try frameHeaderSize(header_bytes[0..4]);
+            offset += 4;
+            if (self.size - offset < header_size) return error.Truncated;
+            const raw_header = header_bytes[0..header_size];
+            try self.file.preadAll(raw_header, offset);
+            const header = try frameHeader(raw_header, deadline);
+            offset += header_size;
+            if (self.size - offset < header.size) return error.Truncated;
+            const start = offset;
+            offset += header.size;
+
+            const is_header = std.mem.eql(u8, header.kind, "OSMHeader");
+            const is_data = std.mem.eql(u8, header.kind, "OSMData");
+            if (!is_header and !is_data) continue;
+            if (is_header and seen_header) return error.RepeatedHeader;
+            if (is_data and !seen_header) return error.HeaderAfterData;
+            try encoded.resize(gpa, header.size);
+            try self.file.preadAll(encoded.items, start);
+            const desc = try describeBlob(encoded.items, 0, header.size, encoded.items, deadline);
+            if (desc.compression != .raw) try decoded.resize(gpa, desc.raw_size);
+            const bytes = try inflate(encoded.items, desc, decoded.items, deadline);
+            if (is_header) {
+                var arena: std.heap.ArenaAllocator = .init(gpa);
+                defer arena.deinit();
+                _ = try parseHeader(arena.allocator(), bytes, deadline);
+                seen_header = true;
+            } else {
+                try consume(context, index, bytes);
+                index += 1;
+            }
+        }
+        if (!seen_header) return error.MissingHeader;
+    }
+};
 
 fn describeBlob(input: []const u8, offset: usize, size: usize, blob: []const u8, deadline: io.Deadline) Error!BlobIndex {
     var reader = protobuf.wire.Reader.init(blob);
@@ -434,15 +502,17 @@ test "OSM PBF header, formats and ordered pool reuse" {
 
     const CountingAllocator = @import("../../infra/arena.zig").CountingAllocator;
     const Check = struct {
-        allocator: *CountingAllocator,
+        allocator: ?*CountingAllocator = null,
         previous_calls: usize = 0,
         next: usize = 0,
 
         fn consume(self: *@This(), i: usize, data: []const u8) !void {
             try testing.expectEqual(self.next, i);
             try testing.expectEqualStrings(&.{ 'A' + @as(u8, @intCast(i)), 'b', 'c' }, data);
-            if (i == 0) self.previous_calls = self.allocator.calls();
-            try testing.expectEqual(self.previous_calls, self.allocator.calls());
+            if (self.allocator) |allocator| {
+                if (i == 0) self.previous_calls = allocator.calls();
+                try testing.expectEqual(self.previous_calls, allocator.calls());
+            }
             self.next += 1;
         }
     };
@@ -452,6 +522,13 @@ test "OSM PBF header, formats and ordered pool reuse" {
         try index.forEach(count.allocator(), workers, .none, &check, Check.consume);
         try testing.expectEqual(index.blobs.len, check.next);
     }
+    const input = try io.File.temporary(".");
+    defer input.close();
+    try input.writeAll(bytes.items);
+    var stream_check: Check = .{};
+    const stream = try Stream.init(input);
+    try stream.forEach(a, .none, &stream_check, Check.consume);
+    try testing.expectEqual(index.blobs.len, stream_check.next);
 
     const Abort = struct {
         fn consume(_: void, _: usize, _: []const u8) error{ConsumerStopped}!void {
@@ -460,6 +537,8 @@ test "OSM PBF header, formats and ordered pool reuse" {
     };
     try testing.expectError(error.ConsumerStopped, index.forEach(a, 4, .none, {}, Abort.consume));
     try testing.expectError(error.DeadlineExceeded, index.forEach(a, 4, .{ .at_ns = 0 }, {}, Abort.consume));
+    try testing.expectError(error.ConsumerStopped, stream.forEach(a, .none, {}, Abort.consume));
+    try testing.expectError(error.DeadlineExceeded, stream.forEach(a, .{ .at_ns = 0 }, {}, Abort.consume));
 }
 
 test "truncated framing, unknown required features and unsupported compression fail" {

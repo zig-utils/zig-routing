@@ -9,7 +9,8 @@
 //! decoders), `lz4` (block and frame decoders, plus a compress round trip),
 //! `dem` (the packed elevation block decoder), and `protobuf` (wire records
 //! and generated message views), `config` (Valhalla JSON settings), and
-//! `osm-pbf` (file framing, block inflation and OSM primitives).
+//! `osm-pbf` (file framing, block inflation and OSM primitives), and
+//! `node-store` (the build-time coordinate index format).
 //!
 //! The contract for every parser: malformed input returns an error, never
 //! panics, overflows or reads out of bounds. The fuzz step builds ReleaseSafe
@@ -133,6 +134,49 @@ test "fuzz osm-pbf" {
         header ++ raw ++ zlib ++ lz4_blob,
         primitive_file,
         header ++ "\x00\x01\x00\x00",
+    }) });
+}
+
+const NodeStoreFuzz = struct {
+    file: routing.infra.io.File,
+    mutex: routing.infra.io.Mutex = .{},
+};
+
+fn fuzzNodeStore(ctx: *NodeStoreFuzz, s: *Smith) !void {
+    var buf: [max_input]u8 = undefined;
+    const input = draw(s, &buf, 0x6e6f_6465);
+    ctx.mutex.lock();
+    defer ctx.mutex.unlock();
+    const file = ctx.file;
+    try file.truncate(input.len);
+    try file.pwriteAll(input, 0);
+    const nodes = routing.build.node_store;
+    const store = nodes.Store.open(file) catch return;
+    var cursor: nodes.Cursor = .{};
+    for ([_]i64{ 0, 1, 2, -1 }) |id| _ = cursor.lookup(store, id, .none) catch return;
+}
+
+test "fuzz node-store" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    var ctx: NodeStoreFuzz = .{ .file = try routing.infra.io.File.temporary(".") };
+    defer ctx.file.close();
+    // One block with ID 1 at (0, 0) and ID 2 at (+1, -1).
+    var record: [76]u8 = @splat(0);
+    record[0..8].* = "ZRNODE01".*;
+    std.mem.writeInt(u64, record[8..16], 44, .little);
+    std.mem.writeInt(u64, record[16..24], 2, .little);
+    std.mem.writeInt(u64, record[24..32], 1, .little);
+    record[40..44].* = .{ 1, 2, 1, 9 };
+    std.mem.writeInt(u64, record[44..52], 0x8000_0000_0000_0001, .little);
+    std.mem.writeInt(u64, record[52..60], 0x8000_0000_0000_0002, .little);
+    std.mem.writeInt(u64, record[60..68], 32, .little);
+    std.mem.writeInt(u32, record[68..72], 12, .little);
+    std.mem.writeInt(u16, record[72..74], 2, .little);
+    try std.testing.fuzz(&ctx, fuzzNodeStore, .{ .corpus = try seeds(state.allocator(), &.{
+        "",
+        &record,
+        record[0 .. record.len - 1],
     }) });
 }
 

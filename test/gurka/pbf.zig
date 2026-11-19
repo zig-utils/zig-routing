@@ -250,3 +250,74 @@ test "primitive decoder round trips the Gurka dataset without allocating while i
     try testing.expectEqual(null, try relations.next());
     try testing.expectEqual(0, counting.calls());
 }
+
+test "way usage filters, saturates and resolves nodes from sorted and unsorted PBFs" {
+    const testing = std.testing;
+    const routing = @import("routing");
+    const io = routing.infra.io;
+    const pbf = routing.build.pbf;
+    const node_store = routing.build.node_store;
+    const Classifier = struct {
+        fn include(_: void, way: *const pbf.block.Way) !bool {
+            var tags = way.tags;
+            while (try tags.next()) |tag| {
+                if (std.mem.eql(u8, tag.key, "highway")) return true;
+            }
+            return false;
+        }
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const min_id = std.math.minInt(i64);
+    const max_id = std.math.maxInt(i64);
+    const signed_nodes: [6]gurka.OsmNode = .{
+        .{ .id = -75, .label = "A", .location = .{ .lat = 1.23, .lng = -4.56 }, .tags = &.{} },
+        .{ .id = min_id, .label = "B", .location = .{ .lat = 0, .lng = 1 }, .tags = &.{} },
+        .{ .id = 1, .label = "C", .location = .{ .lat = -3, .lng = 7 }, .tags = &.{} },
+        .{ .id = 2, .label = "D", .location = .{ .lat = 4, .lng = 5 }, .tags = &.{} },
+        .{ .id = 3, .label = "E", .location = .{ .lat = 8, .lng = 9 }, .tags = &.{} },
+        .{ .id = max_id, .label = "F", .location = .{ .lat = 1, .lng = -1 }, .tags = &.{} },
+    };
+    const highway: gurka.Tags = &.{.{ .key = "highway", .value = "residential" }};
+    const ways: []const gurka.OsmWay = &.{
+        .{ .id = 10, .label = "AAABA", .refs = &.{ -75, -75, -75, min_id, -75 }, .tags = highway },
+        .{ .id = 11, .label = "CD", .refs = &.{ 1, 2 }, .tags = highway },
+        .{ .id = 12, .label = "CF", .refs = &.{ 1, max_id }, .tags = highway },
+        .{ .id = 13, .label = "CE", .refs = &.{ 1, 3 }, .tags = &.{} },
+        .{ .id = 14, .label = "D?", .refs = &.{ 2, 4 }, .tags = highway },
+    };
+    const expected = [_]?node_store.Location{
+        .{ .lat = 12300000, .lon = -45600000, .uses = 3 },
+        .{ .lat = 0, .lon = 10000000, .uses = 1 },
+        .{ .lat = -30000000, .lon = 70000000, .uses = 2 },
+        .{ .lat = 40000000, .lon = 50000000, .uses = 2 },
+        null,
+        .{ .lat = 10000000, .lon = -10000000, .uses = 1 },
+        null,
+    };
+
+    const sorted = signed_nodes;
+    const unsorted = [_]gurka.OsmNode{ sorted[3], sorted[2], sorted[0], sorted[5], sorted[4], sorted[1] };
+    const duplicate = sorted ++ .{sorted[0]};
+    for ([_][]const gurka.OsmNode{ &sorted, &unsorted, &duplicate }, 0..) |nodes, i| {
+        const bytes = try encode(gpa, .{ .nodes = nodes, .ways = ways, .relations = &.{} });
+        const input = try io.File.temporary(".");
+        defer input.close();
+        try input.writeAll(bytes);
+        const source = try pbf.file.Stream.init(input);
+        const file = try io.File.temporary(".");
+        defer file.close();
+        const options: node_store.BuildOptions = .{ .scratch_dir = "." };
+        if (i == 2) {
+            try testing.expectError(error.DuplicateNode, node_store.build(gpa, source, file, options, {}, Classifier.include));
+            try testing.expectError(error.InvalidStore, node_store.Store.open(file));
+            continue;
+        }
+        const store = try node_store.build(gpa, source, file, options, {}, Classifier.include);
+        try testing.expectEqual(5, store.nodeCount());
+        var found: [expected.len]?node_store.Location = undefined;
+        try store.lookupBatch(&.{ -75, min_id, 1, 2, 3, max_id, 4 }, &found, 1, .none);
+        try testing.expectEqualSlices(?node_store.Location, &expected, &found);
+    }
+}

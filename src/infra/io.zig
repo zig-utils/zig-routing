@@ -147,6 +147,22 @@ pub const OpenMode = enum { read_only, read_write, create_truncate };
 pub const File = struct {
     fd: c.fd_t,
 
+    /// A disk-backed scratch file scoped to this handle. Closing it releases
+    /// its storage even if the process exits during a build.
+    pub fn temporary(directory: []const u8) Error!File {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(buf[0 .. buf.len - 1], "{s}/.zr-scratch-XXXXXX", .{directory}) catch
+            return error.InvalidArgument;
+        buf[path.len] = 0;
+        const name = buf[0..path.len :0];
+        const fd = try checkInt(mkostemp(name.ptr, @as(c_int, @bitCast(c.O{ .CLOEXEC = true }))));
+        errdefer _ = c.close(fd);
+        _ = try checkInt(c.unlink(name.ptr));
+        return .{ .fd = fd };
+    }
+
+    extern "c" fn mkostemp(path: [*:0]u8, flags: c_int) c_int;
+
     pub fn open(path: []const u8, mode: OpenMode) Error!File {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         if (path.len >= buf.len) return error.InvalidArgument;
@@ -177,6 +193,23 @@ pub const File = struct {
         const end = c.lseek(self.fd, 0, c.SEEK.END);
         if (end < 0) return fail(@as(c_int, -1));
         return @intCast(end);
+    }
+
+    pub fn truncate(self: File, len: u64) Error!void {
+        const size_bytes = std.math.cast(c.off_t, len) orelse return error.OutOfBounds;
+        _ = try checkInt(c.ftruncate(self.fd, size_bytes));
+    }
+
+    /// Hint that upcoming positional reads will need this file range.
+    pub fn prefetch(self: File, offset: u64, len: u32) void {
+        const start = std.math.cast(c.off_t, offset) orelse return;
+        if (is_linux) {
+            _ = std.os.linux.fadvise(self.fd, start, len, std.os.linux.POSIX_FADV.WILLNEED);
+        } else {
+            const AdviceRange = extern struct { offset: c.off_t, count: c_int };
+            const range: AdviceRange = .{ .offset = start, .count = std.math.cast(c_int, len) orelse return };
+            _ = c.fcntl(self.fd, c.F.RDADVISE, &range);
+        }
     }
 
     /// Reads up to `buf.len` bytes at `offset`. Returns the count read (0 at end).
