@@ -97,7 +97,7 @@ P3.41 | Shadow-deploy /route on the production routing box with the US+DACH bund
 P3.42 | Cut over /route for the consuming apps with Valhalla as fallback | infra | infra | S | P3.41 | needs-human
 
 ## P4 | P4 Acceleration and scale | Customised potentials, node ordering, lazy loading and planet-scale builds.
-P4.01 | Separator partitioner (inertial flow) and nested-dissection order | accel | new | L | P3.15
+P4.01 | Separator partitioner (inertial flow) and nested-dissection order | accel | new | L | P3.15 P0.13
 P4.02 | Make the nested-dissection order the graph id order, with cells as contiguous ranges | build | new | M | P4.01 P3.21
 P4.03 | CCH topology: contraction over the order, elimination tree, cch.topo section | accel | new | L | P4.02
 P4.04 | Metric customisation: lower-bound weights from compiled costing, parallel triangle relaxation | accel | new | L | P4.03 P3.25

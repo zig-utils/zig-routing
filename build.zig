@@ -293,6 +293,16 @@ pub fn build(b: *std.Build) void {
     run_bench_search.addPassthruArgs();
     b.step("bench-search", "Measure edge-based Dijkstra throughput and counters on a graph bundle").dependOn(&run_bench_search.step);
 
+    const bench_partition = b.addExecutable(.{ .name = "bench-partition", .root_module = b.createModule(.{
+        .root_source_file = b.path("test/bench_partition.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "routing", .module = lib_mod }},
+    }) });
+    const run_bench_partition = b.addRunArtifact(bench_partition);
+    run_bench_partition.addPassthruArgs();
+    b.step("bench-partition", "Report nested-dissection separator sizes, balance and time").dependOn(&run_bench_partition.step);
+
     // Fuzz targets (test/fuzz.zig). `zig build test` replays their seeds; `zig build fuzz
     // --fuzz` fuzzes, ReleaseSafe by default so bounds and overflow checks stay on.
     const fuzz_filter = b.option([]const u8, "fuzz-target", "Fuzz one target: request, http, polyline, lz4, dem, protobuf, config, osm-pbf, osm-primitives, osm-dense, node-store, graph-bundle, build-checkpoint, valhalla-tile, costing-reference");
