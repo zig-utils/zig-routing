@@ -66,7 +66,7 @@ fn fuzzOsmPbf(_: void, s: *Smith) !void {
         try std.testing.expectEqual(blob.raw_size, decoded.len);
         try expectBorrowed(if (blob.compression == .raw) input else &scratch, decoded);
         const block = primitives.decode(fixed.allocator(), decoded, .none) catch continue;
-        visitPrimitives(block) catch {};
+        visitPrimitives(block, fixed.allocator()) catch {};
     }
 }
 
@@ -75,17 +75,17 @@ fn visitTags(tags: routing.build.pbf.block.TagIterator) !void {
     while (try it.next()) |_| {}
 }
 
-fn visitPrimitives(block: routing.build.pbf.block.Block) !void {
+fn visitPrimitives(block: routing.build.pbf.block.Block, gpa: std.mem.Allocator) !void {
     const tags = routing.build.tags;
     var tag_scratch: tags.Scratch = .{};
+    var strings = tags.names.StringTable.init(gpa);
+    defer strings.deinit();
     var nodes = block.nodes();
     while (try nodes.next()) |node| _ = try tags.transformNode(&tag_scratch, node.tags, .none);
     var ways = block.ways();
     while (try ways.next()) |item| {
         var way = item;
-        _ = try tags.transformWay(&tag_scratch, way.tags, .none);
-        if (tag_scratch.text(.maxspeed)) |speed|
-            _ = try tags.defaults.normalizeSpeed(speed, .none);
+        _ = try tags.transformIndexedWay(&tag_scratch, &strings, way.tags, .{}, .none);
         while (try way.refs.next()) |_| {}
     }
     var relations = block.relations();
@@ -101,11 +101,11 @@ fn osmPrimitiveSeed(buffer: []u8) ![]const u8 {
     const none = protobuf.no_deadline;
     var raw: [256]u8 = undefined;
     const data = try pbf.PrimitiveBlock.encode(&raw, .{
-        .stringtable = .{ .s = &.{ "", "name", "A" } },
+        .stringtable = .{ .s = &.{ "", "name", "A", "highway", "residential", "maxspeed", "30 mph", "name:en", "Avenue" } },
         .primitivegroup = &.{
             .{ .dense = .{ .id = &.{1}, .lat = &.{-2}, .lon = &.{3}, .keys_vals = &.{ 1, 2, 0 } } },
             .{ .nodes = &.{.{ .id = 2, .lat = 0, .lon = 0 }} },
-            .{ .ways = &.{.{ .id = 3, .refs = &.{ 2, -1 }, .keys = &.{1}, .vals = &.{2} }} },
+            .{ .ways = &.{.{ .id = 3, .refs = &.{ 2, -1 }, .keys = &.{ 1, 3, 5, 7 }, .vals = &.{ 2, 4, 6, 8 } }} },
             .{ .relations = &.{.{ .id = 4, .roles_sid = &.{2}, .memids = &.{3}, .types = &.{1} }} },
         },
     }, none);

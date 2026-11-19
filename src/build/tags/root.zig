@@ -8,6 +8,8 @@ const attrs = @import("attrs.zig");
 const access = @import("access.zig");
 const highway = @import("highway.zig");
 const selection = @import("selection.zig");
+pub const speed = @import("speed.zig");
+pub const names = @import("names.zig");
 
 pub const table = @import("table.zig");
 pub const defaults = @import("defaults.zig");
@@ -20,12 +22,10 @@ pub const NodeAttrs = attrs.NodeAttrs;
 pub fn transformWay(scratch: *Scratch, tags: anytype, deadline: io.Deadline) !?WayAttrs {
     try scratch.load(tags, deadline);
     const selected = try selection.select(scratch, deadline) orelse return null;
-    const base_speed = defaults.speed(selected.road_class);
     var result: WayAttrs = .{
         .road_class = selected.road_class,
         .forward_access = selected.forward,
         .backward_access = selected.backward,
-        .speed = if (scratch.id(.service) == .driveway) base_speed / 2 else base_speed,
         .flags = .{
             .oneway = selected.oneway,
             .oneway_reverse = selected.oneway_reverse,
@@ -34,24 +34,29 @@ pub fn transformWay(scratch: *Scratch, tags: anytype, deadline: io.Deadline) !?W
             .rail = selected.rail,
             .pedestrian_area = selected.pedestrian_area,
         },
-        .names = .{
-            .name = scratch.text(.name),
-            .alt_name = scratch.text(.alt_name),
-            .official_name = scratch.text(.official_name),
-            .ref = scratch.text(.ref),
-            .int_ref = scratch.text(.int_ref),
-            .destination = scratch.text(.destination),
-            .destination_forward = scratch.text(.@"destination:forward"),
-            .destination_backward = scratch.text(.@"destination:backward"),
-            .destination_ref = scratch.text(.@"destination:ref"),
-            .destination_street = scratch.text(.@"destination:street"),
-            .junction_ref = scratch.text(.junction_ref),
-            .junction_name = scratch.text(.junction_name),
-        },
+        .names = names.read(scratch),
     };
     try highway.classify(scratch, selected, deadline, &result);
     try access.applyWay(scratch, selected, deadline, &result);
+    try speed.apply(&result, scratch, selected.road_class, deadline);
     return result;
+}
+
+pub const IndexedWay = struct {
+    attributes: WayAttrs,
+    names: names.Indexed,
+};
+
+/// Own the names for graph construction while retaining the other attributes.
+pub fn transformIndexedWay(
+    scratch: *Scratch,
+    strings: *names.StringTable,
+    tags: anytype,
+    options: names.Options,
+    deadline: io.Deadline,
+) !?IndexedWay {
+    const way = try transformWay(scratch, tags, deadline) orelse return null;
+    return .{ .attributes = way, .names = try strings.indexWay(way, tags, options, deadline) };
 }
 
 /// nodes_proc returns keep even for untagged nodes. The node usage pass
@@ -73,6 +78,7 @@ pub fn includePbfWay(scratch: *Scratch, way: *const pbf.block.Way) !bool {
 test {
     std.testing.refAllDecls(@This());
     _ = @import("access_test.zig");
+    _ = @import("speed_names_test.zig");
 }
 
 test "ways_proc keeps exactly the routable ways and the upstream exceptions" {

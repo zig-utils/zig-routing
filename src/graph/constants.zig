@@ -2,6 +2,11 @@
 
 pub const max_mtb_scale = 6;
 pub const max_mtb_uphill_scale = 5;
+pub const max_assumed_speed = 140;
+pub const unlimited_speed_limit = 255;
+pub const max_lane_count = 15;
+
+pub const SpeedType = enum(u8) { tagged = 0, classified = 1 };
 
 pub const RoadClass = enum(u8) {
     motorway = 0,

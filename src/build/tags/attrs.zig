@@ -9,11 +9,19 @@ pub const Names = struct {
     official_name: ?[]const u8 = null,
     ref: ?[]const u8 = null,
     int_ref: ?[]const u8 = null,
+    direction: ?[]const u8 = null,
+    int_direction: ?[]const u8 = null,
+    tunnel_name: ?[]const u8 = null,
+    bridge_name: ?[]const u8 = null,
     destination: ?[]const u8 = null,
     destination_forward: ?[]const u8 = null,
     destination_backward: ?[]const u8 = null,
     destination_ref: ?[]const u8 = null,
+    destination_ref_to: ?[]const u8 = null,
     destination_street: ?[]const u8 = null,
+    destination_street_to: ?[]const u8 = null,
+    destination_int_ref: ?[]const u8 = null,
+    destination_int_ref_to: ?[]const u8 = null,
     junction_ref: ?[]const u8 = null,
     junction_name: ?[]const u8 = null,
 };
@@ -28,11 +36,28 @@ pub const WayAttrs = struct {
     speed_limit: u8 = 0,
     forward_speed: u8 = 0,
     backward_speed: u8 = 0,
+    truck_speed: u8 = 0,
+    /// The implicit limit label, such as DE:urban. It borrows the input.
+    speed_zone: ?[]const u8 = null,
     lanes: u4 = 0,
     forward_lanes: u4 = 0,
     backward_lanes: u4 = 0,
     flags: Flags = .{},
     names: Names = .{},
+    turn_lanes: TurnLanes = .{},
+
+    pub const TurnLanes = struct {
+        general: ?[]const u8 = null,
+        forward: ?[]const u8 = null,
+        backward: ?[]const u8 = null,
+    };
+
+    pub fn speedType(self: WayAttrs) attr.SpeedType {
+        return if (self.flags.tagged_speed or self.flags.forward_tagged_speed or self.flags.backward_tagged_speed)
+            .tagged
+        else
+            .classified;
+    }
 
     /// Ferry flags override the parsed use when constructing directed edges.
     pub fn edgeUse(self: WayAttrs) attr.Use {

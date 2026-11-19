@@ -9,6 +9,31 @@ const Value = table.Value;
 const TagValue = table.TagValue;
 const key_count = @typeInfo(Key).@"enum".field_names.len;
 
+pub const Iterator = union(enum) {
+    pbf: pbf.block.TagIterator,
+    slice: []const osm.Tag,
+
+    pub fn init(tags: anytype, deadline: io.Deadline) Iterator {
+        if (@TypeOf(tags) == pbf.block.TagIterator) {
+            var iter = tags;
+            iter.deadline = iter.deadline.min(deadline);
+            return .{ .pbf = iter };
+        }
+        return .{ .slice = tags };
+    }
+
+    pub fn next(self: *Iterator) pbf.block.Error!?osm.Tag {
+        return switch (self.*) {
+            .pbf => |*iter| iter.next(),
+            .slice => |*remaining| if (remaining.len == 0) null else blk: {
+                const tag = remaining.*[0];
+                remaining.* = remaining.*[1..];
+                break :blk tag;
+            },
+        };
+    }
+};
+
 pub const Scratch = struct {
     values: [key_count]?TagValue = @splat(null),
     touched: [key_count]Key = undefined,
@@ -20,15 +45,11 @@ pub const Scratch = struct {
         for (self.touched[0..self.count]) |key| self.values[@backingInt(key)] = null;
         self.count = 0;
         if (deadline.expired()) return error.DeadlineExceeded;
-        if (@TypeOf(tags) == pbf.block.TagIterator) {
-            var iter = tags;
-            iter.deadline = iter.deadline.min(deadline);
-            while (try iter.next()) |tag| self.put(tag);
-        } else {
-            for (tags, 0..) |tag, i| {
-                if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
-                self.put(tag);
-            }
+        var iter = Iterator.init(tags, deadline);
+        var count: usize = 0;
+        while (try iter.next()) |tag| : (count += 1) {
+            if (count % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
+            self.put(tag);
         }
     }
 

@@ -166,6 +166,7 @@ pub fn nonnegativeIntPrefix(text: []const u8, deadline: io.Deadline) DeadlineErr
 
 pub fn normalizeSpeed(bytes: []const u8, deadline: io.Deadline) DeadlineError!?f64 {
     const prefix = try numericPrefix(bytes, false, deadline);
+    if (prefix.len == 0) return null;
     var num = std.fmt.parseFloat(f64, prefix) catch return null;
     if (!std.math.isFinite(num)) return null;
     if (std.mem.endsWith(u8, bytes, "mph")) num = @round(num * 1.609344);
