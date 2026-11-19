@@ -257,15 +257,7 @@ test "way usage filters, saturates and resolves nodes from sorted and unsorted P
     const io = routing.infra.io;
     const pbf = routing.build.pbf;
     const node_store = routing.build.node_store;
-    const Classifier = struct {
-        fn include(_: void, way: *const pbf.block.Way) !bool {
-            var tags = way.tags;
-            while (try tags.next()) |tag| {
-                if (std.mem.eql(u8, tag.key, "highway")) return true;
-            }
-            return false;
-        }
-    };
+    const tags = routing.build.tags;
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const gpa = arena.allocator();
@@ -309,12 +301,13 @@ test "way usage filters, saturates and resolves nodes from sorted and unsorted P
         const file = try io.File.temporary(".");
         defer file.close();
         const options: node_store.BuildOptions = .{ .scratch_dir = "." };
+        var tag_scratch: tags.Scratch = .{};
         if (i == 2) {
-            try testing.expectError(error.DuplicateNode, node_store.build(gpa, source, file, options, {}, Classifier.include));
+            try testing.expectError(error.DuplicateNode, node_store.build(gpa, source, file, options, &tag_scratch, tags.includePbfWay));
             try testing.expectError(error.InvalidStore, node_store.Store.open(file));
             continue;
         }
-        const store = try node_store.build(gpa, source, file, options, {}, Classifier.include);
+        const store = try node_store.build(gpa, source, file, options, &tag_scratch, tags.includePbfWay);
         try testing.expectEqual(5, store.nodeCount());
         var found: [expected.len]?node_store.Location = undefined;
         try store.lookupBatch(&.{ -75, min_id, 1, 2, 3, max_id, 4 }, &found, 1, .none);

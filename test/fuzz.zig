@@ -78,10 +78,14 @@ fn visitTags(tags: routing.build.pbf.block.TagIterator) !void {
 fn visitPrimitives(block: routing.build.pbf.block.Block) !void {
     var nodes = block.nodes();
     while (try nodes.next()) |node| try visitTags(node.tags);
+    const tags = routing.build.tags;
+    var tag_scratch: tags.Scratch = .{};
     var ways = block.ways();
     while (try ways.next()) |item| {
         var way = item;
-        try visitTags(way.tags);
+        _ = try tags.transformWay(&tag_scratch, way.tags, .none);
+        if (tag_scratch.text(.maxspeed)) |speed|
+            _ = try tags.defaults.normalizeSpeed(speed, .none);
         while (try way.refs.next()) |_| {}
     }
     var relations = block.relations();

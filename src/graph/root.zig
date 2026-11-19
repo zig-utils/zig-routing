@@ -2,6 +2,8 @@
 
 const std = @import("std");
 
+pub const attributes = @import("attributes.zig");
+
 test {
     std.testing.refAllDecls(@This());
 }
