@@ -136,3 +136,10 @@ oracle/bench-vm.sh utrecht bench/corpora/height.utrecht.tsv
 ```
 
 Germany and US+DACH builds are tracked in [#239](https://github.com/zig-utils/zig-routing/issues/239).
+
+## Gurka fixture check
+
+`oracle/check-gurka.sh` emits a synthetic intersection from the ASCII-map fixture and runs the
+pinned Valhalla tile builder. It checks for graph tiles, three routable ways and one turn restriction.
+Use `ORACLE_PLATFORM=linux/arm64` to run the arm64 oracle. The generated PBF, tiles and build log
+are written under `bench/results/`.

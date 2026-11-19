@@ -114,6 +114,30 @@ pub fn build(b: *std.Build) void {
     const lib_tests = b.addTest(.{ .root_module = lib_mod });
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
 
+    const gurka_imports: []const std.Build.Module.Import = &.{
+        .{ .name = "routing", .module = lib_mod },
+        .{ .name = "protobuf", .module = protobuf },
+    };
+    const gurka_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("test/gurka/examples.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = gurka_imports,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(gurka_tests).step);
+    const gurka_emit = b.addExecutable(.{
+        .name = "gurka-emit",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/gurka/emit.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = gurka_imports,
+        }),
+    });
+    const emit_pbf = b.addRunArtifact(gurka_emit);
+    emit_pbf.addPassthruArgs();
+    b.step("gurka-pbf", "Emit the Gurka intersection fixture as OSM PBF").dependOn(&emit_pbf.step);
+
     // Stage timings (ReleaseFast): zig build perf
     const perf = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("test/perf_height.zig"),
