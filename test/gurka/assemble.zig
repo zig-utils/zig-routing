@@ -1552,3 +1552,68 @@ test "multi-location continuation retries the route with reachable waypoint cand
     try testing.expectEqual(cd, route.legs[0].segments[0].edge);
     try testing.expectEqual(de, route.legs[0].segments[route.legs[0].segments.len - 1].edge);
 }
+
+test "regional registry snaps and routes in one bundle and rejects cross-bundle input" {
+    const snap = routing.snap;
+    const request = routing.api.request;
+    const Point = routing.geo.point.PointLL;
+    const roads = [_]gurka.Way{
+        .{ .label = "AB", .tags = &.{.{ .key = "highway", .value = "residential" }} },
+        .{ .label = "BC", .tags = &.{.{ .key = "highway", .value = "residential" }} },
+    };
+    var state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer state.deinit();
+    const a = state.allocator();
+    const west = try gurka.Map.init(a, try gurka.mapToCoordinatesAt("A---B---C", 20, Point.init(-105, 40)), &roads, &.{}, &.{});
+    const east = try gurka.Map.init(a, try gurka.mapToCoordinatesAt("A---B---C", 20, Point.init(10, 51)), &roads, &.{}, &.{});
+    var west_bundle = try Built.assemble(west.osm, 1);
+    defer west_bundle.deinit();
+    var east_bundle = try Built.assemble(east.osm, 1);
+    defer east_bundle.deinit();
+
+    const regions = [_]snap.registry.Region{
+        try .init("west", &west_bundle.bundle.view, .none),
+        try .init("east", &east_bundle.bundle.view, .none),
+    };
+    const registry: snap.registry.Registry = .{ .regions = &regions };
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    const defaults: snap.candidates.Defaults = .{ .minimum_reachability = 0 };
+    const cost: snap.candidates.Access = .{ .mask = .{ .pedestrian = true } };
+    var locations: [2][2]request.Location = undefined;
+    for ([_]gurka.Map{ west, east }, &regions, &locations) |region, *expected, *inputs| {
+        for ([_][]const u8{ "A", "C" }, inputs) |label, *input| {
+            const node = region.findNode(label).?.location;
+            input.* = .{ .lat = node.lat, .lng = node.lng };
+        }
+        const selected = (try registry.snap(&arena, inputs, defaults, cost, .none)).ok;
+        try testing.expectEqual(expected, selected.region);
+        var engine = try SearchTest.init(testing.allocator, selected.region.view);
+        defer engine.deinit();
+        const route = try routing.search.multi.route(&engine, &arena, SearchTestCost{ .seed = 42 }, inputs, selected.locations, .{
+            .search = .{ .costing = .pedestrian },
+        }, .{});
+        try testing.expectEqual(@as(usize, 1), route.legs.len);
+        try testing.expectEqual(@as(usize, 2), route.legs[0].segments.len);
+        arena.reset();
+    }
+
+    const cross = try registry.snap(&arena, &.{ locations[0][0], locations[1][1] }, defaults, cost, .none);
+    try testing.expectEqual(@as(u16, 170), cross.failure.code);
+    try testing.expectEqualStrings("locations span multiple graph bundles", cross.failure.extra);
+    try testing.expectEqual(@as(usize, 0), arena.used);
+
+    var outside = locations[0][0];
+    outside.lat += 0.00002;
+    const raw = try snap.candidates.search(regions[0].view, arena.allocator(), outside, defaults, cost, .none);
+    try testing.expect(raw.edges.len != 0 or raw.filtered_edges.len != 0);
+    arena.reset();
+    const uncovered = try registry.snap(&arena, &.{ outside, locations[0][1] }, defaults, cost, .none);
+    try testing.expectEqual(@as(u16, 171), uncovered.failure.code);
+
+    var legacy = west_bundle.bundle.view;
+    legacy.coverage = null;
+    const derived = try snap.registry.Region.init("legacy", &legacy, .none);
+    try testing.expectEqual(regions[0].bounds, derived.bounds);
+    try testing.expectError(error.DeadlineExceeded, registry.snap(&arena, &locations[0], defaults, cost, .{ .at_ns = 0 }));
+}

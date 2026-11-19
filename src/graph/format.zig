@@ -8,6 +8,7 @@ pub const magic = "ZRGRAPH\x00".*;
 pub const version: u32 = 1;
 pub const payload_offset = 64 * 1024;
 pub const DatasetUuid = [16]u8;
+pub const Bounds = @import("coverage.zig").Bounds;
 pub const Coordinate = @import("../geo/point.zig").FixedLL;
 
 pub const NodeId = enum(u32) { _ };
@@ -104,11 +105,12 @@ pub const SectionKind = enum(u32) {
     metadata = 11,
     components = 12,
     turn_sides = 13,
+    coverage = 14,
 
     pub fn placement(kind: SectionKind) Placement {
         return switch (kind) {
             .nodes, .edges, .first_edge, .turns, .classes, .turn_sides => .hot,
-            .coordinates, .spatial, .components, .metadata => .warm,
+            .coordinates, .spatial, .components, .metadata, .coverage => .warm,
             .cold_idx, .cold, .slopes => .cold,
         };
     }
@@ -128,6 +130,7 @@ pub const SectionKind = enum(u32) {
             .metadata => "metadata.bin",
             .components => "components.bin",
             .turn_sides => "turn_sides.bin",
+            .coverage => "coverage.bin",
         };
     }
 
@@ -144,6 +147,7 @@ pub const SectionKind = enum(u32) {
             .slopes => u16,
             .spatial => u8,
             .metadata => Metadata,
+            .coverage => Bounds,
             .components, .turn_sides => u32,
         };
     }

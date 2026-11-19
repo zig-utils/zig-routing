@@ -110,6 +110,7 @@ pub const Artifact = enum {
     bundle_components,
     turn_sides,
     bundle_turn_sides,
+    bundle_coverage,
 
     fn filename(self: Artifact) [:0]const u8 {
         return switch (self) {

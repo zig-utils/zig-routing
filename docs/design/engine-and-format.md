@@ -85,6 +85,7 @@ Potential setup is about 0.2 ms: an elimination-tree climb of roughly 1,000-1,30
 
 - **Ids.** Node and directed-edge ids are u32 behind opaque `enum(u32)` types, so widening is a recompile plus a format bump.
 - **Updates.** Full rebuild per bundle. The server loads several bundles and dispatches by location, so DACH can be rebuilt without touching the US.
+- **Regional coverage.** The optional `coverage.bin` section stores one E7 bounding box over the saved nodes and road shapes. West greater than east denotes an antimeridian crossing. Registry setup can derive bounds from node coordinates for older bundles. In overlapping coverage, registry order decides between bundles that can snap all locations to one connected component. If each location snaps and the snaps span different bundles, the request returns Valhalla error 170. Routing across regions requires a merged bundle.
 - **File header (64 B).** Magic, format version, 16-byte dataset UUID, section kind, record size, count and xxh3 of the payload. Startup checks headers, UUIDs and sizes. The `verify` command checks payload hashes offline. The header begins at file offset 0 and the payload begins at 64 KiB, with zero bytes between. The checksum is seedless XXH3-64 over the payload. Bundle creation stages `nodes.bin`, `edges.bin`, `first_edge.bin` and `turns.bin` in a sibling directory and publishes all four in one exclusive rename.
 
 ```zig

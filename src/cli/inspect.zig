@@ -108,6 +108,7 @@ pub fn write(bundle: *const reader.Bundle, out: *io.Writer, json: bool, verified
     const uuid = std.fmt.bytesToHex(graph.dataset_uuid, .lower);
     const edge_record = if (edge_id) |id| try Edge.read(graph, id) else null;
     const node_record = if (node_id) |id| try Node.read(graph, id) else null;
+    const coverage = if (graph.coverage) |records| records[0] else null;
     const ordering = if (graph.metadata) |metadata| .{
         .kind = metadata[0].ordering().?,
         .xxh3 = std.fmt.bytesToHex(std.mem.toBytes(std.mem.nativeToBig(u64, metadata[0].order_hash)), .lower),
@@ -119,6 +120,7 @@ pub fn write(bundle: *const reader.Bundle, out: *io.Writer, json: bool, verified
             .dataset_uuid = uuid,
             .verified = verified,
             .ordering = ordering,
+            .coverage_e7 = coverage,
             .sections = sections[0..count],
             .edge = edge_record,
             .node = node_record,
@@ -129,6 +131,7 @@ pub fn write(bundle: *const reader.Bundle, out: *io.Writer, json: bool, verified
 
     try out.print("Graph bundle v{d}  {s}\n", .{ format.version, uuid });
     if (ordering) |value| try out.print("Ordering {s}  {s}\n", .{ @tagName(value.kind), value.xxh3 });
+    if (coverage) |value| try out.print("Coverage E7 west {d} south {d} east {d} north {d}\n", .{ value.west, value.south, value.east, value.north });
     try out.print("{s: <16} {s: >12} {s: >11} {s: >14}  {s: <4} {s: >14}  {s}\n", .{
         "File", "Records", "Record size", "File bytes", "Use", "Resident bytes", "XXH3-64",
     });

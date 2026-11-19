@@ -242,6 +242,8 @@ const Layout = struct {
         defer pairs.deinit(a);
         const indices = try a.alloc(u32, self.edges.len);
         defer a.free(indices);
+        var coverage: graph.coverage.Builder = .{};
+        try coverage.add(self.coords, writer.deadline);
         for (self.sources, 0..) |ref, i| {
             if (i % 256 == 0 and writer.deadline.expired()) return error.DeadlineExceeded;
             if (i > ref.opposite) continue;
@@ -257,6 +259,7 @@ const Layout = struct {
             const reverse_info = if (edge.endpoint.forward) other_info else here_info;
             if (info.way != reverse_info.way or !std.mem.eql(u8, info.shape, reverse_info.shape)) return error.ValhallaOpposingShapeMismatch;
             try info.decodeShape(a, &points, writer.deadline);
+            try coverage.addShape(points.items, writer.deadline);
             var forward_names: [15]u32 = undefined;
             var reverse_names: [15]u32 = undefined;
             const names = try nameRefs(info, &strings, &cold, &forward_names);
@@ -270,6 +273,7 @@ const Layout = struct {
         }
         try writer.write(.cold_idx, indices);
         _ = try cold.write(writer);
+        if (coverage.finish()) |box| try writer.write(.coverage, &.{box});
         const scratch = try a.alloc(graph.spatial.Pair, pairs.items.len);
         defer a.free(scratch);
         _ = try graph.spatial.write(a, pairs.items, scratch, scratch_dir, writer, writer.deadline);

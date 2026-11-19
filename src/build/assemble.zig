@@ -1452,6 +1452,8 @@ fn appendLevels(out: *std.ArrayList(graph.cold.LevelRange), gpa: Allocator, sour
 
 fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *const Metadata, writer: *format.BundleWriter, scratch_dir: []const u8, means: []const i16) !u64 {
     const topo = shared.topology;
+    var coverage: graph.coverage.Builder = .{};
+    try coverage.add(topo.coordinates, writer.deadline);
     const index = try Scratch(u32).init(topo.output.data.len, scratch_dir);
     defer index.deinit();
     var builder = try ColdBuilder.init(gpa, &metadata.strings, scratch_dir, shared.deadline);
@@ -1479,7 +1481,9 @@ fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *const Metadata, w
                     .layer = way.attr.layer,
                     .levels = metadata.levels.items[way.level_start..][0..way.level_count],
                 };
-                break :blk try builder.append(@bitCast(seg.way_id), way.speeds.limit, mean, try segmentShape(shared.shape_points, seg), active, indoor);
+                const shape = try segmentShape(shared.shape_points, seg);
+                try coverage.addShape(shape, writer.deadline);
+                break :blk try builder.append(@bitCast(seg.way_id), way.speeds.limit, mean, shape, active, indoor);
             } else try builder.append(0, 0, graph.cold.no_elevation, &.{ topo.coordinates[node], topo.coordinates[edge.head] }, &.{}, .{});
             index.data[slot] = graph.cold.directedIndex(record, reverse);
             index.data[opposite] = graph.cold.directedIndex(record, !reverse);
@@ -1487,6 +1491,7 @@ fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *const Metadata, w
     }
     if (builder.record_count != topo.output.data.len / 2) return error.InvalidColdRecordCount;
     try writer.write(.cold_idx, index.data);
+    if (coverage.finish()) |bounds| try writer.write(.coverage, &.{bounds});
     return builder.write(writer);
 }
 

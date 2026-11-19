@@ -142,6 +142,7 @@ pub const View = struct {
     components: ?[]const u32,
     turn_sides: ?[]const u32,
     turn_side_index: ?turn_sides.View,
+    coverage: ?[]const format.Bounds = null,
 
     pub fn parse(files: Files, diagnostic: ?*Diagnostic) !View {
         var headers: Headers = .initFill(null);
@@ -264,6 +265,10 @@ pub const View = struct {
         if (graph.metadata) |records| {
             note(diagnostic, .metadata);
             if (records[0].reserved != 0 or records[0].ordering() == null) return error.InvalidBundleMetadata;
+        }
+        if (graph.coverage) |records| {
+            note(diagnostic, .coverage);
+            if (records.len != 1 or !records[0].valid()) return error.InvalidBundleCoverage;
         }
         note(diagnostic, null);
         return graph;
@@ -409,7 +414,7 @@ pub const View = struct {
             note(diagnostic, kind);
             if (deadline.expired()) return error.DeadlineExceeded;
             const bytes: []const u8 = switch (kind) {
-                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata, .components, .turn_sides => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
+                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata, .components, .turn_sides, .coverage => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
                 inline else => |section| std.mem.sliceAsBytes(@field(self, @tagName(section))),
             };
             var hash = std.hash.XxHash3.init(0);

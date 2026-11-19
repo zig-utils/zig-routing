@@ -58,6 +58,7 @@ pub fn records(comptime kind: format.SectionKind) []const kind.Record() {
         .metadata => &metadata,
         .components => &.{ 0, 0 },
         .turn_sides => &.{ 3, 0, 0 },
+        .coverage => &.{.{ .west = 0, .south = 0, .east = 100000, .north = 0 }},
     };
 }
 
