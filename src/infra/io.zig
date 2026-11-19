@@ -1423,18 +1423,28 @@ pub fn sleepMs(ms: u64) void {
 /// skipped silently (as upstream's recursive_directory_iterator use treats
 /// them as absent data).
 pub fn walkFiles(root: []const u8, context: anytype, comptime visit: fn (@TypeOf(context), []const u8) void) void {
+    const Visitor = struct {
+        fn call(target: @TypeOf(context), path: []const u8) !void {
+            visit(target, path);
+        }
+    };
+    walkFilesUntil(root, .none, context, Visitor.call) catch unreachable;
+}
+
+pub fn walkFilesUntil(root: []const u8, deadline: Deadline, context: anytype, comptime visit: anytype) !void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     if (root.len >= buf.len) return;
     @memcpy(buf[0..root.len], root);
-    walkDir(&buf, root.len, context, visit, 0);
+    try walkDir(&buf, root.len, deadline, context, visit, 0);
 }
 
-fn walkDir(buf: *[std.fs.max_path_bytes]u8, len: usize, context: anytype, comptime visit: fn (@TypeOf(context), []const u8) void, depth: u32) void {
+fn walkDir(buf: *[std.fs.max_path_bytes]u8, len: usize, deadline: Deadline, context: anytype, comptime visit: anytype, depth: u32) anyerror!void {
     if (depth > 32) return;
     buf[len] = 0;
     const dir = c.opendir(@ptrCast(buf)) orelse return;
     defer _ = c.closedir(dir);
     while (c.readdir(dir)) |entry| {
+        if (deadline.expired()) return error.DeadlineExceeded;
         const name = std.mem.sliceTo(&entry.name, 0);
         if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
         if (len + 1 + name.len >= buf.len) continue;
@@ -1442,8 +1452,8 @@ fn walkDir(buf: *[std.fs.max_path_bytes]u8, len: usize, context: anytype, compti
         @memcpy(buf[len + 1 ..][0..name.len], name);
         const sub_len = len + 1 + name.len;
         switch (entry.type) {
-            c.DT.DIR => walkDir(buf, sub_len, context, visit, depth + 1),
-            c.DT.REG => visit(context, buf[0..sub_len]),
+            c.DT.DIR => try walkDir(buf, sub_len, deadline, context, visit, depth + 1),
+            c.DT.REG => try visit(context, buf[0..sub_len]),
             else => {},
         }
     }

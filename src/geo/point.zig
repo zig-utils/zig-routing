@@ -117,6 +117,10 @@ pub const PointLL = struct {
 
     /// Great-circle distance in metres (haversine, clamped for stability).
     pub fn distance(self: PointLL, other: PointLL) f64 {
+        return self.distanceWith(other, libm);
+    }
+
+    pub fn distanceWith(self: PointLL, other: PointLL, comptime math: type) f64 {
         if (self.eql(other)) return 0;
         const phi1 = self.lat * k.rad_per_deg_d;
         const phi2 = other.lat * k.rad_per_deg_d;
@@ -124,13 +128,13 @@ pub const PointLL = struct {
         const lambda1 = self.lng * k.rad_per_deg_d;
         const lambda2 = other.lng * k.rad_per_deg_d;
         const dlambda = lambda2 - lambda1;
-        const c1 = libm.cosF(phi1);
-        const c2 = libm.cosF(phi2);
-        const sdphi2 = libm.sinF(dphi / 2.0);
-        const sdlmb2 = libm.sinF(dlambda / 2.0);
+        const c1 = math.cosF(phi1);
+        const c2 = math.cosF(phi2);
+        const sdphi2 = math.sinF(dphi / 2.0);
+        const sdlmb2 = math.sinF(dlambda / 2.0);
         var h = sdphi2 * sdphi2 + c1 * c2 * sdlmb2 * sdlmb2;
         h = @min(1.0, @max(0.0, h));
-        const d = 2.0 * libm.asinF(@sqrt(h));
+        const d = 2.0 * math.asinF(@sqrt(h));
         return k.rad_earth_meters_d * d;
     }
 
@@ -143,9 +147,13 @@ pub const PointLL = struct {
     /// Radius in metres of the circle through this point and two others;
     /// max f64 when collinear.
     pub fn curvature(self: PointLL, ll1: PointLL, ll2: PointLL) f64 {
-        const a = self.distance(ll1);
-        const b = ll1.distance(ll2);
-        const c = self.distance(ll2);
+        return self.curvatureWith(ll1, ll2, libm);
+    }
+
+    pub fn curvatureWith(self: PointLL, ll1: PointLL, ll2: PointLL, comptime math: type) f64 {
+        const a = self.distanceWith(ll1, math);
+        const b = ll1.distanceWith(ll2, math);
+        const c = self.distanceWith(ll2, math);
         const s = (a + b + c) * 0.5;
         const kk = @sqrt(s * (s - a) * (s - b) * (s - c));
         return if (std.math.isNan(kk) or kk == 0.0) std.math.floatMax(f64) else (a * b * c) / (4.0 * kk);
@@ -153,13 +161,17 @@ pub const PointLL = struct {
 
     /// Initial bearing to `ll2` in degrees [0, 360): 0 north, 90 east.
     pub fn heading(self: PointLL, ll2: PointLL) f64 {
+        return self.headingWith(ll2, libm);
+    }
+
+    pub fn headingWith(self: PointLL, ll2: PointLL, comptime math: type) f64 {
         if (self.eql(ll2)) return 0.0;
         const lat1 = self.lat * k.rad_per_deg_d;
         const lat2 = ll2.lat * k.rad_per_deg_d;
         const dlng = (ll2.lng - self.lng) * k.rad_per_deg_d;
-        const y = libm.sinF(dlng) * libm.cosF(lat2);
-        const x = libm.cosF(lat1) * libm.sinF(lat2) - libm.sinF(lat1) * libm.cosF(lat2) * libm.cosF(dlng);
-        const bearing = libm.atan2F(y, x) * k.deg_per_rad_d;
+        const y = math.sinF(dlng) * math.cosF(lat2);
+        const x = math.cosF(lat1) * math.sinF(lat2) - math.sinF(lat1) * math.cosF(lat2) * math.cosF(dlng);
+        const bearing = math.atan2F(y, x) * k.deg_per_rad_d;
         return if (bearing < 0.0) bearing + 360.0 else bearing;
     }
 

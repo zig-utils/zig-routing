@@ -2,6 +2,7 @@
 // src/mjolnir/graphenhancer.cc (Valhalla 3.9.3).
 const std = @import("std");
 const geo = @import("../geo/point.zig");
+const math = @import("../geo/build_math.zig");
 const io = @import("../infra/io.zig");
 const constants = @import("../graph/constants.zig");
 const EdgeClass = @import("../graph/class_table.zig").EdgeClass;
@@ -51,7 +52,7 @@ pub fn heading(points: []const geo.FixedLL, forward: bool, class: *const EdgeCla
         if (points.len == 2 or travelled >= dist) break;
         if ((i - 1) % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
         const next = points[if (forward) i else points.len - 1 - i].toPoint();
-        const length = previous.distance(next);
+        const length = previous.distanceWith(next, math);
         if (travelled + length > dist) {
             const fraction = (dist - travelled) / length;
             target = .{
@@ -63,7 +64,7 @@ pub fn heading(points: []const geo.FixedLL, forward: bool, class: *const EdgeCla
         travelled += length;
         previous = next;
     }
-    const rounded = @as(u16, @intFromFloat(@round(start.heading(target)))) % 360;
+    const rounded = @as(u16, @intFromFloat(@round(start.headingWith(target, math)))) % 360;
     const shrink: f32 = 255.0 / 359.0;
     const expand: f32 = 359.0 / 255.0;
     const stored: f32 = @round(@as(f32, @floatFromInt(rounded)) * shrink);

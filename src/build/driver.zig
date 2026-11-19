@@ -2,6 +2,7 @@
 const std = @import("std");
 const io = @import("../infra/io.zig");
 const graph = @import("../graph/root.zig");
+const hgt = @import("../elevation/hgt.zig");
 const checkpoint = @import("checkpoint.zig");
 const assemble = @import("assemble.zig");
 const edges = @import("edges.zig");
@@ -50,6 +51,7 @@ const Source = struct {
 const Inputs = struct {
     sources: []const Source,
     dem_dir: ?[]const u8,
+    dem_digest: ?[32]u8 = null,
     drive_side: @import("edge_class.zig").DriveSide,
     order: graph.format.OrderingKind,
 
@@ -58,7 +60,12 @@ const Inputs = struct {
         hash.update("zr-build-v1");
         hash.update(&.{ @intFromBool(self.dem_dir != null), @backingInt(self.drive_side) });
         hash.update(@tagName(self.order));
-        if (self.dem_dir) |path| {
+        if (self.dem_digest) |digest| {
+            hash.update("dem-bytes-v1");
+            hash.update(&digest);
+        } else if (self.dem_dir) |path| {
+            // Resumes of checkpoints from before DEM fingerprints keep
+            // their original dataset identity.
             hash.update(path);
             hash.update(&.{0});
         }
@@ -101,6 +108,24 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
         .order = options.order orelse .hilbert,
     };
     if (previous != null) try checkOptions(a, &inputs, options, diagnostic);
+    var tiles: ?hgt.Tiles = null;
+    defer if (tiles) |*catalog| catalog.deinit();
+    const stamps_elevation = @backingInt(options.from) <= @backingInt(Stage.elevation) and
+        @backingInt(options.to) >= @backingInt(Stage.elevation);
+    if (inputs.dem_dir) |path| {
+        if (previous == null or stamps_elevation or (options.dem_dir != null and inputs.dem_digest != null)) {
+            diagnostic.input = path;
+            tiles = try hgt.Tiles.initBuild(gpa, path, options.deadline);
+            if (previous == null or inputs.dem_digest != null) {
+                const digest = try tiles.?.fingerprint(options.deadline);
+                if (inputs.dem_digest) |expected| {
+                    if (!std.mem.eql(u8, &digest, &expected)) return error.CheckpointInputMismatch;
+                }
+                inputs.dem_digest = digest;
+            }
+            diagnostic.input = null;
+        }
+    }
     const id = inputs.identity();
     var session: checkpoint.Session = .{
         .gpa = gpa,
@@ -124,16 +149,8 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
         .deadline = options.deadline,
         .drive_side = inputs.drive_side,
         .ordering = .{ .kind = inputs.order },
-        .dem_source = if (inputs.dem_dir) |dir| .{ .tiles = dir } else null,
+        .dem_source = if (tiles) |*catalog| .{ .catalog = catalog } else null,
     };
-    if (session.runs(.elevation)) {
-        if (inputs.dem_dir) |path| {
-            diagnostic.input = path;
-            const dir = try io.Directory.open(path);
-            dir.close();
-            diagnostic.input = null;
-        }
-    }
     if (session.runs(.read)) {
         var tx = try session.begin(.read);
         defer tx.deinit();
@@ -195,7 +212,11 @@ fn fingerprintInputs(a: Allocator, options: Options, diagnostic: *Diagnostic) ![
 fn checkOptions(a: Allocator, inputs: *Inputs, options: Options, diagnostic: *Diagnostic) !void {
     if (options.drive_side) |side| if (side != inputs.drive_side) return error.CheckpointInputMismatch;
     if (options.order) |order| if (order != inputs.order) return error.CheckpointInputMismatch;
-    if (options.dem_dir) |dir| if (!std.mem.eql(u8, dir, inputs.dem_dir orelse "")) return error.CheckpointInputMismatch;
+    if (options.dem_dir) |dir| {
+        const saved = inputs.dem_dir orelse return error.CheckpointInputMismatch;
+        if (inputs.dem_digest == null and !std.mem.eql(u8, dir, saved)) return error.CheckpointInputMismatch;
+        inputs.dem_dir = dir;
+    }
     if (options.inputs.len != 0) {
         const current = try fingerprintInputs(a, options, diagnostic);
         if (current.len != inputs.sources.len) return error.CheckpointInputMismatch;

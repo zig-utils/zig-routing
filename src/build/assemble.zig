@@ -2,6 +2,7 @@
 // (Valhalla 3.9.3). Assemble the native dense CSR topology.
 const std = @import("std");
 const geo = @import("../geo/point.zig");
+const math = @import("../geo/build_math.zig");
 const io = @import("../infra/io.zig");
 const graph = @import("../graph/root.zig");
 const format = graph.format;
@@ -1296,20 +1297,20 @@ const ElevationJob = struct {
     }
 
     fn sample(self: *ElevationJob) !void {
-        switch (self.source) {
-            .tiles => |dir| {
-                // The loose tile cache may evict decoded buffers. Each job
-                // owns its cache and keeps its current tile local.
-                var tiles = try dem.hgt.Tiles.init(self.gpa, dir);
-                defer tiles.deinit();
-                var sampler: dem.hgt.Sampler = .{ .tiles = &tiles };
-                try self.emit(&sampler);
-            },
-            .pack => |pack| {
-                var sampler: dem.@"packed".Sampler = .{ .pack = pack };
-                try self.emit(&sampler);
-            },
+        if (self.source == .pack) {
+            var sampler: dem.@"packed".Sampler = .{ .pack = self.source.pack };
+            return self.emit(&sampler);
         }
+        // Each job owns the decompression cache because its sampler holds
+        // the current tile between reads.
+        var tiles = switch (self.source) {
+            .tiles => |dir| try dem.hgt.Tiles.initBuild(self.gpa, dir, self.shared.deadline),
+            .catalog => |catalog| try catalog.borrowMappings(self.gpa, self.shared.deadline),
+            .pack => unreachable,
+        };
+        defer tiles.deinit();
+        var sampler: dem.hgt.Sampler = .{ .tiles = &tiles };
+        try self.emit(&sampler);
     }
 
     fn emit(self: *ElevationJob, sampler: anytype) !void {
@@ -1585,7 +1586,7 @@ fn computeCurvature(points: []const geo.FixedLL, deadline: io.Deadline) !u4 {
     var count: usize = 0;
     for (2..points.len) |i| {
         try checkDeadline(deadline, i - 2);
-        const radius: f32 = @floatCast(points[i - 2].toPoint().curvature(points[i - 1].toPoint(), points[i].toPoint()));
+        const radius: f32 = @floatCast(points[i - 2].toPoint().curvatureWith(points[i - 1].toPoint(), points[i].toPoint(), math));
         if (std.math.isNan(radius)) continue;
         total += if (radius > 1000) 0 else @min(25, 1500 / radius);
         count += 1;

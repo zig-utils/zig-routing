@@ -4,6 +4,7 @@ const std = @import("std");
 const io = @import("../infra/io.zig");
 const geo = @import("../geo/point.zig");
 const line = @import("../geo/line.zig");
+const build_math = @import("../geo/build_math.zig");
 const dem = @import("../elevation/root.zig");
 const format = @import("../graph/format.zig");
 const Allocator = std.mem.Allocator;
@@ -14,6 +15,7 @@ const no_data = dem.hgt.no_data_value;
 
 pub const Source = union(enum) {
     tiles: []const u8,
+    catalog: *const dem.hgt.Tiles,
     pack: *const dem.@"packed".Pack,
 };
 
@@ -165,7 +167,7 @@ pub const Work = struct {
             }
         };
         const sink: Sink = .{ .work = self, .sampler = sampler, .interpolate = interpolate };
-        try line.visitResampledSpherical(self.points.items, posting_interval, false, &sink);
+        try line.visitResampledSphericalWith(self.points.items, posting_interval, false, &sink, build_math);
         try sink.emit(self.points.items[self.points.items.len - 1]);
         const heights = self.heights.items;
 

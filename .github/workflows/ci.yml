@@ -55,6 +55,12 @@ jobs:
             input="oracle/data/$dataset/extract.osm.pbf"
             zig-out/bin/zr build "$input" --work-dir "$work/$dataset-full-work" --output "$work/$dataset-full" --threads 4
             zig-out/bin/zr inspect --verify "$work/$dataset-full"
+            for workers in 1 16; do
+              zig-out/bin/zr build "$input" --work-dir "$work/$dataset-$workers-work" --output "$work/$dataset-$workers" --threads "$workers"
+              zig-out/bin/zr inspect --verify "$work/$dataset-$workers"
+              diff -qr "$work/$dataset-full" "$work/$dataset-$workers"
+            done
+            echo "$dataset has identical bundle bytes with 1, 4 and 16 workers"
             zig-out/bin/zr build "$input" --work-dir "$work/$dataset-split-work" --to enhance --threads 4
             zig-out/bin/zr build --work-dir "$work/$dataset-split-work" --from elevation --output "$work/$dataset-resumed" --threads 4
             diff -qr "$work/$dataset-full" "$work/$dataset-resumed"
@@ -62,6 +68,10 @@ jobs:
           zig build bench-costing -Doptimize=ReleaseFast -- "$work/utrecht-full" 100000
           oracle/fetch.sh liechtenstein
           zig build check-assembly -Doptimize=ReleaseFast -- "$ORACLE_DATA/liechtenstein/extract.osm.pbf" "$work/liechtenstein-dem" "$work" 4 right --dem "$ORACLE_DATA/liechtenstein/elevation"
+          cp -R "$ORACLE_DATA/liechtenstein/elevation" "$work/dem-copy"
+          zig-out/bin/zr build "$ORACLE_DATA/liechtenstein/extract.osm.pbf" --dem "$ORACLE_DATA/liechtenstein/elevation" --output "$work/dem-1" --threads 1
+          zig-out/bin/zr build "$ORACLE_DATA/liechtenstein/extract.osm.pbf" --dem "$work/dem-copy" --output "$work/dem-16" --threads 16
+          diff -qr "$work/dem-1" "$work/dem-16"
           fetch_checked \
             https://download.geofabrik.de/europe/luxembourg-260101.osm.pbf \
             "$work/luxembourg.osm.pbf" \

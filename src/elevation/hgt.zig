@@ -104,20 +104,98 @@ pub const Tiles = struct {
     clock: u64 = 0,
     unpacked_count: usize = 0,
     count: usize = 0,
+    owns_mappings: bool = true,
 
     pub fn init(gpa: Allocator, data_dir: []const u8) Allocator.Error!Tiles {
-        const slots = try gpa.alloc(Slot, tile_count);
-        @memset(slots, .{});
-        var self: Tiles = .{ .gpa = gpa, .slots = slots };
-        var trimmed = data_dir;
-        while (trimmed.len > 1 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
+        var self = try empty(gpa);
+        const trimmed = trimPath(data_dir);
         if (trimmed.len > 0) io.walkFiles(trimmed, &self, addFile);
         return self;
     }
 
+    /// Build inputs choose duplicates by encoding, then by bytes. Neither
+    /// filesystem iteration order nor the tile's storage path decides.
+    pub fn initBuild(gpa: Allocator, data_dir: []const u8, deadline: io.Deadline) !Tiles {
+        var self = try empty(gpa);
+        errdefer self.deinit();
+        const path = trimPath(data_dir);
+        const dir = try io.Directory.open(path);
+        defer dir.close();
+        const Scan = struct {
+            tiles: *Tiles,
+            deadline: io.Deadline,
+
+            fn visit(scan: @This(), file: []const u8) !void {
+                const parsed = parseName(file) orelse return;
+                const slot = &scan.tiles.slots[parsed.index];
+                if (slot.map != null and @backingInt(parsed.format) > @backingInt(slot.format)) return;
+                const map = mapTile(file, parsed.format) orelse return;
+                errdefer map.unmap();
+                if (slot.map) |previous| {
+                    if (parsed.format == slot.format and !try bytesLess(map.bytes, previous.bytes, scan.deadline)) {
+                        map.unmap();
+                        return;
+                    }
+                    previous.unmap();
+                } else {
+                    scan.tiles.count += 1;
+                }
+                slot.* = .{ .format = parsed.format, .map = map };
+            }
+        };
+        try io.walkFilesUntil(path, deadline, Scan{ .tiles = &self, .deadline = deadline }, Scan.visit);
+        return self;
+    }
+
+    /// Each worker owns its decompression cache and borrows the same
+    /// immutable source mappings. The catalog outlives all worker copies.
+    pub fn borrowMappings(self: *const Tiles, gpa: Allocator, deadline: io.Deadline) !Tiles {
+        const slots = try gpa.alloc(Slot, self.slots.len);
+        errdefer gpa.free(slots);
+        for (slots, self.slots, 0..) |*out, slot, i| {
+            if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
+            out.* = .{ .format = slot.format, .map = slot.map };
+        }
+        return .{ .gpa = gpa, .slots = slots, .count = self.count, .owns_mappings = false };
+    }
+
+    pub fn fingerprint(self: *const Tiles, deadline: io.Deadline) ![32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("zr-hgt-v1");
+        for (self.slots, 0..) |slot, i| {
+            if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
+            const map = slot.map orelse continue;
+            var header: [13]u8 = undefined;
+            std.mem.writeInt(u32, header[0..4], @intCast(i), .little);
+            header[4] = @backingInt(slot.format);
+            std.mem.writeInt(u64, header[5..13], map.bytes.len, .little);
+            hash.update(&header);
+            var rest: []const u8 = map.bytes;
+            while (rest.len != 0) {
+                if (deadline.expired()) return error.DeadlineExceeded;
+                const count = @min(rest.len, 1024 * 1024);
+                hash.update(rest[0..count]);
+                rest = rest[count..];
+            }
+        }
+        return hash.finalResult();
+    }
+
+    fn empty(gpa: Allocator) Allocator.Error!Tiles {
+        const slots = try gpa.alloc(Slot, tile_count);
+        @memset(slots, .{});
+        return .{ .gpa = gpa, .slots = slots };
+    }
+
+    fn trimPath(data_dir: []const u8) []const u8 {
+        var trimmed = data_dir;
+        while (trimmed.len > 1 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
+        return trimmed;
+    }
+
     pub fn deinit(self: *Tiles) void {
         for (self.slots) |*s| {
-            if (s.map) |m| m.unmap();
+            if (self.owns_mappings) if (s.map) |m| m.unmap();
             if (s.unpacked) |u| self.gpa.free(u);
         }
         self.gpa.free(self.slots);
@@ -127,14 +205,32 @@ pub const Tiles = struct {
         const parsed = parseName(path) orelse return;
         const slot = &self.slots[parsed.index];
         if (slot.map != null) return; // first one found wins
-        const map = io.Mapping.mapFile(path, .read_only) catch return;
-        if (parsed.format == .raw and map.bytes.len != hgt_bytes) {
-            map.unmap();
-            return;
-        }
-        map.adviseAll(.random) catch {};
+        const map = mapTile(path, parsed.format) orelse return;
         slot.* = .{ .format = parsed.format, .map = map };
         self.count += 1;
+    }
+
+    fn mapTile(path: []const u8, format: Format) ?io.Mapping {
+        const map = io.Mapping.mapFile(path, .read_only) catch return null;
+        if (format == .raw and map.bytes.len != hgt_bytes) {
+            map.unmap();
+            return null;
+        }
+        map.adviseAll(.random) catch {};
+        return map;
+    }
+
+    fn bytesLess(a: []const u8, b: []const u8, deadline: io.Deadline) !bool {
+        const common = @min(a.len, b.len);
+        var offset: usize = 0;
+        while (offset < common) {
+            if (deadline.expired()) return error.DeadlineExceeded;
+            const len = @min(common - offset, 1024 * 1024);
+            const order = std.mem.order(u8, a[offset..][0..len], b[offset..][0..len]);
+            if (order != .eq) return order == .lt;
+            offset += len;
+        }
+        return a.len < b.len;
     }
 
     /// Decodes a tile into `out` (big-endian int16 bytes, `hgt_bytes` long)
@@ -550,4 +646,53 @@ test "sampling raw and lz4 tiles, no-data handling and edges" {
     try testing.expectApproxEqAbs(@as(f64, 3600), out[0], 1e-6);
     try testing.expectApproxEqAbs(@as(f64, 3600), out[1], 1e-6);
     try testing.expectEqual(no_data_value, out[2]);
+}
+
+test "build catalog selects duplicate tiles deterministically and fingerprints contents" {
+    const root = try io.Directory.open(".");
+    defer root.close();
+    const left = try root.temporaryChild();
+    defer root.deleteDir(&left.name) catch {};
+    defer left.dir.close();
+    const right = try root.temporaryChild();
+    defer root.deleteDir(&right.name) catch {};
+    defer right.dir.close();
+    const sub = try left.dir.createChild("nested");
+    defer left.dir.deleteDir("nested") catch {};
+    defer sub.close();
+
+    const name = "N47E008.hgt";
+    const Sparse = struct {
+        fn write(dir: io.Directory, tile: [:0]const u8, first: u8) !void {
+            const file = try dir.openOrCreateFile(tile);
+            defer file.close();
+            try file.truncate(hgt_bytes);
+            try file.pwriteAll(&.{ 0, first }, 0);
+        }
+    };
+    try Sparse.write(left.dir, name, 2);
+    defer left.dir.deleteFile(name) catch {};
+    try Sparse.write(sub, name, 1);
+    defer sub.deleteFile(name) catch {};
+    try Sparse.write(right.dir, name, 1);
+    defer right.dir.deleteFile(name) catch {};
+
+    const index = tileIndex(.{ .lng = 8.5, .lat = 47.5 });
+    var first = try Tiles.initBuild(testing.allocator, &left.name, .none);
+    defer first.deinit();
+    try testing.expectEqual(@as(usize, 1), first.count);
+    try testing.expectEqualSlices(u8, &.{ 0, 1 }, first.samples(index).?[0..2]);
+    const digest = try first.fingerprint(.none);
+    {
+        var second = try Tiles.initBuild(testing.allocator, &right.name, .none);
+        defer second.deinit();
+        try testing.expectEqual(digest, try second.fingerprint(.none));
+        var borrower = try second.borrowMappings(testing.allocator, .none);
+        borrower.deinit();
+        try testing.expectEqualSlices(u8, &.{ 0, 1 }, second.samples(index).?[0..2]);
+    }
+    try Sparse.write(right.dir, name, 3);
+    var changed = try Tiles.initBuild(testing.allocator, &right.name, .none);
+    defer changed.deinit();
+    try testing.expect(!std.mem.eql(u8, &digest, &try changed.fingerprint(.none)));
 }

@@ -154,30 +154,30 @@ pub fn trimShapePct(start_pct: f32, end_pct: f32, shape: *std.ArrayList(PointLL)
 
 /// Great-circle angle between two points in radians, as upstream computes it
 /// inside the resamplers (law of cosines; 0 for equal points).
-fn arc(last: PointLL, p: PointLL) f64 {
+fn arc(last: PointLL, p: PointLL, comptime math: type) f64 {
     if (last.eql(p)) return 0.0;
     const lon2 = p.lng * -k.rad_per_deg_d;
     const lat2 = p.lat * k.rad_per_deg_d;
-    return libm.acosF(libm.sinF(last.lat * k.rad_per_deg_d) * libm.sinF(lat2) +
-        libm.cosF(last.lat * k.rad_per_deg_d) * libm.cosF(lat2) * libm.cosF(last.lng * -k.rad_per_deg_d - lon2));
+    return math.acosF(math.sinF(last.lat * k.rad_per_deg_d) * math.sinF(lat2) +
+        math.cosF(last.lat * k.rad_per_deg_d) * math.cosF(lat2) * math.cosF(last.lng * -k.rad_per_deg_d - lon2));
 }
 
 /// The point `remaining` radians from `last` toward `p` (which is `d`
 /// radians away), as upstream interpolates.
-fn interpolate(last: PointLL, p: PointLL, d: f64, remaining: f64) PointLL {
+fn interpolate(last: PointLL, p: PointLL, d: f64, remaining: f64, comptime math: type) PointLL {
     const lon2 = p.lng * -k.rad_per_deg_d;
     const lat2 = p.lat * k.rad_per_deg_d;
     const lon1 = last.lng * -k.rad_per_deg_d;
     const lat1 = last.lat * k.rad_per_deg_d;
-    const sd = libm.sinF(d);
-    const a = libm.sinF(d - remaining) / sd;
-    const acs1 = a * libm.cosF(lat1);
-    const b = libm.sinF(remaining) / sd;
-    const bcs2 = b * libm.cosF(lat2);
-    const x = acs1 * libm.cosF(lon1) + bcs2 * libm.cosF(lon2);
-    const y = acs1 * libm.sinF(lon1) + bcs2 * libm.sinF(lon2);
-    const z = a * libm.sinF(lat1) + b * libm.sinF(lat2);
-    return .{ .lng = libm.atan2F(y, x) * -k.deg_per_rad_d, .lat = libm.atan2F(z, @sqrt(x * x + y * y)) * k.deg_per_rad_d };
+    const sd = math.sinF(d);
+    const a = math.sinF(d - remaining) / sd;
+    const acs1 = a * math.cosF(lat1);
+    const b = math.sinF(remaining) / sd;
+    const bcs2 = b * math.cosF(lat2);
+    const x = acs1 * math.cosF(lon1) + bcs2 * math.cosF(lon2);
+    const y = acs1 * math.sinF(lon1) + bcs2 * math.sinF(lon2);
+    const z = a * math.sinF(lat1) + b * math.sinF(lat2);
+    return .{ .lng = math.atan2F(y, x) * -k.deg_per_rad_d, .lat = math.atan2F(z, @sqrt(x * x + y * y)) * k.deg_per_rad_d };
 }
 
 /// util.cc `resample_spherical_polyline`: a point every `resolution`
@@ -200,6 +200,10 @@ pub fn resampleSpherical(gpa: Allocator, polyline: []const PointLL, resolution_m
 /// Emits each point to a caller-selected sink while walking the same
 /// great-circle segments as resampleSpherical.
 pub fn visitResampledSpherical(polyline: []const PointLL, resolution_m: f64, preserve: bool, sink: anytype) !void {
+    try visitResampledSphericalWith(polyline, resolution_m, preserve, sink, libm);
+}
+
+pub fn visitResampledSphericalWith(polyline: []const PointLL, resolution_m: f64, preserve: bool, sink: anytype, comptime math: type) !void {
     if (polyline.len == 0) return;
     const checks = @hasDecl(@TypeOf(sink.*), "check");
     const resolution = resolution_m * rad_per_meter;
@@ -209,12 +213,12 @@ pub fn visitResampledSpherical(polyline: []const PointLL, resolution_m: f64, pre
     var last = polyline[0];
     for (polyline[1..], 0..) |p, segment| {
         if (checks and segment & 1023 == 0) try sink.check();
-        var d = arc(last, p);
+        var d = arc(last, p, math);
         if (std.math.isNan(d)) d = 0.0;
         while (d > remaining) {
             const rest = d - remaining;
             if (checks and rest == d and remaining == resolution) return error.InvalidResolution;
-            last = interpolate(last, p, d, remaining);
+            last = interpolate(last, p, d, remaining, math);
             try sink.emit(last);
             d = rest;
             remaining = resolution;
@@ -239,10 +243,10 @@ pub fn uniformResampleSpherical(gpa: Allocator, polyline: []const PointLL, lengt
     var remaining = sample_distance;
     var last = polyline[0];
     for (polyline[1..]) |p| {
-        var d = arc(last, p);
+        var d = arc(last, p, libm);
         if (std.math.isNan(d)) continue;
         while (remaining < d) {
-            last = interpolate(last, p, d, remaining);
+            last = interpolate(last, p, d, remaining, libm);
             try out.append(gpa, last);
             d -= remaining;
             remaining = sample_distance;

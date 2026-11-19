@@ -2,6 +2,7 @@
 // (Valhalla 3.9.3). An edge is in OSM way orientation, before CSR assembly.
 const std = @import("std");
 const geo = @import("../geo/root.zig");
+const math = @import("../geo/build_math.zig");
 const io = @import("../infra/io.zig");
 const node_store = @import("node_store.zig");
 const pbf = @import("pbf/root.zig");
@@ -562,7 +563,7 @@ const Worker = struct {
         var flags: Flags = .{ .way_begin = true };
         while (end < refs.len) : (end += 1) {
             try checkDeadline(deadline, end - 1);
-            length += points[end].toPoint().distance(points[end - 1].toPoint());
+            length += points[end].toPoint().distanceWith(points[end - 1].toPoint(), math);
             const id = refs[end];
             if (end + 1 != refs.len and locations[end].?.uses < 2 and
                 !try self.cuts.contains(usage.keyFor(id)))
