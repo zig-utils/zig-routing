@@ -11,45 +11,11 @@ const none = protobuf.no_deadline;
 const BlobHeader = schema.BlobHeader;
 const Blob = schema.Blob;
 const HeaderBlock = schema.HeaderBlock;
-const StringTable = protobuf.Message(&.{
-    .{ .name = "s", .number = 1, .kind = .bytes, .presence = .repeated },
-});
-const Info = protobuf.Message(&.{
-    .{ .name = "version", .number = 1, .kind = .int32, .presence = .optional },
-    .{ .name = "changeset", .number = 3, .kind = .int64, .presence = .optional },
-});
-const entity_fields = [_]protobuf.Field{
-    .{ .name = "keys", .number = 2, .kind = .uint32, .presence = .repeated, .packed_encoding = true },
-    .{ .name = "vals", .number = 3, .kind = .uint32, .presence = .repeated, .packed_encoding = true },
-    .{ .name = "info", .number = 4, .kind = .message, .presence = .optional, .message = Info },
-};
-const Node = protobuf.Message(&([_]protobuf.Field{
-    .{ .name = "id", .number = 1, .kind = .sint64, .presence = .required },
-} ++ entity_fields ++ [_]protobuf.Field{
-    .{ .name = "lat", .number = 8, .kind = .sint64, .presence = .required },
-    .{ .name = "lon", .number = 9, .kind = .sint64, .presence = .required },
-}));
-const Way = protobuf.Message(&([_]protobuf.Field{
-    .{ .name = "id", .number = 1, .kind = .int64, .presence = .required },
-} ++ entity_fields ++ [_]protobuf.Field{
-    .{ .name = "refs", .number = 8, .kind = .sint64, .presence = .repeated, .packed_encoding = true },
-}));
-const Relation = protobuf.Message(&([_]protobuf.Field{
-    .{ .name = "id", .number = 1, .kind = .int64, .presence = .required },
-} ++ entity_fields ++ [_]protobuf.Field{
-    .{ .name = "roles_sid", .number = 8, .kind = .int32, .presence = .repeated, .packed_encoding = true },
-    .{ .name = "memids", .number = 9, .kind = .sint64, .presence = .repeated, .packed_encoding = true },
-    .{ .name = "types", .number = 10, .kind = .enumeration, .presence = .repeated, .packed_encoding = true },
-}));
-const PrimitiveGroup = protobuf.Message(&.{
-    .{ .name = "nodes", .number = 1, .kind = .message, .presence = .repeated, .message = Node },
-    .{ .name = "ways", .number = 3, .kind = .message, .presence = .repeated, .message = Way },
-    .{ .name = "relations", .number = 4, .kind = .message, .presence = .repeated, .message = Relation },
-});
-const PrimitiveBlock = protobuf.Message(&.{
-    .{ .name = "stringtable", .number = 1, .kind = .message, .presence = .required, .message = StringTable },
-    .{ .name = "primitivegroup", .number = 2, .kind = .message, .presence = .repeated, .message = PrimitiveGroup },
-});
+const Node = schema.Node;
+const Way = schema.Way;
+const Relation = schema.Relation;
+const PrimitiveGroup = schema.PrimitiveGroup;
+const PrimitiveBlock = schema.PrimitiveBlock;
 
 const Strings = struct {
     arena: Allocator,
@@ -206,4 +172,81 @@ test "PBF fixture writes deterministic framing, string IDs and negative way delt
     try std.testing.expectEqual(2, (try refs.next(none)).?);
     try std.testing.expectEqual(-1, (try refs.next(none)).?);
     try std.testing.expectEqual(null, try refs.next(none));
+}
+
+fn expectTags(expected: gurka.Tags, actual: *const @import("routing").build.pbf.block.TagIterator) !void {
+    var tags = actual.*;
+    for (expected) |tag| {
+        const decoded = (try tags.next()) orelse return error.MissingTag;
+        try std.testing.expectEqualStrings(tag.key, decoded.key);
+        try std.testing.expectEqualStrings(tag.value, decoded.value);
+    }
+    try std.testing.expectEqual(null, try tags.next());
+}
+
+test "primitive decoder round trips the Gurka dataset without allocating while iterating" {
+    const testing = std.testing;
+    const routing = @import("routing");
+    var state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+    const fixture = try gurka.Map.init(arena, try gurka.mapToCoordinates("A-B-C", 10), &.{
+        .{ .label = "BA", .tags = &.{.{ .key = "highway", .value = "residential" }} },
+        .{ .label = "BC", .tags = &.{.{ .key = "name", .value = "" }} },
+    }, &.{}, &.{.{
+        .tags = &.{.{ .key = "type", .value = "restriction" }},
+        .members = &.{
+            .{ .kind = .way, .ref = "BA", .role = "from" },
+            .{ .kind = .node, .ref = "B", .role = "via" },
+            .{ .kind = .way, .ref = "BC", .role = "to" },
+        },
+    }});
+    const bytes = try encode(arena, fixture.osm);
+    var index = try routing.build.pbf.file.Index.init(arena, bytes, .none);
+    defer index.deinit();
+    try testing.expectEqual(1, index.blobs.len);
+    const inflated = try index.inflateInto(0, &.{}, .none);
+    var counting = routing.infra.arena.CountingAllocator.init(testing.allocator);
+    const gpa = counting.allocator();
+    var scratch: routing.build.pbf.block.Scratch = .{};
+    defer scratch.deinit(gpa);
+    _ = try scratch.decode(gpa, inflated, .none);
+    counting.resetCounts();
+    const block = try scratch.decode(gpa, inflated, .none);
+    try testing.expectEqual(100, block.granularity);
+    try testing.expectEqual(1000, block.date_granularity);
+
+    var nodes = block.nodes();
+    for (fixture.osm.nodes) |expected| {
+        const node = (try nodes.next()) orelse return error.MissingNode;
+        try testing.expectEqual(expected.id, node.id);
+        try testing.expectEqual(try encodePosition(expected.location.lat, 90), node.lat);
+        try testing.expectEqual(try encodePosition(expected.location.lng, 180), node.lon);
+        try expectTags(expected.tags, &node.tags);
+    }
+    try testing.expectEqual(null, try nodes.next());
+    var ways = block.ways();
+    for (fixture.osm.ways) |expected| {
+        var way = (try ways.next()) orelse return error.MissingWay;
+        try testing.expectEqual(expected.id, way.id);
+        try expectTags(expected.tags, &way.tags);
+        for (expected.refs) |ref| try testing.expectEqual(@as(?i64, ref), try way.refs.next());
+        try testing.expectEqual(null, try way.refs.next());
+    }
+    try testing.expectEqual(null, try ways.next());
+    var relations = block.relations();
+    for (fixture.osm.relations) |expected| {
+        var relation = (try relations.next()) orelse return error.MissingRelation;
+        try testing.expectEqual(expected.id, relation.id);
+        try expectTags(expected.tags, &relation.tags);
+        for (expected.members) |expected_member| {
+            const member = (try relation.members.next()) orelse return error.MissingMember;
+            try testing.expectEqual(@backingInt(expected_member.kind), @backingInt(member.type));
+            try testing.expectEqual(expected_member.id, member.ref);
+            try testing.expectEqualStrings(expected_member.role, member.role);
+        }
+        try testing.expectEqual(null, try relation.members.next());
+    }
+    try testing.expectEqual(null, try relations.next());
+    try testing.expectEqual(0, counting.calls());
 }

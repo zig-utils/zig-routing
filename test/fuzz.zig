@@ -9,7 +9,7 @@
 //! decoders), `lz4` (block and frame decoders, plus a compress round trip),
 //! `dem` (the packed elevation block decoder), and `protobuf` (wire records
 //! and generated message views), `config` (Valhalla JSON settings), and
-//! `osm-pbf` (file framing and block inflation).
+//! `osm-pbf` (file framing, block inflation and OSM primitives).
 //!
 //! The contract for every parser: malformed input returns an error, never
 //! panics, overflows or reads out of bounds. The fuzz step builds ReleaseSafe
@@ -58,11 +58,60 @@ fn fuzzOsmPbf(_: void, s: *Smith) !void {
     var index = routing.build.pbf.file.Index.init(fixed.allocator(), input, .none) catch return;
     defer index.deinit();
     var scratch: [max_input]u8 = undefined;
+    var primitives: routing.build.pbf.block.Scratch = .{};
+    defer primitives.deinit(fixed.allocator());
     for (index.blobs, 0..) |blob, i| {
         const decoded = index.inflateInto(i, &scratch, .none) catch continue;
         try std.testing.expectEqual(blob.raw_size, decoded.len);
         try expectBorrowed(if (blob.compression == .raw) input else &scratch, decoded);
+        const block = primitives.decode(fixed.allocator(), decoded, .none) catch continue;
+        visitPrimitives(block) catch {};
     }
+}
+
+fn visitTags(tags: routing.build.pbf.block.TagIterator) !void {
+    var it = tags;
+    while (try it.next()) |_| {}
+}
+
+fn visitPrimitives(block: routing.build.pbf.block.Block) !void {
+    var nodes = block.nodes();
+    while (try nodes.next()) |node| try visitTags(node.tags);
+    var ways = block.ways();
+    while (try ways.next()) |item| {
+        var way = item;
+        try visitTags(way.tags);
+        while (try way.refs.next()) |_| {}
+    }
+    var relations = block.relations();
+    while (try relations.next()) |item| {
+        var relation = item;
+        try visitTags(relation.tags);
+        while (try relation.members.next()) |_| {}
+    }
+}
+
+fn osmPrimitiveSeed(buffer: []u8) ![]const u8 {
+    const pbf = routing.build.pbf.schema;
+    const none = protobuf.no_deadline;
+    var raw: [256]u8 = undefined;
+    const data = try pbf.PrimitiveBlock.encode(&raw, .{
+        .stringtable = .{ .s = &.{ "", "name", "A" } },
+        .primitivegroup = &.{
+            .{ .dense = .{ .id = &.{1}, .lat = &.{-2}, .lon = &.{3}, .keys_vals = &.{ 1, 2, 0 } } },
+            .{ .nodes = &.{.{ .id = 2, .lat = 0, .lon = 0 }} },
+            .{ .ways = &.{.{ .id = 3, .refs = &.{ 2, -1 }, .keys = &.{1}, .vals = &.{2} }} },
+            .{ .relations = &.{.{ .id = 4, .roles_sid = &.{2}, .memids = &.{3}, .types = &.{1} }} },
+        },
+    }, none);
+    const blob: pbf.Blob.Values = .{ .raw = data };
+    const header = try pbf.BlobHeader.encode(buffer[4..], .{
+        .type = "OSMData",
+        .datasize = @intCast(try pbf.Blob.encodedSize(blob, none)),
+    }, none);
+    std.mem.writeInt(u32, buffer[0..4], @intCast(header.len), .big);
+    const frame = try pbf.Blob.encode(buffer[4 + header.len ..], blob, none);
+    return buffer[0 .. 4 + header.len + frame.len];
 }
 
 test "fuzz osm-pbf" {
@@ -72,6 +121,9 @@ test "fuzz osm-pbf" {
     const raw = "\x00\x00\x00\x0b\x0a\x07OSMData\x18\x06\x0a\x04\x0a\x02\x0a\x00";
     const zlib = "\x00\x00\x00\x0b\x0a\x07OSMData\x18\x10\x1a\x0cx\x9c\xe3b\xe2b\x00\x00\x00F\x00\x17\x10\x04";
     const lz4_blob = "\x00\x00\x00\x0b\x0a\x07OSMData\x18\x09\x32\x05\x40\x0a\x02\x0a\x00\x10\x04";
+    var primitive_frame: [256]u8 = undefined;
+    const framed_primitives = try osmPrimitiveSeed(&primitive_frame);
+    const primitive_file = try std.mem.concat(state.allocator(), u8, &.{ header, framed_primitives });
     try std.testing.fuzz({}, fuzzOsmPbf, .{ .corpus = try seeds(state.allocator(), &.{
         "",
         header,
@@ -79,6 +131,7 @@ test "fuzz osm-pbf" {
         header ++ zlib,
         header ++ lz4_blob,
         header ++ raw ++ zlib ++ lz4_blob,
+        primitive_file,
         header ++ "\x00\x01\x00\x00",
     }) });
 }

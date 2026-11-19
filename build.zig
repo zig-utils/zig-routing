@@ -186,6 +186,16 @@ pub fn build(b: *std.Build) void {
     run_bench_osm_pbf.addPassthruArgs();
     b.step("bench-osm-pbf", "OSM PBF index and inflate throughput").dependOn(&run_bench_osm_pbf.step);
 
+    const check_osm_pbf = b.addExecutable(.{ .name = "check-osm-pbf", .root_module = b.createModule(.{
+        .root_source_file = b.path("test/check_osm_pbf.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "routing", .module = lib_mod }},
+    }) });
+    const run_check_osm_pbf = b.addRunArtifact(check_osm_pbf);
+    run_check_osm_pbf.addPassthruArgs();
+    b.step("check-osm-pbf", "Report OSM PBF primitive counts and tag checksums").dependOn(&run_check_osm_pbf.step);
+
     // Fuzz targets (test/fuzz.zig). `zig build test` replays their seeds; `zig build fuzz
     // --fuzz` fuzzes, ReleaseSafe by default so bounds and overflow checks stay on.
     const fuzz_filter = b.option([]const u8, "fuzz-target", "Fuzz one target: request, http, polyline, lz4, dem, protobuf, config, osm-pbf");
