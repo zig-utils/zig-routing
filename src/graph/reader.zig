@@ -3,12 +3,13 @@
 const std = @import("std");
 const io = @import("../infra/io.zig");
 const format = @import("format.zig");
+const class_table = @import("class_table.zig");
 const Kind = format.SectionKind;
 const Header = format.SectionHeader;
 const kinds = std.enums.values(Kind);
 
-pub const Files = std.EnumArray(Kind, []const u8);
-const Headers = std.EnumArray(Kind, Header);
+pub const Files = std.EnumArray(Kind, ?[]const u8);
+const Headers = std.EnumArray(Kind, ?Header);
 const Mappings = std.EnumArray(Kind, io.Mapping);
 
 pub const Diagnostic = struct {
@@ -29,10 +30,13 @@ pub const Bundle = struct {
         defer dir.close();
         var result: Bundle = .{ .mappings = .initFill(.{ .bytes = &.{} }), .view = undefined };
         errdefer result.close();
-        var files: Files = .initFill(&.{});
+        var files: Files = .initFill(null);
         for (kinds) |kind| {
             note(diagnostic, kind);
-            const file = try dir.readFile(kind.filename());
+            const file = dir.readFile(kind.filename()) catch |err| {
+                if (err == error.FileNotFound and !format.required_sections.contains(kind)) continue;
+                return err;
+            };
             defer file.close();
             const mapping = try io.Mapping.mapFd(file, .read_only);
             result.mappings.set(kind, mapping);
@@ -57,20 +61,26 @@ pub const View = struct {
     edges: []const format.EdgeHot,
     first_edge: []const format.FirstEdge,
     turns: []const format.TurnEntry,
+    classes: ?[]const class_table.EdgeClass,
 
     pub fn parse(files: Files, diagnostic: ?*Diagnostic) !View {
-        var headers: Headers = undefined;
+        var headers: Headers = .initFill(null);
         for (kinds) |kind| {
             note(diagnostic, kind);
-            headers.set(kind, try readHeader(kind, files.get(kind)));
+            const file = files.get(kind) orelse {
+                if (format.required_sections.contains(kind)) return error.MissingSection;
+                continue;
+            };
+            headers.set(kind, try readHeader(kind, file));
         }
-        const uuid = headers.get(.nodes).dataset_uuid;
+        const uuid = headers.get(.nodes).?.dataset_uuid;
         for (kinds) |kind| {
+            const here = headers.get(kind) orelse continue;
             note(diagnostic, kind);
-            if (!std.mem.eql(u8, &headers.get(kind).dataset_uuid, &uuid)) return error.DatasetUuidMismatch;
+            if (!std.mem.eql(u8, &here.dataset_uuid, &uuid)) return error.DatasetUuidMismatch;
         }
-        const node_count = headers.get(.nodes).count;
-        const edge_count = headers.get(.edges).count;
+        const node_count = headers.get(.nodes).?.count;
+        const edge_count = headers.get(.edges).?.count;
         if (node_count > std.math.maxInt(u32)) {
             note(diagnostic, .nodes);
             return error.TooManyRecords;
@@ -79,9 +89,15 @@ pub const View = struct {
             note(diagnostic, .edges);
             return error.TooManyRecords;
         }
-        if (headers.get(.first_edge).count != node_count + 1) {
+        if (headers.get(.first_edge).?.count != node_count + 1) {
             note(diagnostic, .first_edge);
             return error.InvalidCsrCount;
+        }
+        if (headers.get(.classes)) |classes| {
+            if (classes.count > class_table.max_classes) {
+                note(diagnostic, .classes);
+                return error.TooManyClasses;
+            }
         }
 
         var graph: View = .{
@@ -91,17 +107,20 @@ pub const View = struct {
             .edges = undefined,
             .first_edge = undefined,
             .turns = undefined,
+            .classes = null,
         };
         inline for (kinds) |kind| {
-            note(diagnostic, kind);
-            const count: usize = @intCast(headers.get(kind).count);
-            @field(graph, @tagName(kind)) = try io.typedSlice(kind.Record(), files.get(kind), format.payload_offset, count);
+            if (headers.get(kind)) |present| {
+                note(diagnostic, kind);
+                const count: usize = @intCast(present.count);
+                @field(graph, @tagName(kind)) = try io.typedSlice(kind.Record(), files.get(kind).?, format.payload_offset, count);
+            }
         }
         note(diagnostic, null);
         return graph;
     }
 
-    pub fn header(self: *const View, kind: Kind) Header {
+    pub fn header(self: *const View, kind: Kind) ?Header {
         return self.headers.get(kind);
     }
 
@@ -115,6 +134,14 @@ pub const View = struct {
         const index = @backingInt(id);
         if (index >= self.edges.len) return error.InvalidEdgeId;
         return &self.edges[index];
+    }
+
+    pub fn class(self: *const View, id: class_table.ClassId) !*const class_table.EdgeClass {
+        const classes = self.classes orelse return error.MissingClassSection;
+        if (id >= classes.len) return error.InvalidClassId;
+        const entry = &classes[id];
+        if (!entry.valid()) return error.InvalidEdgeClass;
+        return entry;
     }
 
     pub const EdgeRange = struct {
@@ -159,9 +186,11 @@ pub const View = struct {
 
     pub fn verify(self: *const View, deadline: io.Deadline, diagnostic: ?*Diagnostic) !void {
         for (kinds) |kind| {
+            const entry = self.header(kind) orelse continue;
             note(diagnostic, kind);
             if (deadline.expired()) return error.DeadlineExceeded;
             const bytes: []const u8 = switch (kind) {
+                .classes => std.mem.sliceAsBytes(self.classes.?),
                 inline else => |section| std.mem.sliceAsBytes(@field(self, @tagName(section))),
             };
             var hash = std.hash.XxHash3.init(0);
@@ -172,7 +201,7 @@ pub const View = struct {
                 hash.update(chunk);
                 rest = rest[chunk.len..];
             }
-            if (hash.final() != self.header(kind).payload_hash) return error.PayloadHashMismatch;
+            if (hash.final() != entry.payload_hash) return error.PayloadHashMismatch;
         }
         note(diagnostic, null);
     }

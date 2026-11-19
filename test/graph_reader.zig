@@ -66,6 +66,17 @@ test "mapped records have checked typed accessors and offline checksums" {
     try testing.expectError(error.InvalidNodeId, view.node(@fromBackingInt(@intCast(2))));
     try testing.expectError(error.InvalidEdgeId, view.edge(@fromBackingInt(@intCast(2))));
     try testing.expectError(error.InvalidLocalEdge, view.turnRow(@fromBackingInt(@intCast(1)), 1));
+    try testing.expectEqual(3, (try view.class(edges[0].cls.class_id)).access.forward);
+    try testing.expectEqual(7, (try view.class(edges[1].cls.class_id)).access.forward);
+    try testing.expectError(error.InvalidClassId, view.class(2));
+
+    const dir = try fixture.root.child("bundle");
+    defer dir.close();
+    try dir.deleteFile(format.SectionKind.classes.filename());
+    var topology = try reader.Bundle.open(fixture.path(&buf));
+    defer topology.close();
+    try topology.view.verify(.none, null);
+    try testing.expectError(error.MissingClassSection, topology.view.class(0));
 }
 
 test "reader rejects wrong magic, version, section kind, mixed UUIDs and sizes" {
@@ -129,9 +140,13 @@ test "startup skips hashing while accessors safely reject corrupt payloads" {
     var bad = edges[0];
     bad.cls.opp_local = 31;
     try edge_file.pwriteAll(std.mem.asBytes(&bad), format.payload_offset);
+    const class_file = try fixture.section(.classes);
+    defer class_file.close();
+    try class_file.pwriteAll(&.{0xff}, format.payload_offset);
 
     var bundle = try reader.Bundle.open(path_name);
     defer bundle.close();
     try testing.expectError(error.InvalidTurnOffset, bundle.view.turnRow(@fromBackingInt(@intCast(0)), 0));
     try testing.expectError(error.InvalidOpposingEdge, bundle.view.oppEdge(@fromBackingInt(@intCast(0))));
+    try testing.expectError(error.InvalidEdgeClass, bundle.view.class(0));
 }

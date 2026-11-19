@@ -81,6 +81,7 @@ fn fuzzGraphBundle(baseline: *const graph.reader.Files, s: *Smith) !void {
         _ = view.edge(@fromBackingInt(@intCast(id))) catch null;
         _ = view.outEdges(@fromBackingInt(@intCast(id))) catch null;
         _ = view.turnRow(@fromBackingInt(@intCast(id)), @truncate(input[input.len - 1])) catch null;
+        _ = view.class(@truncate(id)) catch null;
         if (view.oppEdge(@fromBackingInt(@intCast(id)))) |other| {
             try std.testing.expect(@backingInt(other) < view.edges.len);
         } else |_| {}
@@ -91,7 +92,7 @@ test "fuzz graph-bundle" {
     var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer state.deinit();
     const a = state.allocator();
-    var baseline: graph.reader.Files = .initFill(&.{});
+    var baseline: graph.reader.Files = .initFill(null);
     var candidates: [graph_kinds.len + 1][]const u8 = undefined;
     candidates[0] = &.{};
     inline for (graph_kinds, 0..) |kind, i| {

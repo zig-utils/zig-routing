@@ -85,8 +85,11 @@ const Node = struct {
 
 pub fn write(graph: *const reader.View, out: *io.Writer, json: bool, verified: bool, edge_id: ?u32, node_id: ?u32) !void {
     var sections: [kinds.len]Section = undefined;
-    for (kinds, &sections) |kind, *section| {
-        const header = graph.header(kind);
+    var count: usize = 0;
+    for (kinds) |kind| {
+        const header = graph.header(kind) orelse continue;
+        const section = &sections[count];
+        count += 1;
         section.* = .{
             .kind = kind,
             .file = kind.filename(),
@@ -106,7 +109,7 @@ pub fn write(graph: *const reader.View, out: *io.Writer, json: bool, verified: b
             .version = format.version,
             .dataset_uuid = uuid,
             .verified = verified,
-            .sections = sections,
+            .sections = sections[0..count],
             .edge = edge_record,
             .node = node_record,
         }, .{}, out);
@@ -116,7 +119,7 @@ pub fn write(graph: *const reader.View, out: *io.Writer, json: bool, verified: b
 
     try out.print("Graph bundle v{d}  {s}\n", .{ format.version, uuid });
     try out.print("{s: <16} {s: >12} {s: >11} {s: >14}  {s}\n", .{ "File", "Records", "Record size", "File bytes", "XXH3-64" });
-    for (sections) |section| {
+    for (sections[0..count]) |section| {
         try out.print("{s: <16} {d: >12} {d: >11} {d: >14}  {s}\n", .{
             section.file, section.count, section.record_size, section.bytes, section.xxh3,
         });

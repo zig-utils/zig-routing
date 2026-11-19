@@ -126,6 +126,40 @@ const NodeHot = extern struct {            // 8 B (+ first_edge: u32 in its own 
 
 **16 GB budget for US+DACH.** Hot graph 5.8, CCH 1.8, three metrics 3.9, spatial resident 0.3, live traffic 0.3 and eight threads of scratch 0.6 come to about 12.7 GB. That leaves about 3 GB for the OS and cold page cache. It is tight: the knobs are two metrics instead of three and keeping cold data on NVMe. Planet needs about 55-60 GB resident with three metrics, so plan for 96-128 GB; 64 GB works only with two metrics.
 
+### Directed-edge field mapping
+
+`classes.bin` is v1 section kind 5. Each record is a 20-byte `EdgeClass` made of five packed
+32-bit words. The builder interns complete records, sorts the distinct tuples lexicographically
+by their little-endian bytes, then remaps handles to the final 20-bit IDs in `EdgeHot`.
+The capacity is 1,048,576 distinct tuples.
+
+| Valhalla 3.9.3 `DirectedEdge` fields | Native representation |
+| --- | --- |
+| `endnode_`, `localedgeidx_`, `opp_local_idx_` | `EdgeHot.head`, `EdgeHot.cls.local`, `EdgeHot.cls.opp_local` |
+| `opp_index_` | Derived as `first_edge[head] + opp_local` |
+| `length_`, `weighted_grade_`, `curvature_` | `EdgeHot.geom` |
+| `speed_`, `free_flow_speed_`, `constrained_flow_speed_`, `truck_speed_`, `has_predicted_speed_` | `EdgeHot.speed` and `EdgeHot.cls.pred_speed`. Predicted profiles and live samples use their traffic sections. |
+| `use_`, `classification_`, `surface_`, `sac_scale_`, `cycle_lane_`, `bike_network_`, `lanecount_`, `density_` | `EdgeClass.category`. The Valhalla bicycle-network predicate uses the national, regional, local and MTB bits. The OSM international-network bit is retained as attribution. |
+| `forwardaccess_`, `reverseaccess_`, `hov_type_` | `EdgeClass.access` stores two 16-bit masks relative to the directed edge. `flags.hov3` distinguishes HOV3 from HOV2. HOV-only access is derived from the forward mask. |
+| `toll_`, `tunnel_`, `bridge_`, `roundabout_`, `link_`, `internal_`, `truck_route_`, `dest_only_`, `dest_only_hgv_`, `not_thru_`, `deadend_` | `EdgeClass.flags` |
+| `lit_`, `sidewalk_left_`, `sidewalk_right_`, `shoulder_`, `dismount_`, `use_sidepath_`, `named_`, `indoor_`, `bss_connection_`, `ctry_crossing_`, `speed_type_` | `EdgeClass.flags` |
+| `traffic_signal_`, `stop_sign_`, `yield_sign_` | `EdgeClass.flags` for controls carried by the segment. Intersection controls are supplied by the corresponding node and turn data. |
+| `max_up_slope_`, `max_down_slope_`, `access_restriction_` | `EdgeClass.detail`. The mask selects applicable cold restriction rules when `EdgeHot.cls.cold_checks` is set. |
+| `start_restriction_`, `end_restriction_`, `complex_restriction_` | `EdgeClass.restrictions` stores both mode masks, with `flags.complex_restriction` for via edges. Sequences and conditions live in the restriction sections. |
+| `restrictions_`, `name_consistency_`, `turntype_`, `stopimpact_.s.stopimpact` | Per-pair `TurnEntry` fields for restrictions, name consistency, turn type and stop impact |
+| `edge_to_left_`, `stopimpact_.s.edge_to_right` | Local intersection geometry supplies these per-turn side relationships for transition costing. |
+| `edgeinfo_offset_`, `forward_`, `sign_`, `turnlanes_`, `lane_conn_` | Cold edge index and orientation, signs, turn lanes and lane connectivity |
+| `stopimpact_.lineid` | Transit line and schedule data |
+| `shortcut_`, `superseded_`, `is_shortcut_`, `leaves_tile_` | CCH arcs are separate from the base graph. The base graph uses dense bundle IDs. |
+
+The way projection sets directional access, lane count, cycle lane, shoulder and segment controls.
+Later build stages fill attributes that depend on relations, restrictions, names, elevation or
+graph topology. The class table keeps those categorical values in the same lookup used by costing.
+
+On the pinned Liechtenstein PBF, `zig build check-edges -- INPUT.osm.pbf SCRATCH_DIR 4 right`
+reported 279 base classes across 15,760 directed edges. Utrecht reported 1,379 across 85,336.
+The class table checksum was identical with 1, 4 and 8 workers on each extract.
+
 ## Q3. Hot loop in Zig
 
 ```zig

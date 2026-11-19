@@ -1,6 +1,7 @@
 //! Graph bundle v1. See docs/design/engine-and-format.md, Q2.
 const std = @import("std");
 const io = @import("../infra/io.zig");
+const class_table = @import("class_table.zig");
 
 pub const magic = "ZRGRAPH\x00".*;
 pub const version: u32 = 1;
@@ -18,7 +19,7 @@ pub const EdgeHot = extern struct {
         curvature: u4,
     },
     cls: packed struct(u32) {
-        class_id: u20,
+        class_id: class_table.ClassId,
         local: u5,
         opp_local: u5,
         cold_checks: u1,
@@ -50,6 +51,7 @@ pub const SectionKind = enum(u32) {
     edges = 2,
     first_edge = 3,
     turns = 4,
+    classes = 5,
 
     pub fn filename(self: SectionKind) [:0]const u8 {
         return switch (self) {
@@ -57,6 +59,7 @@ pub const SectionKind = enum(u32) {
             .edges => "edges.bin",
             .first_edge => "first_edge.bin",
             .turns => "turns.bin",
+            .classes => "classes.bin",
         };
     }
 
@@ -66,6 +69,7 @@ pub const SectionKind = enum(u32) {
             .edges => EdgeHot,
             .first_edge => FirstEdge,
             .turns => TurnEntry,
+            .classes => class_table.EdgeClass,
         };
     }
 
@@ -76,7 +80,8 @@ pub const SectionKind = enum(u32) {
     }
 };
 
-pub const required_sections = std.EnumSet(SectionKind).initMany(&.{ .nodes, .edges, .first_edge, .turns });
+pub const core_sections = [_]SectionKind{ .nodes, .edges, .first_edge, .turns };
+pub const required_sections = std.EnumSet(SectionKind).initMany(&core_sections);
 
 /// File header at offset 0. Zero padding runs up to payload_offset.
 pub const SectionHeader = extern struct {
@@ -311,7 +316,7 @@ test "v1 bundle matches independently packed section hex and publishes together"
 
     const fixture = @embedFile("testdata/bundle-v1.hex");
     var lines = std.mem.tokenizeScalar(u8, fixture, '\n');
-    for (std.enums.values(SectionKind)) |kind| {
+    for (core_sections) |kind| {
         var line = std.mem.splitScalar(u8, lines.next().?, ' ');
         try testing.expectEqualStrings(kind.filename(), line.next().?);
         var expected: [128]u8 = undefined;

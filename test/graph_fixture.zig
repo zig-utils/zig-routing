@@ -13,18 +13,22 @@ const edges = [_]format.EdgeHot{
     .{
         .head = 1,
         .geom = .{ .len_m = 1234, .grade = 2, .curvature = 1 },
-        .cls = .{ .class_id = 7, .local = 0, .opp_local = 0, .cold_checks = 1, .pred_speed = 0 },
+        .cls = .{ .class_id = 0, .local = 0, .opp_local = 0, .cold_checks = 1, .pred_speed = 0 },
         .speed = .{ 140, 50, 35, 40 },
     },
     .{
         .head = 0,
         .geom = .{ .len_m = 1234, .grade = 1, .curvature = 3 },
-        .cls = .{ .class_id = 9, .local = 0, .opp_local = 0, .cold_checks = 0, .pred_speed = 1 },
+        .cls = .{ .class_id = 1, .local = 0, .opp_local = 0, .cold_checks = 0, .pred_speed = 1 },
         .speed = .{ 40, 45, 30, 35 },
     },
 };
 const first_edge = [_]format.FirstEdge{ 0, 1, 2 };
 const turns = [_]format.TurnEntry{ 0xb9, 0x72 };
+const classes = [_]routing.graph.class_table.EdgeClass{
+    .{ .access = .{ .forward = 3, .reverse = 7 } },
+    .{ .access = .{ .forward = 7, .reverse = 3 } },
+};
 
 pub fn records(comptime kind: format.SectionKind) []const kind.Record() {
     return switch (kind) {
@@ -32,6 +36,7 @@ pub fn records(comptime kind: format.SectionKind) []const kind.Record() {
         .edges => &edges,
         .first_edge => &first_edge,
         .turns => &turns,
+        .classes => &classes,
     };
 }
 
