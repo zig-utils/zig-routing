@@ -1,6 +1,6 @@
 # zig-routing issue outline: the single source of truth for keys, titles, labels and dependencies.
 # Format: KEY | title | area | type | size | blocked-by keys (space separated, or -) | flags (optional: needs-human)
-# Order is execution order. A blocker must appear above the issue it blocks.
+# Rows set issue priority. Dependencies may point to any issue and must be acyclic.
 # Phase headers: "## P<n> | milestone title | one-line goal"
 
 ## P0 | P0 Baseline, oracle and harness | Measure Valhalla on our data and build the tools every later phase is gated by.

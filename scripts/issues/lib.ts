@@ -27,10 +27,14 @@ export interface Body {
 }
 
 export function loadOutline(): { phases: Phase[], issues: Issue[] } {
+  return parseOutline(readFileSync(join(DIR, 'OUTLINE.txt'), 'utf8'))
+}
+
+export function parseOutline(source: string): { phases: Phase[], issues: Issue[] } {
   const phases: Phase[] = []
   const issues: Issue[] = []
   const seen = new Set<string>()
-  for (const raw of readFileSync(join(DIR, 'OUTLINE.txt'), 'utf8').split('\n')) {
+  for (const raw of source.split('\n')) {
     const line = raw.trim()
     if (!line) continue
     if (line.startsWith('## ')) {
@@ -44,13 +48,36 @@ export function loadOutline(): { phases: Phase[], issues: Issue[] } {
     if (!key || !title || !area || !type || !size) throw new Error(`Bad outline line: ${line}`)
     if (seen.has(key)) throw new Error(`Duplicate key ${key}`)
     const blockers = !blocked || blocked === '-' ? [] : blocked.split(/\s+/)
-    for (const blocker of blockers) {
-      if (!seen.has(blocker)) throw new Error(`${key} is blocked by ${blocker}, which is not above it`)
-    }
     seen.add(key)
     issues.push({ key, phase: key.split('.')[0]!, title, area, type, size, blockers, flags: flags ? flags.split(/\s+/) : [] })
   }
+  validateDependencies(issues)
   return { phases, issues }
+}
+
+function validateDependencies(issues: Issue[]): void {
+  const byKey = new Map(issues.map(issue => [issue.key, issue]))
+  const checked = new Set<string>()
+  const path: string[] = []
+  const visiting = new Set<string>()
+  function visit(issue: Issue): void {
+    if (checked.has(issue.key)) return
+    if (visiting.has(issue.key)) {
+      const cycle = [...path.slice(path.indexOf(issue.key)), issue.key].join(' -> ')
+      throw new Error(`Dependency cycle: ${cycle}`)
+    }
+    path.push(issue.key)
+    visiting.add(issue.key)
+    for (const key of issue.blockers) {
+      const blocker = byKey.get(key)
+      if (!blocker) throw new Error(`${issue.key} is blocked by unknown issue ${key}`)
+      visit(blocker)
+    }
+    path.pop()
+    visiting.delete(issue.key)
+    checked.add(issue.key)
+  }
+  for (const issue of issues) visit(issue)
 }
 
 export function loadBodies(): Map<string, Body> {

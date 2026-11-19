@@ -178,6 +178,13 @@ for (const phase of phases) {
 
 // Now that every number is known: fill the epics' task lists and the start-here index, then pin it.
 if (!created.__finalized) {
+  const positions = new Map(issues.map((issue, i) => [issue.key, i]))
+  for (const [i, issue] of issues.entries()) {
+    if (!issue.blockers.some(blocker => positions.get(blocker)! > i)) continue
+    const phase = phases.find(candidate => candidate.id === issue.phase)!
+    await withRetry(issue.key, () => gh(['issue', 'edit', String(created[issue.key]), '-R', repo, '--body-file', '-'], leafBody(issue, bodies.get(issue.key)!, phase)))
+    await sleep(800)
+  }
   for (const phase of phases) {
     await withRetry(`epic ${phase.id}`, () => gh(['issue', 'edit', String(created[`EPIC-${phase.id}`]), '-R', repo, '--body-file', '-'], epicBody(phase)))
     await sleep(800)
