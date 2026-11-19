@@ -12,6 +12,8 @@ const Section = struct {
     record_size: u32,
     bytes: u64,
     xxh3: [16]u8,
+    placement: format.Placement,
+    resident_bytes: ?usize,
 };
 
 const Edge = struct {
@@ -83,7 +85,8 @@ const Node = struct {
     }
 };
 
-pub fn write(graph: *const reader.View, out: *io.Writer, json: bool, verified: bool, edge_id: ?u32, node_id: ?u32) !void {
+pub fn write(bundle: *const reader.Bundle, out: *io.Writer, json: bool, verified: bool, edge_id: ?u32, node_id: ?u32) !void {
+    const graph = &bundle.view;
     var sections: [kinds.len]Section = undefined;
     var count: usize = 0;
     for (kinds) |kind| {
@@ -97,6 +100,8 @@ pub fn write(graph: *const reader.View, out: *io.Writer, json: bool, verified: b
             .record_size = header.record_size,
             .bytes = format.payload_offset + header.count * header.record_size,
             .xxh3 = undefined,
+            .placement = kind.placement(),
+            .resident_bytes = bundle.residentBytes(kind, .none) catch null,
         };
         _ = std.fmt.bufPrint(&section.xxh3, "{x:0>16}", .{header.payload_hash}) catch unreachable;
     }
@@ -124,10 +129,14 @@ pub fn write(graph: *const reader.View, out: *io.Writer, json: bool, verified: b
 
     try out.print("Graph bundle v{d}  {s}\n", .{ format.version, uuid });
     if (ordering) |value| try out.print("Ordering {s}  {s}\n", .{ @tagName(value.kind), value.xxh3 });
-    try out.print("{s: <16} {s: >12} {s: >11} {s: >14}  {s}\n", .{ "File", "Records", "Record size", "File bytes", "XXH3-64" });
+    try out.print("{s: <16} {s: >12} {s: >11} {s: >14}  {s: <4} {s: >14}  {s}\n", .{
+        "File", "Records", "Record size", "File bytes", "Use", "Resident bytes", "XXH3-64",
+    });
     for (sections[0..count]) |section| {
-        try out.print("{s: <16} {d: >12} {d: >11} {d: >14}  {s}\n", .{
-            section.file, section.count, section.record_size, section.bytes, section.xxh3,
+        var buffer: [24]u8 = undefined;
+        const resident = if (section.resident_bytes) |bytes| try std.fmt.bufPrint(&buffer, "{d}", .{bytes}) else "unavailable";
+        try out.print("{s: <16} {d: >12} {d: >11} {d: >14}  {s: <4} {s: >14}  {s}\n", .{
+            section.file, section.count, section.record_size, section.bytes, @tagName(section.placement), resident, section.xxh3,
         });
     }
     if (verified) try out.writeAll("All section checksums verified.\n");

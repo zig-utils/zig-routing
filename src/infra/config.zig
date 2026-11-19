@@ -40,6 +40,7 @@ pub const Config = struct {
     pub const ZigRouting = struct {
         build: Build = .{},
         bundle_path: ?[]const u8 = null,
+        mlock_hot: bool = false,
         threads: usize = 0,
         request_memory_bytes: usize = (http.Config{}).arena_cap_bytes,
         max_header_bytes: usize = (http.Config{}).max_header_bytes,

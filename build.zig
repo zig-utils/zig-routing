@@ -138,6 +138,9 @@ pub fn build(b: *std.Build) void {
     graph_inspect.expectStdOutMatch("\"verified\":true");
     graph_inspect.expectStdOutMatch("\"file\":\"edges.bin\",\"count\":2");
     graph_inspect.expectStdOutMatch("\"file\":\"classes.bin\",\"count\":2");
+    graph_inspect.expectStdOutMatch("\"placement\":\"hot\",\"resident_bytes\":");
+    graph_inspect.expectStdOutMatch("\"placement\":\"warm\",\"resident_bytes\":");
+    graph_inspect.expectStdOutMatch("\"placement\":\"cold\",\"resident_bytes\":");
     graph_inspect.expectStdOutMatch("\"edge\":{\"id\":0,\"head\":1,\"opposing\":1");
     graph_inspect.expectStdOutMatch("\"speeds\":{\"speed\":140");
     graph_inspect.expectStdOutMatch("\"node\":{\"id\":1,\"first_edge\":1,\"degree\":1");

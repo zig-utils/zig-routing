@@ -88,6 +88,8 @@ pub const Metadata = extern struct {
     }
 };
 
+pub const Placement = enum { hot, warm, cold };
+
 pub const SectionKind = enum(u32) {
     nodes = 1,
     edges = 2,
@@ -102,6 +104,14 @@ pub const SectionKind = enum(u32) {
     metadata = 11,
     components = 12,
     turn_sides = 13,
+
+    pub fn placement(kind: SectionKind) Placement {
+        return switch (kind) {
+            .nodes, .edges, .first_edge, .turns, .classes, .turn_sides => .hot,
+            .coordinates, .spatial, .components, .metadata => .warm,
+            .cold_idx, .cold, .slopes => .cold,
+        };
+    }
 
     pub fn filename(self: SectionKind) [:0]const u8 {
         return switch (self) {

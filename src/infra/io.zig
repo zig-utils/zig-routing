@@ -510,10 +510,9 @@ pub const Mapping = struct {
     /// Advises the kernel about a page-aligned range (offset is rounded down,
     /// end rounded up). Unsupported advice is a no-op.
     pub fn advise(self: Mapping, offset: usize, len: usize, advice: Advice) Error!void {
-        if (self.bytes.len == 0 or len == 0) return;
-        const start = std.mem.alignBackward(usize, offset, page_size);
-        const end = @min(self.bytes.len, std.mem.alignForward(usize, offset + len, page_size));
-        if (start >= end) return;
+        if (offset >= self.bytes.len or len == 0) return;
+        const start = std.mem.alignBackward(usize, offset, std.heap.pageSize());
+        const end = @min(self.bytes.len, offset +| len);
         const code: u32 = switch (advice) {
             .normal => c.MADV.NORMAL,
             .will_need => c.MADV.WILLNEED,
@@ -535,6 +534,43 @@ pub const Mapping = struct {
     pub fn lock(self: Mapping) Error!void {
         if (self.bytes.len == 0) return;
         _ = try checkInt(c.mlock(@ptrCast(self.bytes.ptr), self.bytes.len));
+    }
+
+    /// Snapshot of resident bytes without reading the mapped data. Count
+    /// only bytes within the file when the final page is partial.
+    pub fn residentBytes(self: Mapping, deadline: Deadline) (Error || error{DeadlineExceeded})!usize {
+        if (self.bytes.len == 0) return 0;
+        const granularity = std.heap.pageSize();
+        const batch_pages = 512;
+        // Linux's mincore can report every page of a file as resident when
+        // the caller cannot write it. Read the process's present bits instead.
+        const pagemap = if (is_linux) try File.open("/proc/self/pagemap", .read_only) else {};
+        defer if (is_linux) pagemap.close();
+        var offset: usize = 0;
+        var resident: usize = 0;
+        while (offset < self.bytes.len) {
+            if (deadline.expired()) return error.DeadlineExceeded;
+            const len = @min(self.bytes.len - offset, granularity * batch_pages);
+            const pages = (len - 1) / granularity + 1;
+            if (is_linux) {
+                var entries: [batch_pages]u64 = undefined;
+                const address = @intFromPtr(self.bytes.ptr) + offset;
+                const first_entry = (address / granularity) * @sizeOf(u64);
+                try pagemap.preadAll(std.mem.sliceAsBytes(entries[0..pages]), first_entry);
+                for (entries[0..pages], 0..) |entry, i| {
+                    if (entry >> 63 != 0) resident += @min(granularity, len - i * granularity);
+                }
+            } else {
+                var entries: [batch_pages]u8 = undefined;
+                const ptr: *align(page_size) anyopaque = @ptrCast(@alignCast(self.bytes.ptr + offset));
+                _ = try checkInt(c.mincore(ptr, len, &entries));
+                for (entries[0..pages], 0..) |entry, i| {
+                    if (entry & 1 != 0) resident += @min(granularity, len - i * granularity);
+                }
+            }
+            offset += len;
+        }
+        return resident;
     }
 
     /// A typed view of `count` records of `T` starting at byte `offset`. The
@@ -1006,6 +1042,28 @@ test "mmap a file and read typed records" {
     const whole = try readFileAlloc(testing.allocator, path, 1 << 20);
     defer testing.allocator.free(whole);
     try testing.expectEqual(@as(usize, 8000), whole.len);
+}
+
+test "mapping residency counts only file bytes in the last page" {
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "resident");
+    defer unlink(path);
+    const file = try File.open(path, .create_truncate);
+    defer file.close();
+    const size = std.heap.pageSize();
+    const len = 2 * size + 73;
+    try file.truncate(len);
+    const map = try Mapping.mapFd(file, .read_only);
+    defer map.unmap();
+
+    try testing.expectError(error.DeadlineExceeded, map.residentBytes(.{ .at_ns = 0 }));
+    try testing.expect(try map.residentBytes(.none) <= len);
+    for (0..3) |page| {
+        const byte: *const volatile u8 = &map.bytes[page * size];
+        _ = byte.*;
+    }
+    try testing.expectEqual(len, try map.residentBytes(.none));
+    try map.advise(size + 37, std.math.maxInt(usize), .random);
 }
 
 test "shared writable mapping is visible to a second mapping" {

@@ -61,7 +61,61 @@ pub const Bundle = struct {
         for (kinds) |kind| self.mappings.get(kind).unmap();
         self.* = undefined;
     }
+
+    /// Call in the startup worker while the bundle remains mapped.
+    pub fn warm(self: *const Bundle, lock_hot: bool, stopping: *const std.atomic.Value(bool)) void {
+        for (kinds) |kind| {
+            if (stopping.load(.acquire)) return;
+            const mapping = self.mappings.get(kind);
+            placeMapping(mapping, kind.placement(), lock_hot);
+        }
+    }
+
+    pub fn residentBytes(self: *const Bundle, kind: Kind, deadline: io.Deadline) !?usize {
+        if (self.view.header(kind) == null) return null;
+        return try self.mappings.get(kind).residentBytes(deadline);
+    }
 };
+
+fn placeMapping(mapping: anytype, placement: format.Placement, lock_hot: bool) void {
+    switch (placement) {
+        .hot => {
+            mapping.adviseAll(.huge_page) catch {};
+            mapping.adviseAll(.will_need) catch {};
+            if (lock_hot) mapping.lock() catch {};
+        },
+        .cold => mapping.adviseAll(.random) catch {},
+        .warm => {},
+    }
+}
+
+test "placement continues when the IO shim rejects advice and page locks" {
+    const Failure = struct {
+        advice: std.EnumSet(io.Advice) = .{},
+        lock_attempts: u8 = 0,
+
+        fn adviseAll(self: *@This(), advice: io.Advice) error{InvalidArgument}!void {
+            self.advice.insert(advice);
+            return error.InvalidArgument;
+        }
+
+        fn lock(self: *@This()) error{AccessDenied}!void {
+            self.lock_attempts += 1;
+            return error.AccessDenied;
+        }
+    };
+    var mapping: Failure = .{};
+    placeMapping(&mapping, .warm, true);
+    try std.testing.expect(mapping.advice.count() == 0 and mapping.lock_attempts == 0);
+    placeMapping(&mapping, .cold, true);
+    try std.testing.expectEqual(std.EnumSet(io.Advice).initOne(.random), mapping.advice);
+    try std.testing.expectEqual(@as(u8, 0), mapping.lock_attempts);
+    placeMapping(&mapping, .hot, false);
+    try std.testing.expect(mapping.advice.contains(.huge_page) and mapping.advice.contains(.will_need));
+    try std.testing.expectEqual(@as(u8, 0), mapping.lock_attempts);
+    placeMapping(&mapping, .hot, true);
+    try std.testing.expectEqual(@as(u8, 1), mapping.lock_attempts);
+}
 
 /// Typed slices borrow the section files. Retrieval checks any payload
 /// values used as indices, since opening a bundle reads only the headers.

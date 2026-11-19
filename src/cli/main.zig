@@ -229,6 +229,9 @@ fn checkConfig(ctx: *Context) !u8 {
 
 const Runtime = struct {
     svc: service.Service,
+    bundle: ?routing.graph.reader.Bundle = null,
+    warmup: ?std.Thread = null,
+    stopping: std.atomic.Value(bool) = .init(false),
     tiles: ?routing.elevation.hgt.Tiles = null,
     pack: ?routing.elevation.@"packed".Pack = null,
     source: routing.elevation.Source = undefined,
@@ -247,8 +250,23 @@ const Runtime = struct {
     }
 
     fn close(self: *Runtime) void {
+        self.stopping.store(true, .release);
+        if (self.warmup) |worker| worker.join();
+        if (self.bundle) |*bundle| bundle.close();
         if (self.pack) |*pack| pack.close();
         if (self.tiles) |*tiles| tiles.deinit();
+    }
+
+    fn startWarmup(self: *Runtime, lock_hot: bool) void {
+        if (self.bundle == null) return;
+        self.warmup = std.Thread.spawn(.{}, warmBundle, .{ self, lock_hot }) catch |err| {
+            std.log.warn("could not start graph warm-up ({t})", .{err});
+            return;
+        };
+    }
+
+    fn warmBundle(self: *Runtime, lock_hot: bool) void {
+        self.bundle.?.warm(lock_hot, &self.stopping);
     }
 };
 
@@ -267,6 +285,9 @@ fn serve(ctx: *Context) !u8 {
     defer runtime.close();
     const elevation = ctx.getOption("elevation") orelse loaded.config.additional_data.elevation;
     try runtime.open(elevation);
+    if (loaded.config.zig_routing.bundle_path) |path| {
+        runtime.bundle = try routing.graph.reader.Bundle.open(path);
+    }
     io.installTerminationHandler();
     var server = http.Server.init(std.heap.c_allocator, settings, runtime.svc.handler());
     try server.start();
@@ -282,6 +303,7 @@ fn serve(ctx: *Context) !u8 {
             routing.version, ip[0], ip[1], ip[2], ip[3], server.port, server.threads.items.len,
         });
     }
+    runtime.startWarmup(loaded.config.zig_routing.mlock_hot);
     while (!io.termination_requested.load(.acquire)) io.sleepMs(200);
     if (@backingInt(app.log_level) >= @backingInt(std.log.Level.info)) {
         std.debug.print("shutting down: draining in-flight requests\n", .{});
@@ -466,7 +488,7 @@ fn inspectGraph(ctx: *Context) !u8 {
     else
         Bundle.openDescribed(path, &diagnostic) catch |err| return graphDiagnostic(ctx, "open", diagnostic, err);
     defer bundle.close();
-    try routing.cli.inspect.write(&bundle.view, ctx.out.?, ctx.wantsJson(), verify, edge_id, node_id);
+    try routing.cli.inspect.write(&bundle, ctx.out.?, ctx.wantsJson(), verify, edge_id, node_id);
     return 0;
 }
 
