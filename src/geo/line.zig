@@ -12,7 +12,6 @@ const k = @import("constants.zig");
 const point = @import("point.zig");
 const Deadline = @import("../infra/io.zig").Deadline;
 const PointLL = point.PointLL;
-const Deadline = @import("../infra/io.zig").Deadline;
 const Allocator = std.mem.Allocator;
 
 const rad_per_meter: f64 = 1.0 / 6378160.187;
