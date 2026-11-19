@@ -65,10 +65,14 @@ pub const Boolean = enum {
     truck,
     bus_taxi,
     psv,
+    psv_bus_node,
+    psv_taxi_node,
     foot,
+    wheelchair,
     bicycle,
     cycleway,
     moped,
+    motorcycle_node,
     oneway,
     private,
     no_thru_traffic,
@@ -95,10 +99,14 @@ pub fn single(kind: Boolean, value: ?Value) ?bool {
         .truck => known(v, &.{ .designated, .yes, .destination, .delivery, .local, .private, .permissive, .official, .permit, .residents }, &(motor_denied ++ .{.unsuitable})),
         .bus_taxi => known(v, &.{ .yes, .designated, .urban, .permissive, .restricted, .destination, .official, .permit }, &.{ .no, .delivery }),
         .psv => known(v, &.{ .bus, .taxi, .yes, .designated, .permissive, .@"1", .@"2" }, &.{.no}),
+        .psv_bus_node => known(v, &.{ .bus, .yes, .designated, .permissive, .@"1", .@"2" }, &.{.no}),
+        .psv_taxi_node => known(v, &.{ .taxi, .yes, .designated, .permissive, .@"1", .@"2" }, &.{.no}),
         .foot => known(v, &(motor_allowed ++ .{ .use_sidepath, .crossing, .sidewalk, .passable, .footway }), &motor_denied),
+        .wheelchair => known(v, &.{ .yes, .designated, .limited, .official, .destination, .public, .permissive, .only, .private, .assisted, .permit, .residents }, &.{ .no, .impassable, .partial, .bad, .half }),
         .bicycle => known(v, &(bike_allowed ++ .{ .official, .permit, .residents }), &.{ .no, .none }),
         .cycleway => known(v, &(bike_allowed ++ .{ .cyclestreet, .crossing }), &.{}),
         .moped => known(v, &.{ .yes, .designated, .private, .permissive, .destination, .delivery, .dismount, .permit, .residents }, &.{ .no, .unknown, .agricultural }),
+        .motorcycle_node => if (v == .residents) null else known(v, &motor_allowed, &motor_denied),
         .oneway => known(v, &.{ .@"-1", .yes, .true, .@"1" }, &.{ .no, .false, .reversible, .alternating }),
         .private => known(v, &.{ .private, .destination, .customers, .delivery, .permit, .residents }, &.{}),
         .no_thru_traffic => known(v, &.{ .destination, .customers, .delivery, .permit, .residents }, &.{}),
@@ -144,6 +152,16 @@ pub fn numericPrefix(bytes: []const u8, decimals: bool, deadline: io.Deadline) D
         }
     }
     return bytes;
+}
+
+/// The nonnegative part of Valhalla's from_chars-based integer parsing.
+pub fn nonnegativeIntPrefix(text: []const u8, deadline: io.Deadline) DeadlineError!?u31 {
+    const unsigned = if (std.mem.startsWith(u8, text, "+")) text[1..] else text;
+    const negative = std.mem.startsWith(u8, unsigned, "-");
+    const digits = if (negative) unsigned[1..] else unsigned;
+    const prefix = try numericPrefix(digits, false, deadline);
+    const value = std.fmt.parseInt(u31, prefix, 10) catch return null;
+    return if (!negative or value == 0) value else null;
 }
 
 pub fn normalizeSpeed(bytes: []const u8, deadline: io.Deadline) DeadlineError!?f64 {

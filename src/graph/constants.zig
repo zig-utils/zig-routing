@@ -1,5 +1,8 @@
 // Ported from valhalla/baldr/graphconstants.h (Valhalla 3.9.3).
 
+pub const max_mtb_scale = 6;
+pub const max_mtb_uphill_scale = 5;
+
 pub const RoadClass = enum(u8) {
     motorway = 0,
     trunk = 1,

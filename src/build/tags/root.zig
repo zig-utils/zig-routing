@@ -5,6 +5,7 @@ const io = @import("../../infra/io.zig");
 const pbf = @import("../pbf/root.zig");
 const osm = @import("../osm.zig");
 const attrs = @import("attrs.zig");
+const access = @import("access.zig");
 const highway = @import("highway.zig");
 const selection = @import("selection.zig");
 
@@ -49,6 +50,7 @@ pub fn transformWay(scratch: *Scratch, tags: anytype, deadline: io.Deadline) !?W
         },
     };
     try highway.classify(scratch, selected, deadline, &result);
+    try access.applyWay(scratch, selected, deadline, &result);
     return result;
 }
 
@@ -56,7 +58,9 @@ pub fn transformWay(scratch: *Scratch, tags: anytype, deadline: io.Deadline) !?W
 /// independently decides which coordinates the graph needs.
 pub fn transformNode(scratch: *Scratch, tags: anytype, deadline: io.Deadline) !?NodeAttrs {
     try scratch.load(tags, deadline);
-    return .{ .name = scratch.text(.name), .ref = scratch.text(.ref), .exit_to = scratch.text(.exit_to) };
+    var result: NodeAttrs = .{ .name = scratch.text(.name), .ref = scratch.text(.ref), .exit_to = scratch.text(.exit_to) };
+    try access.applyNode(scratch, deadline, &result);
+    return result;
 }
 
 /// Selection callback for the node store's way usage pass.
@@ -68,6 +72,7 @@ pub fn includePbfWay(scratch: *Scratch, way: *const pbf.block.Way) !bool {
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("access_test.zig");
 }
 
 test "ways_proc keeps exactly the routable ways and the upstream exceptions" {

@@ -165,19 +165,9 @@ fn taggedSurface(tags: *const Scratch, deadline: io.Deadline) !?Surface {
     };
 }
 
-/// Copy the numeric prefix accepted by Valhalla's from_chars-based get_number.
-fn mtbScale(text: []const u8, deadline: io.Deadline) !?u31 {
-    const unsigned = if (std.mem.startsWith(u8, text, "+")) text[1..] else text;
-    const negative = std.mem.startsWith(u8, unsigned, "-");
-    const digits = if (negative) unsigned[1..] else unsigned;
-    const prefix = try defaults.numericPrefix(digits, false, deadline);
-    const value = std.fmt.parseInt(u31, prefix, 10) catch return null;
-    return if (!negative or value == 0) value else null;
-}
-
 fn surface(tags: *const Scratch, road_class: constants.RoadClass, use: Use, deadline: io.Deadline) !Surface {
     if (tags.text(.@"mtb:scale")) |text| {
-        if (try mtbScale(text, deadline)) |scale| {
+        if (try defaults.nonnegativeIntPrefix(text, deadline)) |scale| {
             return switch (scale) {
                 0 => .dirt,
                 1 => .gravel,
@@ -185,7 +175,7 @@ fn surface(tags: *const Scratch, road_class: constants.RoadClass, use: Use, dead
             };
         }
     } else if (tags.text(.@"mtb:scale:uphill")) |text| {
-        if (try mtbScale(text, deadline)) |scale| return if (scale < 2) .gravel else .path;
+        if (try defaults.nonnegativeIntPrefix(text, deadline)) |scale| return if (scale < 2) .gravel else .path;
     }
     if (try taggedSurface(tags, deadline)) |value| return value;
     if (tags.get(.sac_scale) != null or tags.id(.highway) == .via_ferrata) return .path;
