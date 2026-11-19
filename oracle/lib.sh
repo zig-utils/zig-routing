@@ -63,7 +63,10 @@ sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
 fetch_checked() {
   local url="$1" dest="$2" want="$3"
   if [ -f "$dest" ] && [ "$(sha256 "$dest")" = "$want" ]; then return 0; fi
-  curl -sSfL -o "$dest.part" "$url" || die "download failed: $url"
+  if ! curl -sSfL --connect-timeout 15 --max-time 180 --retry 4 --retry-all-errors --retry-delay 5 -o "$dest.part" "$url"; then
+    rm -f "$dest.part"
+    die "download failed: $url"
+  fi
   local got
   got=$(sha256 "$dest.part")
   [ "$got" = "$want" ] || { rm -f "$dest.part"; die "checksum mismatch for $url: got $got"; }
