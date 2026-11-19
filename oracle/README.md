@@ -169,6 +169,29 @@ node. It retains up to 32 arcs at each node. Higher-degree junctions use co-loca
 linked by zero-length arcs, with slots reserved at both ends of each link. The class table marks
 these arcs explicitly. All real segments use Valhalla's minimum stored length of one metre.
 
+### Turn tables
+
+Each node's `turn_off` selects a dense matrix in `turns.bin`. The incoming row uses the
+opposing arc's local index at the junction. Each byte stores the Valhalla turn type in
+bits 0-2, initial stop impact in bits 3-5, and shared-name consistency in bit 6.
+Bit 7 is reserved for turn restrictions. The builder samples the shape close to the
+junction and quantizes the bearing as Valhalla does. It compares the indexed street names
+and refs. Country-specific base names and language filtering require admin data.
+
+The assembler interns complete matrices by their bytes. This preserves direct row access
+and gives larger graphs more opportunities for reuse. The budget counts the section payload,
+excluding the fixed v1 header and alignment padding.
+
+| Extract | Nodes | Distinct matrices | Pool bytes | Bytes/node |
+| --- | ---: | ---: | ---: | ---: |
+| Liechtenstein | 6,280 | 1,370 | 14,621 | 2.328 |
+| Utrecht | 30,638 | 4,259 | 54,387 | 1.775 |
+| Luxembourg 2026-01-01 | 187,650 | 11,819 | 149,451 | 0.796 |
+
+CI verifies the [Geofabrik Luxembourg extract](https://download.geofabrik.de/europe/luxembourg.html)
+against SHA-256 `d8f3e1dabb4d9d5489500c35432eb393089c32222cfff8cf50706852f0696a80` and runs the
+country budget with `zig build check-assembly -Doptimize=ReleaseFast -- INPUT.osm.pbf OUTPUT_BUNDLE SCRATCH_DIR 4 right --sub-byte-turns`.
+
 ### HTTP and route checks
 
 `compare-height.ts` sends the same random `/height` requests (shapes, encoded polylines at

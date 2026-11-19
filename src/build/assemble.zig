@@ -10,9 +10,10 @@ const edges = @import("edges.zig");
 const tags = @import("tags/root.zig");
 const pbf = @import("pbf/root.zig");
 const edge_class = @import("edge_class.zig");
+const turns = @import("turns.zig");
 
 const Allocator = std.mem.Allocator;
-const max_degree = 32;
+const max_degree = turns.max_degree;
 const max_workers = 16;
 
 pub const Options = struct {
@@ -31,6 +32,8 @@ pub const Stats = struct {
     split_nodes: u32,
     connectors: u32,
     distinct_classes: usize,
+    turn_pool_bytes: usize,
+    distinct_turn_matrices: usize,
     assembly_ns: u64,
 };
 
@@ -43,7 +46,12 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     const shape_file = try io.File.temporary(options.scratch_dir);
     defer shape_file.close();
 
-    var metadata: Metadata = .{ .gpa = gpa, .drive_side = options.drive_side };
+    var metadata: Metadata = .{
+        .gpa = gpa,
+        .drive_side = options.drive_side,
+        .deadline = options.deadline,
+        .strings = .init(gpa),
+    };
     defer metadata.deinit();
     const source_stats = try edges.buildObserved(gpa, source, .{ .edges = edge_file, .shapes = shape_file }, .{
         .scratch_dir = options.scratch_dir,
@@ -78,13 +86,16 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     var table = try populate(gpa, &shared, options.workers);
     defer table.deinit();
     try validate(topology.first_edge, topology.output.data, topology.coordinates, table.classes, options.deadline);
+    var turn_pool = turns.Pool.init(gpa);
+    defer turn_pool.deinit();
+    try buildTurns(&shared, table.classes, metadata.name_ids.items, options.drive_side, &turn_pool);
 
     try writer.write(.nodes, topology.nodes);
     try writer.write(.edges, topology.output.data);
     try writer.write(.first_edge, topology.first_edge);
     try writer.write(.classes, table.classes);
     try writer.write(.coordinates, topology.coordinates);
-    try writer.write(.turns, &.{});
+    try writer.write(.turns, turn_pool.bytes.items);
     return .{
         .source = source_stats,
         .nodes = @intCast(topology.nodes.len),
@@ -92,6 +103,8 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
         .split_nodes = plan.split_nodes,
         .connectors = plan.connectors,
         .distinct_classes = table.classes.len,
+        .turn_pool_bytes = turn_pool.bytes.items.len,
+        .distinct_turn_matrices = turn_pool.indices.count(),
         .assembly_ns = timer.read(),
     };
 }
@@ -106,18 +119,25 @@ const Way = struct {
     speeds: [2]u8,
     truck_speed: u8,
     oneway: bool,
+    name_start: u32,
+    name_end: u32,
 };
 
 const Ways = std.AutoHashMapUnmanaged(i64, Way);
 const Metadata = struct {
     gpa: Allocator,
     drive_side: edge_class.DriveSide,
+    deadline: io.Deadline,
+    strings: tags.names.StringTable,
+    name_ids: std.ArrayList(tags.names.Id) = .empty,
     nodes: std.AutoHashMapUnmanaged(i64, format.NodeHot) = .empty,
     ways: Ways = .empty,
 
     fn deinit(self: *Metadata) void {
         self.nodes.deinit(self.gpa);
         self.ways.deinit(self.gpa);
+        self.name_ids.deinit(self.gpa);
+        self.strings.deinit();
     }
 
     fn node(self: *Metadata, id: i64, attrs: tags.NodeAttrs) !void {
@@ -133,7 +153,7 @@ const Metadata = struct {
         if (!std.meta.eql(hot, neutral_node)) try self.nodes.put(self.gpa, id, hot);
     }
 
-    fn way(self: *Metadata, id: i64, attrs: tags.WayAttrs, _: pbf.block.TagIterator) !void {
+    fn way(self: *Metadata, id: i64, attrs: tags.WayAttrs, raw_tags: pbf.block.TagIterator) !void {
         const use = attrs.edgeUse();
         const directed_use = if (attrs.flags.turn_channel and attrs.use != .construction)
             .turn_channel
@@ -152,6 +172,15 @@ const Metadata = struct {
         }
         const entry = try self.ways.getOrPut(self.gpa, id);
         if (entry.found_existing) return error.DuplicateWay;
+        const indexed = try self.strings.indexWay(attrs, raw_tags, .{}, self.deadline);
+        const name_start = std.math.cast(u32, self.name_ids.items.len) orelse return error.TooManyNames;
+        for ([_]tags.names.Id{ indexed.name.text, indexed.ref.text, indexed.official_name.text, indexed.alt_name.text }) |text| {
+            var tokens = std.mem.tokenizeScalar(u8, self.strings.get(text).?, ';');
+            while (tokens.next()) |token| {
+                if (self.deadline.expired()) return error.DeadlineExceeded;
+                try self.name_ids.append(self.gpa, try self.strings.intern(token));
+            }
+        }
         entry.value_ptr.* = .{
             .by_direction = pair,
             .speeds = .{
@@ -160,6 +189,8 @@ const Metadata = struct {
             },
             .truck_speed = attrs.truck_speed,
             .oneway = attrs.flags.oneway,
+            .name_start = name_start,
+            .name_end = std.math.cast(u32, self.name_ids.items.len) orelse return error.TooManyNames,
         };
     }
 };
@@ -507,6 +538,30 @@ fn remapEdges(rows: []format.EdgeHot, ids: []const classes.ClassId, deadline: io
     for (rows, 0..) |*row, i| {
         try checkDeadline(deadline, i);
         row.cls.class_id = ids[row.cls.class_id];
+    }
+}
+
+fn buildTurns(shared: *const Shared, edge_classes: []const classes.EdgeClass, name_ids: []const tags.names.Id, side: edge_class.DriveSide, pool: *turns.Pool) !void {
+    const topo = shared.topology;
+    var approaches: [max_degree]turns.Approach = undefined;
+    var entries: [turns.max_matrix_size]u8 = undefined;
+    for (topo.nodes, 0..) |*node, i| {
+        try checkDeadline(shared.deadline, i);
+        const first = topo.first_edge[i];
+        const degree = topo.first_edge[i + 1] - first;
+        for (approaches[0..degree], topo.output.data[first..][0..degree], 0..) |*approach, edge, local| {
+            const class = &edge_classes[edge.cls.class_id];
+            approach.* = .{ .bearing = 0, .class = class, .names = &.{} };
+            if (class.flags.node_connector) continue;
+            const ref = topo.slot_refs.data[first + local];
+            const segment = shared.segments[ref / 2];
+            const way = shared.ways.get(segment.way_id) orelse return error.MissingWayAttributes;
+            approach.bearing = try turns.heading(try segmentShape(shared.shape_points, segment), ref & 1 == 0, class, shared.deadline);
+            approach.names = name_ids[way.name_start..way.name_end];
+        }
+        const matrix = entries[0 .. degree * degree];
+        try turns.matrix(approaches[0..degree], node.attr.signal != 0, side, matrix, shared.deadline);
+        node.turn_off = try pool.intern(matrix);
     }
 }
 

@@ -16,6 +16,10 @@ pub fn main(init: std.process.Init) !void {
         std.meta.stringToEnum(build.edge_class.DriveSide, text) orelse return usage()
     else
         .right;
+    const require_sub_byte_turns = if (args.next()) |flag|
+        if (std.mem.eql(u8, flag, "--sub-byte-turns")) true else return usage()
+    else
+        false;
     if (args.next() != null) return usage();
 
     const file = try io.File.open(input, .read_only);
@@ -37,6 +41,7 @@ pub fn main(init: std.process.Init) !void {
         defer warm.close();
         try warm.view.verify(.none, null);
         try build.assemble.validate(warm.view.first_edge, warm.view.edges, warm.view.coordinates.?, warm.view.classes.?, .none);
+        try validateTurns(&warm.view, stats.turn_pool_bytes);
     }
 
     var times: [32]u64 = undefined;
@@ -54,6 +59,7 @@ pub fn main(init: std.process.Init) !void {
         .stats = stats,
         .elapsed_ns = elapsed_ns,
         .edges_per_second = rate(stats.directed_edges, stats.assembly_ns),
+        .turn_bytes_per_node = @as(f64, @floatFromInt(stats.turn_pool_bytes)) / @as(f64, @floatFromInt(@max(stats.nodes, 1))),
         .peak_rss_bytes = try io.peakRssBytes(),
         .warm_open_median_ns = times[times.len / 2],
         .warm_open_max_ns = times[times.len - 1],
@@ -62,6 +68,21 @@ pub fn main(init: std.process.Init) !void {
     try stdout.interface.writeByte('\n');
     try stdout.interface.flush();
     if (times[times.len - 1] >= open_budget_ns) return error.BundleOpenTooSlow;
+    if (require_sub_byte_turns and stats.turn_pool_bytes >= stats.nodes) return error.TurnPoolTooLarge;
+}
+
+fn validateTurns(view: *const graph.reader.View, expected_bytes: usize) !void {
+    if (view.turns.len != expected_bytes) return error.TurnPoolSizeMismatch;
+    for (0..view.nodes.len) |i| {
+        const node: graph.format.NodeId = @fromBackingInt(@as(u32, @intCast(i)));
+        const degree = (try view.outEdgeRange(node)).count();
+        for (0..degree) |local| {
+            const row = try view.turnRow(node, @intCast(local));
+            for (row) |entry| {
+                if (entry & 0x80 != 0) return error.UnexpectedTurnRestriction;
+            }
+        }
+    }
 }
 
 fn datasetId(file: io.File, side: build.edge_class.DriveSide) !graph.format.DatasetUuid {
@@ -83,6 +104,6 @@ fn rate(count: u32, ns: u64) f64 {
 }
 
 fn usage() error{InvalidArguments} {
-    std.debug.print("usage: zig build check-assembly -- INPUT.osm.pbf OUTPUT_BUNDLE SCRATCH_DIR [WORKERS] [right|left]\n", .{});
+    std.debug.print("usage: zig build check-assembly -- INPUT.osm.pbf OUTPUT_BUNDLE SCRATCH_DIR [WORKERS] [right|left] [--sub-byte-turns]\n", .{});
     return error.InvalidArguments;
 }

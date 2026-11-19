@@ -146,6 +146,44 @@ test "assemble directs speed and access and preserves node attributes and coordi
     try testing.expect(!(try view.class(reverse.cls.class_id)).forwardAccess().auto);
 }
 
+test "assembled turn rows use opposing locals, shared names and class-based stops" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const fixture = try gurka.Map.init(arena.allocator(), try gurka.mapToCoordinates("    D\n    |\nA---B---C\n    |\n    E", 20), &.{
+        .{ .label = "AB", .tags = &.{
+            .{ .key = "highway", .value = "primary" },
+            .{ .key = "name", .value = "Main;Old Main" },
+        } },
+        .{ .label = "BC", .tags = &.{
+            .{ .key = "highway", .value = "primary" },
+            .{ .key = "name", .value = "Old Main" },
+        } },
+        .{ .label = "BD", .tags = &.{.{ .key = "highway", .value = "residential" }} },
+        .{ .label = "BE", .tags = &.{.{ .key = "highway", .value = "residential" }} },
+    }, &.{.{ .label = "B", .tags = &.{.{ .key = "highway", .value = "traffic_signals" }} }}, &.{});
+
+    var result = try Built.assemble(fixture.osm, 4);
+    defer result.deinit();
+    const view = &result.bundle.view;
+    try checkOpposites(view, 8);
+    const a = try at(view, fixture.findNode("A").?.location.toFixed());
+    const b = try at(view, fixture.findNode("B").?.location.toFixed());
+    const ab: format.EdgeId = @fromBackingInt((try view.outEdgeRange(a)).first);
+    const row = try view.turnRow(b, (try view.edge(ab)).cls.opp_local);
+    // Reverse (3, same name), straight (0, shared name), left (5), right (3).
+    for ([_][]const u8{ "A", "C", "D", "E" }, [_]u8{ 0x5c, 0x40, 0x2e, 0x1a }) |label, expected| {
+        const target = try at(view, fixture.findNode(label).?.location.toFixed());
+        for (try view.outEdges(b)) |edge| {
+            if (edge.head != @backingInt(target)) continue;
+            try testing.expectEqual(expected, row[edge.cls.local]);
+            break;
+        } else return error.MissingTestEdge;
+    }
+    try testing.expectEqualSlices(u8, &.{0x44}, try view.turnRow(a, 0));
+    const c = try at(view, fixture.findNode("C").?.location.toFixed());
+    try testing.expectEqual((try view.node(a)).turn_off, (try view.node(c)).turn_off);
+}
+
 test "high-degree node aliases reserve both directions and preserve connectivity" {
     const leaves = 63;
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -182,12 +220,18 @@ test "high-degree node aliases reserve both directions and preserve connectivity
     for (view.coordinates.?, 0..) |point, i| {
         if (point.lat != 0 or point.lng != 0) continue;
         aliases += 1;
-        const outgoing = try view.outEdges(@fromBackingInt(@as(u32, @intCast(i))));
+        const id: format.NodeId = @fromBackingInt(@as(u32, @intCast(i)));
+        const outgoing = try view.outEdges(id);
         try testing.expect(outgoing.len <= 32);
         for (outgoing) |edge| {
             const alias = (try view.class(edge.cls.class_id)).flags.node_connector;
             try testing.expectEqual(alias, edge.geom.len_m == 0);
-            if (alias) connectors += 1 else real += 1;
+            if (alias) {
+                connectors += 1;
+                for (try view.turnRow(id, edge.cls.local)) |entry| {
+                    try testing.expectEqual(build.turns.encode(.straight, 0, true), entry);
+                }
+            } else real += 1;
         }
     }
     try testing.expectEqual(3, aliases);

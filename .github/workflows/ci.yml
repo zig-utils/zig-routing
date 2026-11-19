@@ -46,10 +46,16 @@ jobs:
       - name: Validate assembled fixture bundles
         if: matrix.os == 'ubuntu-latest'
         run: |
+          source oracle/lib.sh
           work=$(mktemp -d)
           for dataset in liechtenstein utrecht; do
             zig build check-assembly -- "oracle/data/$dataset/extract.osm.pbf" "$work/$dataset" "$work" 4 right
           done
+          fetch_checked \
+            https://download.geofabrik.de/europe/luxembourg-260101.osm.pbf \
+            "$work/luxembourg.osm.pbf" \
+            d8f3e1dabb4d9d5489500c35432eb393089c32222cfff8cf50706852f0696a80
+          zig build check-assembly -Doptimize=ReleaseFast -- "$work/luxembourg.osm.pbf" "$work/luxembourg" "$work" 4 right --sub-byte-turns
       - uses: actions/checkout@v6
         if: matrix.os == 'ubuntu-latest'
         with:
