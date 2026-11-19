@@ -62,6 +62,7 @@ pub const View = struct {
     first_edge: []const format.FirstEdge,
     turns: []const format.TurnEntry,
     classes: ?[]const class_table.EdgeClass,
+    coordinates: ?[]const format.Coordinate,
 
     pub fn parse(files: Files, diagnostic: ?*Diagnostic) !View {
         var headers: Headers = .initFill(null);
@@ -99,6 +100,12 @@ pub const View = struct {
                 return error.TooManyClasses;
             }
         }
+        if (headers.get(.coordinates)) |coords| {
+            if (coords.count != node_count) {
+                note(diagnostic, .coordinates);
+                return error.InvalidCoordinateCount;
+            }
+        }
 
         var graph: View = .{
             .headers = headers,
@@ -108,6 +115,7 @@ pub const View = struct {
             .first_edge = undefined,
             .turns = undefined,
             .classes = null,
+            .coordinates = null,
         };
         inline for (kinds) |kind| {
             if (headers.get(kind)) |present| {
@@ -142,6 +150,13 @@ pub const View = struct {
         const entry = &classes[id];
         if (!entry.valid()) return error.InvalidEdgeClass;
         return entry;
+    }
+
+    pub fn coordinate(self: *const View, id: format.NodeId) !format.Coordinate {
+        const coords = self.coordinates orelse return error.MissingCoordinatesSection;
+        const index = @backingInt(id);
+        if (index >= coords.len) return error.InvalidNodeId;
+        return coords[index];
     }
 
     pub const EdgeRange = struct {
@@ -191,6 +206,7 @@ pub const View = struct {
             if (deadline.expired()) return error.DeadlineExceeded;
             const bytes: []const u8 = switch (kind) {
                 .classes => std.mem.sliceAsBytes(self.classes.?),
+                .coordinates => std.mem.sliceAsBytes(self.coordinates.?),
                 inline else => |section| std.mem.sliceAsBytes(@field(self, @tagName(section))),
             };
             var hash = std.hash.XxHash3.init(0);

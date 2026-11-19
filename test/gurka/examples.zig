@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 test {
     _ = @import("pbf.zig");
     _ = @import("edges.zig");
+    _ = @import("assemble.zig");
 }
 
 pub fn intersection(arena: Allocator) !gurka.Map {

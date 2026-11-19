@@ -104,6 +104,20 @@ pub fn build(
     context: anytype,
     comptime consumeWay: fn (@TypeOf(context), i64, tags.WayAttrs, pbf.block.TagIterator) anyerror!void,
 ) !Stats {
+    return buildObserved(gpa, source, out, options, context, consumeWay, null);
+}
+
+/// Observe normalized attributes for referenced nodes with tags while the
+/// node store is built. An unsorted input replay can revisit a node.
+pub fn buildObserved(
+    gpa: Allocator,
+    source: pbf.file.Stream,
+    out: Output,
+    options: Options,
+    context: anytype,
+    comptime consumeWay: fn (@TypeOf(context), i64, tags.WayAttrs, pbf.block.TagIterator) anyerror!void,
+    comptime observeNode: ?fn (@TypeOf(context), i64, tags.NodeAttrs) anyerror!void,
+) !Stats {
     if (out.edges.fd == out.shapes.fd) return error.InvalidEdgeOutput;
     const store_file = try io.File.temporary(options.scratch_dir);
     defer store_file.close();
@@ -113,10 +127,25 @@ pub fn build(
         .cuts = try usage.Usage.init(options.scratch_dir),
     };
     defer prep.deinit();
+    const Observe = struct {
+        prep: *Preparation,
+        context: @TypeOf(context),
+
+        fn include(self: *@This(), way: *const pbf.block.Way) !bool {
+            return self.prep.include(way);
+        }
+
+        fn observe(self: *@This(), node: pbf.block.Node) !void {
+            if (try self.prep.observeNode(node)) |attrs| {
+                if (observeNode) |func| try func(self.context, node.id, attrs);
+            }
+        }
+    };
+    var inputs: Observe = .{ .prep = &prep, .context = context };
     const store = try node_store.buildObserving(gpa, source, store_file, .{
         .scratch_dir = options.scratch_dir,
         .deadline = options.deadline,
-    }, &prep, Preparation.include, Preparation.observeNode);
+    }, &inputs, Observe.include, Observe.observe);
     const cuts = try prep.cuts.freeze(options.deadline);
 
     var used = try usage.Usage.init(options.scratch_dir);
@@ -219,9 +248,9 @@ const Preparation = struct {
         return true;
     }
 
-    fn observeNode(self: *Preparation, node: pbf.block.Node) !void {
+    fn observeNode(self: *Preparation, node: pbf.block.Node) !?tags.NodeAttrs {
         var input = node.tags;
-        if (try input.next() == null) return;
+        if (try input.next() == null) return null;
         const attrs = (try tags.transformNode(&self.scratch, node.tags, self.options.deadline)).?;
         switch (attrs.type) {
             .gate,
@@ -238,6 +267,7 @@ const Preparation = struct {
         }
         if (attrs.flags.traffic_signal or attrs.flags.stop_sign or attrs.flags.yield_sign)
             try self.controls.put(self.gpa, node.id, attrs.flags);
+        return attrs;
     }
 };
 

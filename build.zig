@@ -253,6 +253,16 @@ pub fn build(b: *std.Build) void {
     run_check_edges.addPassthruArgs();
     b.step("check-edges", "Report counts from the ways-to-edges stage").dependOn(&run_check_edges.step);
 
+    const check_assembly = b.addExecutable(.{ .name = "check-assembly", .root_module = b.createModule(.{
+        .root_source_file = b.path("test/check_assembly.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{.{ .name = "routing", .module = lib_mod }},
+    }) });
+    const run_check_assembly = b.addRunArtifact(check_assembly);
+    run_check_assembly.addPassthruArgs();
+    b.step("check-assembly", "Build and validate topology from a PBF and time warm bundle opens").dependOn(&run_check_assembly.step);
+
     // Fuzz targets (test/fuzz.zig). `zig build test` replays their seeds; `zig build fuzz
     // --fuzz` fuzzes, ReleaseSafe by default so bounds and overflow checks stay on.
     const fuzz_filter = b.option([]const u8, "fuzz-target", "Fuzz one target: request, http, polyline, lz4, dem, protobuf, config, osm-pbf, node-store, graph-bundle");

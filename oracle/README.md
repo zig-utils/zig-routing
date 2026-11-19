@@ -144,6 +144,31 @@ counted in either orientation and retained. Edges between distinct nodes at iden
 are retained with their measured zero length. Valhalla applies its minimum stored length during
 directed-edge assembly.
 
+### CSR assembly and warm opens
+
+```bash
+work=$(mktemp -d)
+zig build check-assembly -- oracle/data/liechtenstein/extract.osm.pbf "$work/liechtenstein" "$work" 4 right
+zig build check-assembly -- oracle/data/utrecht/extract.osm.pbf "$work/utrecht" "$work" 4 right
+```
+
+The check assembles a bundle, verifies every section checksum and checks every directed edge
+against its opposing edge. It reports the directed edges per second for the CSR assembly,
+validation and section writing, plus peak RSS for the whole build. It then times 32 warm opens
+and requires each to finish in under 50 ms. CI runs both extracts.
+
+ReleaseFast on an Apple M3 Pro with four workers produced these results from the pinned PBFs.
+
+| Extract | Nodes | Directed edges | Assembly edges/s | Peak RSS | Slowest warm open | Validation errors |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Liechtenstein | 6,280 | 15,760 | 2.89 million | 57.0 MiB | 0.096 ms | 0 |
+| Utrecht | 30,638 | 85,336 | 5.80 million | 85.5 MiB | 0.149 ms | 0 |
+
+The assembler assigns dense IDs in segment encounter order and groups outgoing arcs by source
+node. It retains up to 32 arcs at each node. Higher-degree junctions use co-located aliases
+linked by zero-length arcs, with slots reserved at both ends of each link. The class table marks
+these arcs explicitly. All real segments use Valhalla's minimum stored length of one metre.
+
 ### HTTP and route checks
 
 `compare-height.ts` sends the same random `/height` requests (shapes, encoded polylines at

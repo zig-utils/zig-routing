@@ -7,6 +7,7 @@ pub const magic = "ZRGRAPH\x00".*;
 pub const version: u32 = 1;
 pub const payload_offset = 64 * 1024;
 pub const DatasetUuid = [16]u8;
+pub const Coordinate = @import("../geo/point.zig").FixedLL;
 
 pub const NodeId = enum(u32) { _ };
 pub const EdgeId = enum(u32) { _ };
@@ -52,6 +53,7 @@ pub const SectionKind = enum(u32) {
     first_edge = 3,
     turns = 4,
     classes = 5,
+    coordinates = 6,
 
     pub fn filename(self: SectionKind) [:0]const u8 {
         return switch (self) {
@@ -60,6 +62,7 @@ pub const SectionKind = enum(u32) {
             .first_edge => "first_edge.bin",
             .turns => "turns.bin",
             .classes => "classes.bin",
+            .coordinates => "coordinates.bin",
         };
     }
 
@@ -70,6 +73,7 @@ pub const SectionKind = enum(u32) {
             .first_edge => FirstEdge,
             .turns => TurnEntry,
             .classes => class_table.EdgeClass,
+            .coordinates => Coordinate,
         };
     }
 
@@ -117,6 +121,8 @@ comptime {
     std.debug.assert(@sizeOf(NodeHot) == 8 and @alignOf(NodeHot) == 4);
     std.debug.assert(@offsetOf(NodeHot, "turn_off") == 0 and @offsetOf(NodeHot, "attr") == 4);
     std.debug.assert(@sizeOf(NodeId) == 4 and @sizeOf(EdgeId) == 4);
+    std.debug.assert(@sizeOf(Coordinate) == 8);
+    std.debug.assert(@offsetOf(Coordinate, "lng") == 0 and @offsetOf(Coordinate, "lat") == 4);
     std.debug.assert(@sizeOf(FirstEdge) == 4 and @sizeOf(TurnEntry) == 1);
     std.debug.assert(payload_offset % @alignOf(EdgeHot) == 0);
     std.debug.assert(payload_offset % @alignOf(NodeHot) == 0);

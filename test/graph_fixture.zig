@@ -29,6 +29,7 @@ const classes = [_]routing.graph.class_table.EdgeClass{
     .{ .access = .{ .forward = 3, .reverse = 7 } },
     .{ .access = .{ .forward = 7, .reverse = 3 } },
 };
+const coordinates = [_]format.Coordinate{ .{ .lng = 0, .lat = 0 }, .{ .lng = 100000, .lat = 0 } };
 
 pub fn records(comptime kind: format.SectionKind) []const kind.Record() {
     return switch (kind) {
@@ -37,6 +38,7 @@ pub fn records(comptime kind: format.SectionKind) []const kind.Record() {
         .first_edge => &first_edge,
         .turns => &turns,
         .classes => &classes,
+        .coordinates => &coordinates,
     };
 }
 
