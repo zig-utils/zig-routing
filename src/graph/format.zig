@@ -271,6 +271,41 @@ pub const BundleWriter = struct {
         self.written.insert(kind);
     }
 
+    pub fn copySection(self: *BundleWriter, comptime kind: SectionKind, input: io.File) !void {
+        const T = kind.Record();
+        var header: SectionHeader = undefined;
+        try input.preadAll(std.mem.asBytes(&header), 0);
+        if (!std.mem.eql(u8, &header.magic_tag, &magic) or header.format_version != version or
+            header.record_size != @sizeOf(T) or header.kind != @backingInt(kind) or header.reserved != 0 or
+            !std.mem.allEqual(u8, &header.reserved_tail, 0) or !std.mem.eql(u8, &header.dataset_uuid, &self.uuid))
+            return error.InvalidSectionHeader;
+        const payload = std.math.mul(u64, header.count, @sizeOf(T)) catch return error.SectionTooLarge;
+        if (try input.size() != std.math.add(u64, payload_offset, payload) catch return error.SectionTooLarge)
+            return error.InvalidSectionSize;
+        const Source = struct {
+            file: io.File,
+            count: u64,
+            hash: u64,
+
+            fn produce(source: @This(), output: *SectionWriter(kind)) !void {
+                var records: [@max(1, 128 * 1024 / @sizeOf(T))]T = undefined;
+                var offset: u64 = payload_offset;
+                var remaining = source.count;
+                while (remaining != 0) {
+                    if (output.deadline.expired()) return error.DeadlineExceeded;
+                    const chunk = records[0..@intCast(@min(remaining, records.len))];
+                    const bytes = std.mem.sliceAsBytes(chunk);
+                    try source.file.preadAll(bytes, offset);
+                    try output.append(chunk);
+                    offset += bytes.len;
+                    remaining -= chunk.len;
+                }
+                if (output.hash.final() != source.hash) return error.PayloadHashMismatch;
+            }
+        };
+        try self.stream(kind, Source{ .file = input, .count = header.count, .hash = header.payload_hash }, Source.produce);
+    }
+
     /// Publish every section together. A bundle already at the destination
     /// keeps its name and contents.
     pub fn commit(self: *BundleWriter) !void {
@@ -282,6 +317,7 @@ pub const BundleWriter = struct {
         if (self.deadline.expired()) return error.DeadlineExceeded;
         try self.parent.renameExclusive(&self.temp_name, self.target[0..self.target_len :0]);
         self.committed = true;
+        try self.parent.sync();
     }
 };
 

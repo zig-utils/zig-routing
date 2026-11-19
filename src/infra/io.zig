@@ -292,6 +292,23 @@ pub const Directory = struct {
         return .{ .fd = try checkInt(c.openat(self.fd, name, flags)) };
     }
 
+    pub fn createChild(self: Directory, name: [:0]const u8) Error!Directory {
+        try checkChildName(name);
+        _ = try checkInt(c.mkdirat(self.fd, name, 0o755));
+        errdefer self.deleteDir(name) catch {};
+        return self.child(name);
+    }
+
+    /// Held until this directory descriptor is closed.
+    pub fn lockExclusive(self: Directory) Error!void {
+        while (true) {
+            const result = c.flock(self.fd, c.LOCK.EX | c.LOCK.NB);
+            if (result != 0 and c.errno(result) == .INTR) continue;
+            _ = try checkInt(result);
+            return;
+        }
+    }
+
     pub fn temporaryChild(self: Directory) Error!struct { dir: Directory, name: TempName } {
         var name: TempName = undefined;
         name[0..4].* = ".zr-".*;
@@ -349,6 +366,44 @@ pub const Directory = struct {
         } else {
             _ = try checkInt(c.renameatx_np(self.fd, old, self.fd, new, .{ .EXCL = true }));
         }
+    }
+
+    /// Atomically swap two existing sibling paths.
+    pub fn exchange(self: Directory, first: [:0]const u8, second: [:0]const u8) Error!void {
+        try checkChildName(first);
+        try checkChildName(second);
+        if (is_linux) {
+            const linux = std.os.linux;
+            const rc = linux.renameat2(self.fd, first, self.fd, second, .{ .EXCHANGE = true });
+            const code = linux.errno(rc);
+            if (code != .SUCCESS) return failErrno(code);
+        } else {
+            _ = try checkInt(c.renameatx_np(self.fd, first, self.fd, second, .{ .SWAP = true }));
+        }
+    }
+
+    pub fn writeAtomic(self: Directory, name: [:0]const u8, bytes: []const u8) !void {
+        try checkChildName(name);
+        var nonce: [16]u8 = undefined;
+        try fillRandom(&nonce);
+        var tmp: [44]u8 = undefined;
+        const printed = try std.fmt.bufPrint(tmp[0 .. tmp.len - 1], ".zr-report-{s}", .{std.fmt.bytesToHex(nonce, .lower)});
+        tmp[printed.len] = 0;
+        const staged = tmp[0..printed.len :0];
+        const file = try self.createFile(staged);
+        defer file.close();
+        errdefer self.deleteFile(staged) catch {};
+        try file.pwriteAll(bytes, 0);
+        try file.sync();
+        try self.replaceFile(staged, name);
+        try self.sync();
+    }
+
+    /// Atomically replace a sibling file.
+    pub fn replaceFile(self: Directory, old: [:0]const u8, new: [:0]const u8) Error!void {
+        try checkChildName(old);
+        try checkChildName(new);
+        _ = try checkInt(c.renameat(self.fd, old, self.fd, new));
     }
 
     const directory_flags: c.O = .{ .DIRECTORY = true, .CLOEXEC = true, .ACCMODE = .RDONLY };

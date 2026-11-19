@@ -214,7 +214,15 @@ pub const Stream = struct {
         return .{ .file = file, .size = try file.size() };
     }
 
+    pub fn validateHeader(self: Stream, gpa: Allocator, deadline: io.Deadline) !void {
+        return self.read(gpa, deadline, {}, null);
+    }
+
     pub fn forEach(self: Stream, gpa: Allocator, deadline: io.Deadline, context: anytype, comptime consume: anytype) !void {
+        return self.read(gpa, deadline, context, consume);
+    }
+
+    fn read(self: Stream, gpa: Allocator, deadline: io.Deadline, context: anytype, comptime consume: anytype) !void {
         var encoded: std.ArrayList(u8) = .empty;
         defer encoded.deinit(gpa);
         var decoded: std.ArrayList(u8) = .empty;
@@ -252,13 +260,36 @@ pub const Stream = struct {
                 var arena: std.heap.ArenaAllocator = .init(gpa);
                 defer arena.deinit();
                 _ = try parseHeader(arena.allocator(), bytes, deadline);
+                if (@TypeOf(consume) == @TypeOf(null)) return;
                 seen_header = true;
             } else {
-                try consume(context, index, bytes);
+                if (@TypeOf(consume) != @TypeOf(null)) try consume(context, index, bytes);
                 index += 1;
             }
         }
         if (!seen_header) return error.MissingHeader;
+    }
+};
+
+/// Read each source in input order while presenting one block sequence.
+pub const Streams = struct {
+    files: []const Stream,
+
+    pub fn forEach(self: Streams, gpa: Allocator, deadline: io.Deadline, context: anytype, comptime consume: anytype) !void {
+        const Forward = struct {
+            target: @TypeOf(context),
+            next: usize = 0,
+
+            fn emit(forward: *@This(), _: usize, bytes: []const u8) !void {
+                try consume(forward.target, forward.next, bytes);
+                forward.next += 1;
+            }
+        };
+        var forward: Forward = .{ .target = context };
+        for (self.files) |file| {
+            if (deadline.expired()) return error.DeadlineExceeded;
+            try file.forEach(gpa, deadline, &forward, Forward.emit);
+        }
     }
 };
 

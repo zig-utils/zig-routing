@@ -76,6 +76,15 @@ pub const Usage = struct {
         return .{ .dir = dir, .leaves = leaves };
     }
 
+    /// Transfer ownership of writable checkpoint copies.
+    pub fn reopen(dir: io.File, leaves: io.File) !Usage {
+        const dir_bytes = try dir.size();
+        const leaf_bytes = try leaves.size();
+        if (dir_bytes < @sizeOf(Branch) or dir_bytes % @sizeOf(Branch) != 0 or leaf_bytes % @sizeOf(Leaf) != 0)
+            return error.InvalidUsageStore;
+        return .{ .dir = dir, .leaves = leaves, .branches = dir_bytes / @sizeOf(Branch), .pages = leaf_bytes / @sizeOf(Leaf) };
+    }
+
     pub fn deinit(self: *Usage) void {
         self.leaves.close();
         self.dir.close();

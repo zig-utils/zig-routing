@@ -8,6 +8,7 @@ const pbf = @import("pbf/root.zig");
 const tags = @import("tags/root.zig");
 const usage = @import("node_store/usage.zig");
 const way_shape = @import("way_shape.zig");
+const checkpoint = @import("checkpoint.zig");
 const culdesac = @import("culdesac.zig");
 
 const Allocator = std.mem.Allocator;
@@ -99,7 +100,7 @@ pub const Output = struct {
 /// The allocator must support concurrent use when workers run in parallel.
 pub fn build(
     gpa: Allocator,
-    source: pbf.file.Stream,
+    source: anytype,
     out: Output,
     options: Options,
     context: anytype,
@@ -112,7 +113,7 @@ pub fn build(
 /// node store is built. An unsorted input replay can revisit a node.
 pub fn buildObserved(
     gpa: Allocator,
-    source: pbf.file.Stream,
+    source: anytype,
     out: Output,
     options: Options,
     context: anytype,
@@ -125,7 +126,7 @@ pub fn buildObserved(
 /// Also report loop roads classified by the geometry-dependent parser pass.
 pub fn buildWithGeometry(
     gpa: Allocator,
-    source: pbf.file.Stream,
+    source: anytype,
     out: Output,
     options: Options,
     context: anytype,
@@ -133,37 +134,30 @@ pub fn buildWithGeometry(
     comptime observeNode: ?fn (@TypeOf(context), i64, tags.NodeAttrs) anyerror!void,
     comptime observeCuldesac: ?fn (@TypeOf(context), i64) anyerror!void,
 ) !Stats {
-    if (out.edges.fd == out.shapes.fd) return error.InvalidEdgeOutput;
     const store_file = try io.File.temporary(options.scratch_dir);
     defer store_file.close();
-    var prep: Preparation = .{
-        .gpa = gpa,
-        .options = options,
-        .cuts = try usage.Usage.init(options.scratch_dir),
-        .track_culdesacs = observeCuldesac != null,
-    };
+    var referenced = try usage.Usage.init(options.scratch_dir);
+    defer referenced.deinit();
+    var prep = try Preparation.init(gpa, options, observeCuldesac != null);
     defer prep.deinit();
-    const Observe = struct {
-        prep: *Preparation,
-        context: @TypeOf(context),
+    try prep.selectWays(source, &referenced);
+    const store = try prep.collectNodes(source, &referenced, store_file, context, observeNode);
+    return generate(gpa, source, out, options, &prep, store, context, consumeWay, observeCuldesac);
+}
 
-        fn include(self: *@This(), way: *const pbf.block.Way) !bool {
-            return self.prep.include(way);
-        }
-
-        fn observe(self: *@This(), node: pbf.block.Node) !void {
-            if (try self.prep.observeNode(node)) |attrs| {
-                if (observeNode) |func| try func(self.context, node.id, attrs);
-            }
-        }
-    };
-    var inputs: Observe = .{ .prep = &prep, .context = context };
-    const store = try node_store.buildObserving(gpa, source, store_file, .{
-        .scratch_dir = options.scratch_dir,
-        .deadline = options.deadline,
-    }, &inputs, Observe.include, Observe.observe);
+pub fn generate(
+    gpa: Allocator,
+    source: anytype,
+    out: Output,
+    options: Options,
+    prep: *Preparation,
+    store: node_store.Store,
+    context: anytype,
+    comptime consumeWay: fn (@TypeOf(context), i64, tags.WayAttrs, pbf.block.TagIterator) anyerror!void,
+    comptime observeCuldesac: ?fn (@TypeOf(context), i64) anyerror!void,
+) !Stats {
+    if (out.edges.fd == out.shapes.fd) return error.InvalidEdgeOutput;
     const cuts = try prep.cuts.freeze(options.deadline);
-
     var used = try usage.Usage.init(options.scratch_dir);
     defer used.deinit();
     try out.edges.truncate(0);
@@ -223,7 +217,46 @@ fn shapeOf(refs: []const i64) way_shape.Shape {
     return if (refs[0] == refs[refs.len - 1]) .closed else .open;
 }
 
-const Preparation = struct {
+const ControlEntry = extern struct {
+    id: i64,
+    flags: u16,
+    reserved: u16 = 0,
+    padding: u32 = 0,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(ControlEntry) == 16 and @offsetOf(ControlEntry, "flags") == 8);
+}
+
+const SelectionStats = struct {
+    selected_ways: u64,
+    too_short_ways: u64,
+};
+
+pub fn saveUsage(tx: *checkpoint.Transaction, store: *usage.Usage, directory: checkpoint.Artifact, leaves: checkpoint.Artifact) !void {
+    const frozen = try store.freeze(tx.deadline);
+    try tx.stash(directory, frozen.dir);
+    try tx.stash(leaves, frozen.leaves);
+}
+
+pub fn loadUsage(saved: checkpoint.Existing, scratch: []const u8, directory: checkpoint.Artifact, leaves: checkpoint.Artifact, deadline: io.Deadline) !usage.Usage {
+    const dir = try loadUsageFile(saved, scratch, directory, deadline);
+    errdefer dir.close();
+    const leaf = try loadUsageFile(saved, scratch, leaves, deadline);
+    errdefer leaf.close();
+    return usage.Usage.reopen(dir, leaf);
+}
+
+fn loadUsageFile(saved: checkpoint.Existing, scratch: []const u8, key: checkpoint.Artifact, deadline: io.Deadline) !io.File {
+    const source = try saved.read(key, deadline);
+    defer source.close();
+    const target = try io.File.temporary(scratch);
+    errdefer target.close();
+    _ = try checkpoint.transfer(source, target, deadline);
+    return target;
+}
+
+pub const Preparation = struct {
     gpa: Allocator,
     options: Options,
     cuts: usage.Usage,
@@ -234,8 +267,104 @@ const Preparation = struct {
     track_culdesacs: bool,
     culdesacs: culdesac.Tracker = .{},
     too_short_ways: u64 = 0,
+    selected_ways: u64 = 0,
 
-    fn deinit(self: *Preparation) void {
+    pub fn init(gpa: Allocator, options: Options, track_culdesacs: bool) !Preparation {
+        return .{
+            .gpa = gpa,
+            .options = options,
+            .cuts = try usage.Usage.init(options.scratch_dir),
+            .track_culdesacs = track_culdesacs,
+        };
+    }
+
+    pub fn selectWays(self: *Preparation, source: anytype, referenced: *usage.Usage) !void {
+        try node_store.markReferenced(self.gpa, source, referenced, self.options.deadline, self, include);
+    }
+
+    pub fn collectNodes(
+        self: *Preparation,
+        source: anytype,
+        referenced: *usage.Usage,
+        output: io.File,
+        context: anytype,
+        comptime observeNodeAttrs: ?fn (@TypeOf(context), i64, tags.NodeAttrs) anyerror!void,
+    ) !node_store.Store {
+        const Observe = struct {
+            preparation: *Preparation,
+            target: @TypeOf(context),
+
+            fn accept(observer: *@This(), node: pbf.block.Node) !void {
+                if (try observer.preparation.observeNode(node)) |attrs| {
+                    if (observeNodeAttrs) |func| try func(observer.target, node.id, attrs);
+                }
+            }
+        };
+        var observer: Observe = .{ .preparation = self, .target = context };
+        return node_store.collectReferenced(self.gpa, source, referenced, output, .{
+            .scratch_dir = self.options.scratch_dir,
+            .deadline = self.options.deadline,
+        }, &observer, Observe.accept);
+    }
+
+    pub fn saveTags(self: *Preparation, tx: *checkpoint.Transaction) !void {
+        try saveUsage(tx, &self.cuts, .cuts_directory, .cuts_leaves);
+        try tx.writeArray(self.culdesacs.candidates.items, .loops);
+        try tx.writeArray(self.culdesacs.refs.items, .loop_refs);
+        try tx.writeJson(self.gpa, SelectionStats{
+            .selected_ways = self.selected_ways,
+            .too_short_ways = self.too_short_ways,
+        }, .source_stats);
+    }
+
+    pub fn loadTags(self: *Preparation, saved: checkpoint.Existing) !void {
+        const loops = try saved.map(.loops, self.options.deadline);
+        defer loops.unmap();
+        const refs = try saved.map(.loop_refs, self.options.deadline);
+        defer refs.unmap();
+        try self.culdesacs.restore(
+            self.gpa,
+            try checkpoint.array(culdesac.Candidate, loops),
+            try checkpoint.array(i64, refs),
+            self.options.deadline,
+        );
+        const stats = try saved.readJson(SelectionStats, self.gpa, .source_stats, self.options.deadline);
+        defer stats.deinit();
+        self.selected_ways = stats.value.selected_ways;
+        self.too_short_ways = stats.value.too_short_ways;
+    }
+
+    pub fn saveNodes(self: *Preparation, tx: *checkpoint.Transaction) !void {
+        try saveUsage(tx, &self.cuts, .cuts_directory, .cuts_leaves);
+        const file = try tx.create(.controls);
+        defer file.close();
+        var iter = self.controls.iterator();
+        var offset: u64 = 0;
+        while (iter.next()) |entry| {
+            try checkDeadline(self.options.deadline, @intCast(offset / @sizeOf(ControlEntry)));
+            const row: ControlEntry = .{ .id = entry.key_ptr.*, .flags = @bitCast(entry.value_ptr.*) };
+            try file.pwriteAll(std.mem.asBytes(&row), offset);
+            offset += @sizeOf(ControlEntry);
+        }
+        try file.sync();
+    }
+
+    pub fn loadNodes(self: *Preparation, saved: checkpoint.Existing) !void {
+        const mapped = try saved.map(.controls, self.options.deadline);
+        defer mapped.unmap();
+        for (try checkpoint.array(ControlEntry, mapped), 0..) |entry, i| {
+            try checkDeadline(self.options.deadline, i);
+            try self.controls.put(self.gpa, entry.id, @bitCast(entry.flags));
+        }
+    }
+
+    pub fn loadCuts(self: *Preparation, saved: checkpoint.Existing) !void {
+        const cuts = try loadUsage(saved, self.options.scratch_dir, .cuts_directory, .cuts_leaves, self.options.deadline);
+        self.cuts.deinit();
+        self.cuts = cuts;
+    }
+
+    pub fn deinit(self: *Preparation) void {
         self.cuts.deinit();
         self.controls.deinit(self.gpa);
         self.refs.deinit(self.gpa);
@@ -271,6 +400,7 @@ const Preparation = struct {
         if (self.track_culdesacs and repeated and !attrs.flags.roundabout and attrs.use == .road and
             @backingInt(attrs.road_class) > @backingInt(@TypeOf(attrs.road_class).tertiary))
             try self.culdesacs.candidate(self.gpa, way.id, refs, &self.last, self.options.deadline);
+        self.selected_ways += 1;
         return true;
     }
 

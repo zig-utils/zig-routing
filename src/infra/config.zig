@@ -29,7 +29,16 @@ pub const Config = struct {
         drain_seconds: u32 = 28,
     };
 
+    pub const Build = struct {
+        inputs: []const []const u8 = &.{},
+        dem_dir: ?[]const u8 = null,
+        work_dir: ?[]const u8 = null,
+        bundle_path: ?[]const u8 = null,
+        threads: ?usize = null,
+    };
+
     pub const ZigRouting = struct {
+        build: Build = .{},
         bundle_path: ?[]const u8 = null,
         threads: usize = 0,
         request_memory_bytes: usize = (http.Config{}).arena_cap_bytes,

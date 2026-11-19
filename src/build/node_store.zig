@@ -387,7 +387,7 @@ pub const BuildOptions = struct {
 /// be incomplete. It has no valid header until the directory is complete.
 pub fn build(
     gpa: std.mem.Allocator,
-    source: pbf.file.Stream,
+    source: anytype,
     output: io.File,
     options: BuildOptions,
     context: anytype,
@@ -400,7 +400,7 @@ pub fn build(
 /// out of order, some nodes can be observed again during the replay.
 pub fn buildObserving(
     gpa: std.mem.Allocator,
-    source: pbf.file.Stream,
+    source: anytype,
     output: io.File,
     options: BuildOptions,
     context: anytype,
@@ -409,33 +409,61 @@ pub fn buildObserving(
 ) !Store {
     var used = try usage.Usage.init(options.scratch_dir);
     defer used.deinit();
+    try markReferenced(gpa, source, &used, options.deadline, context, includeWay);
+    return collectReferenced(gpa, source, &used, output, options, context, observeNode);
+}
+
+pub fn markReferenced(gpa: std.mem.Allocator, source: anytype, used: *usage.Usage, deadline: io.Deadline, context: anytype, comptime includeWay: anytype) !void {
+    const Pass = struct {
+        gpa: std.mem.Allocator,
+        deadline: io.Deadline,
+        selection: @TypeOf(context),
+        used: *usage.Usage,
+        scratch: pbf.block.Scratch = .{},
+
+        fn consume(self: *@This(), _: usize, bytes: []const u8) !void {
+            const block = try self.scratch.decode(self.gpa, bytes, self.deadline);
+            var ways = block.ways();
+            while (try ways.next()) |item| {
+                var way = item;
+                if (try includeWay(self.selection, &way)) {
+                    while (try way.refs.next()) |id| try self.used.mark(keyFor(id));
+                }
+            }
+        }
+    };
+    var pass: Pass = .{ .gpa = gpa, .deadline = deadline, .selection = context, .used = used };
+    defer pass.scratch.deinit(gpa);
+    try source.forEach(gpa, deadline, &pass, Pass.consume);
+}
+
+pub fn collectReferenced(
+    gpa: std.mem.Allocator,
+    source: anytype,
+    used: *usage.Usage,
+    output: io.File,
+    options: BuildOptions,
+    context: anytype,
+    comptime observeNode: ?fn (@TypeOf(context), pbf.block.Node) anyerror!void,
+) !Store {
     var writer = try Writer.init(output, options.scratch_dir);
     defer writer.directory.close();
 
     const Pass = struct {
         const Self = @This();
-        const Mode = union(enum) { usage, sorted_nodes, unsorted_nodes: io.File };
+        const Mode = union(enum) { sorted_nodes, unsorted_nodes: io.File };
         gpa: std.mem.Allocator,
         deadline: io.Deadline,
         selection: @TypeOf(context),
         used: *usage.Usage,
         writer: *Writer,
         scratch: pbf.block.Scratch = .{},
-        mode: Mode = .usage,
+        mode: Mode = .sorted_nodes,
         out_of_order: bool = false,
 
         fn consume(self: *Self, _: usize, bytes: []const u8) !void {
             const block = try self.scratch.decode(self.gpa, bytes, self.deadline);
             switch (self.mode) {
-                .usage => {
-                    var ways = block.ways();
-                    while (try ways.next()) |item| {
-                        var way = item;
-                        if (try includeWay(self.selection, &way)) {
-                            while (try way.refs.next()) |id| try self.used.mark(keyFor(id));
-                        }
-                    }
-                },
                 .sorted_nodes => {
                     var nodes = block.nodes();
                     while (try nodes.next()) |node| {
@@ -465,12 +493,10 @@ pub fn buildObserving(
         .gpa = gpa,
         .deadline = options.deadline,
         .selection = context,
-        .used = &used,
+        .used = used,
         .writer = &writer,
     };
     defer pass.scratch.deinit(gpa);
-    try source.forEach(gpa, options.deadline, &pass, Pass.consume);
-    pass.mode = .sorted_nodes;
     source.forEach(gpa, options.deadline, &pass, Pass.consume) catch |err| {
         if (!pass.out_of_order) return err;
         try writer.restart();

@@ -92,7 +92,15 @@ fn createCommands(a: Allocator) !*Command {
         option("port", "Bind to a TCP port", .int),
         option("elevation", "Read HGT tiles or a packed DEM", .string),
     }, &.{});
-    _ = try command(root, "build", "Build a graph bundle from OSM data", stub, &.{}, &.{});
+    _ = try command(root, "build", "Build a graph bundle from OSM data", buildGraph, &.{
+        option("output", "Publish the graph bundle at this path", .string),
+        option("work-dir", "Directory for stage checkpoints and build-stats.json", .string),
+        option("dem", "Directory of HGT elevation tiles", .string),
+        option("from", "First stage to run (default read)", .string),
+        option("to", "Last stage to run (default finalize)", .string),
+        option("order", "Dense node ordering (hilbert or encounter)", .string),
+        option("drive-side", "Default driving side (right or left)", .string),
+    }, &.{arg("OSM_PBF", "Source OSM PBF files").withRequired(false).withVariadic(true)});
     _ = try command(root, "route", "Run one request in process", route, &.{
         option("action", "Valhalla action (default route)", .string),
         option("file", "Read the request JSON from a file", .string),
@@ -385,6 +393,64 @@ fn compareServers(ctx: *Context) !u8 {
         .label = ctx.getOption("label") orelse "",
     }, ctx.getOption("endpoint") orelse "/route", ctx.getOption("out"), ctx.getOption("worst"), ctx.wantsJson());
     return if (ok) 0 else 1;
+}
+
+fn buildGraph(ctx: *Context) !u8 {
+    const driver = routing.build.driver;
+    const loaded = try App.from(ctx).load(ctx, ctx.getOption("config"));
+    const configured = loaded.config.zig_routing;
+    const settings = configured.build;
+    const output = ctx.getOption("output") orelse settings.bundle_path orelse configured.bundle_path;
+    const work_dir = ctx.getOption("work-dir") orelse settings.work_dir orelse
+        if (output) |path| try std.fmt.allocPrint(ctx.allocator, "{s}.work", .{path}) else return badOption(ctx, "provide --work-dir or --output");
+    const from = std.meta.stringToEnum(driver.Stage, ctx.getOption("from") orelse "read") orelse
+        return badOption(ctx, "unknown --from stage");
+    const to = std.meta.stringToEnum(driver.Stage, ctx.getOption("to") orelse "finalize") orelse
+        return badOption(ctx, "unknown --to stage");
+    const order = if (ctx.getOption("order")) |text|
+        std.meta.stringToEnum(routing.graph.format.OrderingKind, text) orelse return badOption(ctx, "--order expects hilbert or encounter")
+    else
+        null;
+    const side = if (ctx.getOption("drive-side")) |text|
+        std.meta.stringToEnum(routing.build.edge_class.DriveSide, text) orelse return badOption(ctx, "--drive-side expects right or left")
+    else
+        null;
+    const arguments = try ctx.allocator.alloc([]const u8, ctx.getArgumentCount());
+    for (arguments, 0..) |*value, i| value.* = ctx.getArgument(i).?;
+    const options: driver.Options = .{
+        .inputs = if (arguments.len == 0) settings.inputs else arguments,
+        .output = output,
+        .work_dir = work_dir,
+        .dem_dir = ctx.getOption("dem") orelse settings.dem_dir orelse loaded.config.additional_data.elevation,
+        .drive_side = side,
+        .order = order,
+        .workers = (try unsigned(ctx, usize, "threads")) orelse settings.threads orelse configured.threads,
+        .from = from,
+        .to = to,
+    };
+    var diagnostic: driver.Diagnostic = .{};
+    const allocator = std.heap.c_allocator;
+    const result = driver.run(allocator, options, if (ctx.wantsJson()) null else ctx.out, &diagnostic) catch |err| {
+        const stage = if (diagnostic.stage) |stage| @tagName(stage) else "setup";
+        const message = if (diagnostic.input) |path|
+            try std.fmt.allocPrint(ctx.allocator, "build {s} could not read {s} ({s})", .{ stage, path, @errorName(err) })
+        else switch (err) {
+            error.MissingOsmInput => "provide at least one OSM PBF input",
+            error.MissingBundlePath => "provide --output to finalize the bundle",
+            error.InvalidStageRange => "--from must precede or equal --to",
+            error.BuildWorkDirectoryBusy => "another build is using this work directory",
+            error.MissingCheckpoint => try std.fmt.allocPrint(ctx.allocator, "build checkpoint for {s} is missing", .{stage}),
+            error.StaleCheckpoint => try std.fmt.allocPrint(ctx.allocator, "build checkpoint for {s} is stale, restart from {s}", .{ stage, stage }),
+            error.PathAlreadyExists => "the bundle destination already contains different data",
+            error.CheckpointInputMismatch => "the work directory belongs to different build inputs",
+            else => try std.fmt.allocPrint(ctx.allocator, "build {s} failed ({s})", .{ stage, @errorName(err) }),
+        };
+        ctx.setDiagnostic(message);
+        return err;
+    };
+    defer result.deinit(allocator);
+    if (ctx.wantsJson()) try ctx.writeJson(result);
+    return 0;
 }
 
 fn inspectGraph(ctx: *Context) !u8 {

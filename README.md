@@ -48,6 +48,37 @@ zig build run
 the request from a file, run `zr --config valhalla.json route --action height --file height.json`.
 Successful responses go to stdout. Valhalla error bodies go to stderr with a failing exit code.
 
+### Build a graph bundle
+
+```bash
+zr build extract.osm.pbf --output graph --work-dir work --threads 4
+zr inspect --verify graph
+```
+
+The driver accepts one or more OSM PBF inputs and an optional HGT directory
+with `--dem`. It writes stage timing, rows per second, output bytes and peak
+RSS to `build-stats.json` in the work directory. The default work directory
+is the output path with `.work` appended.
+
+`--from` and `--to` select an inclusive range of stages in dependency order.
+For example, stop after enhancement and resume from the elevation checkpoint
+boundary:
+
+```bash
+zr build extract.osm.pbf --work-dir work --to enhance
+zr build --work-dir work --from elevation --output graph
+```
+
+The stages run in this order:
+
+```text
+read tags node_store edges order assemble enhance elevation turns cold spatial validate finalize
+```
+
+Resume uses the completed checkpoints in the same work directory. The last
+stage publishes the verified bundle atomically. A repeat can reuse an identical
+published bundle, and an existing different bundle is preserved.
+
 `zr inspect BUNDLE` reports a graph bundle's sections, counts and sizes. Add `--verify` to
 check every payload checksum, `--edge ID` or `--node ID` to print a record, and `--json` for
 machine-readable output.
@@ -70,6 +101,9 @@ URI form. `timeout_seconds` sets the processing deadline (`-1` disables it), and
 `zig_routing.threads` defaults to one worker per CPU when set to zero.
 `request_memory_bytes`, `max_header_bytes` and `max_body_bytes` set the corresponding
 server limits. The schema includes `bundle_path` and `metric_cache_bytes` for the graph and metric cache.
+
+In a build configuration, `zig_routing.build` accepts `inputs`, `dem_dir`,
+`work_dir`, `bundle_path` and `threads`. Command-line values override configuration.
 
 ## Profiling
 

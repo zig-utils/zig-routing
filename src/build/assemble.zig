@@ -15,6 +15,7 @@ const ColdBuilder = @import("cold_builder.zig").Builder;
 const elevation = @import("elevation.zig");
 const dem = @import("../elevation/root.zig");
 const enhance = @import("enhance.zig");
+const checkpoint = @import("checkpoint.zig");
 const node_order = @import("order.zig");
 
 const Allocator = std.mem.Allocator;
@@ -58,12 +59,7 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     const shape_file = try io.File.temporary(options.scratch_dir);
     defer shape_file.close();
 
-    var metadata: Metadata = .{
-        .gpa = gpa,
-        .drive_side = options.drive_side,
-        .deadline = options.deadline,
-        .strings = .init(gpa),
-    };
+    var metadata = Metadata.init(gpa, options);
     defer metadata.deinit();
     const source_stats = try edges.buildWithGeometry(gpa, source, .{ .edges = edge_file, .shapes = shape_file }, .{
         .scratch_dir = options.scratch_dir,
@@ -111,13 +107,7 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     defer turn_pool.deinit();
     try buildTurns(&shared, table.classes, metadata.name_ids.items, &turn_pool);
 
-    try writer.write(.nodes, topology.nodes);
-    try writer.write(.edges, topology.output.data);
-    try writer.write(.first_edge, topology.first_edge);
-    try writer.write(.classes, table.classes);
-    try writer.write(.coordinates, topology.coordinates);
-    try writer.write(.turns, turn_pool.bytes.items);
-    if (terrain) |*present| try writer.write(.slopes, present.slopes.data);
+    try writeTopology(writer, topology, table.classes, turn_pool.bytes.items, if (terrain) |present| present.slopes.data else null);
     const topology_ns = timer.read();
     const means: []const i16 = if (terrain) |*present| present.means.data else &.{};
     const cold_bytes = try buildCold(gpa, &shared, &metadata, writer, options.scratch_dir, means);
@@ -144,30 +134,242 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     };
 }
 
+/// Run the graph stages against the segment files. The same algorithms and
+/// section writers are used by build() for ephemeral callers.
+pub fn buildStaged(
+    session: *checkpoint.Session,
+    metadata: *const Metadata,
+    source_stats: edges.Stats,
+    edge_file: io.File,
+    shape_file: io.File,
+    options: Options,
+) !void {
+    const gpa = session.gpa;
+    const edge_map = try io.Mapping.mapFd(edge_file, .read_only);
+    defer edge_map.unmap();
+    const shape_map = try io.Mapping.mapFd(shape_file, .read_only);
+    defer shape_map.unmap();
+    const segments = try checkpoint.array(edges.Edge, edge_map);
+    const points = try checkpoint.array(geo.FixedLL, shape_map);
+    if (segments.len != source_stats.edges or points.len != source_stats.shape_points or segments.len > std.math.maxInt(u32) / 2)
+        return error.InvalidSegmentCheckpoint;
+
+    var plan = blk: {
+        if (session.runs(.order)) {
+            const start = io.Timer.start();
+            var tx = try session.begin(.order);
+            defer tx.deinit();
+            var layout = try Layout.plan(gpa, segments, points, metadata, options);
+            errdefer layout.deinit(gpa);
+            if (layout.nodes.items.len != source_stats.nodes) return error.NodeCountMismatch;
+            try layout.save(gpa, &tx);
+            try session.commit(&tx, layout.nodes.items.len, start);
+            break :blk layout;
+        }
+        const saved = try session.open(.order);
+        defer saved.close();
+        break :blk try Layout.load(gpa, saved, options.deadline);
+    };
+    defer plan.deinit(gpa);
+    if (session.endsAt(.order)) return;
+
+    const assembly_start = io.Timer.start();
+    if (session.runs(.assemble)) session.current.* = .assemble;
+    var topology = if (session.runs(.assemble))
+        try Topology.init(gpa, &plan, segments, options)
+    else
+        try Topology.load(gpa, session, options);
+    defer topology.deinit(gpa);
+    if (topology.placements.data.len != 2 * segments.len) return error.InvalidCheckpoint;
+    const shared: Shared = .{
+        .topology = &topology,
+        .segments = segments,
+        .shape_points = points,
+        .ways = &metadata.ways,
+        .deadline = options.deadline,
+    };
+    var edge_classes: ?[]const classes.EdgeClass = null;
+    defer if (edge_classes) |owned| gpa.free(owned);
+    if (session.runs(.assemble)) {
+        var tx = try session.begin(.assemble);
+        defer tx.deinit();
+        const table = try populate(gpa, &shared, options.workers);
+        gpa.free(table.remap);
+        edge_classes = table.classes;
+        try validate(topology.first_edge, topology.output.data, topology.coordinates, table.classes, options.deadline);
+        try topology.savePlacement(&tx);
+        try saveAttributes(topology, table.classes, &tx);
+        try session.commit(&tx, topology.output.data.len, assembly_start);
+    }
+    if (session.endsAt(.assemble)) return;
+
+    if (edge_classes == null) {
+        const source: checkpoint.Stage = if (session.runs(.enhance)) .assemble else .enhance;
+        const saved = try session.open(source);
+        defer saved.close();
+        edge_classes = try loadArray(classes.EdgeClass, gpa, saved, .classes, options.deadline);
+        try validate(topology.first_edge, topology.output.data, topology.coordinates, edge_classes.?, options.deadline);
+    }
+    if (session.runs(.enhance)) {
+        const start = io.Timer.start();
+        var tx = try session.begin(.enhance);
+        defer tx.deinit();
+        const enhanced = try enhanceGraph(gpa, &shared, &plan, edge_classes.?, options);
+        gpa.free(enhanced.remap);
+        gpa.free(edge_classes.?);
+        edge_classes = enhanced.classes;
+        try saveAttributes(topology, enhanced.classes, &tx);
+        try session.commit(&tx, topology.output.data.len, start);
+    }
+    if (session.endsAt(.enhance)) return;
+
+    var terrain: ?Terrain = null;
+    defer if (terrain) |*present| present.deinit();
+    if (session.runs(.elevation)) {
+        const start = io.Timer.start();
+        var tx = try session.begin(.elevation);
+        defer tx.deinit();
+        if (options.dem_source) |source_dem| {
+            terrain = try stampElevation(gpa, &shared, options.scratch_dir, options.workers, source_dem);
+            try tx.writeArray(terrain.?.means.data, .means);
+            try tx.writeArray(terrain.?.slopes.data, .slopes);
+        }
+        const coverage: elevation.Coverage = if (terrain) |present| present.coverage else .{ .total_edges = segments.len };
+        try tx.writeArray(topology.output.data, .directed_edges);
+        try tx.writeJson(gpa, coverage, .terrain_stats);
+        try session.commit(&tx, if (terrain != null) segments.len else 0, start);
+    }
+    if (session.endsAt(.elevation)) return;
+
+    var turn_pool = turns.Pool.init(gpa);
+    defer turn_pool.deinit();
+    if (session.runs(.turns)) {
+        const start = io.Timer.start();
+        var tx = try session.begin(.turns);
+        defer tx.deinit();
+        try buildTurns(&shared, edge_classes.?, metadata.name_ids.items, &turn_pool);
+        try tx.writeArray(topology.nodes, .nodes);
+        try tx.writeArray(turn_pool.bytes.items, .turn_pool);
+        try tx.writeJson(gpa, turn_pool.indices.count(), .turn_stats);
+        try session.commit(&tx, topology.nodes.len, start);
+    }
+    if (session.endsAt(.turns)) return;
+
+    if (session.runs(.cold)) {
+        const start = io.Timer.start();
+        var tx = try session.begin(.cold);
+        defer tx.deinit();
+        var writer = try stageWriter(session.*, tx);
+        defer writer.deinit();
+        const saved_turns = try session.open(.turns);
+        defer saved_turns.close();
+        const turn_data = try saved_turns.map(.turn_pool, options.deadline);
+        defer turn_data.unmap();
+        const saved_terrain = try session.open(.elevation);
+        defer saved_terrain.close();
+        const coverage = try saved_terrain.readJson(elevation.Coverage, gpa, .terrain_stats, options.deadline);
+        defer coverage.deinit();
+        const means_map = if (coverage.value.dem_configured) try saved_terrain.map(.means, options.deadline) else null;
+        defer if (means_map) |mapped| mapped.unmap();
+        const slopes_map = if (coverage.value.dem_configured) try saved_terrain.map(.slopes, options.deadline) else null;
+        defer if (slopes_map) |mapped| mapped.unmap();
+        const means = if (means_map) |mapped| try checkpoint.array(i16, mapped) else &.{};
+        if (means.len != 0 and means.len != segments.len) return error.InvalidCheckpoint;
+        try writeTopology(&writer, topology, edge_classes.?, turn_data.bytes, if (slopes_map) |mapped| try checkpoint.array(u16, mapped) else null);
+        const cold_bytes = try buildCold(gpa, &shared, metadata, &writer, options.scratch_dir, means);
+        try tx.writeJson(gpa, cold_bytes, .source_stats);
+        try writer.write(.metadata, &.{.{
+            .ordering_kind = @backingInt(options.ordering.kind),
+            .order_hash = plan.order_hash,
+        }});
+        try tx.saveSections(&writer);
+        try session.commit(&tx, topology.output.data.len / 2, start);
+    }
+    if (session.endsAt(.cold)) return;
+
+    if (session.runs(.spatial)) {
+        const start = io.Timer.start();
+        var tx = try session.begin(.spatial);
+        defer tx.deinit();
+        var writer = try stageWriter(session.*, tx);
+        defer writer.deinit();
+        const spatial = try buildSpatial(gpa, &shared, &writer, options.scratch_dir, options.workers);
+        try tx.writeJson(gpa, spatial, .spatial_stats);
+        try tx.saveSections(&writer);
+        try session.commit(&tx, spatial.cells, start);
+    }
+}
+
+fn saveAttributes(topology: Topology, edge_classes: []const classes.EdgeClass, tx: *checkpoint.Transaction) !void {
+    try tx.writeArray(topology.nodes, .nodes);
+    try tx.writeArray(topology.output.data, .directed_edges);
+    try tx.writeArray(edge_classes, .classes);
+}
+
+fn writeTopology(writer: *format.BundleWriter, topology: Topology, edge_classes: []const classes.EdgeClass, turn_data: []const u8, slopes: ?[]const u16) !void {
+    try writer.write(.nodes, topology.nodes);
+    try writer.write(.edges, topology.output.data);
+    try writer.write(.first_edge, topology.first_edge);
+    try writer.write(.classes, edge_classes);
+    try writer.write(.coordinates, topology.coordinates);
+    try writer.write(.turns, turn_data);
+    if (slopes) |data| try writer.write(.slopes, data);
+}
+
+pub fn stageWriter(session: checkpoint.Session, tx: checkpoint.Transaction) !format.BundleWriter {
+    const path = try std.fs.path.join(session.gpa, &.{ session.path, &tx.name, "bundle" });
+    defer session.gpa.free(path);
+    return format.BundleWriter.init(path, session.identity, session.deadline);
+}
+
 const neutral_node: format.NodeHot = .{
     .turn_off = 0,
     .attr = .{ .access = @bitCast(graph.constants.AccessMask.all_tag_modes), .type = 0, .density = 0, .signal = 0 },
 };
 
-const Way = struct {
+const Way = extern struct {
     by_direction: [2]classes.EdgeClass,
-    speeds: [2]u8,
-    truck_speed: u8,
-    speed_limit: u8,
-    oneway: bool,
-    importance: u3,
-    has_names: bool,
-    layer: i8,
+    speeds: packed struct(u32) {
+        forward: u8,
+        backward: u8,
+        truck: u8,
+        limit: u8,
+    },
+    attr: packed struct(u32) {
+        oneway: bool,
+        importance: u3,
+        has_names: bool,
+        layer: i8,
+        reserved: u19 = 0,
+    },
     level_start: u32,
-    level_count: u24,
+    level_count: u32,
     name_start: u32,
     ref_start: u32,
     ref_end: u32,
     name_end: u32,
 };
 
+const WayEntry = extern struct {
+    id: i64,
+    way: Way,
+};
+
+const NodeEntry = extern struct {
+    id: i64,
+    hot: format.NodeHot,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(Way) == 72);
+    std.debug.assert(@offsetOf(Way, "by_direction") == 0 and @offsetOf(Way, "speeds") == 40 and @offsetOf(Way, "attr") == 44);
+    std.debug.assert(@offsetOf(Way, "level_start") == 48 and @offsetOf(Way, "name_end") == 68);
+    std.debug.assert(@sizeOf(WayEntry) == 80 and @offsetOf(WayEntry, "way") == 8);
+    std.debug.assert(@sizeOf(NodeEntry) == 16 and @offsetOf(NodeEntry, "hot") == 8);
+}
+
 const Ways = std.AutoHashMapUnmanaged(i64, Way);
-const Metadata = struct {
+pub const Metadata = struct {
     gpa: Allocator,
     drive_side: edge_class.DriveSide,
     deadline: io.Deadline,
@@ -177,7 +379,113 @@ const Metadata = struct {
     nodes: std.AutoHashMapUnmanaged(i64, format.NodeHot) = .empty,
     ways: Ways = .empty,
 
-    fn deinit(self: *Metadata) void {
+    pub fn init(gpa: Allocator, options: Options) Metadata {
+        return .{ .gpa = gpa, .drive_side = options.drive_side, .deadline = options.deadline, .strings = .init(gpa) };
+    }
+
+    pub fn saveNodes(self: *const Metadata, tx: *checkpoint.Transaction) !void {
+        const file = try tx.create(.node_attributes);
+        defer file.close();
+        var rows: [2048]NodeEntry = undefined;
+        var count: usize = 0;
+        var offset: u64 = 0;
+        var iter = self.nodes.iterator();
+        while (iter.next()) |entry| {
+            rows[count] = .{ .id = entry.key_ptr.*, .hot = entry.value_ptr.* };
+            count += 1;
+            if (count == rows.len) {
+                if (self.deadline.expired()) return error.DeadlineExceeded;
+                try file.pwriteAll(std.mem.asBytes(&rows), offset);
+                offset += @sizeOf(@TypeOf(rows));
+                count = 0;
+            }
+        }
+        try file.pwriteAll(std.mem.sliceAsBytes(rows[0..count]), offset);
+        try file.sync();
+    }
+
+    pub fn loadNodes(self: *Metadata, saved: checkpoint.Existing) !void {
+        const mapped = try saved.map(.node_attributes, self.deadline);
+        defer mapped.unmap();
+        for (try checkpoint.array(NodeEntry, mapped), 0..) |entry, i| {
+            try checkDeadline(self.deadline, i);
+            try self.nodes.put(self.gpa, entry.id, entry.hot);
+        }
+    }
+
+    pub fn saveWays(self: *const Metadata, tx: *checkpoint.Transaction) !void {
+        const file = try tx.create(.way_attributes);
+        defer file.close();
+        var rows: [512]WayEntry = undefined;
+        var count: usize = 0;
+        var offset: u64 = 0;
+        var iter = self.ways.iterator();
+        while (iter.next()) |entry| {
+            rows[count] = .{ .id = entry.key_ptr.*, .way = entry.value_ptr.* };
+            count += 1;
+            if (count == rows.len) {
+                if (self.deadline.expired()) return error.DeadlineExceeded;
+                try file.pwriteAll(std.mem.asBytes(&rows), offset);
+                offset += @sizeOf(@TypeOf(rows));
+                count = 0;
+            }
+        }
+        try file.pwriteAll(std.mem.sliceAsBytes(rows[0..count]), offset);
+        try file.sync();
+        const names = try tx.create(.names);
+        defer names.close();
+        offset = 0;
+        for (self.strings.strings.items, 0..) |text, i| {
+            try checkDeadline(self.deadline, i);
+            const size = std.math.cast(u32, text.len) orelse return error.NameTooLarge;
+            try names.pwriteAll(std.mem.asBytes(&size), offset);
+            offset += @sizeOf(u32);
+            try names.pwriteAll(text, offset);
+            offset += size;
+        }
+        try names.sync();
+        try tx.writeArray(self.name_ids.items, .name_refs);
+        try tx.writeArray(self.levels.items, .levels);
+    }
+
+    pub fn loadWays(self: *Metadata, saved: checkpoint.Existing) !void {
+        const names = try saved.map(.names, self.deadline);
+        defer names.unmap();
+        var remaining: []const u8 = names.bytes;
+        while (remaining.len != 0) {
+            if (self.deadline.expired()) return error.DeadlineExceeded;
+            if (remaining.len < @sizeOf(u32)) return error.InvalidCheckpoint;
+            const len = std.mem.readInt(u32, remaining[0..@sizeOf(u32)], .little);
+            remaining = remaining[@sizeOf(u32)..];
+            if (len == 0 or len > remaining.len) return error.InvalidCheckpoint;
+            _ = try self.strings.intern(remaining[0..len]);
+            remaining = remaining[len..];
+        }
+        const refs = try saved.map(.name_refs, self.deadline);
+        defer refs.unmap();
+        for (try checkpoint.array(tags.names.Id, refs), 0..) |id, i| {
+            try checkDeadline(self.deadline, i);
+            if (self.strings.get(id) == null) return error.InvalidCheckpoint;
+            try self.name_ids.append(self.gpa, id);
+        }
+        const levels = try saved.map(.levels, self.deadline);
+        defer levels.unmap();
+        try self.levels.appendSlice(self.gpa, try checkpoint.array(graph.cold.LevelRange, levels));
+
+        const ways = try saved.map(.way_attributes, self.deadline);
+        defer ways.unmap();
+        for (try checkpoint.array(WayEntry, ways), 0..) |entry, i| {
+            try checkDeadline(self.deadline, i);
+            const attrs = entry.way;
+            if (attrs.name_start > attrs.ref_start or attrs.ref_start > attrs.ref_end or attrs.name_start > attrs.name_end or
+                attrs.name_end - attrs.name_start > graph.cold.max_names or attrs.name_end > self.name_ids.items.len or
+                attrs.level_start > self.levels.items.len or attrs.level_count > self.levels.items.len - attrs.level_start)
+                return error.InvalidCheckpoint;
+            try self.ways.put(self.gpa, entry.id, attrs);
+        }
+    }
+
+    pub fn deinit(self: *Metadata) void {
         self.nodes.deinit(self.gpa);
         self.ways.deinit(self.gpa);
         self.name_ids.deinit(self.gpa);
@@ -185,7 +493,7 @@ const Metadata = struct {
         self.strings.deinit();
     }
 
-    fn node(self: *Metadata, id: i64, attrs: tags.NodeAttrs) !void {
+    pub fn node(self: *Metadata, id: i64, attrs: tags.NodeAttrs) !void {
         const hot: format.NodeHot = .{
             .turn_off = 0,
             .attr = .{
@@ -198,7 +506,7 @@ const Metadata = struct {
         if (!std.meta.eql(hot, neutral_node)) try self.nodes.put(self.gpa, id, hot);
     }
 
-    fn way(self: *Metadata, id: i64, attrs: tags.WayAttrs, raw_tags: pbf.block.TagIterator) !void {
+    pub fn way(self: *Metadata, id: i64, attrs: tags.WayAttrs, raw_tags: pbf.block.TagIterator) !void {
         const use = attrs.edgeUse();
         const directed_use = if (attrs.flags.turn_channel and attrs.use != .construction)
             .turn_channel
@@ -234,17 +542,19 @@ const Metadata = struct {
         entry.value_ptr.* = .{
             .by_direction = pair,
             .speeds = .{
-                if (attrs.flags.forward_tagged_speed) attrs.forward_speed else attrs.speed,
-                if (attrs.flags.backward_tagged_speed) attrs.backward_speed else attrs.speed,
+                .forward = if (attrs.flags.forward_tagged_speed) attrs.forward_speed else attrs.speed,
+                .backward = if (attrs.flags.backward_tagged_speed) attrs.backward_speed else attrs.speed,
+                .truck = attrs.truck_speed,
+                .limit = attrs.speed_limit,
             },
-            .truck_speed = attrs.truck_speed,
-            .speed_limit = attrs.speed_limit,
-            .oneway = attrs.flags.oneway,
-            .importance = @intCast(@backingInt(attrs.road_class)),
-            .has_names = name_start != name_end,
-            .layer = attrs.layer,
+            .attr = .{
+                .oneway = attrs.flags.oneway,
+                .importance = @intCast(@backingInt(attrs.road_class)),
+                .has_names = name_start != name_end,
+                .layer = attrs.layer,
+            },
             .level_start = level_start,
-            .level_count = std.math.cast(u24, self.levels.items.len - level_start) orelse return error.TooManyLevels,
+            .level_count = std.math.cast(u32, self.levels.items.len - level_start) orelse return error.TooManyLevels,
             .name_start = name_start,
             .ref_start = ref_start,
             .ref_end = ref_end,
@@ -264,7 +574,7 @@ const Metadata = struct {
         }
     }
 
-    fn culdesac(self: *Metadata, id: i64) !void {
+    pub fn culdesac(self: *Metadata, id: i64) !void {
         const way_attrs = self.ways.getPtr(id) orelse return;
         for (&way_attrs.by_direction) |*class| {
             if (class.category.use == @backingInt(graph.constants.Use.road))
@@ -273,13 +583,17 @@ const Metadata = struct {
     }
 };
 
-const Node = struct {
+const Node = extern struct {
+    osm_id: i64,
     point: geo.FixedLL,
     hot: format.NodeHot,
     degree: u32 = 0,
     first_alias: u32 = 0,
     placed: u32 = 0,
+    reserved: u32 = 0,
 };
+
+const LayoutStats = struct { node_count: u32, split_nodes: u32, connectors: u32, order_hash: u64 };
 
 const Layout = struct {
     nodes: std.ArrayList(Node) = .empty,
@@ -311,6 +625,40 @@ const Layout = struct {
         }
         if (2 * (@as(u64, segments.len) + self.connectors) > std.math.maxInt(u32))
             return error.TooManyDirectedEdges;
+        return self;
+    }
+
+    fn save(self: *const Layout, gpa: Allocator, tx: *checkpoint.Transaction) !void {
+        try tx.writeArray(self.nodes.items, .logical_nodes);
+        try tx.writeJson(gpa, LayoutStats{
+            .node_count = self.node_count,
+            .split_nodes = self.split_nodes,
+            .connectors = self.connectors,
+            .order_hash = self.order_hash,
+        }, .layout_stats);
+    }
+
+    fn load(gpa: Allocator, saved: checkpoint.Existing, deadline: io.Deadline) !Layout {
+        const stats = try saved.readJson(LayoutStats, gpa, .layout_stats, deadline);
+        defer stats.deinit();
+        const mapped = try saved.map(.logical_nodes, deadline);
+        defer mapped.unmap();
+        var self: Layout = .{
+            .node_count = stats.value.node_count,
+            .split_nodes = stats.value.split_nodes,
+            .connectors = stats.value.connectors,
+            .order_hash = stats.value.order_hash,
+        };
+        errdefer self.deinit(gpa);
+        try self.nodes.appendSlice(gpa, try checkpoint.array(Node, mapped));
+        var total: u32 = 0;
+        for (self.nodes.items, 0..) |node, i| {
+            try checkDeadline(deadline, i);
+            if (node.reserved != 0 or node.placed != 0 or node.degree == 0 or node.first_alias != total) return error.InvalidCheckpoint;
+            total = std.math.add(u32, total, aliasCount(node.degree)) catch return error.InvalidCheckpoint;
+            try self.by_id.putNoClobber(gpa, node.osm_id, @intCast(i));
+        }
+        if (total != self.node_count) return error.InvalidCheckpoint;
         return self;
     }
 
@@ -349,7 +697,7 @@ const Layout = struct {
         const entry = try self.by_id.getOrPut(gpa, id);
         if (!entry.found_existing) {
             entry.value_ptr.* = std.math.cast(u32, self.nodes.items.len) orelse return error.TooManyNodes;
-            try self.nodes.append(gpa, .{ .point = point, .hot = metadata.nodes.get(id) orelse neutral_node });
+            try self.nodes.append(gpa, .{ .osm_id = id, .point = point, .hot = metadata.nodes.get(id) orelse neutral_node });
         }
         const node = &self.nodes.items[entry.value_ptr.*];
         if (node.point.lat != point.lat or node.point.lng != point.lng) return error.InconsistentCoordinates;
@@ -395,6 +743,9 @@ const Placement = extern struct {
 
 comptime {
     std.debug.assert(@import("builtin").target.cpu.arch.endian() == .little);
+    std.debug.assert(@sizeOf(Node) == 40 and @offsetOf(Node, "osm_id") == 0);
+    std.debug.assert(@offsetOf(Node, "point") == 8 and @offsetOf(Node, "hot") == 16);
+    std.debug.assert(@offsetOf(Node, "degree") == 24 and @offsetOf(Node, "reserved") == 36);
     std.debug.assert(@sizeOf(Placement) == 8 and @offsetOf(Placement, "node") == 0 and @offsetOf(Placement, "slot") == 4);
 }
 
@@ -411,6 +762,17 @@ fn Scratch(comptime T: type) type {
             const mapping = try io.Mapping.mapFd(file, .shared_writable);
             errdefer mapping.unmap();
             return .{ .mapping = mapping, .data = try mapping.sliceMut(T, 0, count) };
+        }
+
+        fn load(saved: checkpoint.Existing, key: checkpoint.Artifact, options: Options) !@This() {
+            const file = try saved.read(key, options.deadline);
+            defer file.close();
+            const bytes = try file.size();
+            if (bytes % @sizeOf(T) != 0) return error.InvalidCheckpoint;
+            const self = try init(@intCast(bytes / @sizeOf(T)), options.scratch_dir);
+            errdefer self.deinit();
+            try file.preadAll(std.mem.sliceAsBytes(self.data), 0);
+            return self;
         }
 
         fn deinit(self: @This()) void {
@@ -489,6 +851,52 @@ const Topology = struct {
         };
     }
 
+    fn savePlacement(self: Topology, tx: *checkpoint.Transaction) !void {
+        try tx.writeArray(self.coordinates, .coordinates);
+        try tx.writeArray(self.groups, .groups);
+        try tx.writeArray(self.first_edge, .first_edge);
+        try tx.writeArray(self.slot_refs.data, .slot_refs);
+        try tx.writeArray(self.placements.data, .placements);
+    }
+
+    fn load(gpa: Allocator, session: *checkpoint.Session, options: Options) !Topology {
+        const base = try session.open(.assemble);
+        defer base.close();
+        const nodes_stage: checkpoint.Stage = if (@backingInt(session.from) > @backingInt(checkpoint.Stage.turns)) .turns else if (@backingInt(session.from) > @backingInt(checkpoint.Stage.enhance)) .enhance else .assemble;
+        const edges_stage: checkpoint.Stage = if (@backingInt(session.from) > @backingInt(checkpoint.Stage.elevation)) .elevation else if (@backingInt(session.from) > @backingInt(checkpoint.Stage.enhance)) .enhance else .assemble;
+        const nodes_source = try session.open(nodes_stage);
+        defer nodes_source.close();
+        const edges_source = try session.open(edges_stage);
+        defer edges_source.close();
+
+        const nodes = try loadArray(format.NodeHot, gpa, nodes_source, .nodes, options.deadline);
+        errdefer gpa.free(nodes);
+        const coordinates = try loadArray(format.Coordinate, gpa, base, .coordinates, options.deadline);
+        errdefer gpa.free(coordinates);
+        const groups = try loadArray(Group, gpa, base, .groups, options.deadline);
+        errdefer gpa.free(groups);
+        const first_edge = try loadArray(u32, gpa, base, .first_edge, options.deadline);
+        errdefer gpa.free(first_edge);
+        const slot_refs = try Scratch(u32).load(base, .slot_refs, options);
+        errdefer slot_refs.deinit();
+        const placements = try Scratch(Placement).load(base, .placements, options);
+        errdefer placements.deinit();
+        const output = try Scratch(format.EdgeHot).load(edges_source, .directed_edges, options);
+        errdefer output.deinit();
+        if (groups.len != nodes.len or coordinates.len != nodes.len or first_edge.len != nodes.len + 1 or
+            first_edge[0] != 0 or first_edge[nodes.len] != output.data.len or slot_refs.data.len != output.data.len)
+            return error.InvalidCheckpoint;
+        return .{
+            .nodes = nodes,
+            .coordinates = coordinates,
+            .groups = groups,
+            .first_edge = first_edge,
+            .slot_refs = slot_refs,
+            .placements = placements,
+            .output = output,
+        };
+    }
+
     fn deinit(self: Topology, gpa: Allocator) void {
         self.output.deinit();
         self.placements.deinit();
@@ -499,6 +907,12 @@ const Topology = struct {
         gpa.free(self.nodes);
     }
 };
+
+fn loadArray(comptime T: type, gpa: Allocator, saved: checkpoint.Existing, key: checkpoint.Artifact, deadline: io.Deadline) ![]T {
+    const mapping = try saved.map(key, deadline);
+    defer mapping.unmap();
+    return gpa.dupe(T, try checkpoint.array(T, mapping));
+}
 
 const Shared = struct {
     topology: *Topology,
@@ -534,7 +948,7 @@ const Job = struct {
                 const way = shared.ways.get(segment.way_id) orelse return error.MissingWayAttributes;
                 const direction = ref & 1;
                 var class = way.by_direction[direction];
-                edge_class.applySegmentControls(&class, segment.flags, direction == 0, way.oneway);
+                edge_class.applySegmentControls(&class, segment.flags, direction == 0, way.attr.oneway);
                 const encoded_len = try encodeLength(segment.length_m);
                 const curvature = try computeCurvature(try segmentShape(shared.shape_points, segment), shared.deadline);
                 topo.output.data[slot] = .{
@@ -547,7 +961,7 @@ const Job = struct {
                         .cold_checks = 0,
                         .pred_speed = 0,
                     },
-                    .speed = .{ way.speeds[direction], 0, 0, way.truck_speed },
+                    .speed = .{ if (direction == 0) way.speeds.forward else way.speeds.backward, 0, 0, way.speeds.truck },
                 };
             }
             if (!group.has_left and !group.has_right) continue;
@@ -821,7 +1235,7 @@ fn orderWalks(shared: *const Shared, plan: *const Layout, base: []const classes.
             } else {
                 const segment = shared.segments[topo.slot_refs.data[slot] / 2];
                 const way = shared.ways.get(segment.way_id) orelse return error.MissingWayAttributes;
-                rank.* = graph.constants.incidentEdgeRank(class.forwardAccess().auto, way.importance, way.has_names);
+                rank.* = graph.constants.incidentEdgeRank(class.forwardAccess().auto, way.attr.importance, way.attr.has_names);
             }
             positions[rank.*] += 1;
         }
@@ -1039,10 +1453,10 @@ fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *const Metadata, w
                 reverse = ref & 1 != 0;
                 const mean = if (means.len == 0) graph.cold.no_elevation else means[ref / 2];
                 const indoor: graph.cold.Indoor = .{
-                    .layer = way.layer,
+                    .layer = way.attr.layer,
                     .levels = metadata.levels.items[way.level_start..][0..way.level_count],
                 };
-                break :blk try builder.append(@bitCast(seg.way_id), way.speed_limit, mean, try segmentShape(shared.shape_points, seg), active, indoor);
+                break :blk try builder.append(@bitCast(seg.way_id), way.speeds.limit, mean, try segmentShape(shared.shape_points, seg), active, indoor);
             } else try builder.append(0, 0, graph.cold.no_elevation, &.{ topo.coordinates[node], topo.coordinates[edge.head] }, &.{}, .{});
             index.data[slot] = graph.cold.directedIndex(record, reverse);
             index.data[opposite] = graph.cold.directedIndex(record, !reverse);

@@ -51,6 +51,14 @@ jobs:
           for dataset in liechtenstein utrecht; do
             zig build check-assembly -- "oracle/data/$dataset/extract.osm.pbf" "$work/$dataset" "$work" 4 right
           done
+          for dataset in liechtenstein utrecht; do
+            input="oracle/data/$dataset/extract.osm.pbf"
+            zig-out/bin/zr build "$input" --work-dir "$work/$dataset-full-work" --output "$work/$dataset-full" --threads 4
+            zig-out/bin/zr inspect --verify "$work/$dataset-full"
+            zig-out/bin/zr build "$input" --work-dir "$work/$dataset-split-work" --to enhance --threads 4
+            zig-out/bin/zr build --work-dir "$work/$dataset-split-work" --from elevation --output "$work/$dataset-resumed" --threads 4
+            diff -qr "$work/$dataset-full" "$work/$dataset-resumed"
+          done
           oracle/fetch.sh liechtenstein
           zig build check-assembly -Doptimize=ReleaseFast -- "$ORACLE_DATA/liechtenstein/extract.osm.pbf" "$work/liechtenstein-dem" "$work" 4 right --dem "$ORACLE_DATA/liechtenstein/elevation"
           fetch_checked \

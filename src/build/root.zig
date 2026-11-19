@@ -2,6 +2,8 @@
 
 const std = @import("std");
 
+pub const driver = @import("driver.zig");
+pub const checkpoint = @import("checkpoint.zig");
 pub const osm = @import("osm.zig");
 pub const osmxml = @import("osmxml.zig");
 pub const pbf = @import("pbf/root.zig");

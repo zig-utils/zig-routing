@@ -11,7 +11,8 @@
 //! and generated message views), `config` (Valhalla JSON settings), and
 //! `osm-pbf` (file framing, block inflation and OSM primitives), and
 //! `node-store` (the build-time coordinate index format) and `graph-bundle`
-//! (section headers, checksums and typed topology access).
+//! (section headers, checksums and typed topology access), and
+//! `build-checkpoint` (restart manifests).
 //!
 //! The contract for every parser: malformed input returns an error, never
 //! panics, overflows or reads out of bounds. The fuzz step builds ReleaseSafe
@@ -131,6 +132,32 @@ test "fuzz graph-bundle" {
         candidates[i + 1] = raw;
     }
     try std.testing.fuzz(&baseline, fuzzGraphBundle, .{ .corpus = try seeds(a, &candidates) });
+}
+
+fn fuzzBuildCheckpoint(_: void, smith: *Smith) !void {
+    var buf: [max_input]u8 = undefined;
+    const input = draw(smith, &buf, 0x6275_696c);
+    _ = routing.build.checkpoint.Manifest.parse(std.testing.allocator, input) catch return;
+}
+
+test "fuzz build-checkpoint" {
+    const gpa = std.testing.allocator;
+    const checkpoint = routing.build.checkpoint;
+    var files: std.EnumArray(checkpoint.Artifact, ?checkpoint.Fingerprint) = .initFill(null);
+    files.set(.segments, .{ .bytes = 48, .xxh3 = 94132 });
+    const fixture: checkpoint.Manifest = .{
+        .identity = @splat(0x1f),
+        .parent = 987654321,
+        .metric = .{ .stage = .edges, .elapsed_ns = 100, .rows = 1, .bytes = 48, .peak_rss_bytes = 1000, .rows_per_second = 1e7 },
+        .files = files,
+    };
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const encoded = try std.json.Stringify.valueAlloc(a, fixture, .{});
+    const round_trip = try checkpoint.Manifest.parse(a, encoded);
+    try std.testing.expectEqual(fixture.parent, round_trip.parent);
+    try std.testing.fuzz({}, fuzzBuildCheckpoint, .{ .corpus = try seeds(a, &.{ "", "{}", encoded }) });
 }
 
 fn fuzzOsmPbf(_: void, s: *Smith) !void {
