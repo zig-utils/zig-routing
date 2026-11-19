@@ -6,7 +6,8 @@ const constants = @import("../../graph/constants.zig");
 const io = @import("../../infra/io.zig");
 const attrs = @import("attrs.zig");
 const defaults = @import("defaults.zig");
-const Scratch = @import("input.zig").Scratch;
+const input = @import("input.zig");
+const Scratch = input.Scratch;
 const Selection = @import("selection.zig").Selection;
 
 const Surface = constants.Surface;
@@ -17,11 +18,11 @@ pub fn classify(tags: *const Scratch, selected: Selection, deadline: io.Deadline
     const effective_highway = if (highway == .construction) tags.text(.construction) else tags.text(.highway);
     out.use = useFor(tags, selected);
     if (out.use == .platform) out.road_class = .service_other;
-    out.surface = try surface(tags, out.road_class, out.use, deadline);
+    out.surface = try surface(tags, out.road_class, out.use, out.bicycle, deadline);
     // ParseWays assigns the highway tile level after choosing the surface.
     if (selected.ferry or selected.rail) out.road_class = .primary;
     out.flags.link = tags.id(.link) == .true or if (effective_highway) |text|
-        try contains(text, "_link", false, deadline)
+        try input.contains(text, "_link", false, deadline)
     else
         false;
     out.flags.bridge = tags.id(.bridge) == .yes or tags.id(.bridge) == .@"1";
@@ -107,17 +108,6 @@ fn useFor(tags: *const Scratch, selected: Selection) Use {
     return result;
 }
 
-fn contains(text: []const u8, needle: []const u8, ignore_case: bool, deadline: io.Deadline) !bool {
-    if (text.len < needle.len) return false;
-    for (0..text.len - needle.len + 1) |i| {
-        if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
-        const part = text[i..][0..needle.len];
-        if (if (ignore_case) std.ascii.eqlIgnoreCase(part, needle) else std.mem.eql(u8, part, needle))
-            return true;
-    }
-    return false;
-}
-
 const surface_patterns = [_]struct { surface: Surface, values: []const []const u8 }{
     .{ .surface = .gravel, .values = &.{"unpaved"} },
     .{ .surface = .paved_smooth, .values = &.{ "paved", "pavement", "asphalt", "concrete", "cement", "chipseal", "metal" } },
@@ -133,7 +123,7 @@ fn namedSurface(text: []const u8, deadline: io.Deadline) !?Surface {
     if (std.ascii.eqlIgnoreCase(text, "stone")) return .paved_rough;
     for (surface_patterns) |group| {
         for (group.values) |needle| {
-            if (try contains(text, needle, true, deadline)) return group.surface;
+            if (try input.contains(text, needle, true, deadline)) return group.surface;
         }
     }
     return null;
@@ -165,17 +155,17 @@ fn taggedSurface(tags: *const Scratch, deadline: io.Deadline) !?Surface {
     };
 }
 
-fn surface(tags: *const Scratch, road_class: constants.RoadClass, use: Use, deadline: io.Deadline) !Surface {
-    if (tags.text(.@"mtb:scale")) |text| {
-        if (try defaults.nonnegativeIntPrefix(text, deadline)) |scale| {
+fn surface(tags: *const Scratch, road_class: constants.RoadClass, use: Use, bike: attrs.BicycleAttrs, deadline: io.Deadline) !Surface {
+    if (tags.get(.@"mtb:scale") != null) {
+        if (bike.mtb_scale) |scale| {
             return switch (scale) {
                 0 => .dirt,
                 1 => .gravel,
                 else => .path,
             };
         }
-    } else if (tags.text(.@"mtb:scale:uphill")) |text| {
-        if (try defaults.nonnegativeIntPrefix(text, deadline)) |scale| return if (scale < 2) .gravel else .path;
+    } else if (bike.mtb_uphill_scale) |scale| {
+        return if (scale < 2) .gravel else .path;
     }
     if (try taggedSurface(tags, deadline)) |value| return value;
     if (tags.get(.sac_scale) != null or tags.id(.highway) == .via_ferrata) return .path;

@@ -1,5 +1,6 @@
 //! Per-worker tag storage shared by PBF and XML transforms.
 
+const std = @import("std");
 const io = @import("../../infra/io.zig");
 const pbf = @import("../pbf/root.zig");
 const osm = @import("../osm.zig");
@@ -76,3 +77,14 @@ pub const Scratch = struct {
         return (self.get(key) orelse return null).text();
     }
 };
+
+pub fn contains(text: []const u8, needle: []const u8, ignore_case: bool, deadline: io.Deadline) !bool {
+    if (text.len < needle.len) return false;
+    for (0..text.len - needle.len + 1) |i| {
+        if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
+        const part = text[i..][0..needle.len];
+        if (if (ignore_case) std.ascii.eqlIgnoreCase(part, needle) else std.mem.eql(u8, part, needle))
+            return true;
+    }
+    return false;
+}

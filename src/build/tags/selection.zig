@@ -101,6 +101,7 @@ pub const Selection = struct {
     pedestrian_area: bool,
     bicycle_only: bool,
     other_modes_denied: bool,
+    forward_pedestrian_denied: bool,
     explicit: Explicit,
 };
 
@@ -116,19 +117,8 @@ fn inherited(value: ?bool, fallback: Flag) Flag {
     return if (value) |v| Flag.fromBool(v) else fallback;
 }
 
-fn cycleReverse(v: ?Value) bool {
-    return v == .opposite or v == .opposite_lane or v == .opposite_track;
-}
-
 fn busReverse(v: ?Value) bool {
     return v == .opposite or v == .opposite_lane;
-}
-
-fn cycleLane(v: ?Value) bool {
-    return switch (v orelse return false) {
-        .shared_lane, .share_busway, .shared, .opposite_lane, .lane, .buffered_lane, .opposite_track, .track => true,
-        else => false,
-    };
 }
 
 fn yesOrDesignated(v: ?Value) bool {
@@ -293,7 +283,7 @@ pub fn select(tags: *const Scratch, deadline: io.Deadline) !?Selection {
 
     if ((yes_oneway and bike_oneway == .no) or bike_back == .yes or bike_back == .no) backward.bicycle = .allow;
     if (backward.bicycle == .missing or backward.bicycle == .deny)
-        backward.bicycle = Flag.fromBool(cycleReverse(tags.id(.cycleway)) or cycleReverse(cycle_left) or cycleReverse(cycle_right));
+        backward.bicycle = Flag.fromBool(defaults.oppositeCycleway(tags.id(.cycleway)) or defaults.oppositeCycleway(cycle_left) or defaults.oppositeCycleway(cycle_right));
     if ((yes_oneway and bus_id == .no) or yesOrDesignated(bus_back)) backward.bus = .allow;
     if (backward.bus == .missing or backward.bus == .deny)
         backward.bus = Flag.fromBool(busReverse(busway) or busReverse(bus_left) or busReverse(bus_right) or
@@ -341,7 +331,7 @@ pub fn select(tags: *const Scratch, deadline: io.Deadline) !?Selection {
         fillBackward(&backward.motorcycle, forward.motorcycle, tags.get(.@"oneway:motorcycle") == null or moto_oneway == .no);
         fillBackward(&backward.pedestrian, forward.pedestrian, tags.get(.@"oneway:foot") == null or foot_oneway == .no);
     }
-    if (cycleLane(bike_both) or (cycleLane(cycle_left) and cycleLane(cycle_right))) {
+    if (defaults.cycleLane(bike_both) != .none or (defaults.cycleLane(cycle_left) != .none and defaults.cycleLane(cycle_right) != .none)) {
         forward.bicycle = .allow;
         backward.bicycle = .allow;
     }
@@ -395,6 +385,7 @@ pub fn select(tags: *const Scratch, deadline: io.Deadline) !?Selection {
         .bicycle_only = forward.pedestrian == .deny and forward.auto == .deny and
             backward.auto == .deny and (forward.bicycle == .allow or backward.bicycle == .allow),
         .other_modes_denied = forward.otherModesDenied() and backward.otherModesDenied(),
+        .forward_pedestrian_denied = forward.pedestrian == .deny,
         .explicit = explicit,
     };
 }

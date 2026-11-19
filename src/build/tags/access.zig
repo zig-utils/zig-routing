@@ -53,7 +53,7 @@ pub fn applyWay(tags: *const Scratch, selected: Selection, deadline: io.Deadline
         backward = .{};
     }
 
-    if (way.use != .construction and try mountainBikeAccess(tags, deadline)) {
+    if (way.use != .construction and mountainBikeAccess(tags, way.bicycle)) {
         if (!way.flags.oneway_reverse) forward.bicycle = true;
         if (!way.flags.oneway) backward.bicycle = true;
     }
@@ -89,18 +89,11 @@ fn isHovOnly(tags: *const Scratch, roundabout: bool, deadline: io.Deadline) !boo
 
 /// The parser enables bicycle access for supported MTB grades, or when
 /// only the IMBA scale or description is present.
-fn mountainBikeAccess(tags: *const Scratch, deadline: io.Deadline) !bool {
-    const downhill = tags.text(.@"mtb:scale");
-    const uphill = tags.text(.@"mtb:scale:uphill");
-    if (downhill) |text| {
-        if (try defaults.nonnegativeIntPrefix(text, deadline)) |scale|
-            if (scale < constants.max_mtb_scale) return true;
-    }
-    if (uphill) |text| {
-        if (try defaults.nonnegativeIntPrefix(text, deadline)) |scale|
-            if (scale < constants.max_mtb_uphill_scale) return true;
-    }
-    return downhill == null and uphill == null and
+fn mountainBikeAccess(tags: *const Scratch, bike: attrs.BicycleAttrs) bool {
+    if ((bike.mtb_scale orelse constants.max_mtb_scale) < constants.max_mtb_scale or
+        (bike.mtb_uphill_scale orelse constants.max_mtb_uphill_scale) < constants.max_mtb_uphill_scale)
+        return true;
+    return tags.get(.@"mtb:scale") == null and tags.get(.@"mtb:scale:uphill") == null and
         (tags.get(.@"mtb:scale:imba") != null or tags.get(.@"mtb:description") != null);
 }
 

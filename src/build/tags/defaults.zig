@@ -59,6 +59,19 @@ pub fn speed(road_class: attr.RoadClass) u8 {
     };
 }
 
+pub fn cycleLane(value: ?Value) attr.CycleLane {
+    return switch (value orelse return .none) {
+        .shared_lane, .share_busway, .shared => .shared,
+        .opposite_lane, .lane, .buffered_lane => .dedicated,
+        .opposite_track, .track => .separated,
+        else => .none,
+    };
+}
+
+pub fn oppositeCycleway(value: ?Value) bool {
+    return value == .opposite or value == .opposite_lane or value == .opposite_track;
+}
+
 pub const Boolean = enum {
     access,
     motor_vehicle,

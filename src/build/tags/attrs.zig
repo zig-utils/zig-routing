@@ -26,6 +26,30 @@ pub const Names = struct {
     junction_name: ?[]const u8 = null,
 };
 
+pub const TrailVisibility = enum { excellent, good, intermediate, bad, horrible, no };
+pub const TactilePaving = enum { yes, no, partial, incorrect };
+
+pub const BicycleAttrs = struct {
+    lane_left: attr.CycleLane = .none,
+    lane_right: attr.CycleLane = .none,
+    left_opposite: bool = false,
+    right_opposite: bool = false,
+    use_sidepath: bool = false,
+    dismount: bool = false,
+    network: attr.BikeNetwork = .{},
+    mtb_scale: ?u31 = null,
+    mtb_uphill_scale: ?u31 = null,
+};
+
+pub const PedestrianAttrs = struct {
+    sac_scale: attr.SacScale = .none,
+    trail_visibility: ?TrailVisibility = null,
+    step_count: ?u32 = null,
+    tactile_paving: ?TactilePaving = null,
+    /// Raw foot designation, borrowing the input tags.
+    foot: ?[]const u8 = null,
+};
+
 pub const WayAttrs = struct {
     road_class: attr.RoadClass = .service_other,
     use: attr.Use = .road,
@@ -45,6 +69,8 @@ pub const WayAttrs = struct {
     flags: Flags = .{},
     names: Names = .{},
     turn_lanes: TurnLanes = .{},
+    bicycle: BicycleAttrs = .{},
+    pedestrian: PedestrianAttrs = .{},
 
     pub const TurnLanes = struct {
         general: ?[]const u8 = null,
@@ -109,6 +135,8 @@ pub const NodeAttrs = struct {
     name: ?[]const u8 = null,
     ref: ?[]const u8 = null,
     exit_to: ?[]const u8 = null,
+    step_count: ?u32 = null,
+    tactile_paving: ?TactilePaving = null,
 
     pub const Flags = packed struct(u16) {
         named_intersection: bool = false,

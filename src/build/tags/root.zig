@@ -6,6 +6,7 @@ const pbf = @import("../pbf/root.zig");
 const osm = @import("../osm.zig");
 const attrs = @import("attrs.zig");
 const access = @import("access.zig");
+const bike_foot = @import("bike_foot.zig");
 const highway = @import("highway.zig");
 const selection = @import("selection.zig");
 pub const speed = @import("speed.zig");
@@ -26,6 +27,7 @@ pub fn transformWay(scratch: *Scratch, tags: anytype, deadline: io.Deadline) !?W
         .road_class = selected.road_class,
         .forward_access = selected.forward,
         .backward_access = selected.backward,
+        .bicycle = try bike_foot.readMountainBike(scratch, deadline),
         .flags = .{
             .oneway = selected.oneway,
             .oneway_reverse = selected.oneway_reverse,
@@ -38,6 +40,7 @@ pub fn transformWay(scratch: *Scratch, tags: anytype, deadline: io.Deadline) !?W
     };
     try highway.classify(scratch, selected, deadline, &result);
     try access.applyWay(scratch, selected, deadline, &result);
+    try bike_foot.applyWay(&result, scratch, selected, deadline);
     try speed.apply(&result, scratch, selected.road_class, deadline);
     return result;
 }
@@ -65,6 +68,7 @@ pub fn transformNode(scratch: *Scratch, tags: anytype, deadline: io.Deadline) !?
     try scratch.load(tags, deadline);
     var result: NodeAttrs = .{ .name = scratch.text(.name), .ref = scratch.text(.ref), .exit_to = scratch.text(.exit_to) };
     try access.applyNode(scratch, deadline, &result);
+    try bike_foot.applyNode(&result, scratch, deadline);
     return result;
 }
 
@@ -79,6 +83,7 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("access_test.zig");
     _ = @import("speed_names_test.zig");
+    _ = @import("bike_foot_test.zig");
 }
 
 test "ways_proc keeps exactly the routable ways and the upstream exceptions" {

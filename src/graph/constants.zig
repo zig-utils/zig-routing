@@ -8,6 +8,45 @@ pub const max_lane_count = 15;
 
 pub const SpeedType = enum(u8) { tagged = 0, classified = 1 };
 
+pub const CycleLane = enum(u2) {
+    none = 0,
+    shared = 1,
+    dedicated = 2,
+    separated = 3,
+};
+
+pub const SacScale = enum(u3) {
+    none = 0,
+    hiking = 1,
+    mountain_hiking = 2,
+    demanding_mountain_hiking = 3,
+    alpine_hiking = 4,
+    demanding_alpine_hiking = 5,
+    difficult_alpine_hiking = 6,
+};
+
+pub const BikeNetwork = packed struct(u8) {
+    ncn: bool = false,
+    rcn: bool = false,
+    lcn: bool = false,
+    mtb: bool = false,
+    icn: bool = false,
+    reserved: u3 = 0,
+
+    /// The four network flags used by Valhalla 3.9.3's bicycle costing.
+    pub fn costingMask(self: BikeNetwork) u4 {
+        return @truncate(@as(u8, @bitCast(self)));
+    }
+
+    /// Union the way tags with the route relations found in the relation pass.
+    pub fn merge(self: BikeNetwork, relations: BikeNetwork) BikeNetwork {
+        return @bitCast(@as(u8, @bitCast(self)) | @as(u8, @bitCast(relations)));
+    }
+};
+
+// From valhalla/sif/costconstants.h.
+pub const PedestrianType = enum(u8) { foot = 0, wheelchair = 1, blind = 2 };
+
 pub const RoadClass = enum(u8) {
     motorway = 0,
     trunk = 1,
@@ -104,6 +143,13 @@ pub const AccessMask = packed struct(u16) {
     reserved: u5 = 0,
 
     pub const all_tag_modes: AccessMask = @bitCast(@as(u16, 0x07ff));
+
+    pub fn allowsPedestrian(self: AccessMask, pedestrian_type: PedestrianType) bool {
+        return switch (pedestrian_type) {
+            .foot, .blind => self.pedestrian,
+            .wheelchair => self.wheelchair,
+        };
+    }
 };
 
 test "attribute discriminants match upstream graph constants" {
