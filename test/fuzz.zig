@@ -9,7 +9,8 @@
 //! decoders), `lz4` (block and frame decoders, plus a compress round trip),
 //! `dem` (the packed elevation block decoder), and `protobuf` (wire records
 //! and generated message views), `config` (Valhalla JSON settings), and
-//! `osm-pbf` (file framing, block inflation and OSM primitives), and
+//! `osm-pbf` (file framing and block inflation), `osm-primitives` and
+//! `osm-dense` (PrimitiveBlock and DenseNodes decoding), and
 //! `node-store` (the build-time coordinate index format) and `graph-bundle`
 //! (section headers, checksums and typed topology access), and
 //! `build-checkpoint` (restart manifests), `valhalla-tile` (offline tile import),
@@ -89,12 +90,17 @@ fn fuzzGraphBundle(baseline: *const graph.reader.Files, s: *Smith) !void {
         }
     }
     const arbitrary = if (raw.len >= 4) std.mem.readInt(u32, raw[0..4], .little) else std.math.maxInt(u32);
-    for ([_]u32{ 0, 1, arbitrary }) |id| {
+    for ([_]u32{ 0, 1, arbitrary, std.math.maxInt(u32) }) |id| {
         _ = view.node(@fromBackingInt(@intCast(id))) catch null;
         _ = view.component(@fromBackingInt(id)) catch null;
+        _ = view.coordinate(@fromBackingInt(id)) catch null;
         _ = view.edge(@fromBackingInt(@intCast(id))) catch null;
-        _ = view.outEdges(@fromBackingInt(@intCast(id))) catch null;
-        _ = view.turnRow(@fromBackingInt(@intCast(id)), @truncate(input[input.len - 1])) catch null;
+        if (view.outEdges(@fromBackingInt(id))) |edges| {
+            try expectBorrowed(std.mem.sliceAsBytes(view.edges), std.mem.sliceAsBytes(edges));
+        } else |_| {}
+        if (view.turnRow(@fromBackingInt(id), @truncate(input[input.len - 1]))) |row| {
+            try expectBorrowed(view.turns, row);
+        } else |_| {}
         _ = view.turnSides(@fromBackingInt(id), @truncate(input[input.len - 1]), @truncate(id)) catch null;
         _ = view.class(@truncate(id)) catch null;
         const edge: graph.format.EdgeId = @fromBackingInt(id);
@@ -293,22 +299,75 @@ test "fuzz build-checkpoint" {
     try std.testing.fuzz({}, fuzzBuildCheckpoint, .{ .corpus = try seeds(a, &.{ "", "{}", encoded }) });
 }
 
-fn fuzzOsmPbf(_: void, s: *Smith) !void {
+const pbf_fixtures = [_][]const u8{
+    @embedFile("fuzz/seeds/liechtenstein.pbf"),
+    @embedFile("fuzz/seeds/utrecht.pbf"),
+};
+const max_primitive_bytes = 2 * max_input;
+
+const PbfStreamFuzz = struct {
+    file: routing.infra.io.File,
+    mutex: routing.infra.io.Mutex = .{},
+
+    fn consume(_: void, _: usize, _: []const u8) !void {}
+};
+
+fn fuzzOsmPbf(ctx: *PbfStreamFuzz, s: *Smith) !void {
     var buf: [max_input]u8 = undefined;
     const input = draw(s, &buf, 0x6f73_6d70);
+    try fuzzIndexedPbf(input);
+    if (input.len == 0) return;
+    ctx.mutex.lock();
+    defer ctx.mutex.unlock();
+    try ctx.file.truncate(input.len);
+    try ctx.file.pwriteAll(input, 0);
+    const stream = try routing.build.pbf.file.Stream.init(ctx.file);
+    var memory: [384 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&memory);
+    stream.forEach(fixed.allocator(), .none, {}, PbfStreamFuzz.consume) catch {};
+}
+
+fn fuzzIndexedPbf(input: []const u8) !void {
     var memory: [256 * 1024]u8 = undefined;
     var fixed = std.heap.FixedBufferAllocator.init(&memory);
     var index = routing.build.pbf.file.Index.init(fixed.allocator(), input, .none) catch return;
     defer index.deinit();
-    var scratch: [max_input]u8 = undefined;
-    var primitives: routing.build.pbf.block.Scratch = .{};
-    defer primitives.deinit(fixed.allocator());
+    var scratch: [max_primitive_bytes]u8 = undefined;
+    try std.testing.expectError(error.InvalidBlobIndex, index.inflateInto(index.blobs.len, &scratch, .none));
     for (index.blobs, 0..) |blob, i| {
         const decoded = index.inflateInto(i, &scratch, .none) catch continue;
         try std.testing.expectEqual(blob.raw_size, decoded.len);
         try expectBorrowed(if (blob.compression == .raw) input else &scratch, decoded);
-        const block = primitives.decode(fixed.allocator(), decoded, .none) catch continue;
-        visitPrimitives(block, fixed.allocator()) catch {};
+    }
+}
+
+fn fuzzOsmPrimitives(_: void, s: *Smith) !void {
+    var buf: [max_primitive_bytes]u8 = undefined;
+    const input = draw(s, &buf, 0x7072_696d);
+    var memory: [384 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&memory);
+    var primitives: routing.build.pbf.block.Scratch = .{};
+    defer primitives.deinit(fixed.allocator());
+    const block = primitives.decode(fixed.allocator(), input, .none) catch return;
+    visitPrimitives(block, fixed.allocator()) catch {};
+}
+
+fn fuzzOsmDense(_: void, s: *Smith) !void {
+    var buf: [max_primitive_bytes]u8 = undefined;
+    const input = draw(s, &buf, 0x6465_6e73);
+    var memory: [384 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&memory);
+    var primitives: routing.build.pbf.block.Scratch = .{};
+    defer primitives.deinit(fixed.allocator());
+    const block = primitives.decode(fixed.allocator(), input, .none) catch return;
+    var nodes = block.nodes();
+    while (nodes.next() catch return) |node| {
+        try std.testing.expect(@abs(node.lon) <= 1_800_000_000 and @abs(node.lat) <= 900_000_000);
+        var tags = node.tags;
+        while (tags.next() catch return) |tag| {
+            try expectBorrowed(input, tag.key);
+            try expectBorrowed(input, tag.value);
+        }
     }
 }
 
@@ -371,7 +430,9 @@ test "fuzz osm-pbf" {
     var primitive_frame: [256]u8 = undefined;
     const framed_primitives = try osmPrimitiveSeed(&primitive_frame);
     const primitive_file = try std.mem.concat(state.allocator(), u8, &.{ header, framed_primitives });
-    try std.testing.fuzz({}, fuzzOsmPbf, .{ .corpus = try seeds(state.allocator(), &.{
+    var ctx: PbfStreamFuzz = .{ .file = try routing.infra.io.File.temporary(".") };
+    defer ctx.file.close();
+    try std.testing.fuzz(&ctx, fuzzOsmPbf, .{ .corpus = try seeds(state.allocator(), &.{
         "",
         header,
         header ++ raw,
@@ -379,8 +440,39 @@ test "fuzz osm-pbf" {
         header ++ lz4_blob,
         header ++ raw ++ zlib ++ lz4_blob,
         primitive_file,
+        pbf_fixtures[0],
+        pbf_fixtures[1],
         header ++ "\x00\x01\x00\x00",
     }) });
+}
+
+fn unpackSeed(a: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    var index = try routing.build.pbf.file.Index.init(a, bytes, .none);
+    defer index.deinit();
+    try std.testing.expectEqual(@as(usize, 1), index.blobs.len);
+    try std.testing.expect(index.blobs[0].raw_size <= max_primitive_bytes);
+    const scratch = try a.alloc(u8, index.inflate_capacity);
+    return index.inflateInto(0, scratch, .none);
+}
+
+test "fuzz osm-primitives" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const a = state.allocator();
+    const header = "\x00\x00\x00\x0d\x0a\x09OSMHeader\x18\x12\x0a\x10\x22\x0eOsmSchema-V0.6";
+    var frame: [256]u8 = undefined;
+    const sample = try std.mem.concat(a, u8, &.{ header, try osmPrimitiveSeed(&frame) });
+    try std.testing.fuzz({}, fuzzOsmPrimitives, .{ .corpus = try seeds(a, &.{
+        "", try unpackSeed(a, sample), try unpackSeed(a, pbf_fixtures[0]), try unpackSeed(a, pbf_fixtures[1]),
+    }) });
+}
+
+test "fuzz osm-dense" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const a = state.allocator();
+    const block = try unpackSeed(a, pbf_fixtures[0]);
+    try std.testing.fuzz({}, fuzzOsmDense, .{ .corpus = try seeds(a, &.{ "", block, block[0 .. block.len - 1] }) });
 }
 
 const NodeStoreFuzz = struct {

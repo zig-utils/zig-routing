@@ -281,6 +281,10 @@ pub const FixedLL = extern struct {
     lng: i32,
     lat: i32,
 
+    pub fn inRange(self: FixedLL) bool {
+        return @abs(self.lng) <= 1_800_000_000 and @abs(self.lat) <= 900_000_000;
+    }
+
     /// Coordinates after the unsigned upstream OSMNode conversion.
     pub fn toOsmPoint(fixed: FixedLL) PointLL {
         const lon: f64 = @floatFromInt(@as(i64, fixed.lng) + 1_800_000_000);

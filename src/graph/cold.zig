@@ -260,8 +260,7 @@ pub const Record = struct {
         for (0..vertices.len) |i| {
             if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
             const vertex = (try decoder.nextFixed()) orelse return error.IncompleteShape;
-            if (vertex.lng < -1_800_000_000 or vertex.lng > 1_800_000_000 or
-                vertex.lat < -900_000_000 or vertex.lat > 900_000_000) return error.InvalidColdCoordinate;
+            if (!vertex.inRange()) return error.InvalidColdCoordinate;
             vertices[if (self.reverse) vertices.len - 1 - i else i] = vertex;
         }
         if (!decoder.empty()) return error.TrailingShapeBytes;

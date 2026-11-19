@@ -158,11 +158,16 @@ test "startup skips hashing while accessors safely reject corrupt payloads" {
 
     const offsets = try fixture.section(.first_edge);
     defer offsets.close();
+    try offsets.pwriteAll(&.{ 1, 0, 0, 0 }, format.payload_offset);
+    try testing.expectError(error.InvalidCsrEndpoints, reader.Bundle.open(path_name));
+    try offsets.pwriteAll(std.mem.sliceAsBytes(sample.records(.first_edge)), format.payload_offset);
     try offsets.pwriteAll(&.{ 0xff, 0xff, 0xff, 0xff }, format.payload_offset + @sizeOf(u32));
     {
         var bundle = try reader.Bundle.open(path_name);
         defer bundle.close();
         var diagnostic: reader.Diagnostic = .{};
+        try testing.expectError(error.PayloadHashMismatch, reader.Bundle.openVerified(path_name, .none, &diagnostic));
+        try testing.expectEqual(@as(?format.SectionKind, .first_edge), diagnostic.section);
         try testing.expectError(error.PayloadHashMismatch, bundle.view.verify(.none, &diagnostic));
         try testing.expectEqual(@as(?format.SectionKind, .first_edge), diagnostic.section);
         try testing.expectError(error.InvalidCsrRange, bundle.view.outEdges(@fromBackingInt(@intCast(0))));
@@ -180,10 +185,14 @@ test "startup skips hashing while accessors safely reject corrupt payloads" {
     const class_file = try fixture.section(.classes);
     defer class_file.close();
     try class_file.pwriteAll(&.{0xff}, format.payload_offset);
+    const coordinate_file = try fixture.section(.coordinates);
+    defer coordinate_file.close();
+    try coordinate_file.pwriteAll(&.{ 0, 0, 0, 0x80 }, format.payload_offset);
 
     var bundle = try reader.Bundle.open(path_name);
     defer bundle.close();
     try testing.expectError(error.InvalidTurnOffset, bundle.view.turnRow(@fromBackingInt(@intCast(0)), 0));
     try testing.expectError(error.InvalidOpposingEdge, bundle.view.oppEdge(@fromBackingInt(@intCast(0))));
     try testing.expectError(error.InvalidEdgeClass, bundle.view.class(0));
+    try testing.expectError(error.InvalidCoordinate, bundle.view.coordinate(@fromBackingInt(0)));
 }

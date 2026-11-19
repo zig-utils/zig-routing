@@ -460,11 +460,12 @@ fn inspectGraph(ctx: *Context) !u8 {
     const verify = std.mem.eql(u8, ctx.getOption("verify") orelse "false", "true");
     const path = ctx.getArgument(0).?;
     var diagnostic: routing.graph.reader.Diagnostic = .{};
-    var bundle = routing.graph.reader.Bundle.openDescribed(path, &diagnostic) catch |err|
-        return graphDiagnostic(ctx, "open", diagnostic, err);
+    const Bundle = routing.graph.reader.Bundle;
+    var bundle = if (verify)
+        Bundle.openVerified(path, .none, &diagnostic) catch |err| return graphDiagnostic(ctx, "verify", diagnostic, err)
+    else
+        Bundle.openDescribed(path, &diagnostic) catch |err| return graphDiagnostic(ctx, "open", diagnostic, err);
     defer bundle.close();
-    if (verify) bundle.view.verify(.none, &diagnostic) catch |err|
-        return graphDiagnostic(ctx, "verify", diagnostic, err);
     try routing.cli.inspect.write(&bundle.view, ctx.out.?, ctx.wantsJson(), verify, edge_id, node_id);
     return 0;
 }

@@ -27,6 +27,14 @@ pub const Bundle = struct {
         return openDescribed(path, null);
     }
 
+    /// Check payload integrity before giving the caller a view of the bundle.
+    pub fn openVerified(path: []const u8, deadline: io.Deadline, diagnostic: ?*Diagnostic) !Bundle {
+        var bundle = try openDescribed(path, diagnostic);
+        errdefer bundle.close();
+        try bundle.view.verify(deadline, diagnostic);
+        return bundle;
+    }
+
     pub fn openDescribed(path: []const u8, diagnostic: ?*Diagnostic) !Bundle {
         note(diagnostic, null);
         const dir = try io.Directory.open(path);
@@ -178,6 +186,10 @@ pub const View = struct {
                 @field(graph, @tagName(kind)) = try io.typedSlice(kind.Record(), files.get(kind).?, format.payload_offset, count);
             }
         }
+        if (graph.first_edge[0] != 0 or graph.first_edge[graph.first_edge.len - 1] != edge_count) {
+            note(diagnostic, .first_edge);
+            return error.InvalidCsrEndpoints;
+        }
         if (graph.cold) |bytes| {
             note(diagnostic, .cold);
             graph.cold_data = try cold.View.parse(bytes);
@@ -227,7 +239,9 @@ pub const View = struct {
         const coords = self.coordinates orelse return error.MissingCoordinatesSection;
         const index = @backingInt(id);
         if (index >= coords.len) return error.InvalidNodeId;
-        return coords[index];
+        const point = coords[index];
+        if (!point.inRange()) return error.InvalidCoordinate;
+        return point;
     }
 
     pub const EdgeRange = struct {

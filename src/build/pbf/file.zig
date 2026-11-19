@@ -14,6 +14,8 @@ pub const max_blob_bytes = 32 * 1024 * 1024;
 pub const Error = protobuf.Error || io.InflateError || error{
     InvalidBlobHeaderSize,
     InvalidBlobSize,
+    InvalidBlobIndex,
+    InvalidBlobOffset,
     MissingHeader,
     RepeatedHeader,
     HeaderAfterData,
@@ -131,6 +133,7 @@ pub const Index = struct {
 
     /// Raw blocks borrow the input. Compressed blocks borrow `scratch`.
     pub fn inflateInto(self: *const Index, i: usize, scratch: []u8, deadline: io.Deadline) Error![]const u8 {
+        if (i >= self.blobs.len) return error.InvalidBlobIndex;
         return inflate(self.input, self.blobs[i], scratch, deadline);
     }
 
@@ -333,6 +336,7 @@ fn describeBlob(input: []const u8, offset: usize, size: usize, blob: []const u8,
 
 fn inflate(input: []const u8, blob: BlobIndex, scratch: []u8, deadline: io.Deadline) Error![]const u8 {
     if (deadline.expired()) return error.DeadlineExceeded;
+    if (blob.payload_offset > input.len or blob.payload_size > input.len - blob.payload_offset) return error.InvalidBlobOffset;
     const bytes = input[blob.payload_offset..][0..blob.payload_size];
     if (blob.compression == .raw) return bytes;
     if (scratch.len < blob.raw_size) return error.InflateBufferTooSmall;

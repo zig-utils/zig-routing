@@ -15,8 +15,9 @@ set -uo pipefail
 
 seconds=600
 if [ "${1:-}" = "-s" ]; then seconds="$2"; shift 2; fi
+[[ "$seconds" =~ ^[1-9][0-9]*$ ]] || { echo "fuzz: expected a positive duration in seconds" >&2; exit 2; }
 targets=("$@")
-[ ${#targets[@]} -eq 0 ] && targets=(request http polyline lz4 dem protobuf config osm-pbf node-store graph-bundle build-checkpoint valhalla-tile costing-reference)
+[ ${#targets[@]} -eq 0 ] && targets=(request http polyline lz4 dem protobuf config osm-pbf osm-primitives osm-dense node-store graph-bundle build-checkpoint valhalla-tile costing-reference)
 
 ZIG="${ZIG:-zig}"
 if ! command -v "$ZIG" >/dev/null 2>&1 && [ -x "$HOME/.local/share/zig-0.17-master/zig" ]; then
@@ -31,21 +32,23 @@ kill_tree() {
   kill -TERM "$pid" 2>/dev/null || true
 }
 
-# Build once so the time limit is spent fuzzing, not compiling.
-"$ZIG" build fuzz >/dev/null || { echo "fuzz: seed replay failed"; exit 1; }
-
 failed=0
 for t in "${targets[@]}"; do
   log=$(mktemp)
   stopped="$log.stopped"
   rm -f .zig-cache/f/crash "$stopped"
-  "$ZIG" build fuzz -Dfuzz-target="$t" --fuzz=100G >"$log" 2>&1 &
-  pid=$!
-  ( sleep "$seconds"; touch "$stopped"; kill_tree "$pid" ) &
-  watcher=$!
-  wait "$pid" 2>/dev/null
-  kill_tree "$watcher" 2>/dev/null
-  wait "$watcher" 2>/dev/null
+  # Replay seeds in the instrumented binary before starting the timer.
+  if "$ZIG" build fuzz -Dfuzz-target="$t" --fuzz=1 >"$log" 2>&1 &&
+      [ ! -f .zig-cache/f/crash ] &&
+      ! grep -qE 'terminated with signal|panic:|error: test .* failed' "$log"; then
+    "$ZIG" build fuzz -Dfuzz-target="$t" --fuzz=100G >>"$log" 2>&1 &
+    pid=$!
+    ( sleep "$seconds"; touch "$stopped"; kill_tree "$pid" ) &
+    watcher=$!
+    wait "$pid" 2>/dev/null
+    kill_tree "$watcher" 2>/dev/null
+    wait "$watcher" 2>/dev/null
+  fi
 
   if [ -f .zig-cache/f/crash ] || grep -qE 'terminated with signal|panic:|error: test .* failed' "$log"; then
     stamp=$(date -u +%Y%m%dT%H%M%SZ)

@@ -160,8 +160,8 @@ pub const TagIterator = struct {
             },
             .dense => |*fields| blk: {
                 if (fields.pairs == 0) return null;
-                const key = (try fields.values.next(self.deadline)).?;
-                const value = (try fields.values.next(self.deadline)).?;
+                const key = try fields.values.next(self.deadline) orelse return error.InvalidDenseTags;
+                const value = try fields.values.next(self.deadline) orelse return error.InvalidDenseTags;
                 fields.pairs -= 1;
                 break :blk try self.tag(key, value);
             },

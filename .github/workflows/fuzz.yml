@@ -9,6 +9,11 @@ on:
       seconds:
         description: Seconds per target
         default: '600'
+      targets:
+        description: Fuzz target group
+        type: choice
+        options: [all, graph-parsers]
+        default: all
 
 env:
   ZIG_VERSION: 0.17.0-dev.1857+3c46da14d
@@ -19,14 +24,16 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        target: [request, http, polyline, lz4, dem, protobuf, config, osm-pbf, node-store, graph-bundle, build-checkpoint, valhalla-tile, costing-reference]
+        target: ${{ fromJSON(inputs.targets == 'graph-parsers' && '["osm-pbf","osm-primitives","osm-dense","graph-bundle"]' || '["request","http","polyline","lz4","dem","protobuf","config","osm-pbf","osm-primitives","osm-dense","node-store","graph-bundle","build-checkpoint","valhalla-tile","costing-reference"]') }}
       fail-fast: false
     steps:
       - uses: actions/checkout@v6
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-      - run: scripts/fuzz.sh -s "${{ github.event.inputs.seconds || '600' }}" ${{ matrix.target }}
+      - run: scripts/fuzz.sh -s "$FUZZ_SECONDS" "${{ matrix.target }}"
+        env:
+          FUZZ_SECONDS: ${{ inputs.seconds || '600' }}
       - if: failure()
         uses: actions/upload-artifact@v5
         with:
