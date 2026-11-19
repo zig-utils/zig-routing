@@ -75,6 +75,7 @@ fn fuzzGraphBundle(baseline: *const graph.reader.Files, s: *Smith) !void {
     }
     const view = graph.reader.View.parse(files, null) catch return;
     view.verify(.none, null) catch {};
+    const gpa = std.testing.allocator;
     const arbitrary = if (raw.len >= 4) std.mem.readInt(u32, raw[0..4], .little) else std.math.maxInt(u32);
     for ([_]u32{ 0, 1, arbitrary }) |id| {
         _ = view.node(@fromBackingInt(@intCast(id))) catch null;
@@ -82,6 +83,12 @@ fn fuzzGraphBundle(baseline: *const graph.reader.Files, s: *Smith) !void {
         _ = view.outEdges(@fromBackingInt(@intCast(id))) catch null;
         _ = view.turnRow(@fromBackingInt(@intCast(id)), @truncate(input[input.len - 1])) catch null;
         _ = view.class(@truncate(id)) catch null;
+        const edge: graph.format.EdgeId = @fromBackingInt(id);
+        _ = view.wayId(edge) catch null;
+        if (view.shape(edge, gpa)) |shape| gpa.free(shape) else |_| {}
+        if (view.names(edge)) |names| {
+            for (0..names.count()) |i| _ = names.at(i) catch null;
+        } else |_| {}
         if (view.oppEdge(@fromBackingInt(@intCast(id)))) |other| {
             try std.testing.expect(@backingInt(other) < view.edges.len);
         } else |_| {}

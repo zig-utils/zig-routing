@@ -54,6 +54,8 @@ pub const SectionKind = enum(u32) {
     turns = 4,
     classes = 5,
     coordinates = 6,
+    cold_idx = 7,
+    cold = 8,
 
     pub fn filename(self: SectionKind) [:0]const u8 {
         return switch (self) {
@@ -63,6 +65,8 @@ pub const SectionKind = enum(u32) {
             .turns => "turns.bin",
             .classes => "classes.bin",
             .coordinates => "coordinates.bin",
+            .cold_idx => "cold_idx.bin",
+            .cold => "cold.bin",
         };
     }
 
@@ -74,6 +78,8 @@ pub const SectionKind = enum(u32) {
             .turns => TurnEntry,
             .classes => class_table.EdgeClass,
             .coordinates => Coordinate,
+            .cold_idx => u32,
+            .cold => u8,
         };
     }
 
@@ -220,6 +226,7 @@ pub const BundleWriter = struct {
     pub fn commit(self: *BundleWriter) !void {
         if (self.committed) return error.BundleCommitted;
         if (!required_sections.subsetOf(self.written)) return error.MissingSection;
+        if (self.written.contains(.cold) != self.written.contains(.cold_idx)) return error.MissingSection;
         if (self.deadline.expired()) return error.DeadlineExceeded;
         try self.staging.sync();
         if (self.deadline.expired()) return error.DeadlineExceeded;

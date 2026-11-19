@@ -14,7 +14,9 @@
 //! instead of reading past the end.
 
 const std = @import("std");
-const PointLL = @import("point.zig").PointLL;
+const point = @import("point.zig");
+const PointLL = point.PointLL;
+const FixedLL = point.FixedLL;
 
 pub const Error = error{
     /// Input ended in the middle of a value.
@@ -77,6 +79,15 @@ fn writeVarint(out: []u8, pos: *usize, value: u32) Error!void {
     if (pos.* >= out.len) return error.NoSpaceLeft;
     out[pos.*] = @intCast(number & 0x7f);
     pos.* += 1;
+}
+
+/// Encode one E7 shape vertex relative to the previous vertex. Pass zero
+/// coordinates as the predecessor of the first vertex.
+pub fn encodeFixedVarint(point_ll: FixedLL, previous: FixedLL, out: *[10]u8) []const u8 {
+    var pos: usize = 0;
+    writeVarint(out, &pos, zigzagEncode(i32, point_ll.lat -% previous.lat)) catch unreachable;
+    writeVarint(out, &pos, zigzagEncode(i32, point_ll.lng -% previous.lng)) catch unreachable;
+    return out[0..pos];
 }
 
 fn toFixed(v: f64, comptime digits: u8) Error!i32 {
@@ -216,26 +227,34 @@ pub fn Decoder(comptime format: Format) type {
                 if (format == .polyline) {
                     if (byte < 63 or byte > 126) return error.InvalidCharacter;
                     const chunk: u32 = byte - 63;
-                    if (shift >= 32) return error.Overflow;
-                    result |= (chunk & 0x1f) << @intCast(shift);
+                    const group = chunk & 0x1f;
+                    if (shift >= 32 or group > @as(u32, std.math.maxInt(u32)) >> @as(u5, @intCast(shift))) return error.Overflow;
+                    result |= group << @intCast(shift);
                     shift += 5;
                     if (chunk < 0x20) return result;
                 } else {
-                    if (shift >= 32) return error.Overflow;
-                    result |= (@as(u32, byte) & 0x7f) << @intCast(shift);
+                    const group = @as(u32, byte) & 0x7f;
+                    if (shift >= 32 or group > @as(u32, std.math.maxInt(u32)) >> @as(u5, @intCast(shift))) return error.Overflow;
+                    result |= group << @intCast(shift);
                     shift += 7;
                     if (byte & 0x80 == 0) return result;
                 }
             }
         }
 
-        pub fn next(self: *Self) Error!?PointLL {
+        /// Decode a vertex at the encoded integer precision.
+        pub fn nextFixed(self: *Self) Error!?FixedLL {
             if (self.empty()) return null;
             const dlat = try self.readVarint();
             const dlon = try self.readVarint();
             self.lat +%= zigzagDecode(u32, dlat);
             self.lon +%= zigzagDecode(u32, dlon);
-            return .{ .lng = @as(f64, @floatFromInt(self.lon)) * self.precision, .lat = @as(f64, @floatFromInt(self.lat)) * self.precision };
+            return .{ .lng = self.lon, .lat = self.lat };
+        }
+
+        pub fn next(self: *Self) Error!?PointLL {
+            const fixed = (try self.nextFixed()) orelse return null;
+            return .{ .lng = @as(f64, @floatFromInt(fixed.lng)) * self.precision, .lat = @as(f64, @floatFromInt(fixed.lat)) * self.precision };
         }
     };
 }

@@ -192,6 +192,32 @@ CI verifies the [Geofabrik Luxembourg extract](https://download.geofabrik.de/eur
 against SHA-256 `d8f3e1dabb4d9d5489500c35432eb393089c32222cfff8cf50706852f0696a80` and runs the
 country budget with `zig build check-assembly -Doptimize=ReleaseFast -- INPUT.osm.pbf OUTPUT_BUNDLE SCRATCH_DIR 4 right --sub-byte-turns`.
 
+### Cold graph data
+
+`cold_idx.bin` stores one `u32` per directed edge. Its low 31 bits identify the undirected
+record and its high bit reverses the OSM-order shape. Within `cold.bin`, a directory groups
+contiguous record IDs in chunks of up to 256. The builder assigns IDs in order of first
+encounter in the CSR, so the records follow local adjacency in the assembled graph.
+
+Each record holds the 64-bit OSM way ID, encoded shape length and vertex count, the
+mean-elevation slot, speed limit, and up to 255 references into a shared string table.
+Shapes use E7 coordinate deltas with zigzag varints. The elevation slot starts at Valhalla's
+missing-data value, -500 m. Names and route refs borrow mapped bytes. Shape decoding writes
+in travel order into the caller's arena. Synthetic alias links have two coincident vertices
+and use way ID zero.
+
+The assembly check verifies each opposing pair's cold index and shape endpoints, and reads
+every name reference. `cold_bytes_per_directed_edge` includes both cold section payloads,
+including their directories and strings. It excludes each section's fixed header and padding.
+`edges_per_second` measures the hot topology and turn-table stage. `elapsed_ns` covers
+PBF decoding and all writes through bundle commit.
+
+| Extract | Undirected records | Total cold payload bytes | Bytes per directed edge |
+| --- | ---: | ---: | ---: |
+| Liechtenstein | 7,880 | 607,780 | 38.56 |
+| Utrecht | 42,668 | 2,390,111 | 28.01 |
+| Luxembourg 2026-01-01 | 237,668 | 15,006,731 | 31.57 |
+
 ### HTTP and route checks
 
 `compare-height.ts` sends the same random `/height` requests (shapes, encoded polylines at

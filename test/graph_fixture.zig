@@ -30,6 +30,15 @@ const classes = [_]routing.graph.class_table.EdgeClass{
     .{ .access = .{ .forward = 7, .reverse = 3 } },
 };
 const coordinates = [_]format.Coordinate{ .{ .lng = 0, .lat = 0 }, .{ .lng = 100000, .lat = 0 } };
+const cold_idx = [_]u32{ 0, 0x8000_0000 };
+// One chunk, one record, one name. The shape encodes both coordinates above.
+const cold_bytes =
+    "\x01\x00\x00\x00\x01\x00\x00\x00\x4e\x00\x00\x00\x00\x00\x00\x00" ++
+    "\x00\x00\x00\x00\x00\x00\x00\x00\x2e\x00\x00\x00\x00\x00\x00\x00" ++
+    "\x00\x00\x00\x00\x00\x00\x00\x00\x1e\x00\x00\x00\x00\x00\x00\x00" ++
+    "\xef\xcd\xab\x89\x67\x45\x23\x01\x06\x00\x00\x00\x02\x00\x00\x00\x0c\xfe\x23\x01" ++
+    "\x00\x00\x00\xc0\x9a\x0c\x00\x00\x00\x00" ++
+    "\x00\x00\x00\x00\x00\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00Main";
 
 pub fn records(comptime kind: format.SectionKind) []const kind.Record() {
     return switch (kind) {
@@ -39,6 +48,8 @@ pub fn records(comptime kind: format.SectionKind) []const kind.Record() {
         .turns => &turns,
         .classes => &classes,
         .coordinates => &coordinates,
+        .cold_idx => &cold_idx,
+        .cold => cold_bytes,
     };
 }
 

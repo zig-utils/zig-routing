@@ -79,6 +79,40 @@ test "mapped records have checked typed accessors and offline checksums" {
     try testing.expectError(error.MissingClassSection, topology.view.class(0));
 }
 
+test "cold sections are optional as a pair and reject unsafe indexes and offsets" {
+    const fixture = try Fixture.create();
+    defer fixture.deinit();
+    var buf: [80]u8 = undefined;
+    const path_name = fixture.path(&buf);
+    const index = try fixture.section(.cold_idx);
+    defer index.close();
+    const data = try fixture.section(.cold);
+    defer data.close();
+    const first: format.EdgeId = @fromBackingInt(@as(u32, 0));
+    try index.pwriteAll(&.{ 0xff, 0xff, 0xff, 0xff }, format.payload_offset);
+    {
+        var bundle = try reader.Bundle.open(path_name);
+        defer bundle.close();
+        try testing.expectError(error.InvalidColdIndex, bundle.view.wayId(first));
+    }
+    try index.pwriteAll(&.{ 0, 0, 0, 0 }, format.payload_offset);
+    // The first record offset follows the cold header and two chunk entries.
+    try data.pwriteAll(&.{1}, format.payload_offset + 32);
+    {
+        var bundle = try reader.Bundle.open(path_name);
+        defer bundle.close();
+        try testing.expectError(error.InvalidColdChunk, bundle.view.shape(first, testing.allocator));
+    }
+    const dir = try fixture.root.child("bundle");
+    defer dir.close();
+    try dir.deleteFile(format.SectionKind.cold.filename());
+    try testing.expectError(error.MissingSection, reader.Bundle.open(path_name));
+    try dir.deleteFile(format.SectionKind.cold_idx.filename());
+    var bundle = try reader.Bundle.open(path_name);
+    defer bundle.close();
+    try testing.expectError(error.MissingColdData, bundle.view.wayId(first));
+}
+
 test "reader rejects wrong magic, version, section kind, mixed UUIDs and sizes" {
     const fixture = try Fixture.create();
     defer fixture.deinit();

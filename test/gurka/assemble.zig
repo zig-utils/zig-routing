@@ -184,6 +184,62 @@ test "assembled turn rows use opposing locals, shared names and class-based stop
     try testing.expectEqual((try view.node(a)).turn_off, (try view.node(c)).turn_off);
 }
 
+test "cold records share names and round trip exact E7 shapes in either direction" {
+    const points: [4]format.Coordinate = .{
+        .{ .lng = 10000117, .lat = 10000220 },
+        .{ .lng = 10000488, .lat = 10000673 },
+        .{ .lng = 10000901, .lat = 10000234 },
+        .{ .lng = 10001903, .lat = 10000613 },
+    };
+    var nodes: [points.len]gurka.OsmNode = undefined;
+    for (points, &nodes, 1..) |point, *node, id| {
+        node.* = .{ .id = @intCast(id), .label = "", .location = point.toPoint(), .tags = &.{} };
+    }
+    const way_id: i64 = 0x1_0123_4567;
+    const ways: []const gurka.OsmWay = &.{
+        .{ .id = way_id, .label = "ABC", .refs = &.{ 1, 2, 3 }, .tags = &.{
+            .{ .key = "highway", .value = "secondary" },
+            .{ .key = "name", .value = "Main;Old Main" },
+            .{ .key = "ref", .value = "L 17" },
+            .{ .key = "maxspeed", .value = "35" },
+        } },
+        .{ .id = way_id + 1, .label = "CD", .refs = &.{ 3, 4 }, .tags = &.{
+            .{ .key = "highway", .value = "secondary" },
+            .{ .key = "name", .value = "Main" },
+        } },
+    };
+    var result = try Built.assemble(.{ .nodes = &nodes, .ways = ways, .relations = &.{} }, 4);
+    defer result.deinit();
+    const view = &result.bundle.view;
+    try checkOpposites(view, 4);
+    const a = try at(view, points[0]);
+    const c = try at(view, points[2]);
+    const d = try at(view, points[3]);
+    const ac: format.EdgeId = @fromBackingInt((try view.outEdgeRange(a)).first);
+    const ca = try view.oppEdge(ac);
+    const dc: format.EdgeId = @fromBackingInt((try view.outEdgeRange(d)).first);
+    try testing.expectEqual(@backingInt(c), (try view.edge(dc)).head);
+    try testing.expectEqual(2, view.cold_data.?.header.record_count);
+    try testing.expectEqual(3, view.cold_data.?.header.name_count);
+    try testing.expectEqual(@as(u64, @intCast(way_id)), try view.wayId(ac));
+    try testing.expectEqual(try view.wayId(ac), try view.wayId(ca));
+    try testing.expectEqual(35, (try view.coldRecord(ca)).speedLimit());
+    const names = try view.names(ac);
+    try testing.expectEqual(3, names.count());
+    try testing.expectEqualStrings("Main", (try names.at(0)).text);
+    try testing.expectEqualStrings("Old Main", (try names.at(1)).text);
+    const ref = try names.at(2);
+    try testing.expectEqualStrings("L 17", ref.text);
+    try testing.expect(ref.route);
+    try testing.expectEqual((try names.at(0)).text.ptr, (try (try view.names(dc)).at(0)).text.ptr);
+    const forward = try view.shape(ac, testing.allocator);
+    defer testing.allocator.free(forward);
+    const backward = try view.shape(ca, testing.allocator);
+    defer testing.allocator.free(backward);
+    try testing.expectEqualSlices(format.Coordinate, points[0..3], forward);
+    try testing.expectEqualSlices(format.Coordinate, &.{ points[2], points[1], points[0] }, backward);
+}
+
 test "high-degree node aliases reserve both directions and preserve connectivity" {
     const leaves = 63;
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -214,6 +270,7 @@ test "high-degree node aliases reserve both directions and preserve connectivity
     try testing.expectEqual(1, result.stats.split_nodes);
     try testing.expectEqual(2, result.stats.connectors);
     try testing.expectEqual(leaves + 3, view.nodes.len);
+    try testing.expectEqual(leaves + 2, view.cold_data.?.header.record_count);
     var aliases: usize = 0;
     var real: usize = 0;
     var connectors: usize = 0;

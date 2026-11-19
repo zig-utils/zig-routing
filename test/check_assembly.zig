@@ -42,6 +42,7 @@ pub fn main(init: std.process.Init) !void {
         try warm.view.verify(.none, null);
         try build.assemble.validate(warm.view.first_edge, warm.view.edges, warm.view.coordinates.?, warm.view.classes.?, .none);
         try validateTurns(&warm.view, stats.turn_pool_bytes);
+        try validateCold(init.gpa, &warm.view, stats.cold_records, stats.cold_payload_bytes);
     }
 
     var times: [32]u64 = undefined;
@@ -55,11 +56,13 @@ pub fn main(init: std.process.Init) !void {
 
     var buf: [4096]u8 = undefined;
     var stdout = io.stdoutWriter(init.io, &buf);
+    const cold_bytes = stats.cold_payload_bytes + @as(u64, stats.directed_edges) * @sizeOf(u32);
     try std.json.Stringify.value(.{
         .stats = stats,
         .elapsed_ns = elapsed_ns,
         .edges_per_second = rate(stats.directed_edges, stats.assembly_ns),
         .turn_bytes_per_node = @as(f64, @floatFromInt(stats.turn_pool_bytes)) / @as(f64, @floatFromInt(@max(stats.nodes, 1))),
+        .cold_bytes_per_directed_edge = @as(f64, @floatFromInt(cold_bytes)) / @as(f64, @floatFromInt(@max(stats.directed_edges, 1))),
         .peak_rss_bytes = try io.peakRssBytes(),
         .warm_open_median_ns = times[times.len / 2],
         .warm_open_max_ns = times[times.len - 1],
@@ -81,6 +84,31 @@ fn validateTurns(view: *const graph.reader.View, expected_bytes: usize) !void {
             for (row) |entry| {
                 if (entry & 0x80 != 0) return error.UnexpectedTurnRestriction;
             }
+        }
+    }
+}
+
+fn validateCold(allocator: std.mem.Allocator, view: *const graph.reader.View, records: u32, payload_bytes: u64) !void {
+    const table = view.cold_data orelse return error.MissingColdData;
+    if (table.header.record_count != records or table.bytes.len != payload_bytes) return error.ColdSizeMismatch;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    for (0..view.nodes.len) |i| {
+        const node: graph.format.NodeId = @fromBackingInt(@as(u32, @intCast(i)));
+        const range = try view.outEdgeRange(node);
+        for (range.first..range.end) |j| {
+            const id: graph.format.EdgeId = @fromBackingInt(@as(u32, @intCast(j)));
+            const opposite = @backingInt(try view.oppEdge(id));
+            const indexes = view.cold_idx.?;
+            if (indexes[j] ^ indexes[opposite] != graph.cold.directedIndex(0, true)) return error.ColdOpposingIndexMismatch;
+            if (j > opposite) continue;
+            const points = try view.shape(id, arena.allocator());
+            const head: graph.format.NodeId = @fromBackingInt((try view.edge(id)).head);
+            if (!std.meta.eql(points[0], try view.coordinate(node)) or
+                !std.meta.eql(points[points.len - 1], try view.coordinate(head))) return error.ColdShapeEndpointMismatch;
+            const names = try view.names(id);
+            for (0..names.count()) |name| _ = try names.at(name);
+            _ = arena.reset(.retain_capacity);
         }
     }
 }

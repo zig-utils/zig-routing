@@ -4,6 +4,7 @@ const std = @import("std");
 const io = @import("../infra/io.zig");
 const format = @import("format.zig");
 const class_table = @import("class_table.zig");
+const cold = @import("cold.zig");
 const Kind = format.SectionKind;
 const Header = format.SectionHeader;
 const kinds = std.enums.values(Kind);
@@ -63,6 +64,9 @@ pub const View = struct {
     turns: []const format.TurnEntry,
     classes: ?[]const class_table.EdgeClass,
     coordinates: ?[]const format.Coordinate,
+    cold_idx: ?[]const u32,
+    cold: ?[]const u8,
+    cold_data: ?cold.View,
 
     pub fn parse(files: Files, diagnostic: ?*Diagnostic) !View {
         var headers: Headers = .initFill(null);
@@ -106,6 +110,18 @@ pub const View = struct {
                 return error.InvalidCoordinateCount;
             }
         }
+        const cold_header = headers.get(.cold);
+        const cold_index = headers.get(.cold_idx);
+        if ((cold_header == null) != (cold_index == null)) {
+            note(diagnostic, if (cold_header == null) .cold else .cold_idx);
+            return error.MissingSection;
+        }
+        if (cold_index) |index| {
+            if (index.count != edge_count or edge_count % 2 != 0) {
+                note(diagnostic, .cold_idx);
+                return error.InvalidColdIndexCount;
+            }
+        }
 
         var graph: View = .{
             .headers = headers,
@@ -116,6 +132,9 @@ pub const View = struct {
             .turns = undefined,
             .classes = null,
             .coordinates = null,
+            .cold_idx = null,
+            .cold = null,
+            .cold_data = null,
         };
         inline for (kinds) |kind| {
             if (headers.get(kind)) |present| {
@@ -123,6 +142,11 @@ pub const View = struct {
                 const count: usize = @intCast(present.count);
                 @field(graph, @tagName(kind)) = try io.typedSlice(kind.Record(), files.get(kind).?, format.payload_offset, count);
             }
+        }
+        if (graph.cold) |bytes| {
+            note(diagnostic, .cold);
+            graph.cold_data = try cold.View.parse(bytes);
+            if (graph.cold_data.?.header.record_count != edge_count / 2) return error.InvalidColdRecordCount;
         }
         note(diagnostic, null);
         return graph;
@@ -199,14 +223,35 @@ pub const View = struct {
         return self.turns[@intCast(start)..@intCast(end)];
     }
 
+    pub fn coldRecord(self: *const View, id: format.EdgeId) !cold.Record {
+        _ = try self.edge(id);
+        const table = self.cold_data orelse return error.MissingColdData;
+        return table.record(self.cold_idx.?[@backingInt(id)]);
+    }
+
+    pub fn wayId(self: *const View, id: format.EdgeId) !u64 {
+        return (try self.coldRecord(id)).wayId();
+    }
+
+    pub fn names(self: *const View, id: format.EdgeId) !cold.Names {
+        return (try self.coldRecord(id)).names(self.cold_data.?);
+    }
+
+    pub fn shape(self: *const View, id: format.EdgeId, arena: std.mem.Allocator) ![]format.Coordinate {
+        return self.shapeWithDeadline(id, arena, .none);
+    }
+
+    pub fn shapeWithDeadline(self: *const View, id: format.EdgeId, arena: std.mem.Allocator, deadline: io.Deadline) ![]format.Coordinate {
+        return (try self.coldRecord(id)).shape(arena, deadline);
+    }
+
     pub fn verify(self: *const View, deadline: io.Deadline, diagnostic: ?*Diagnostic) !void {
         for (kinds) |kind| {
             const entry = self.header(kind) orelse continue;
             note(diagnostic, kind);
             if (deadline.expired()) return error.DeadlineExceeded;
             const bytes: []const u8 = switch (kind) {
-                .classes => std.mem.sliceAsBytes(self.classes.?),
-                .coordinates => std.mem.sliceAsBytes(self.coordinates.?),
+                inline .classes, .coordinates, .cold_idx, .cold => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
                 inline else => |section| std.mem.sliceAsBytes(@field(self, @tagName(section))),
             };
             var hash = std.hash.XxHash3.init(0);

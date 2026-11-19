@@ -11,6 +11,7 @@ const tags = @import("tags/root.zig");
 const pbf = @import("pbf/root.zig");
 const edge_class = @import("edge_class.zig");
 const turns = @import("turns.zig");
+const ColdBuilder = @import("cold_builder.zig").Builder;
 
 const Allocator = std.mem.Allocator;
 const max_degree = turns.max_degree;
@@ -34,6 +35,8 @@ pub const Stats = struct {
     distinct_classes: usize,
     turn_pool_bytes: usize,
     distinct_turn_matrices: usize,
+    cold_records: u32,
+    cold_payload_bytes: u64,
     assembly_ns: u64,
 };
 
@@ -96,6 +99,8 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     try writer.write(.classes, table.classes);
     try writer.write(.coordinates, topology.coordinates);
     try writer.write(.turns, turn_pool.bytes.items);
+    const topology_ns = timer.read();
+    const cold_bytes = try buildCold(gpa, &shared, &metadata, writer, options.scratch_dir);
     return .{
         .source = source_stats,
         .nodes = @intCast(topology.nodes.len),
@@ -105,7 +110,9 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
         .distinct_classes = table.classes.len,
         .turn_pool_bytes = turn_pool.bytes.items.len,
         .distinct_turn_matrices = turn_pool.indices.count(),
-        .assembly_ns = timer.read(),
+        .cold_records = @intCast(topology.output.data.len / 2),
+        .cold_payload_bytes = cold_bytes,
+        .assembly_ns = topology_ns,
     };
 }
 
@@ -118,8 +125,11 @@ const Way = struct {
     by_direction: [2]classes.EdgeClass,
     speeds: [2]u8,
     truck_speed: u8,
+    speed_limit: u8,
     oneway: bool,
     name_start: u32,
+    ref_start: u32,
+    ref_end: u32,
     name_end: u32,
 };
 
@@ -173,14 +183,16 @@ const Metadata = struct {
         const entry = try self.ways.getOrPut(self.gpa, id);
         if (entry.found_existing) return error.DuplicateWay;
         const indexed = try self.strings.indexWay(attrs, raw_tags, .{}, self.deadline);
-        const name_start = std.math.cast(u32, self.name_ids.items.len) orelse return error.TooManyNames;
-        for ([_]tags.names.Id{ indexed.name.text, indexed.ref.text, indexed.official_name.text, indexed.alt_name.text }) |text| {
-            var tokens = std.mem.tokenizeScalar(u8, self.strings.get(text).?, ';');
-            while (tokens.next()) |token| {
-                if (self.deadline.expired()) return error.DeadlineExceeded;
-                try self.name_ids.append(self.gpa, try self.strings.intern(token));
-            }
-        }
+        const name_start = try self.nameOffset();
+        const ref_first = attrs.road_class == .motorway or attrs.road_class == .trunk;
+        if (!ref_first) try self.appendNames(indexed.name.text);
+        const ref_start = try self.nameOffset();
+        try self.appendNames(indexed.ref.text);
+        const ref_end = try self.nameOffset();
+        if (ref_first) try self.appendNames(indexed.name.text);
+        if (indexed.alt_name.text != indexed.name.text) try self.appendNames(indexed.alt_name.text);
+        if (indexed.official_name.text != indexed.name.text and indexed.official_name.text != indexed.alt_name.text)
+            try self.appendNames(indexed.official_name.text);
         entry.value_ptr.* = .{
             .by_direction = pair,
             .speeds = .{
@@ -188,10 +200,25 @@ const Metadata = struct {
                 if (attrs.flags.backward_tagged_speed) attrs.backward_speed else attrs.speed,
             },
             .truck_speed = attrs.truck_speed,
+            .speed_limit = attrs.speed_limit,
             .oneway = attrs.flags.oneway,
             .name_start = name_start,
-            .name_end = std.math.cast(u32, self.name_ids.items.len) orelse return error.TooManyNames,
+            .ref_start = ref_start,
+            .ref_end = ref_end,
+            .name_end = @min(try self.nameOffset(), name_start +| graph.cold.max_names),
         };
+    }
+
+    fn nameOffset(self: *const Metadata) !u32 {
+        return std.math.cast(u32, self.name_ids.items.len) orelse error.TooManyNames;
+    }
+
+    fn appendNames(self: *Metadata, id: tags.names.Id) !void {
+        var tokens = std.mem.tokenizeScalar(u8, self.strings.get(id).?, ';');
+        while (tokens.next()) |token| {
+            if (self.deadline.expired()) return error.DeadlineExceeded;
+            try self.name_ids.append(self.gpa, try self.strings.intern(token));
+        }
     }
 };
 
@@ -563,6 +590,41 @@ fn buildTurns(shared: *const Shared, edge_classes: []const classes.EdgeClass, na
         try turns.matrix(approaches[0..degree], node.attr.signal != 0, side, matrix, shared.deadline);
         node.turn_off = try pool.intern(matrix);
     }
+}
+
+fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *const Metadata, writer: *format.BundleWriter, scratch_dir: []const u8) !u64 {
+    const topo = shared.topology;
+    const index = try Scratch(u32).init(topo.output.data.len, scratch_dir);
+    defer index.deinit();
+    var builder = try ColdBuilder.init(gpa, &metadata.strings, scratch_dir, shared.deadline);
+    defer builder.deinit();
+    var refs: [graph.cold.max_names]u32 = undefined;
+    for (topo.nodes, 0..) |_, node| {
+        try checkDeadline(shared.deadline, node);
+        const first = topo.first_edge[node];
+        const end = topo.first_edge[node + 1];
+        for (topo.output.data[first..end], first..end) |edge, slot| {
+            const opposite = topo.first_edge[edge.head] + edge.cls.opp_local;
+            if (slot > opposite) continue;
+            var reverse = false;
+            const record = if (edge.cls.local < topo.groups[node].real_degree) blk: {
+                const ref = topo.slot_refs.data[slot];
+                const seg = shared.segments[ref / 2];
+                const way = shared.ways.get(seg.way_id) orelse return error.MissingWayAttributes;
+                const active = refs[0 .. way.name_end - way.name_start];
+                for (active, way.name_start..way.name_end) |*name, i| {
+                    name.* = try builder.nameRef(metadata.name_ids.items[i], i >= way.ref_start and i < way.ref_end);
+                }
+                reverse = ref & 1 != 0;
+                break :blk try builder.append(@bitCast(seg.way_id), way.speed_limit, try segmentShape(shared.shape_points, seg), active);
+            } else try builder.append(0, 0, &.{ topo.coordinates[node], topo.coordinates[edge.head] }, &.{});
+            index.data[slot] = graph.cold.directedIndex(record, reverse);
+            index.data[opposite] = graph.cold.directedIndex(record, !reverse);
+        }
+    }
+    if (builder.record_count != topo.output.data.len / 2) return error.InvalidColdRecordCount;
+    try writer.write(.cold_idx, index.data);
+    return builder.write(writer);
 }
 
 fn checkDeadline(deadline: io.Deadline, index: usize) !void {
