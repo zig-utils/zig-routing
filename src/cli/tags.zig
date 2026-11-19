@@ -6,6 +6,7 @@ const constants = @import("../graph/constants.zig");
 const osm = @import("../build/osm.zig");
 const pbf = @import("../build/pbf/root.zig");
 const tags = @import("../build/tags/root.zig");
+const way_shape = @import("../build/way_shape.zig");
 
 pub fn dump(gpa: std.mem.Allocator, path: []const u8, raw: bool, out: *io.Writer, deadline: io.Deadline) !void {
     const file = try io.File.open(path, .read_only);
@@ -67,11 +68,11 @@ const State = struct {
         }
         var ways = block.ways();
         while (try ways.next()) |way| {
-            const shape = try wayShape(way);
+            const shape = try way_shape.inspect(way.refs);
             if (self.raw) {
                 try self.record(.{ .kind = osm.Kind.way, .id = way.id, .shape = shape, .tags = try self.rawTags(way.tags) });
             } else {
-                try self.wayRecord(way, try hasWayShape(way.tags, shape));
+                try self.wayRecord(way, try way_shape.accepts(shape, way.tags));
             }
         }
     }
@@ -235,27 +236,4 @@ const State = struct {
 
 fn optionalName(value: anytype) ?[]const u8 {
     return if (value) |item| @tagName(item) else null;
-}
-
-const Shape = enum { short, open, closed };
-
-fn wayShape(way: pbf.block.Way) !Shape {
-    var refs = way.refs;
-    const first = try refs.next() orelse return .short;
-    var last = try refs.next() orelse return .short;
-    while (try refs.next()) |id| last = id;
-    return if (first == last) .closed else .open;
-}
-
-/// Apply ParseWays' input-shape filter to the comparison only. Even when
-/// the parser skips a shape, the record retains the tag retention decision.
-fn hasWayShape(source: pbf.block.TagIterator, shape: Shape) !bool {
-    if (shape != .closed) return shape == .open;
-    var iter = source;
-    while (try iter.next()) |tag| {
-        for ([_][]const u8{ "building", "landuse", "leisure", "natural" }) |key| {
-            if (std.mem.eql(u8, tag.key, key)) return false;
-        }
-    }
-    return true;
 }

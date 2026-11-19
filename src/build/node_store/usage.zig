@@ -100,25 +100,64 @@ pub const Usage = struct {
         return (Bits.init(@truncate(key))).count(&slot.data);
     }
 
+    /// Set membership without incrementing an existing count.
+    pub fn insert(self: *Usage, key: u64) !bool {
+        const slot = (try self.get(key >> leaf_bits, true)).?;
+        const bits: Bits = .init(@truncate(key));
+        if (bits.count(&slot.data) != 0) return false;
+        slot.data.low[bits.word] |= bits.bit;
+        slot.dirty = true;
+        return true;
+    }
+
+    /// Finish writes before creating independent concurrent cursors. The
+    /// owner keeps the files open and immutable while a cursor is in use.
+    pub fn freeze(self: *Usage, deadline: io.Deadline) !View {
+        try self.flushAll(deadline);
+        return .{ .dir = self.dir, .leaves = self.leaves };
+    }
+
+    pub const View = struct {
+        dir: io.File,
+        leaves: io.File,
+
+        pub fn cursor(self: View) Cursor {
+            return .{ .usage = .{ .dir = self.dir, .leaves = self.leaves } };
+        }
+    };
+
+    pub const Cursor = struct {
+        usage: Usage,
+
+        pub fn contains(self: *Cursor, key: u64) !bool {
+            return (try self.usage.count(key)) != 0;
+        }
+    };
+
     /// Save by ID when the source is unsorted. One position slot per used
     /// leaf index. This never creates entries for unreferenced nodes.
-    pub fn locate(self: *Usage, positions: io.File, key: u64, coordinates: Coordinates) !void {
-        const slot = try self.get(key >> leaf_bits, false) orelse return;
+    pub fn locate(self: *Usage, positions: io.File, key: u64, coordinates: Coordinates) !bool {
+        const slot = try self.get(key >> leaf_bits, false) orelse return false;
         const index: u8 = @truncate(key);
         const bits: Bits = .init(index);
-        if (bits.count(&slot.data) == 0) return;
+        if (bits.count(&slot.data) == 0) return false;
         if (slot.data.located[bits.word] & bits.bit != 0) return error.DuplicateNode;
         try positions.pwriteAll(std.mem.asBytes(&coordinates), try positionOffset(slot.page, index));
         slot.data.located[bits.word] |= bits.bit;
         slot.dirty = true;
+        return true;
     }
 
     pub fn emitLocated(self: *Usage, positions: io.File, deadline: io.Deadline, context: anytype, comptime emit: anytype) !void {
+        try self.flushAll(deadline);
+        try self.emitBranch(0, 0, levels, positions, deadline, context, emit);
+    }
+
+    fn flushAll(self: *Usage, deadline: io.Deadline) !void {
         for (&self.cache) |*slot| {
             if (deadline.expired()) return error.DeadlineExceeded;
             try self.flush(slot);
         }
-        try self.emitBranch(0, 0, levels, positions, deadline, context, emit);
     }
 
     fn emitBranch(self: *const Usage, branch: u64, prefix: u64, level: usize, positions: io.File, deadline: io.Deadline, context: anytype, comptime emit: anytype) !void {

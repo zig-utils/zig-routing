@@ -393,6 +393,20 @@ pub fn build(
     context: anytype,
     comptime includeWay: anytype,
 ) !Store {
+    return buildObserving(gpa, source, output, options, context, includeWay, null);
+}
+
+/// The observer receives just the way-referenced nodes. When the input is
+/// out of order, some nodes can be observed again during the replay.
+pub fn buildObserving(
+    gpa: std.mem.Allocator,
+    source: pbf.file.Stream,
+    output: io.File,
+    options: BuildOptions,
+    context: anytype,
+    comptime includeWay: anytype,
+    comptime observeNode: ?fn (@TypeOf(context), pbf.block.Node) anyerror!void,
+) !Store {
     var used = try usage.Usage.init(options.scratch_dir);
     defer used.deinit();
     var writer = try Writer.init(output, options.scratch_dir);
@@ -408,6 +422,7 @@ pub fn build(
         writer: *Writer,
         scratch: pbf.block.Scratch = .{},
         mode: Mode = .usage,
+        out_of_order: bool = false,
 
         fn consume(self: *Self, _: usize, bytes: []const u8) !void {
             const block = try self.scratch.decode(self.gpa, bytes, self.deadline);
@@ -426,13 +441,22 @@ pub fn build(
                     while (try nodes.next()) |node| {
                         const key = keyFor(node.id);
                         const uses = try self.used.count(key);
-                        if (uses != 0) try self.writer.append(key, .{ .lat = node.lat, .lon = node.lon }, uses);
+                        if (uses == 0) continue;
+                        self.writer.append(key, .{ .lat = node.lat, .lon = node.lon }, uses) catch |err| {
+                            if (err == error.OutOfOrder) self.out_of_order = true;
+                            return err;
+                        };
+                        if (observeNode) |observe| try observe(self.selection, node);
                     }
                 },
                 .unsorted_nodes => |positions| {
                     var nodes = block.nodes();
-                    while (try nodes.next()) |node|
-                        try self.used.locate(positions, keyFor(node.id), .{ .lat = node.lat, .lon = node.lon });
+                    while (try nodes.next()) |node| {
+                        const located = try self.used.locate(positions, keyFor(node.id), .{ .lat = node.lat, .lon = node.lon });
+                        if (observeNode) |observe| {
+                            if (located) try observe(self.selection, node);
+                        }
+                    }
                 },
             }
         }
@@ -448,7 +472,7 @@ pub fn build(
     try source.forEach(gpa, options.deadline, &pass, Pass.consume);
     pass.mode = .sorted_nodes;
     source.forEach(gpa, options.deadline, &pass, Pass.consume) catch |err| {
-        if (err != error.OutOfOrder) return err;
+        if (!pass.out_of_order) return err;
         try writer.restart();
         const positions = try io.File.temporary(options.scratch_dir);
         defer positions.close();

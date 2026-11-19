@@ -116,6 +116,34 @@ Liechtenstein and 34 in Utrecht.
 The fixtures derive from OpenStreetMap data © OpenStreetMap contributors, under the
 [Open Database License](https://www.openstreetmap.org/copyright).
 
+### Way splitting and edge counts
+
+```bash
+mkdir -p bench/results
+zig build check-edges -- oracle/data/liechtenstein/extract.osm.pbf bench/results 4
+zig build check-edges -- oracle/data/utrecht/extract.osm.pbf bench/results 4
+```
+
+The check counts distinct emitted endpoints and one edge per segment in OSM way orientation. The
+Valhalla comparison uses level-2 tile headers after `valhalla_build_tiles --end build` with the
+default oracle options and the same PBFs. Each segment contributes two directed-edge records there.
+
+| Extract | Zig nodes | Zig edges | Oracle base level-2 nodes | Oracle base level-2 directed edges | Oracle final level-2 nodes | Oracle final level-2 directed edges |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Liechtenstein | 6,280 | 7,880 | 6,280 | 15,760 | 6,090 | 13,938 |
+| Utrecht | 30,638 | 42,668 | 30,638 | 85,336 | 28,906 | 75,658 |
+
+The base comparison has zero allowed count differences. For the final level-2 totals, the
+allow-list is the measured change at Valhalla's hierarchy stage. It moved 190 nodes and 1,822
+directed edges out of level 2 in Liechtenstein, and 1,732 nodes and 9,678 directed edges in Utrecht.
+The counts were unchanged after the filter stage and again from hierarchy through validation.
+
+The splitter counts missing references and skips the entire unresolved way, as Valhalla does.
+It counts and omits same-node edges. Exact overlapping shapes with the same endpoint IDs are
+counted in either orientation and retained. Edges between distinct nodes at identical coordinates
+are retained with their measured zero length. Valhalla applies its minimum stored length during
+directed-edge assembly.
+
 ### HTTP and route checks
 
 `compare-height.ts` sends the same random `/height` requests (shapes, encoded polylines at

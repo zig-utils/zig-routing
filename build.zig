@@ -214,6 +214,16 @@ pub fn build(b: *std.Build) void {
     run_bench_node_store.addPassthruArgs();
     b.step("bench-node-store", "Verify node locations and measure store size, lookups and peak RSS").dependOn(&run_bench_node_store.step);
 
+    const check_edges = b.addExecutable(.{ .name = "check-edges", .root_module = b.createModule(.{
+        .root_source_file = b.path("test/check_edges.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{.{ .name = "routing", .module = lib_mod }},
+    }) });
+    const run_check_edges = b.addRunArtifact(check_edges);
+    run_check_edges.addPassthruArgs();
+    b.step("check-edges", "Report counts from the ways-to-edges stage").dependOn(&run_check_edges.step);
+
     // Fuzz targets (test/fuzz.zig). `zig build test` replays their seeds; `zig build fuzz
     // --fuzz` fuzzes, ReleaseSafe by default so bounds and overflow checks stay on.
     const fuzz_filter = b.option([]const u8, "fuzz-target", "Fuzz one target: request, http, polyline, lz4, dem, protobuf, config, osm-pbf, node-store");
