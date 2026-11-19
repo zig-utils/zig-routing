@@ -33,15 +33,26 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // The one binary: `zr serve | build | route | bench | diff | inspect`.
+    const version_options = b.addOptions();
+    const commit = b.option([]const u8, "commit", "Source commit for release builds") orelse switch (b.runFallible(
+        &.{ "git", "rev-parse", "HEAD" },
+        .{ .cwd = .{ .path = b.root.joinString(b.allocator, ".") catch @panic("OOM") }, .stderr_behavior = .ignore },
+    )) {
+        .success => |value| std.mem.trim(u8, value, "\r\n"),
+        else => "unknown",
+    };
+    version_options.addOption([]const u8, "commit", commit);
+
     const exe = b.addExecutable(.{
         .name = "zr",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = b.path("src/cli/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "routing", .module = lib_mod },
+                .{ .name = "zig_cli", .module = zig_cli },
+                .{ .name = "build_options", .module = version_options.createModule() },
             },
         }),
     });
@@ -54,6 +65,51 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const test_step = b.step("test", "Run unit tests");
+    const help_test = b.addRunArtifact(exe);
+    help_test.addArg("--help");
+    for ([_][]const u8{ "serve", "build", "route", "bench", "diff", "inspect", "config", "dem", "import-valhalla" }) |name| {
+        help_test.expectStdOutMatch(name);
+    }
+    test_step.dependOn(&help_test.step);
+
+    const unknown_command = b.addRunArtifact(exe);
+    unknown_command.addArg("not-a-command");
+    unknown_command.expectExitCode(2);
+    unknown_command.expectStdErrMatch("Unknown command 'not-a-command'");
+    test_step.dependOn(&unknown_command.step);
+
+    const unknown_flag = b.addRunArtifact(exe);
+    unknown_flag.addArgs(&.{ "serve", "--json", "--unknown" });
+    unknown_flag.expectExitCode(2);
+    unknown_flag.expectStdErrMatch("\"kind\":\"UnknownOption\"");
+    test_step.dependOn(&unknown_flag.step);
+
+    const version_test = b.addRunArtifact(exe);
+    version_test.addArg("--version");
+    version_test.expectStdOutMatch("commit ");
+    version_test.expectStdOutMatch("features ");
+    test_step.dependOn(&version_test.step);
+
+    const route_test = b.addRunArtifact(exe);
+    route_test.addArgs(&.{ "route", "{bad json" });
+    route_test.expectExitCode(1);
+    route_test.expectStdErrMatch("\"error_code\":100");
+    test_step.dependOn(&route_test.step);
+
+    const route_files = b.addWriteFiles();
+    const height_config = route_files.add("valhalla.json",
+        \\{"additional_data":{"elevation":""},"loki":{"actions":["height"]}}
+    );
+    const height_request = route_files.add("height.json",
+        \\{"shape":[{"lat":0,"lon":0}]}
+    );
+    const height_test = b.addRunArtifact(exe);
+    height_test.addArg("--config");
+    height_test.addFileArg(height_config);
+    height_test.addArgs(&.{ "route", "--action", "height", "--file" });
+    height_test.addFileArg(height_request);
+    height_test.expectStdOutMatch("\"height\":[null]");
+    test_step.dependOn(&height_test.step);
 
     const lib_tests = b.addTest(.{ .root_module = lib_mod });
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);

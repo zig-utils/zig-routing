@@ -39,6 +39,15 @@ zig build test
 zig build run
 ```
 
+## Command line
+
+`zr --help` lists commands and shared flags. Use `zr COMMAND --help` for each command's options.
+`zr --version` prints the source commit, Zig toolchain and enabled target CPU features.
+
+`zr route '<json>'` dispatches a request in process. To select a different action and read
+the request from a file, run `zr --config valhalla.json route --action height --file height.json`.
+Successful responses go to stdout. Valhalla error bodies go to stderr with a failing exit code.
+
 ## Configuration
 
 `zr serve --config valhalla.json` reads Valhalla JSON settings. Use

@@ -53,14 +53,19 @@ pub const Service = struct {
 
     fn handleHttp(context: *anyopaque, ctx: *http.Ctx, req: *const http.Request, res: *http.Response) void {
         const self: *Service = @ptrCast(@alignCast(context));
-        self.serve(ctx, req, res) catch {
+        self.handle(ctx, req, res);
+    }
+
+    /// Dispatch the same request and error handling for HTTP and the one-shot CLI.
+    pub fn handle(self: *Service, ctx: *http.Ctx, req: *const http.Request, res: *http.Response) void {
+        self.dispatch(ctx, req, res) catch {
             // Out of request memory: a plain 413 (the arena cap was hit).
             res.status = 413;
             res.body.clearRetainingCapacity();
         };
     }
 
-    fn serve(self: *Service, ctx: *http.Ctx, req: *const http.Request, res: *http.Response) Allocator.Error!void {
+    fn dispatch(self: *Service, ctx: *http.Ctx, req: *const http.Request, res: *http.Response) Allocator.Error!void {
         const a = res.gpa;
         if (req.method != .GET and req.method != .POST) return writeError(a, res, .{ .code = 101 }, .json);
 

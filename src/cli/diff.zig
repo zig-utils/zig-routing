@@ -904,63 +904,11 @@ pub fn writeWorst(gpa: Allocator, dir: []const u8, r: *const Report, lines: []co
 // Command line
 // ---------------------------------------------------------------------------
 
-pub const usage =
-    \\usage: zr diff A_URL B_URL --corpus FILE [options]
-    \\
-    \\  --corpus FILE     one request per line: PATH<TAB>BODY, or a body for --endpoint
-    \\  --endpoint PATH   path for lines without one (default /route)
-    \\  --threads N       requests in flight (default 4)
-    \\  --timeout T       per-response timeout, e.g. 30s (default 60s)
-    \\  --out FILE        write the JSON report here
-    \\  --worst DIR       write each scorer's worst failures here (existing directory)
-    \\  --keep N          worst failures kept per scorer (default 10)
-    \\  --label TEXT      recorded in the report
-    \\
-    \\Exits 1 when a gate is below its threshold or a request got no answer.
-    \\
-;
-
-/// Entry point for `zr diff`; `args` excludes the program and "diff".
-/// Returns whether every gate passed.
-pub fn main(gpa: Allocator, args: []const []const u8) !bool {
+pub fn runCommand(gpa: Allocator, opts: Options, input_meta: Meta, endpoint: []const u8, out_path: ?[]const u8, worst_dir: ?[]const u8, json_output: bool) !bool {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    if (args.len < 2 or args[0].len == 0 or args[0][0] == '-' or args[1].len == 0 or args[1][0] == '-') return usageError();
-
-    var opts: Options = .{ .a = try bench.parseTarget(args[0]), .b = try bench.parseTarget(args[1]) };
-    var meta: Meta = .{ .a = args[0], .b = args[1], .corpus_path = "", .corpus_hash = 0 };
-    var endpoint: []const u8 = "/route";
-    var out_path: ?[]const u8 = null;
-    var worst_dir: ?[]const u8 = null;
-    var i: usize = 2;
-    while (i < args.len) : (i += 2) {
-        if (i + 1 >= args.len) return usageError();
-        const flag = args[i];
-        const v = args[i + 1];
-        if (std.mem.eql(u8, flag, "--corpus")) {
-            meta.corpus_path = v;
-        } else if (std.mem.eql(u8, flag, "--endpoint")) {
-            endpoint = v;
-        } else if (std.mem.eql(u8, flag, "--threads")) {
-            opts.threads = try std.fmt.parseInt(usize, v, 10);
-        } else if (std.mem.eql(u8, flag, "--timeout")) {
-            opts.timeout_ms = @intCast(try bench.parseDuration(v) / std.time.ns_per_ms);
-        } else if (std.mem.eql(u8, flag, "--out")) {
-            out_path = v;
-        } else if (std.mem.eql(u8, flag, "--worst")) {
-            worst_dir = v;
-        } else if (std.mem.eql(u8, flag, "--keep")) {
-            opts.worst = try std.fmt.parseInt(usize, v, 10);
-        } else if (std.mem.eql(u8, flag, "--label")) {
-            meta.label = v;
-        } else {
-            std.debug.print("unknown option {s}\n", .{flag});
-            return usageError();
-        }
-    }
-    if (meta.corpus_path.len == 0) return usageError();
-
+    var meta = input_meta;
     const text = try io.readFileAlloc(arena, meta.corpus_path, 4 << 30);
     meta.corpus_hash = std.hash.Wyhash.hash(0, text);
     const lines = try parseCorpus(arena, text, endpoint);
@@ -976,19 +924,15 @@ pub fn main(gpa: Allocator, args: []const []const u8) !bool {
         const n = try writeWorst(gpa, dir, &report, lines);
         try out.print(arena, "wrote {d} worst cases to {s}\n", .{ n, dir });
     }
-    std.debug.print("{s}", .{out.items});
-    if (out_path) |path| {
+    if (!json_output) std.debug.print("{s}", .{out.items});
+    if (out_path != null or json_output) {
         var file_bytes: std.ArrayList(u8) = .empty;
         try writeReport(arena, &file_bytes, meta, &report);
         try file_bytes.append(arena, '\n');
-        try io.writeFile(path, file_bytes.items);
+        if (out_path) |path| try io.writeFile(path, file_bytes.items);
+        if (json_output) try io.writeStdout(file_bytes.items);
     }
     return report.ok();
-}
-
-fn usageError() error{InvalidArgument} {
-    std.debug.print("{s}", .{usage});
-    return error.InvalidArgument;
 }
 
 // ---------------------------------------------------------------------------

@@ -7,8 +7,8 @@
     // Zero external dependencies: Zig std plus our own zig-utils libraries only.
     .dependencies = .{
         .zig_cli = .{
-            .url = "git+https://github.com/zig-utils/zig-cli.git#d5b6d7cce234514e53073d566696cd2e69ef4836",
-            .hash = "zig_cli-0.1.3-18T51LbtAwC1D5ymlw-xAeLSMooNBx2X2gDM4PawGb6c",
+            .url = "git+https://github.com/zig-utils/zig-cli.git#9da0217f7309003023f59cfc0f189f8a7952c52e",
+            .hash = "zig_cli-0.1.7-18T51F3HBACthLfY8ZikGG_1XmlqFWfag20LKSzLoQQM",
         },
         .zig_config = .{
             .url = "git+https://github.com/zig-utils/zig-config.git#509644848032ba30683ad6899bd16f621841d433",

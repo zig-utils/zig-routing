@@ -59,13 +59,13 @@ pub const Response = struct {
 pub const Ctx = struct {
     worker_id: usize,
     arena: *arena_mod.Arena,
-    stream: io.Stream,
+    stream: ?io.Stream = null,
     deadline: io.Deadline,
 
     /// True when the client disconnected or the deadline passed. Long loops
     /// call this every few thousand iterations.
     pub fn cancelled(self: *const Ctx) bool {
-        return self.deadline.expired() or self.stream.peerClosed();
+        return self.deadline.expired() or if (self.stream) |stream| stream.peerClosed() else false;
     }
 };
 

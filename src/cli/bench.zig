@@ -281,8 +281,10 @@ const Worker = struct {
 
     fn dueAt(self: *const Worker, seq: u64) u64 {
         // Threads interleave: thread t owns global slots t, t+T, t+2T, ...
-        const slot = @as(f64, @floatFromInt(seq * self.threads + self.id));
-        return self.clock.start_ns + @as(u64, @intFromFloat(slot * self.clock.open_interval_ns));
+        const slot = @as(f64, @floatFromInt(seq *| self.threads +| self.id));
+        const offset = slot * self.clock.open_interval_ns;
+        if (offset >= 0x1p64) return std.math.maxInt(u64);
+        return self.clock.start_ns +| @as(u64, @intFromFloat(offset));
     }
 
     fn openLoop(self: *const Worker) bool {
@@ -404,7 +406,7 @@ const Worker = struct {
         c.resp_len = null;
         c.close_after = false;
         c.start_ns = start;
-        c.deadline_ns = now + self.opts.timeout_ns;
+        c.deadline_ns = now +| self.opts.timeout_ns;
         c.measured = start >= self.clock.warm_end_ns;
         if (c.measured) self.issued_measured += 1;
         c.state = .writing;
@@ -516,14 +518,17 @@ fn parseHead(c: *Conn) !void {
 
 pub fn run(gpa: Allocator, opts: Options, corpus: *const Corpus) !Result {
     if (opts.connections == 0) return error.InvalidArgument;
+    if (opts.rate) |rate| {
+        if (!std.math.isFinite(rate) or rate <= 0 or !std.math.isFinite(ns_per_s / rate)) return error.InvalidArgument;
+    }
     const cpus = std.Thread.getCpuCount() catch 1;
     const threads = if (opts.threads > 0) @min(opts.threads, opts.connections) else @min(cpus, opts.connections);
 
     const start = io.monotonicNs() + 20 * ns_per_ms;
     const clock: Clock = .{
         .start_ns = start,
-        .warm_end_ns = start + opts.warmup_ns,
-        .stop_ns = if (opts.requests != null) std.math.maxInt(u64) else start + opts.warmup_ns + opts.duration_ns,
+        .warm_end_ns = start +| opts.warmup_ns,
+        .stop_ns = if (opts.requests != null) std.math.maxInt(u64) else start +| opts.warmup_ns +| opts.duration_ns,
         .open_interval_ns = if (opts.rate) |r| ns_per_s / r else 0,
     };
 
@@ -746,6 +751,10 @@ pub fn writeSummary(out: *std.ArrayList(u8), gpa: Allocator, r: *const Result) !
 
 /// `--compare a.json b.json`: one row per tracked number, with b relative to a.
 pub fn compare(arena: Allocator, a_text: []const u8, b_text: []const u8, out: *std.ArrayList(u8)) !void {
+    return writeComparison(arena, a_text, b_text, out, false);
+}
+
+fn writeComparison(arena: Allocator, a_text: []const u8, b_text: []const u8, out: *std.ArrayList(u8), json_output: bool) !void {
     const a = try json.parse(arena, a_text);
     const b = try json.parse(arena, b_text);
     const rows = [_]struct { label: []const u8, path: []const u8 }{
@@ -758,10 +767,30 @@ pub fn compare(arena: Allocator, a_text: []const u8, b_text: []const u8, out: *s
         .{ .label = "latency p99.9 us", .path = "/latency_us/p999" },
         .{ .label = "latency max us", .path = "/latency_us/max" },
     };
-    try out.print(arena, "{s:<18} {s:>14} {s:>14} {s:>9}\n", .{ "", nonEmpty(json.get([]const u8, a, "/label", ""), "a"), nonEmpty(json.get([]const u8, b, "/label", ""), "b"), "change" });
+    const a_label = nonEmpty(json.get([]const u8, a, "/label", ""), "a");
+    const b_label = nonEmpty(json.get([]const u8, b, "/label", ""), "b");
+    var w = JsonWriter.init(arena, out);
+    if (json_output) {
+        try w.beginObject();
+        try w.field("a", a_label);
+        try w.field("b", b_label);
+        try w.beginArrayField("metrics");
+    } else {
+        try out.print(arena, "{s:<18} {s:>14} {s:>14} {s:>9}\n", .{ "", a_label, b_label, "change" });
+    }
     for (rows) |row| {
         const va = json.get(f64, a, row.path, 0);
         const vb = json.get(f64, b, row.path, 0);
+        if (json_output) {
+            try w.beginObject();
+            try w.field("name", row.label);
+            try w.field("a", va);
+            try w.field("b", vb);
+            try w.key("change_percent");
+            if (va == 0) try w.null_() else try w.float((vb - va) / va * 100);
+            try w.endObject();
+            continue;
+        }
         try out.print(arena, "{s:<18} {d:>14.1} {d:>14.1} ", .{ row.label, va, vb });
         if (va == 0) {
             try out.print(arena, "{s:>9}\n", .{"-"});
@@ -771,6 +800,11 @@ pub fn compare(arena: Allocator, a_text: []const u8, b_text: []const u8, out: *s
             const text = std.fmt.bufPrint(&cell, "{s}{d:.1}%", .{ if (delta < 0) "-" else "+", @abs(delta) }) catch "?";
             try out.print(arena, "{s:>9}\n", .{text});
         }
+    }
+    if (json_output) {
+        try w.endArray();
+        try w.endObject();
+        try out.append(arena, '\n');
     }
 }
 
@@ -782,109 +816,38 @@ fn nonEmpty(s: []const u8, fallback: []const u8) []const u8 {
 // Command line
 // ---------------------------------------------------------------------------
 
-pub const usage =
-    \\usage: zr bench URL --corpus FILE [options]
-    \\       zr bench --compare A.json B.json
-    \\
-    \\  --corpus FILE       one request per line: PATH<TAB>BODY, or a body for --endpoint
-    \\  --endpoint PATH     path for lines without one (default /route)
-    \\  --connections N     keep-alive connections (default 16)
-    \\  --threads N         client threads (default min(CPUs, connections))
-    \\  --rate R            open loop at R requests/s (default: closed loop)
-    \\  --duration T        measured time, e.g. 30s, 2m (default 10s)
-    \\  --requests N        stop after N measured requests instead
-    \\  --warmup T          excluded warm-up (default 2s)
-    \\  --timeout T         per-request timeout (default 30s)
-    \\  --counters          report Linux client hardware counters when available
-    \\  --out FILE          write the JSON result here
-    \\  --dataset NAME      --commit SHA  --label TEXT   recorded in the result
-    \\
-;
-
 pub fn parseDuration(s: []const u8) !u64 {
     const units = [_]struct { suffix: []const u8, ns: u64 }{
         .{ .suffix = "ms", .ns = ns_per_ms },
         .{ .suffix = "s", .ns = ns_per_s },
         .{ .suffix = "m", .ns = 60 * ns_per_s },
+        .{ .suffix = "", .ns = ns_per_s },
     };
     for (units) |u| {
-        if (std.mem.endsWith(u8, s, u.suffix)) {
-            const v = try std.fmt.parseFloat(f64, s[0 .. s.len - u.suffix.len]);
-            if (v < 0) return error.InvalidArgument;
-            return @intFromFloat(v * @as(f64, @floatFromInt(u.ns)));
-        }
+        if (!std.mem.endsWith(u8, s, u.suffix)) continue;
+        const value = try std.fmt.parseFloat(f64, s[0 .. s.len - u.suffix.len]);
+        const ns = value * @as(f64, @floatFromInt(u.ns));
+        if (!std.math.isFinite(ns) or ns < 0 or ns >= 0x1p64) return error.InvalidArgument;
+        return @intFromFloat(ns);
     }
-    const v = try std.fmt.parseFloat(f64, s);
-    if (v < 0) return error.InvalidArgument;
-    return @intFromFloat(v * ns_per_s);
+    unreachable;
 }
 
-/// Entry point for `zr bench`; `args` excludes the program and "bench".
-pub fn main(gpa: Allocator, args: []const []const u8) !void {
+pub fn compareFiles(gpa: Allocator, a_path: []const u8, b_path: []const u8, json_output: bool) !void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    const a = try io.readFileAlloc(arena, a_path, 64 << 20);
+    const b = try io.readFileAlloc(arena, b_path, 64 << 20);
     var out: std.ArrayList(u8) = .empty;
+    try writeComparison(arena, a, b, &out, json_output);
+    try io.writeStdout(out.items);
+}
 
-    if (args.len >= 1 and std.mem.eql(u8, args[0], "--compare")) {
-        if (args.len != 3) return usageError();
-        const a = try io.readFileAlloc(arena, args[1], 64 << 20);
-        const b = try io.readFileAlloc(arena, args[2], 64 << 20);
-        try compare(arena, a, b, &out);
-        std.debug.print("{s}", .{out.items});
-        return;
-    }
-    if (args.len < 1 or args[0].len == 0 or args[0][0] == '-') return usageError();
-
-    var opts: Options = .{ .target = try parseTarget(args[0]) };
-    var meta: Meta = .{ .target = args[0], .corpus_path = "" };
-    var endpoint: []const u8 = "/route";
-    var out_path: ?[]const u8 = null;
-    var i: usize = 1;
-    while (i < args.len) {
-        const flag = args[i];
-        i += 1;
-        if (std.mem.eql(u8, flag, "--counters")) {
-            opts.measure_counters = true;
-            continue;
-        }
-        if (i >= args.len) return usageError();
-        const v = args[i];
-        i += 1;
-        if (std.mem.eql(u8, flag, "--corpus")) {
-            meta.corpus_path = v;
-        } else if (std.mem.eql(u8, flag, "--endpoint")) {
-            endpoint = v;
-        } else if (std.mem.eql(u8, flag, "--connections")) {
-            opts.connections = try std.fmt.parseInt(usize, v, 10);
-        } else if (std.mem.eql(u8, flag, "--threads")) {
-            opts.threads = try std.fmt.parseInt(usize, v, 10);
-        } else if (std.mem.eql(u8, flag, "--rate")) {
-            opts.rate = try std.fmt.parseFloat(f64, v);
-            if (opts.rate.? <= 0) return error.InvalidArgument;
-        } else if (std.mem.eql(u8, flag, "--duration")) {
-            opts.duration_ns = try parseDuration(v);
-        } else if (std.mem.eql(u8, flag, "--requests")) {
-            opts.requests = try std.fmt.parseInt(u64, v, 10);
-        } else if (std.mem.eql(u8, flag, "--warmup")) {
-            opts.warmup_ns = try parseDuration(v);
-        } else if (std.mem.eql(u8, flag, "--timeout")) {
-            opts.timeout_ns = try parseDuration(v);
-        } else if (std.mem.eql(u8, flag, "--out")) {
-            out_path = v;
-        } else if (std.mem.eql(u8, flag, "--dataset")) {
-            meta.dataset = v;
-        } else if (std.mem.eql(u8, flag, "--commit")) {
-            meta.commit = v;
-        } else if (std.mem.eql(u8, flag, "--label")) {
-            meta.label = v;
-        } else {
-            std.debug.print("unknown option {s}\n", .{flag});
-            return usageError();
-        }
-    }
-    if (meta.corpus_path.len == 0) return usageError();
-
+pub fn runCommand(gpa: Allocator, opts: Options, meta: Meta, endpoint: []const u8, out_path: ?[]const u8, json_output: bool) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
     const text = try io.readFileAlloc(arena, meta.corpus_path, 4 << 30);
     const corpus = try loadCorpus(gpa, text, opts.target.host, endpoint);
     defer corpus.deinit(gpa);
@@ -894,6 +857,7 @@ pub fn main(gpa: Allocator, args: []const []const u8) !void {
     defer gpa.destroy(result);
     result.* = try run(gpa, opts, &corpus);
 
+    var out: std.ArrayList(u8) = .empty;
     try writeSummary(&out, arena, result);
     if (opts.measure_counters) {
         if (result.client_counters) |counts| {
@@ -906,18 +870,14 @@ pub fn main(gpa: Allocator, args: []const []const u8) !void {
             try out.appendSlice(arena, "client hardware counters unavailable\n");
         }
     }
-    std.debug.print("{s}", .{out.items});
-    if (out_path) |path| {
+    if (!json_output) std.debug.print("{s}", .{out.items});
+    if (out_path != null or json_output) {
         var file_bytes: std.ArrayList(u8) = .empty;
         try writeResult(arena, &file_bytes, meta, opts, &corpus, result);
         try file_bytes.append(arena, '\n');
-        try io.writeFile(path, file_bytes.items);
+        if (out_path) |path| try io.writeFile(path, file_bytes.items);
+        if (json_output) try io.writeStdout(file_bytes.items);
     }
-}
-
-fn usageError() error{InvalidArgument} {
-    std.debug.print("{s}", .{usage});
-    return error.InvalidArgument;
 }
 
 // ---------------------------------------------------------------------------

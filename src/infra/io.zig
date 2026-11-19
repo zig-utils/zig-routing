@@ -3,8 +3,8 @@
 //!
 //! The Zig 0.17-dev standard library moves these APIs often (std.time.Timer,
 //! std.fs.cwd and blocking sockets are gone, and std.Io wants an `Io` handle
-//! threaded everywhere). Everything here goes straight to libc through
-//! `std.c`, so a toolchain bump should touch this file and little else.
+//! threaded everywhere). Operating-system calls use `std.c` and CLI writers
+//! use the standard library, so toolchain changes are isolated here.
 //! Other source files must not use `std.Io.{Dir,File,net,Clock,Threaded}`;
 //! CI greps for it.
 
@@ -356,6 +356,16 @@ fn writeAllFd(fd: c.fd_t, bytes: []const u8) Error!void {
 
 pub fn writeStdout(bytes: []const u8) Error!void {
     return writeAllFd(c.STDOUT_FILENO, bytes);
+}
+
+pub const Writer = std.Io.Writer;
+
+pub fn stdoutWriter(system: std.Io, buffer: []u8) std.Io.File.Writer {
+    return std.Io.File.stdout().writerStreaming(system, buffer);
+}
+
+pub fn stderrWriter(system: std.Io, buffer: []u8) std.Io.File.Writer {
+    return std.Io.File.stderr().writerStreaming(system, buffer);
 }
 
 pub const Address = struct {

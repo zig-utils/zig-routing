@@ -17,13 +17,6 @@ const pk = @import("../elevation/packed.zig");
 const PointLL = @import("../geo/point.zig").PointLL;
 const Allocator = std.mem.Allocator;
 
-pub const usage =
-    \\usage: zr dem pack HGT_DIR OUT.zdem [--threads N]
-    \\       zr dem verify PACK HGT_DIR [--samples N] [--threads N]
-    \\       zr dem info PACK
-    \\
-;
-
 /// Runs `work(ctx, slot, index)` for every tile index, `threads` at a time,
 /// then `done(ctx, slot, index)` for each in ascending order before the next
 /// batch starts. `slot` is the worker's number (0..threads), for buffers.
@@ -39,8 +32,9 @@ fn forTiles(threads: usize, indices: []const u32, ctx: anytype, comptime work: f
     }
 }
 
-fn threadCount(requested: ?usize) usize {
-    return requested orelse (std.Thread.getCpuCount() catch 4);
+pub fn threadCount(requested: ?usize) usize {
+    if (requested) |count| if (count != 0) return count;
+    return std.Thread.getCpuCount() catch 4;
 }
 
 // ---------------------------------------------------------------------------
@@ -83,7 +77,7 @@ const PackCtx = struct {
     }
 };
 
-fn pack(gpa: Allocator, dir: []const u8, out: []const u8, threads: usize) !void {
+pub fn pack(gpa: Allocator, dir: []const u8, out: []const u8, threads: usize) !void {
     var tiles = try hgt.Tiles.init(gpa, dir);
     defer tiles.deinit();
     const indices = try tiles.indices(gpa);
@@ -186,7 +180,7 @@ const VerifyCtx = struct {
     }
 };
 
-fn verify(gpa: Allocator, pack_path: []const u8, dir: []const u8, samples: usize, threads: usize) !void {
+pub fn verify(gpa: Allocator, pack_path: []const u8, dir: []const u8, samples: usize, threads: usize) !void {
     var p = try pk.Pack.open(pack_path);
     defer p.close();
     var tiles = try hgt.Tiles.init(gpa, dir);
@@ -227,7 +221,22 @@ fn verify(gpa: Allocator, pack_path: []const u8, dir: []const u8, samples: usize
 // ---------------------------------------------------------------------------
 // info
 
-fn info(pack_path: []const u8) !void {
+pub const Info = struct {
+    path: []const u8,
+    version: u32,
+    bytes: u64,
+    tiles: u32,
+    constant_tiles: usize,
+    predicted_blocks: usize,
+    constant_blocks: usize,
+    block_dim: u32,
+    payload_bytes: u64,
+    directory_bytes: u64,
+    percent_raw: f64,
+    bits_per_post: f64,
+};
+
+pub fn loadInfo(pack_path: []const u8) !Info {
     var p = try pk.Pack.open(pack_path);
     defer p.close();
     var constant_tiles: usize = 0;
@@ -249,6 +258,23 @@ fn info(pack_path: []const u8) !void {
     }
     const size = p.header.end_offset;
     const raw = @as(u64, p.header.tile_count) * hgt.hgt_bytes;
+    return .{
+        .path = pack_path,
+        .version = p.header.version,
+        .bytes = size,
+        .tiles = p.header.tile_count,
+        .constant_tiles = constant_tiles,
+        .predicted_blocks = predicted_blocks,
+        .constant_blocks = constant_blocks,
+        .block_dim = pk.block_dim,
+        .payload_bytes = payload,
+        .directory_bytes = size - p.header.slots_offset,
+        .percent_raw = 100 * @as(f64, @floatFromInt(size)) / @as(f64, @floatFromInt(@max(raw, 1))),
+        .bits_per_post = 8 * @as(f64, @floatFromInt(size)) / @as(f64, @floatFromInt(@max(raw / 2, 1))),
+    };
+}
+
+pub fn printInfo(info: Info) void {
     std.debug.print(
         \\{s}: packed DEM v{d}, {d} bytes
         \\  tiles      {d} ({d} constant)
@@ -257,45 +283,10 @@ fn info(pack_path: []const u8) !void {
         \\  size       {d:.1}% of raw .hgt, {d:.2} bits a post
         \\
     , .{
-        pack_path,                                                                     p.header.version,             size,
-        p.header.tile_count,                                                           constant_tiles,               predicted_blocks,
-        constant_blocks,                                                               pk.block_dim,                 pk.block_dim,
-        payload,                                                                       size - p.header.slots_offset, 100 * @as(f64, @floatFromInt(size)) / @as(f64, @floatFromInt(@max(raw, 1))),
-        8 * @as(f64, @floatFromInt(size)) / @as(f64, @floatFromInt(@max(raw / 2, 1))),
+        info.path,            info.version,   info.bytes,     info.tiles,         info.constant_tiles,  info.predicted_blocks,
+        info.constant_blocks, info.block_dim, info.block_dim, info.payload_bytes, info.directory_bytes, info.percent_raw,
+        info.bits_per_post,
     });
-}
-
-/// Entry point for `zr dem`; `args` excludes the program and "dem".
-pub fn main(gpa: Allocator, args: []const []const u8) !void {
-    if (args.len < 2) return usageError();
-    var positional: [2][]const u8 = undefined;
-    var npos: usize = 0;
-    var threads: ?usize = null;
-    var samples: usize = 1000;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "--threads") and i + 1 < args.len) {
-            i += 1;
-            threads = try std.fmt.parseInt(usize, args[i], 10);
-        } else if (std.mem.eql(u8, a, "--samples") and i + 1 < args.len) {
-            i += 1;
-            samples = try std.fmt.parseInt(usize, args[i], 10);
-        } else if (a.len > 0 and a[0] != '-' and npos < positional.len) {
-            positional[npos] = a;
-            npos += 1;
-        } else return usageError();
-    }
-    const cmd = args[0];
-    if (std.mem.eql(u8, cmd, "pack") and npos == 2) return pack(gpa, positional[0], positional[1], threadCount(threads));
-    if (std.mem.eql(u8, cmd, "verify") and npos == 2) return verify(gpa, positional[0], positional[1], samples, threadCount(threads));
-    if (std.mem.eql(u8, cmd, "info") and npos == 1) return info(positional[0]);
-    return usageError();
-}
-
-fn usageError() error{InvalidArgument} {
-    std.debug.print("{s}", .{usage});
-    return error.InvalidArgument;
 }
 
 test "pack, verify and info on synthetic tiles" {
@@ -310,7 +301,9 @@ test "pack, verify and info on synthetic tiles" {
     const out = try std.fmt.bufPrint(&out_buf, "{s}/x.zdem", .{dir});
     try pack(gpa, dir, out, 2);
     try verify(gpa, out, dir, 2000, 2);
-    try info(out);
+    const info = try loadInfo(out);
+    try std.testing.expectEqual(2, info.tiles);
+    printInfo(info);
     // Verify against a directory missing one tile reports the extra tile.
     var lone_buf: [256]u8 = undefined;
     const lone = try std.fmt.bufPrint(&lone_buf, "{s}/N47", .{dir});
