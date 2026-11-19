@@ -1,0 +1,24 @@
+signed32: -1
+signed64: -9223372036854775808
+unsigned32: 4294967295
+unsigned64: 18446744073709551615
+zigzag32: -2147483648
+zigzag64: 9223372036854775807
+fixed_32: 16909060
+fixed_64: 72623859790382856
+signed_fixed32: -12345678
+signed_fixed64: -123456789012345
+f32: 1.5
+f64: -2.25
+flag: false
+text: "Grüezi"
+blob: "\000\377\012"
+child { id: -3 payload: "nested" }
+numbers: [0, 127, 128, 16384]
+words: [0, 16909060]
+deltas: [-1, 0, 1]
+children { id: 10 }
+children { id: 12 payload: "" }
+choice: NEGATIVE
+wide: [42, 18446744073709551615]
+zero: 0

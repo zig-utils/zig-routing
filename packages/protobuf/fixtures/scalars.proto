@@ -1,0 +1,39 @@
+syntax = "proto2";
+package routing_fixture;
+
+message Child {
+  required sint64 id = 1;
+  optional bytes payload = 2;
+}
+
+enum Choice {
+  UNKNOWN = 0;
+  FIRST = 1;
+  NEGATIVE = -1;
+}
+
+message Scalars {
+  required int32 signed32 = 1;
+  optional int64 signed64 = 2;
+  optional uint32 unsigned32 = 3;
+  optional uint64 unsigned64 = 4;
+  optional sint32 zigzag32 = 5;
+  optional sint64 zigzag64 = 6;
+  optional fixed32 fixed_32 = 7;
+  optional fixed64 fixed_64 = 8;
+  optional sfixed32 signed_fixed32 = 9;
+  optional sfixed64 signed_fixed64 = 10;
+  optional float f32 = 11;
+  optional double f64 = 12;
+  optional bool flag = 13;
+  optional string text = 14;
+  optional bytes blob = 15;
+  optional Child child = 16;
+  repeated uint64 numbers = 17 [packed = true];
+  repeated fixed32 words = 18 [packed = true];
+  repeated sint32 deltas = 19 [packed = false];
+  repeated Child children = 20;
+  optional Choice choice = 21;
+  repeated fixed64 wide = 22 [packed = true];
+  optional int32 zero = 23;
+}

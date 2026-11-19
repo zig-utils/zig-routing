@@ -7,8 +7,8 @@
 //! Targets: `request` (the API request parser), `http` (request head, query
 //! string, percent decoding), `polyline` (polyline 5/6/7 and varint
 //! decoders), `lz4` (block and frame decoders, plus a compress round trip),
-//! `dem` (the packed elevation block decoder).
-//! The protobuf decoder gets its target with the codec (P1.07).
+//! `dem` (the packed elevation block decoder), and `protobuf` (wire records
+//! and generated message views).
 //!
 //! The contract for every parser: malformed input returns an error, never
 //! panics, overflows or reads out of bounds. The fuzz step builds ReleaseSafe
@@ -21,6 +21,7 @@
 const std = @import("std");
 const routing = @import("routing");
 const lz4 = @import("lz4");
+const protobuf = @import("protobuf");
 const http = routing.server.http;
 const request = routing.api.request;
 const polyline = routing.geo.polyline;
@@ -46,6 +47,76 @@ fn seeds(gpa: std.mem.Allocator, raw: []const []const u8) ![]const []const u8 {
     const out = try gpa.alloc([]const u8, raw.len);
     for (out, raw) |*o, r| o.* = try seed(gpa, r);
     return out;
+}
+
+const ProtoChild = protobuf.Message(&.{
+    .{ .number = 1, .name = "id", .kind = .sint64, .presence = .required },
+    .{ .number = 2, .name = "body", .kind = .bytes, .presence = .optional },
+});
+const ProtoInput = protobuf.Message(&.{
+    .{ .number = 1, .name = "child", .kind = .message, .presence = .optional, .message = ProtoChild },
+    .{ .number = 2, .name = "title", .kind = .string, .presence = .optional },
+    .{ .number = 3, .name = "deltas", .kind = .sint32, .presence = .repeated, .packed_encoding = true },
+    .{ .number = 4, .name = "fixed", .kind = .fixed32, .presence = .repeated },
+    .{ .number = 5, .name = "children", .kind = .message, .presence = .repeated, .message = ProtoChild },
+});
+
+fn expectBorrowed(input: []const u8, field: []const u8) !void {
+    const start = @intFromPtr(input.ptr);
+    const address = @intFromPtr(field.ptr);
+    try std.testing.expect(address >= start and address - start <= input.len);
+    try std.testing.expect(field.len <= input.len - (address - start));
+}
+
+fn checkProtoChild(input: []const u8, child: ProtoChild.View) !void {
+    _ = try child.get("id", protobuf.no_deadline);
+    if (try child.get("body", protobuf.no_deadline)) |bytes| try expectBorrowed(input, bytes);
+}
+
+pub fn fuzzProtobuf(_: void, s: *Smith) !void {
+    var buf: [max_input]u8 = undefined;
+    const input = draw(s, &buf, 0x7072_6f74);
+    const deadline = protobuf.no_deadline;
+    var reader = protobuf.wire.Reader.init(input);
+    while (reader.next(deadline) catch return) |field| {
+        if (field.value == .length_delimited) try expectBorrowed(input, field.value.length_delimited);
+    }
+    const message = ProtoInput.decode(input, deadline) catch return;
+    if (try message.get("title", deadline)) |title| try expectBorrowed(input, title);
+    if (try message.get("child", deadline)) |child| try checkProtoChild(input, child);
+    var children = try message.get("children", deadline);
+    var count: usize = 0;
+    while (try children.next(deadline)) |child| {
+        try checkProtoChild(input, child);
+        count += 1;
+        try std.testing.expect(count <= input.len);
+    }
+    inline for (.{ "deltas", "fixed" }) |name| {
+        var entries = try message.get(name, deadline);
+        count = 0;
+        while (try entries.next(deadline)) |_| {
+            count += 1;
+            try std.testing.expect(count <= input.len);
+        }
+    }
+}
+
+const protobuf_seeds = [_][]const u8{
+    "",
+    "\x0a\x02\x08\x07\x0a\x03\x12\x01A\x12\x02hi\x18\x01\x1a\x03\x00\x80\x01",
+    "\x22\x04\x99\x88\x77\x66\x25\x01\x00\x00\x00\x2a\x02\x08\x04",
+    "\x3b\x43\x08\x00\x44\x3c\x1a\x00",
+    "\x1a\x01\x80",
+    "\x12\x01\xff",
+    "\x12\xff\xff\xff\xff\xff\xff\xff\xff\xff\x01",
+    "\x08\x80\x80\x80\x80\x80\x80\x80\x80\x80\x02",
+    "\x3b\x44",
+};
+
+test "fuzz protobuf" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    try std.testing.fuzz({}, fuzzProtobuf, .{ .corpus = try seeds(arena_state.allocator(), &protobuf_seeds) });
 }
 
 // ---------------------------------------------------------------------------
