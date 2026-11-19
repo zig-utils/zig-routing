@@ -88,7 +88,7 @@ P3.32 | Path to legs: shape assembly, summaries, elapsed time by recost | search
 P3.33 | /route serializer for directions_type none: units, shape formats, ids | api | port | M | P3.32 P1.13
 P3.34 | zr import-valhalla: test-only reader of Valhalla tiles into our format | cli | test | L | P3.12 P3.14
 P3.35 | Costing parity harness (gate A): per-call edge and transition cost against the oracle | costing | test | M | P3.27 P3.28 P0.04
-P3.36 | Experiment E1: label throughput of the search core on Germany | search | experiment | S | P3.29 P3.22
+P3.36 | Experiment E1: label throughput of the search core on Germany | search | experiment | S | P3.29 P3.22 P0.12 P0.13
 P3.37 | Zero steady-state allocation tests for /height and /route | infra | perf | S | P3.33
 P3.38 | Fuzzing: PBF reader and graph format loader | infra | test | S | P3.02 P3.13
 P3.39 | Port the gurka suites that cover pedestrian and bicycle behaviour | infra | test | L | P3.33 P1.18 P3.22
