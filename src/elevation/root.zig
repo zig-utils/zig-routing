@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const PointLL = @import("../geo/point.zig").PointLL;
+const io = @import("../infra/io.zig");
 const Allocator = std.mem.Allocator;
 
 pub const hgt = @import("hgt.zig");
@@ -36,30 +37,68 @@ pub const Source = union(enum) {
     /// tiles: their posts are plain memory, and on an M3 Pro scattered points
     /// sample at about 20 ns each in request order against 35 ns sorted,
     /// while through a pack sorting takes them from about 13 us to 4 us.
-    /// Every point goes through the same per-point code as `getAll`, so the
-    /// results are identical. `scratch` is the request arena.
+    /// Contiguous groups use SIMD with the scalar rounding order. The request
+    /// arena supplies the sort keys for scattered packed requests.
     pub fn getAllBatched(self: Source, scratch: Allocator, pts: []const PointLL, out: []f64) Allocator.Error!void {
+        return self.getAllBatchedUntil(scratch, pts, out, .none) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.DeadlineExceeded => unreachable,
+        };
+    }
+
+    pub fn getAllBatchedUntil(self: Source, scratch: Allocator, pts: []const PointLL, out: []f64, deadline: io.Deadline) (Allocator.Error || error{DeadlineExceeded})!void {
         const n = pts.len;
-        if (self == .tiles or n < 64 or n >= 1 << index_bits) return self.getAll(pts, out);
+        if (n < 64) {
+            if (deadline.expired()) return error.DeadlineExceeded;
+            return self.getAll(pts, out);
+        }
+        if (self == .tiles) {
+            var cursor: hgt.Sampler = .{ .tiles = self.tiles };
+            return hgt.sampleAll(&cursor, pts, out, deadline);
+        }
+        const pack = self.pack;
         var changes: usize = 0;
         var prev: u64 = std.math.maxInt(u64);
-        for (pts) |p| {
+        for (pts, 0..) |p, i| {
+            try checkDeadline(deadline, i);
             const k = blockKey(p);
             changes += @intFromBool(k != prev);
+            if (changes * 8 >= n) break;
             prev = k;
         }
         // A path changes block every few dozen points; scattered points nearly every time.
-        if (changes * 8 < n) return self.getAll(pts, out);
+        if (changes * 8 < n or n >= 1 << index_bits) {
+            var cursor: @"packed".Sampler = .{ .pack = pack };
+            return hgt.sampleAll(&cursor, pts, out, deadline);
+        }
 
         const keys = try scratch.alloc(u64, n);
         const tmp = try scratch.alloc(u64, n);
-        for (keys, pts, 0..) |*k, p, i| k.* = (blockKey(p) << index_bits) | i;
-        radixSort(keys, tmp);
-        const sorted = try scratch.alloc(PointLL, n);
-        for (sorted, keys) |*s, k| s.* = pts[@intCast(k & index_mask)];
-        const heights = try scratch.alloc(f64, n);
-        self.getAll(sorted, heights);
-        for (keys, heights) |k, h| out[@intCast(k & index_mask)] = h;
+        for (keys, pts, 0..) |*k, p, i| {
+            try checkDeadline(deadline, i);
+            k.* = (blockKey(p) << index_bits) | i;
+        }
+        try radixSort(keys, tmp, deadline);
+        try sampleSorted(pack, pts, keys, out, deadline);
+    }
+
+    pub fn sampler(self: Source) Sampler {
+        return switch (self) {
+            .tiles => |tiles| .{ .tiles = .{ .tiles = tiles } },
+            .pack => |pack| .{ .pack = .{ .pack = pack } },
+        };
+    }
+};
+
+pub const Sampler = union(enum) {
+    tiles: hgt.Sampler,
+    pack: @"packed".Sampler,
+
+    pub fn get(self: *Sampler, point: PointLL) f64 {
+        return switch (self.*) {
+            .tiles => |*tiles| tiles.get(point),
+            .pack => |*pack| pack.get(point),
+        };
     }
 };
 
@@ -70,20 +109,52 @@ const index_mask: u64 = (1 << index_bits) - 1;
 const key_bits = 28;
 
 fn blockKey(p: PointLL) u64 {
-    const tile = hgt.tileIndex(p);
-    const lon = @floor(p.lng);
-    const lat = @floor(p.lat);
-    const u = (p.lng - lon) * (hgt.hgt_dim - 1);
-    const v = (1.0 - (p.lat - lat)) * (hgt.hgt_dim - 1);
+    const pos = hgt.GridPosition.at(p);
     // Out-of-range input (NaN, beyond the tile grid) keys to block 0; it is
     // only an ordering hint, the sampler handles such points itself.
-    const bx: u64 = if (u >= 0 and u < hgt.hgt_dim) @as(u64, @intFromFloat(u)) / @"packed".block_dim else 0;
-    const by: u64 = if (v >= 0 and v < hgt.hgt_dim) @as(u64, @intFromFloat(v)) / @"packed".block_dim else 0;
-    return (@as(u64, @min(tile, 0xffff)) << 12) | (by * @"packed".blocks_per_side + bx);
+    const bx: u64 = if (pos.u >= 0 and pos.u < hgt.hgt_dim) @as(u64, @intFromFloat(pos.u)) / @"packed".block_dim else 0;
+    const by: u64 = if (pos.v >= 0 and pos.v < hgt.hgt_dim) @as(u64, @intFromFloat(pos.v)) / @"packed".block_dim else 0;
+    return (@as(u64, @min(pos.tile, 0xffff)) << 12) | (by * @"packed".blocks_per_side + bx);
+}
+
+inline fn checkDeadline(deadline: io.Deadline, i: usize) error{DeadlineExceeded}!void {
+    if (i & 1023 == 0 and deadline.expired()) return error.DeadlineExceeded;
+}
+
+fn sampleSorted(pack: *const @"packed".Pack, points: []const PointLL, keys: []const u64, out: []f64, deadline: io.Deadline) error{DeadlineExceeded}!void {
+    var sampler: @"packed".Sampler = .{ .pack = pack };
+    var start: usize = 0;
+    var next_check: usize = 0;
+    while (start < keys.len) {
+        if (start >= next_check) {
+            if (deadline.expired()) return error.DeadlineExceeded;
+            next_check = start + 1024;
+        }
+        const block_key = keys[start] >> index_bits;
+        var end = start + 1;
+        while (end < @min(keys.len, next_check) and keys[end] >> index_bits == block_key) : (end += 1) {}
+        if (end < keys.len) {
+            const next = keys[end] >> index_bits;
+            if (next != block_key) pack.prefetchBlock(@intCast(next >> 12), @intCast(next & 0xfff));
+        }
+        const available = sampler.select(@intCast(block_key >> 12));
+        while (available and end - start >= hgt.batch_width) : (start += hgt.batch_width) {
+            const group = keys[start..][0..hgt.batch_width];
+            var positions: [hgt.batch_width]hgt.GridPosition = undefined;
+            for (&positions, group) |*pos, key| pos.* = .at(points[@intCast(key & index_mask)]);
+            const values = sampler.sampleBatch(&positions);
+            for (group, values) |key, value| out[@intCast(key & index_mask)] = value;
+        }
+        for (keys[start..end]) |key| {
+            const index: usize = @intCast(key & index_mask);
+            out[index] = if (available) sampler.sample(.at(points[index])) else hgt.no_data_value;
+        }
+        start = end;
+    }
 }
 
 /// LSD radix sort on the key bits above the index: two 14-bit passes.
-fn radixSort(keys: []u64, tmp: []u64) void {
+fn radixSort(keys: []u64, tmp: []u64, deadline: io.Deadline) error{DeadlineExceeded}!void {
     const digit_bits = key_bits / 2;
     const buckets = 1 << digit_bits;
     var counts: [buckets]u32 = undefined;
@@ -92,14 +163,19 @@ fn radixSort(keys: []u64, tmp: []u64) void {
     inline for (0..2) |pass| {
         const shift = index_bits + pass * digit_bits;
         @memset(&counts, 0);
-        for (src) |k| counts[@intCast((k >> shift) & (buckets - 1))] += 1;
+        for (src, 0..) |k, i| {
+            try checkDeadline(deadline, i);
+            counts[@intCast((k >> shift) & (buckets - 1))] += 1;
+        }
         var sum: u32 = 0;
-        for (&counts) |*c| {
+        for (&counts, 0..) |*c, i| {
+            try checkDeadline(deadline, i);
             const v = c.*;
             c.* = sum;
             sum += v;
         }
-        for (src) |k| {
+        for (src, 0..) |k, i| {
+            try checkDeadline(deadline, i);
             const b: usize = @intCast((k >> shift) & (buckets - 1));
             dst[counts[b]] = k;
             counts[b] += 1;

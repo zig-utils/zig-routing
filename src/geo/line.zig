@@ -179,23 +179,43 @@ fn interpolate(last: PointLL, p: PointLL, d: f64, remaining: f64) PointLL {
 /// vertex. With `preserve`, original vertices are kept as well. As
 /// upstream, the final vertex is only included when `preserve` is set.
 pub fn resampleSpherical(gpa: Allocator, polyline: []const PointLL, resolution_m: f64, preserve: bool, out: *std.ArrayList(PointLL)) Allocator.Error!void {
+    const Output = struct {
+        gpa: Allocator,
+        out: *std.ArrayList(PointLL),
+
+        pub fn emit(self: *const @This(), p: PointLL) Allocator.Error!void {
+            try self.out.append(self.gpa, p);
+        }
+    };
+    const output: Output = .{ .gpa = gpa, .out = out };
+    try visitResampledSpherical(polyline, resolution_m, preserve, &output);
+}
+
+/// Emits each point to a caller-selected sink while walking the same
+/// great-circle segments as resampleSpherical.
+pub fn visitResampledSpherical(polyline: []const PointLL, resolution_m: f64, preserve: bool, sink: anytype) !void {
     if (polyline.len == 0) return;
-    try out.append(gpa, polyline[0]);
+    const checks = @hasDecl(@TypeOf(sink.*), "check");
     const resolution = resolution_m * rad_per_meter;
+    if (checks and resolution <= 0) return error.InvalidResolution;
+    try sink.emit(polyline[0]);
     var remaining = resolution;
     var last = polyline[0];
-    for (polyline[1..]) |p| {
+    for (polyline[1..], 0..) |p, segment| {
+        if (checks and segment & 1023 == 0) try sink.check();
         var d = arc(last, p);
         if (std.math.isNan(d)) d = 0.0;
         while (d > remaining) {
+            const rest = d - remaining;
+            if (checks and rest == d and remaining == resolution) return error.InvalidResolution;
             last = interpolate(last, p, d, remaining);
-            try out.append(gpa, last);
-            d -= remaining;
+            try sink.emit(last);
+            d = rest;
             remaining = resolution;
         }
         remaining -= d;
         last = p;
-        if (preserve) try out.append(gpa, last);
+        if (preserve) try sink.emit(last);
     }
 }
 

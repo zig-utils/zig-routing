@@ -167,7 +167,9 @@ pub fn fuzzRequest(_: void, s: *Smith) !void {
     const fast = try request.parseHttp(arena, path, query, body);
     // The /height shape fast path must agree with the general parser.
     if (std.mem.eql(u8, path, "/height")) {
-        try std.testing.expect(request.resultsEqual(fast, try request.parseHttpReference(arena, path, query, body)));
+        const reference = try request.parseHttpReference(arena, path, query, body);
+        try std.testing.expect(request.resultsEqual(fast, reference));
+        try std.testing.expect(request.resultsEqual(try request.parseHttpForHeight(arena, path, query, body), reference));
     }
 }
 

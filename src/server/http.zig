@@ -221,6 +221,7 @@ pub fn reason(status: u16) []const u8 {
         500 => "Internal Server Error",
         501 => "Not Implemented",
         503 => "Service Unavailable",
+        504 => "Gateway Time-out",
         else => "Unknown",
     };
 }

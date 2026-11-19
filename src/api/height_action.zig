@@ -15,6 +15,7 @@ const json_writer = @import("json_writer.zig");
 const dem = @import("../elevation/root.zig");
 const elevation = dem.hgt;
 const geo = @import("../geo/root.zig");
+const io = @import("../infra/io.zig");
 const PointLL = geo.PointLL;
 const Allocator = std.mem.Allocator;
 
@@ -35,53 +36,122 @@ fn coordinate(v: f64, buf: *[40]u8) []const u8 {
 }
 
 pub fn handle(svc: *service.Service, ctx: *http.Ctx, options: *request.Options, res: *http.Response) Allocator.Error!?errors.Failure {
-    _ = ctx;
     const a = res.gpa;
     const source: *const dem.Source = @ptrCast(@alignCast(svc.state orelse return .{ .code = 107, .extra = "no elevation data configured" }));
 
-    if (options.shape.len < 1) return .{ .code = 312 };
-    var shape = try a.alloc(PointLL, options.shape.len);
-    for (options.shape, shape) |l, *p| p.* = .{ .lng = l.lng, .lat = l.lat };
+    const shape = try options.heightPoints(a);
+    if (shape.len == 0) return .{ .code = 312 };
 
-    var resampled = false;
-    var encoded = options.encoded_polyline;
     if (options.resample_distance) |rd| {
-        if (rd < svc.limits.skadi_min_resample) {
-            // Upstream appends " " + std::to_string(min_resample) + " meters".
-            return .{ .code = 313, .extra = try std.fmt.allocPrint(a, " {d:.6} meters", .{svc.limits.skadi_min_resample}) };
-        }
-        if (shape.len > 1) {
-            const last = shape[shape.len - 1];
-            var out: std.ArrayList(PointLL) = .empty;
-            try geo.line.resampleSpherical(a, shape, rd, false, &out);
-            try out.append(a, last);
-            shape = out.items;
-            if (options.encoded_polyline != null) {
-                const buf = try a.alloc(u8, geo.polyline.maxEncodedLen(.polyline, shape.len));
-                const n = (if (options.shape_format == .polyline5)
-                    geo.polyline.encode(.polyline, 5, shape, buf)
-                else
-                    geo.polyline.encode(.polyline, 6, shape, buf)) catch return .{ .code = 599 };
-                encoded = buf[0..n];
-            }
-            resampled = true;
-        }
+        if (rd < svc.limits.skadi_min_resample) return try resampleLimit(a, svc.limits.skadi_min_resample);
+        if (shape.len > 1) return sampleResampled(svc.limits, ctx.deadline, source.*, options, res, shape, rd);
     }
     if (shape.len > svc.limits.skadi_max_shape) {
-        return .{ .code = 314, .extra = try std.fmt.allocPrint(a, " ({d}{s}). The limit is {d}", .{ shape.len, if (resampled) " after resampling" else "", svc.limits.skadi_max_shape }) };
+        return try shapeLimit(a, shape.len, svc.limits.skadi_max_shape, false);
     }
 
     const heights = try a.alloc(f64, shape.len);
-    try source.getAllBatched(a, shape, heights);
+    source.getAllBatchedUntil(a, shape, heights, ctx.deadline) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DeadlineExceeded => return timedOut(res),
+    };
 
     var ranges: []f64 = &.{};
     if (options.range) {
         ranges = try a.alloc(f64, shape.len);
         ranges[0] = 0;
-        for (1..shape.len) |i| ranges[i] = ranges[i - 1] + shape[i].distance(shape[i - 1]);
+        for (1..shape.len) |i| {
+            if (i & 1023 == 0 and ctx.deadline.expired()) return timedOut(res);
+            ranges[i] = ranges[i - 1] + shape[i].distance(shape[i - 1]);
+        }
     }
 
-    try serialize(a, &res.body, options, shape, encoded, heights, ranges);
+    try serialize(a, &res.body, options, shape, options.encoded_polyline, heights, ranges);
+    return null;
+}
+
+fn resampleLimit(a: Allocator, min: f32) Allocator.Error!errors.Failure {
+    // Upstream adds a space before std::to_string(min_resample).
+    return .{ .code = 313, .extra = try std.fmt.allocPrint(a, " {d:.6} meters", .{min}) };
+}
+
+fn shapeLimit(a: Allocator, count: usize, max: usize, resampled: bool) Allocator.Error!errors.Failure {
+    return .{
+        .code = 314,
+        .extra = try std.fmt.allocPrint(a, " ({d}{s}). The limit is {d}", .{ count, if (resampled) " after resampling" else "", max }),
+    };
+}
+
+const HeightSink = struct {
+    arena: Allocator,
+    sampler: dem.Sampler,
+    deadline: io.Deadline,
+    max_shape: usize,
+    with_range: bool,
+    points: std.ArrayList(PointLL) = .empty,
+    heights: std.ArrayList(f64) = .empty,
+    ranges: std.ArrayList(f64) = .empty,
+    count: usize = 0,
+
+    pub fn check(self: *const HeightSink) error{DeadlineExceeded}!void {
+        if (self.deadline.expired()) return error.DeadlineExceeded;
+    }
+
+    pub fn emit(self: *HeightSink, point: PointLL) (Allocator.Error || error{DeadlineExceeded})!void {
+        if (self.count & 1023 == 0) try self.check();
+        self.count += 1;
+        // The error includes the complete resampled count. Only retain and
+        // sample points that could appear in a successful response.
+        if (self.count > self.max_shape) return;
+        if (self.with_range) {
+            const range = if (self.points.last()) |prev|
+                self.ranges.last().? + point.distance(prev)
+            else
+                0;
+            try self.ranges.append(self.arena, range);
+        }
+        try self.points.append(self.arena, point);
+        try self.heights.append(self.arena, self.sampler.get(point));
+    }
+};
+
+fn timedOut(res: *http.Response) Allocator.Error!?errors.Failure {
+    res.status = 504;
+    res.content_type = "text/plain";
+    try res.writeBody("The server didn't respond in time");
+    return null;
+}
+
+fn sampleResampled(limits: service.Limits, deadline: io.Deadline, source: dem.Source, options: *const request.Options, res: *http.Response, points: []const PointLL, distance: f64) Allocator.Error!?errors.Failure {
+    const a = res.gpa;
+    var sink: HeightSink = .{
+        .arena = a,
+        .sampler = source.sampler(),
+        .deadline = deadline,
+        .max_shape = limits.skadi_max_shape,
+        .with_range = options.range,
+    };
+    geo.line.visitResampledSpherical(points, distance, false, &sink) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DeadlineExceeded => return timedOut(res),
+        error.InvalidResolution => return try resampleLimit(a, limits.skadi_min_resample),
+    };
+    sink.emit(points[points.len - 1]) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DeadlineExceeded => return timedOut(res),
+    };
+    if (sink.count > limits.skadi_max_shape) return try shapeLimit(a, sink.count, limits.skadi_max_shape, true);
+    const shape = sink.points.items;
+    var encoded = options.encoded_polyline;
+    if (encoded != null) {
+        const buf = try a.alloc(u8, geo.polyline.maxEncodedLen(.polyline, shape.len));
+        const n = (if (options.shape_format == .polyline5)
+            geo.polyline.encode(.polyline, 5, shape, buf)
+        else
+            geo.polyline.encode(.polyline, 6, shape, buf)) catch return .{ .code = 599 };
+        encoded = buf[0..n];
+    }
+    try serialize(a, &res.body, options, shape, encoded, sink.heights.items, sink.ranges.items);
     return null;
 }
 
@@ -272,12 +342,12 @@ const SteadyState = struct {
     fn run(arena: *arena_mod.Arena, self: SteadyState) anyerror!void {
         for (self.bodies) |body| {
             const a = arena.allocator();
-            var options = switch (try request.parseHttp(a, "/height", &.{}, body)) {
+            var options = switch (try request.parseHttpForHeight(a, "/height", &.{}, body)) {
                 .ok => |o| o,
                 .failure => return error.TestUnexpectedResult,
             };
             var res: http.Response = .{ .gpa = a };
-            var ctx: http.Ctx = undefined;
+            var ctx: http.Ctx = .{ .worker_id = 0, .arena = arena, .deadline = .none };
             if (try handle(self.svc, &ctx, &options, &res)) |f| {
                 std.debug.print("failure {d}\n", .{f.code});
                 return error.TestUnexpectedResult;
@@ -327,4 +397,46 @@ test "bulk /height reaches no allocator after warm-up" {
         "{\"shape\":[{\"lat\":47.2,\"lon\":8.3},{\"lat\":47.25,\"lon\":8.35}],\"resample_distance\":40,\"height_precision\":2}",
     };
     try arena_mod.expectNoSteadyStateAlloc(SteadyState, .{ .svc = &svc, .bodies = &bodies }, SteadyState.run);
+
+    var scratch: std.heap.ArenaAllocator = .init(gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const input: []const PointLL = &.{
+        .{ .lng = 8.4, .lat = 47.3 },
+        .{ .lng = 8.48, .lat = 47.35 },
+        .{ .lng = 8.51, .lat = 47.4 },
+    };
+    const distance = 80;
+    var shape: std.ArrayList(PointLL) = .empty;
+    try geo.line.resampleSpherical(a, input, distance, false, &shape);
+    try shape.append(a, input[input.len - 1]);
+    const heights = try a.alloc(f64, shape.items.len);
+    source.getAll(shape.items, heights);
+    const ranges = try a.alloc(f64, shape.items.len);
+    ranges[0] = 0;
+    for (1..ranges.len) |i| ranges[i] = ranges[i - 1] + shape.items[i].distance(shape.items[i - 1]);
+    const encoded = try a.alloc(u8, geo.polyline.maxEncodedLen(.polyline, shape.items.len));
+    inline for (.{ 5, 6 }) |precision| {
+        const options: request.Options = .{
+            .action = .height,
+            .range = true,
+            .height_precision = 2,
+            .shape_format = if (precision == 5) .polyline5 else .polyline6,
+            .encoded_polyline = "",
+        };
+        const len = try geo.polyline.encode(.polyline, precision, shape.items, encoded);
+        var expected: std.ArrayList(u8) = .empty;
+        try serialize(a, &expected, &options, shape.items, encoded[0..len], heights, ranges);
+        var actual: http.Response = .{ .gpa = a };
+        try testing.expectEqual(null, try sampleResampled(.{}, .none, source, &options, &actual, input, distance));
+        try testing.expectEqualStrings(expected.items, actual.body.items);
+    }
+    const options: request.Options = .{ .action = .height, .range = true };
+    var excess: http.Response = .{ .gpa = a };
+    const failure = (try sampleResampled(.{ .skadi_max_shape = 2 }, .none, source, &options, &excess, input, distance)).?;
+    try testing.expectEqual(314, failure.code);
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, " ({d} after resampling). The limit is 2", .{shape.items.len}), failure.extra);
+    var timed: http.Response = .{ .gpa = a };
+    try testing.expectEqual(null, try sampleResampled(.{}, .{ .at_ns = 0 }, source, &options, &timed, input, distance));
+    try testing.expectEqual(504, timed.status);
 }

@@ -74,7 +74,11 @@ pub const Service = struct {
 
         var query: std.ArrayList(request.QueryParam) = .empty;
         for (req.query) |q| try query.append(a, .{ .key = q.key, .value = q.value });
-        const parsed = try request.parseHttp(a, req.path, query.items, req.body);
+        const native_height = self.handlers[@backingInt(Action.height)] == &@import("height_action.zig").handle;
+        const parsed = if (native_height)
+            try request.parseHttpForHeight(a, req.path, query.items, req.body)
+        else
+            try request.parseHttp(a, req.path, query.items, req.body);
         var options = switch (parsed) {
             .failure => |f| return writeError(a, res, f, .json),
             .ok => |o| o,

@@ -31,14 +31,13 @@ const Stages = struct {
 /// Runs one request body through the /height stages the handler runs.
 fn stages(a: std.mem.Allocator, source: routing.elevation.Source, body: []const u8, s: *Stages) !void {
     var t = io.Timer.start();
-    const parsed = try routing.api.request.parseHttp(a, "/height", &.{}, body);
+    const parsed = try routing.api.request.parseHttpForHeight(a, "/height", &.{}, body);
     var o = switch (parsed) {
         .ok => |o| o,
         .failure => return,
     };
     s.parse += t.lap();
-    const pts = try a.alloc(routing.geo.PointLL, o.shape.len);
-    for (o.shape, pts) |l, *p| p.* = .{ .lng = l.lng, .lat = l.lat };
+    const pts = try o.heightPoints(a);
     const h = try a.alloc(f64, pts.len);
     try source.getAllBatched(a, pts, h);
     var ranges: []f64 = &.{};
@@ -86,9 +85,8 @@ test "perf: bulk height stages" {
     {
         _ = arena.reset(.retain_capacity);
         const a = arena.allocator();
-        const parsed = try routing.api.request.parseHttp(a, "/height", &.{}, body.items);
-        const pts = try a.alloc(routing.geo.PointLL, parsed.ok.shape.len);
-        for (parsed.ok.shape, pts) |l, *p| p.* = .{ .lng = l.lng, .lat = l.lat };
+        const parsed = try routing.api.request.parseHttpForHeight(a, "/height", &.{}, body.items);
+        const pts = try parsed.ok.heightPoints(a);
         const h = try a.alloc(f64, pts.len);
         var scratch = std.heap.ArenaAllocator.init(gpa);
         defer scratch.deinit();

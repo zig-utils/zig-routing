@@ -13,6 +13,7 @@ const std = @import("std");
 const json = @import("json.zig");
 const errors = @import("errors.zig");
 const polyline = @import("../geo/polyline.zig");
+const PointLL = @import("../geo/point.zig").PointLL;
 const Allocator = std.mem.Allocator;
 
 pub const Action = enum(u8) {
@@ -119,10 +120,29 @@ pub const Options = struct {
     shape: []Location = &.{},
     encoded_polyline: ?[]const u8 = null,
     // /height
+    /// The native handler needs only coordinates from a plain numeric shape.
+    height_points: ?[]const PointLL = null,
     range: bool = false,
     height_precision: u32 = 0,
     resample_distance: ?f64 = null,
     warnings: std.ArrayList(u16) = .empty,
+
+    pub fn heightPoints(self: *const Options, arena: Allocator) Allocator.Error![]const PointLL {
+        if (self.height_points) |points| return points;
+        const points = try arena.alloc(PointLL, self.shape.len);
+        for (self.shape, points) |location, *p| p.* = .{ .lng = location.lng, .lat = location.lat };
+        return points;
+    }
+
+    fn shapeCount(self: *const Options) usize {
+        return if (self.height_points) |points| points.len else self.shape.len;
+    }
+
+    fn shapePoint(self: *const Options, i: usize) PointLL {
+        if (self.height_points) |points| return points[i];
+        const location = self.shape[i];
+        return .{ .lng = location.lng, .lat = location.lat };
+    }
 };
 
 pub const Result = union(enum) {
@@ -135,16 +155,23 @@ pub const Result = union(enum) {
 /// other query parameter is added as a string member (body keys win, as
 /// upstream appends query members after the body's).
 pub fn parseHttp(arena: Allocator, path: []const u8, query: []const QueryParam, body: []const u8) Allocator.Error!Result {
-    return parseHttpWith(arena, path, query, body, true);
+    return parseHttpWith(arena, path, query, body, .locations);
+}
+
+/// Parse plain /height shapes directly into the coordinates its handler reads.
+pub fn parseHttpForHeight(arena: Allocator, path: []const u8, query: []const QueryParam, body: []const u8) Allocator.Error!Result {
+    return parseHttpWith(arena, path, query, body, .height_points);
 }
 
 /// `parseHttp` without the /height shape fast path: the reference the fast
 /// path is tested against.
 pub fn parseHttpReference(arena: Allocator, path: []const u8, query: []const QueryParam, body: []const u8) Allocator.Error!Result {
-    return parseHttpWith(arena, path, query, body, false);
+    return parseHttpWith(arena, path, query, body, .reference);
 }
 
-fn parseHttpWith(arena: Allocator, path: []const u8, query: []const QueryParam, body: []const u8, allow_fast: bool) Allocator.Error!Result {
+const ShapeMode = enum { reference, locations, height_points };
+
+fn parseHttpWith(arena: Allocator, path: []const u8, query: []const QueryParam, body: []const u8, mode: ShapeMode) Allocator.Error!Result {
     const action = Action.fromPath(path) orelse .no_action;
     var text: []const u8 = body;
     for (query) |q| if (std.mem.eql(u8, q.key, "json") and q.value.len > 0) {
@@ -154,7 +181,7 @@ fn parseHttpWith(arena: Allocator, path: []const u8, query: []const QueryParam, 
     // A /height shape is nearly all of a bulk request. When it is a plain
     // array of {"lat":n,"lon":n}, read it straight from the text and hand the
     // rest of the document (shape replaced by []) to the general parser.
-    const fast: ?FastShape = if (allow_fast and action == .height and text.len >= 128) try fastShape(arena, text) else null;
+    const fast: ?FastShape = if (mode != .reference and action == .height and text.len >= 128) try fastShape(arena, text) else null;
     if (fast) |f| text = f.rest;
     var doc: json.Value = if (text.len == 0) .{ .object = .empty } else json.parse(arena, text) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -169,15 +196,20 @@ fn parseHttpWith(arena: Allocator, path: []const u8, query: []const QueryParam, 
     var result = try fromJson(arena, doc, action);
     if (fast) |f| switch (result) {
         .ok => |*o| if (o.encoded_polyline == null) {
-            // What parseLocations would have built from the same points.
-            const locs = try arena.alloc(Location, f.points.len);
-            for (locs, f.points, 0..) |*l, p, i| {
-                l.* = defaultLocation(p[0], p[1], o);
-                l.original_index = @intCast(i);
+            if (mode == .height_points) {
+                for (f.points) |*p| p.lng = circularClamp(p.lng, -180, 180);
+                o.height_points = f.points;
+            } else {
+                // What parseLocations would have built from the same points.
+                const locs = try arena.alloc(Location, f.points.len);
+                for (locs, f.points, 0..) |*l, p, i| {
+                    l.* = defaultLocation(p.lat, p.lng, o);
+                    l.original_index = @intCast(i);
+                }
+                locs[0].type = .@"break";
+                locs[locs.len - 1].type = .@"break";
+                o.shape = locs;
             }
-            locs[0].type = .@"break";
-            locs[locs.len - 1].type = .@"break";
-            o.shape = locs;
         },
         .failure => {},
     };
@@ -187,8 +219,8 @@ fn parseHttpWith(arena: Allocator, path: []const u8, query: []const QueryParam, 
 const FastShape = struct {
     /// The document with the shape array replaced by `[]`.
     rest: []const u8,
-    /// (lat, lon) of each point, lat already range-checked.
-    points: []const [2]f64,
+    /// Latitudes are range-checked. Longitudes still need circular clamping.
+    points: []PointLL,
 };
 
 inline fn isWs(c: u8) bool {
@@ -384,6 +416,7 @@ fn fastShape(arena: Allocator, t: []const u8) Allocator.Error!?FastShape {
     if (i >= t.len or t[i] != '{') return null;
     i = skipWs(t, i + 1);
     var span: ?[2]usize = null;
+    var points: std.ArrayList(PointLL) = .empty;
     while (i < t.len and t[i] == '"') {
         const key_end = skipString(t, i) orelse return null;
         const key = t[i + 1 .. key_end - 1];
@@ -391,11 +424,12 @@ fn fastShape(arena: Allocator, t: []const u8) Allocator.Error!?FastShape {
         i = skipWs(t, key_end);
         if (i >= t.len or t[i] != ':') return null;
         i = skipWs(t, i + 1);
-        const end = skipValue(t, i) orelse return null;
-        if (std.mem.eql(u8, key, "shape")) {
+        const end: usize = if (std.mem.eql(u8, key, "shape")) shape: {
             if (span != null) return null; // duplicate keys: the general parser's rule decides
+            const end = (try parsePlainShape(arena, t, i, &points)) orelse return null;
             span = .{ i, end };
-        }
+            break :shape end;
+        } else skipValue(t, i) orelse return null;
         i = skipWs(t, end);
         if (i < t.len and t[i] == ',') {
             i = skipWs(t, i + 1);
@@ -404,24 +438,6 @@ fn fastShape(arena: Allocator, t: []const u8) Allocator.Error!?FastShape {
         break;
     }
     const s = span orelse return null;
-    if (t[s[0]] != '[') return null;
-
-    var points: std.ArrayList([2]f64) = .empty;
-    try points.ensureTotalCapacity(arena, (s[1] - s[0]) / 24 + 1);
-    var j = skipWs(t, s[0] + 1);
-    if (j < t.len and t[j] == ']') return null; // empty: nothing to gain
-    while (true) {
-        var p: [2]f64 = undefined;
-        j = parsePoint(t, j, &p) orelse return null;
-        if (p[0] < -90.0 or p[0] > 90.0) return null;
-        try points.append(arena, p);
-        j = skipWs(t, j);
-        if (j >= t.len) return null;
-        if (t[j] == ']') break;
-        if (t[j] != ',') return null;
-        j += 1;
-    }
-    if (j + 1 != s[1]) return null;
 
     const rest = try arena.alloc(u8, t.len - (s[1] - s[0]) + 2);
     @memcpy(rest[0..s[0]], t[0..s[0]]);
@@ -429,6 +445,24 @@ fn fastShape(arena: Allocator, t: []const u8) Allocator.Error!?FastShape {
     rest[s[0] + 1] = ']';
     @memcpy(rest[s[0] + 2 ..], t[s[1]..]);
     return .{ .rest = rest, .points = points.items };
+}
+
+fn parsePlainShape(arena: Allocator, t: []const u8, start: usize, points: *std.ArrayList(PointLL)) Allocator.Error!?usize {
+    if (start >= t.len or t[start] != '[') return null;
+    try points.ensureTotalCapacity(arena, @min((t.len - start) / 24 + 1, 4096));
+    var j = skipWs(t, start + 1);
+    if (j < t.len and t[j] == ']') return null; // empty: nothing to gain
+    while (true) {
+        var p: [2]f64 = undefined;
+        j = parsePoint(t, j, &p) orelse return null;
+        if (p[0] < -90.0 or p[0] > 90.0) return null;
+        try points.append(arena, .{ .lat = p[0], .lng = p[1] });
+        j = skipWs(t, j);
+        if (j >= t.len) return null;
+        if (t[j] == ']') return j + 1;
+        if (t[j] != ',') return null;
+        j += 1;
+    }
 }
 
 pub const QueryParam = struct { key: []const u8, value: []const u8 };
@@ -852,8 +886,12 @@ pub fn resultsEqual(x: Result, y: Result) bool {
             if ((a.id == null) != (b.id == null) or (a.id != null and !std.mem.eql(u8, a.id.?, b.id.?))) return false;
             if ((a.encoded_polyline == null) != (b.encoded_polyline == null)) return false;
             if (!std.mem.eql(u16, a.warnings.items, b.warnings.items)) return false;
-            if (a.shape.len != b.shape.len or a.locations.len != b.locations.len) return false;
-            for (a.shape, b.shape) |p, q| if (!std.meta.eql(p, q)) return false;
+            if (a.shapeCount() != b.shapeCount() or a.locations.len != b.locations.len) return false;
+            if (a.height_points != null or b.height_points != null) {
+                for (0..a.shapeCount()) |i| if (!std.meta.eql(a.shapePoint(i), b.shapePoint(i))) return false;
+            } else {
+                for (a.shape, b.shape) |p, q| if (!std.meta.eql(p, q)) return false;
+            }
             return true;
         },
     }
@@ -936,6 +974,7 @@ test "the /height shape fast path parses exactly like the general parser" {
             std.debug.print("differs on: {s}\n", .{padded});
             return error.TestUnexpectedResult;
         }
+        try testing.expect(resultsEqual(try parseHttpForHeight(a, "/height", q, body), ref));
         if (fastShape(a, padded) catch null) |_| fast_taken += 1;
     }
     // The generator mostly produces plain shapes, so the fast path is exercised.

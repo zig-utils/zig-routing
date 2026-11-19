@@ -482,20 +482,46 @@ pub const Pack = struct {
     /// Elevations of many points, exactly as `hgt.getAll` on the source tiles.
     pub fn getAll(self: *const Pack, pts: []const PointLL, out: []f64) void {
         std.debug.assert(out.len >= pts.len);
-        var cur_index: u32 = std.math.maxInt(u32);
-        var cur: ?*const TileEntry = null;
-        for (pts, out[0..pts.len]) |p, *o| {
-            const index = hgt.tileIndex(p);
-            if (index != cur_index) {
-                cur_index = index;
-                cur = self.entry(index);
-            }
-            const e = cur orelse {
-                o.* = hgt.no_data_value;
-                continue;
-            };
-            o.* = sampleTile(self, e, p);
+        var sampler: Sampler = .{ .pack = self };
+        for (pts, out[0..pts.len]) |p, *o| o.* = sampler.get(p);
+    }
+
+    pub fn prefetchBlock(self: *const Pack, tile: u32, block: usize) void {
+        const e = self.entry(tile) orelse return;
+        if (e.kind == .constant) return;
+        const b = &self.blocks[e.first_block + block];
+        if (b.kind != .constant) @prefetch(self.blockPayload(b).ptr, .{ .locality = 2 });
+    }
+};
+
+pub const Sampler = struct {
+    pack: *const Pack,
+    index: u32 = std.math.maxInt(u32),
+    posts: ?TilePosts = null,
+
+    pub fn select(self: *Sampler, index: u32) bool {
+        if (index != self.index) {
+            self.index = index;
+            self.posts = if (self.pack.entry(index)) |e| .{ .pack = self.pack, .entry = e } else null;
         }
+        return self.posts != null;
+    }
+
+    pub fn sample(self: *Sampler, p: hgt.GridPosition) f64 {
+        const posts = &self.posts.?;
+        if (posts.entry.kind == .constant) return hgt.interpolateWith(ConstantPosts{ .value = posts.entry.constant }, p.u, p.v);
+        return hgt.interpolateWith(posts, p.u, p.v);
+    }
+
+    pub fn sampleBatch(self: *Sampler, points: *const [hgt.batch_width]hgt.GridPosition) [hgt.batch_width]f64 {
+        const posts = &self.posts.?;
+        if (posts.entry.kind == .constant) return hgt.interpolateBatch(ConstantPosts{ .value = posts.entry.constant }, points);
+        return hgt.interpolateBatch(posts, points);
+    }
+
+    pub fn get(self: *Sampler, point: PointLL) f64 {
+        const p = hgt.GridPosition.at(point);
+        return if (self.select(p.tile)) self.sample(p) else hgt.no_data_value;
     }
 };
 
@@ -524,6 +550,7 @@ const TilePosts = struct {
     entry: *const TileEntry,
     last_block: usize = std.math.maxInt(usize),
     last_posts: *const [block_dim * block_dim]i16 = undefined,
+    last_constant: ?i16 = null,
 
     pub fn sample(self: *TilePosts, i: usize) i16 {
         const r = i / tile_dim;
@@ -533,10 +560,11 @@ const TilePosts = struct {
         const block = br * blocks_per_side + bc;
         if (block != self.last_block) {
             const b = &self.pack.blocks[self.entry.first_block + block];
-            if (b.kind == .constant) return b.constant;
-            self.last_posts = cache.posts(self.pack, self.entry, br, bc, b);
             self.last_block = block;
+            self.last_constant = if (b.kind == .constant) b.constant else null;
+            if (b.kind != .constant) self.last_posts = cache.posts(self.pack, self.entry, br, bc, b);
         }
+        if (self.last_constant) |value| return value;
         return self.last_posts[(r % block_dim) * blockSize(bc) + col % block_dim];
     }
 };

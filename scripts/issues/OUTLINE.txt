@@ -46,7 +46,7 @@ P2.01 | Elevation tiles: .hgt, .hgt.gz, .hgt.lz4 reader with an mmap cache | ele
 P2.02 | Bilinear elevation sampler matching skadi exactly, including no-data handling | elevation | port | S | P2.01
 P2.03 | /height API: shape, encoded_polyline, range, height_precision, resample_distance | api | port | M | P2.02 P1.13 P1.02 P1.03
 P2.04 | DEM repack: block-compressed mmap-friendly elevation format and zr dem pack | elevation | new | M | P2.01
-P2.05 | Bulk /height: sort by tile, SIMD batches, perf budget | elevation | perf | S | P2.03 P2.04
+P2.05 | Bulk /height: sort by tile, SIMD batches, perf budget | elevation | perf | S | P2.03 P2.04 | needs-human
 P2.09 | Keep compressed HGT tile samples valid through concurrent cache eviction | elevation | new | S | P2.02
 P2.06 | Phase 2 gate: exact /height parity with the oracle and at least 10x points per second | elevation | gate | S | P2.05 P0.07 P0.08 P2.09
 P2.07 | Deploy zr serve on the production routing box beside Valhalla and shadow-compare /height | infra | infra | M | P2.06 P0.03 | needs-human

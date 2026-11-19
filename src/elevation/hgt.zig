@@ -30,12 +30,30 @@ pub const Format = enum(u8) { unknown, raw, gzip, lz4 };
 /// Tile index of the tile containing a coordinate, computed as upstream
 /// does (including its uint16 casts: longitude 180 lands in the next row).
 pub fn tileIndex(p: PointLL) u32 {
-    const lon = @floor(p.lng);
-    const lat = @floor(p.lat);
+    return tileIndexAt(@floor(p.lng), @floor(p.lat));
+}
+
+inline fn tileIndexAt(lon: f64, lat: f64) u32 {
     const ilat: u16 = @intFromFloat(@max(0, lat + 90));
     const ilon: u16 = @intFromFloat(@max(0, lon + 180));
     return @as(u32, ilat) * 360 + ilon;
 }
+
+pub const GridPosition = struct {
+    tile: u32,
+    u: f64,
+    v: f64,
+
+    pub inline fn at(p: PointLL) GridPosition {
+        const lon = @floor(p.lng);
+        const lat = @floor(p.lat);
+        return .{
+            .tile = tileIndexAt(lon, lat),
+            .u = (p.lng - lon) * (hgt_dim - 1),
+            .v = (1.0 - (p.lat - lat)) * (hgt_dim - 1),
+        };
+    }
+};
 
 /// "N47E008.hgt"-style name (without directory) for a tile index.
 pub fn tileName(index: u32, buf: []u8) []const u8 {
@@ -260,6 +278,125 @@ pub fn interpolateWith(src: anytype, u: f64, v: f64) f64 {
     }
     if (adjust == 0) return no_data_value;
     return value / adjust;
+}
+
+pub const batch_width = 4;
+
+/// Vector interpolation of interior points. The scalar expression, including
+/// the normalization by the sum of the four weights, fixes the rounding order.
+pub fn interpolateBatch(src: anytype, points: *const [batch_width]GridPosition) [batch_width]f64 {
+    const F64 = @Vector(batch_width, f64);
+    const Index = @Vector(batch_width, usize);
+    const Posts = @Vector(batch_width, i16);
+    var us: [batch_width]f64 = undefined;
+    var vs: [batch_width]f64 = undefined;
+    inline for (0..batch_width) |i| {
+        us[i] = points[i].u;
+        vs[i] = points[i].v;
+    }
+    const u: F64 = us;
+    const v: F64 = vs;
+    const xl = @floor(u);
+    const yl = @floor(v);
+    if (@reduce(.Or, xl >= @as(F64, @splat(hgt_dim - 1))) or @reduce(.Or, yl >= @as(F64, @splat(hgt_dim - 1)))) {
+        return scalarBatch(src, points);
+    }
+    const x: Index = @intFromFloat(xl);
+    const y: Index = @intFromFloat(yl);
+    const offset = y * @as(Index, @splat(hgt_dim)) + x;
+    var a: Posts = undefined;
+    var b: Posts = undefined;
+    var c: Posts = undefined;
+    var d: Posts = undefined;
+    inline for (0..batch_width) |i| {
+        a[i] = src.sample(offset[i]);
+        b[i] = src.sample(offset[i] + 1);
+        c[i] = src.sample(offset[i] + hgt_dim);
+        d[i] = src.sample(offset[i] + hgt_dim + 1);
+    }
+    const low: Posts = @splat(no_data_low);
+    const high: Posts = @splat(no_data_high);
+    if (@reduce(.Or, (a < low) | (b < low) | (c < low) | (d < low) |
+        (a > high) | (b > high) | (c > high) | (d > high)))
+    {
+        return scalarBatch(src, points);
+    }
+
+    const ur = u - xl;
+    const vr = v - yl;
+    const ui = @as(F64, @splat(1)) - ur;
+    const vi = @as(F64, @splat(1)) - vr;
+    const aw = ui * vi;
+    const bw = ur * vi;
+    const cw = ui * vr;
+    const dw = ur * vr;
+    const upper = @as(F64, @floatFromInt(a)) * aw + @as(F64, @floatFromInt(b)) * bw;
+    const lower = @as(F64, @floatFromInt(c)) * cw + @as(F64, @floatFromInt(d)) * dw;
+    return (upper + lower) / ((aw + bw) + (cw + dw));
+}
+
+fn scalarBatch(src: anytype, points: *const [batch_width]GridPosition) [batch_width]f64 {
+    var values: [batch_width]f64 = undefined;
+    for (points, &values) |p, *out| out.* = interpolateWith(src, p.u, p.v);
+    return values;
+}
+
+/// Tile reuse for sequential points, including points emitted by a resampler.
+pub const Sampler = struct {
+    tiles: *Tiles,
+    index: u32 = std.math.maxInt(u32),
+    data: ?[]const u8 = null,
+
+    pub fn select(self: *Sampler, index: u32) bool {
+        if (index != self.index) {
+            self.index = index;
+            self.data = self.tiles.samples(index);
+        }
+        return self.data != null;
+    }
+
+    pub fn sample(self: *const Sampler, p: GridPosition) f64 {
+        return interpolate(self.data.?, p.u, p.v);
+    }
+
+    pub fn sampleBatch(self: *const Sampler, points: *const [batch_width]GridPosition) [batch_width]f64 {
+        return interpolateBatch(BigEndianPosts{ .data = self.data.? }, points);
+    }
+
+    pub fn get(self: *Sampler, point: PointLL) f64 {
+        const p = GridPosition.at(point);
+        return if (self.select(p.tile)) self.sample(p) else no_data_value;
+    }
+};
+
+/// The cursor selects a tile once for a group of consecutive points in it.
+pub fn sampleAll(sampler: anytype, pts: []const PointLL, out: []f64, deadline: io.Deadline) error{DeadlineExceeded}!void {
+    var i: usize = 0;
+    var next_check: usize = 0;
+    while (i < pts.len) {
+        if (i >= next_check) {
+            if (deadline.expired()) return error.DeadlineExceeded;
+            next_check = i + 1024;
+        }
+        const first = GridPosition.at(pts[i]);
+        const available = sampler.select(first.tile);
+        var positions: [batch_width]GridPosition = undefined;
+        positions[0] = first;
+        var n: usize = 1;
+        while (n < batch_width and i + n < pts.len) : (n += 1) {
+            const p = GridPosition.at(pts[i + n]);
+            if (p.tile != first.tile) break;
+            positions[n] = p;
+        }
+        if (!available) {
+            @memset(out[i..][0..n], no_data_value);
+        } else if (n == batch_width) {
+            out[i..][0..batch_width].* = sampler.sampleBatch(&positions);
+        } else {
+            for (positions[0..n], out[i..][0..n]) |p, *value| value.* = sampler.sample(p);
+        }
+        i += n;
+    }
 }
 
 /// Elevation at a point (skadi `sample::get`), or `no_data_value`.
