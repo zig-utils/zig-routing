@@ -7,6 +7,7 @@ const constants = @import("../graph/constants.zig");
 const EdgeClass = @import("../graph/class_table.zig").EdgeClass;
 const names = @import("tags/names.zig");
 const DriveSide = @import("edge_class.zig").DriveSide;
+const turn_sides = @import("../graph/turn_sides.zig");
 
 pub const Type = enum(u3) {
     straight,
@@ -78,9 +79,9 @@ pub const Approach = struct {
 pub const max_degree = 32;
 pub const max_matrix_size = max_degree * max_degree;
 
-pub fn matrix(approaches: []const Approach, signal: bool, side: DriveSide, out: []u8, deadline: io.Deadline) !void {
+pub fn matrix(approaches: []const Approach, signal: bool, side: DriveSide, out: []u8, sides: []u2, deadline: io.Deadline) !void {
     const degree = approaches.len;
-    if (degree > max_degree or out.len != degree * degree) return error.InvalidTurnMatrix;
+    if (degree > max_degree or out.len != degree * degree or sides.len != out.len) return error.InvalidTurnMatrix;
     var all_links = true;
     var physical_count: usize = 0;
     for (approaches) |edge| {
@@ -92,17 +93,40 @@ pub fn matrix(approaches: []const Approach, signal: bool, side: DriveSide, out: 
         if (deadline.expired()) return error.DeadlineExceeded;
         const from_heading = (from.bearing + 180) % 360;
         for (approaches, 0..) |to, out_local| {
-            const entry = &out[in_local * degree + out_local];
+            const index = in_local * degree + out_local;
+            const entry = &out[index];
             if (from.class.flags.node_connector or to.class.flags.node_connector) {
                 entry.* = encode(.straight, 0, true);
+                sides[index] = 0;
                 continue;
             }
             const degrees = (to.bearing + 360 - from_heading) % 360;
             const kind = turnType(degrees);
             const stop = stopImpact(approaches, in_local, out_local, kind, signal, all_links, physical_count, side);
             entry.* = encode(kind, stop, try sameNames(from.names, to.names, deadline));
+            sides[index] = @bitCast(edgeSides(approaches, physical_count, in_local, out_local, from_heading, degrees));
         }
     }
+}
+
+// ProcessEdgeTransitions classifies sides relative to both the incoming
+// heading and the selected outgoing edge. Construction is not a crossing.
+fn edgeSides(approaches: []const Approach, physical_count: usize, from: usize, to: usize, heading_from: u16, turn_degrees: u16) turn_sides.Sides {
+    var result: turn_sides.Sides = .{};
+    if (physical_count <= 2) return result;
+    for (approaches, 0..) |edge, index| {
+        if (index == from or index == to or edge.class.flags.node_connector or isUse(edge.class, .construction)) continue;
+        const degrees = (edge.bearing + 360 - heading_from) % 360;
+        if (turn_degrees > 180) {
+            result.right = result.right or degrees > turn_degrees or degrees < 180;
+            result.left = result.left or (degrees < turn_degrees and degrees > 180);
+        } else {
+            result.right = result.right or (degrees > turn_degrees and degrees < 180);
+            result.left = result.left or degrees < turn_degrees or degrees > 180;
+        }
+        if (result.left and result.right) break;
+    }
+    return result;
 }
 
 fn sameNames(a: []const names.Id, b: []const names.Id, deadline: io.Deadline) !bool {
@@ -202,6 +226,59 @@ pub const Pool = struct {
         self.indices.putAssumeCapacityNoClobber(owned, offset);
         self.bytes.appendSliceAssumeCapacity(value);
         return offset;
+    }
+};
+
+/// A sparse rank directory and a deduplicated pool of 2-bit turn matrices.
+/// Append nodes in CSR order. Nodes without side data consume no reference.
+pub const SidePool = struct {
+    gpa: std.mem.Allocator,
+    directory: []u32,
+    references: std.ArrayList(u32) = .empty,
+    matrices: Pool,
+
+    pub fn init(gpa: std.mem.Allocator, nodes: usize) !SidePool {
+        const directory = try gpa.alloc(u32, turn_sides.directoryEnd(nodes));
+        @memset(directory, 0);
+        return .{ .gpa = gpa, .directory = directory, .matrices = .init(gpa) };
+    }
+
+    pub fn deinit(self: *SidePool) void {
+        self.gpa.free(self.directory);
+        self.references.deinit(self.gpa);
+        self.matrices.deinit();
+    }
+
+    pub fn append(self: *SidePool, node: usize, sides: []const u2) !void {
+        if (std.mem.allEqual(u2, sides, 0)) return;
+        var words: [max_matrix_size / turn_sides.entries_per_word]u32 = @splat(0);
+        for (sides, 0..) |side, i| {
+            const shift: u5 = @intCast(i % turn_sides.entries_per_word * 2);
+            words[i / turn_sides.entries_per_word] |= @as(u32, side) << shift;
+        }
+        const count = (sides.len + turn_sides.entries_per_word - 1) / turn_sides.entries_per_word;
+        const offset = try self.matrices.intern(std.mem.sliceAsBytes(words[0..count]));
+        const block = 1 + (node / turn_sides.block_nodes) * 2;
+        if (self.directory[block] == 0)
+            self.directory[block + 1] = std.math.cast(u32, self.directory.len + self.references.items.len) orelse return error.TurnPoolTooLarge;
+        self.directory[block] |= @as(u32, 1) << @as(u5, @truncate(node));
+        try self.references.append(self.gpa, offset / @sizeOf(u32));
+    }
+
+    pub fn finish(self: *const SidePool, deadline: io.Deadline) ![]u32 {
+        const matrices_start = self.directory.len + self.references.items.len;
+        const count = matrices_start + self.matrices.bytes.items.len / @sizeOf(u32);
+        if (count > std.math.maxInt(u32)) return error.TurnPoolTooLarge;
+        const words = try self.gpa.alloc(u32, count);
+        errdefer self.gpa.free(words);
+        @memcpy(words[0..self.directory.len], self.directory);
+        words[0] = @intCast(matrices_start);
+        for (words[self.directory.len..matrices_start], self.references.items, 0..) |*slot, offset, i| {
+            if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
+            slot.* = @intCast(matrices_start + offset);
+        }
+        @memcpy(std.mem.sliceAsBytes(words[matrices_start..]), self.matrices.bytes.items);
+        return words;
     }
 };
 

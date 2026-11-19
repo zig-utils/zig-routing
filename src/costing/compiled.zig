@@ -52,6 +52,9 @@ pub const Rules = struct {
     floors: Floors = .{},
     unit_size: u32 = 1,
     node_access_mask: u16 = 0,
+    /// Static metric inputs that the model evaluates outside the generic
+    /// speed and class tables, such as walking pace and grade penalties.
+    model_metric_key: MetricKey = @splat(0),
 };
 
 const default_speed = blk: {
@@ -145,6 +148,7 @@ pub fn compileInto(comptime Model: type, options: Model.Canonical, classes: []co
     hash.update(std.mem.asBytes(&rules.floors.edge_factor));
     hash.update(std.mem.asBytes(&rules.floors.speed_ratio));
     hash.update(std.mem.asBytes(&rules.floors.turn_factor));
+    hash.update(&rules.model_metric_key);
     var key: MetricKey = undefined;
     hash.final(&key);
     return .{
@@ -234,7 +238,7 @@ fn finiteAdd(a: f32, b: f32) f32 {
     return @min(a + b, std.math.floatMax(f32));
 }
 
-fn floorTicks(value: f64) Tick {
+pub fn floorTicks(value: f64) Tick {
     const scaled = value * round_guard * ticks_per_cost;
     std.debug.assert(scaled >= 0);
     if (scaled >= 0x1p64) return forbidden_tick - 1;
@@ -265,6 +269,10 @@ pub fn Cache(comptime Model: type) type {
 
             pub fn tables(self: Lease) *const Compiled {
                 return &self.slot.compiled;
+            }
+
+            pub fn profile(self: Lease) *const Model.Canonical {
+                return &self.slot.options.?;
             }
 
             pub fn release(self: *Lease) void {

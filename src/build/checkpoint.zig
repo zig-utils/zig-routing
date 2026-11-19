@@ -108,6 +108,8 @@ pub const Artifact = enum {
     bundle_spatial,
     bundle_metadata,
     bundle_components,
+    turn_sides,
+    bundle_turn_sides,
 
     fn filename(self: Artifact) [:0]const u8 {
         return switch (self) {

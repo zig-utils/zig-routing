@@ -6,6 +6,7 @@ const format = @import("format.zig");
 const class_table = @import("class_table.zig");
 const cold = @import("cold.zig");
 const spatial = @import("spatial.zig");
+const turn_sides = @import("turn_sides.zig");
 const Kind = format.SectionKind;
 const Header = format.SectionHeader;
 const kinds = std.enums.values(Kind);
@@ -73,6 +74,8 @@ pub const View = struct {
     spatial_index: ?spatial.View,
     metadata: ?[]const format.Metadata,
     components: ?[]const u32,
+    turn_sides: ?[]const u32,
+    turn_side_index: ?turn_sides.View,
 
     pub fn parse(files: Files, diagnostic: ?*Diagnostic) !View {
         var headers: Headers = .initFill(null);
@@ -165,6 +168,8 @@ pub const View = struct {
             .spatial_index = null,
             .metadata = null,
             .components = null,
+            .turn_sides = null,
+            .turn_side_index = null,
         };
         inline for (kinds) |kind| {
             if (headers.get(kind)) |present| {
@@ -181,6 +186,10 @@ pub const View = struct {
         if (graph.spatial) |bytes| {
             note(diagnostic, .spatial);
             graph.spatial_index = try spatial.View.parse(bytes, @intCast(edge_count));
+        }
+        if (graph.turn_sides) |words| {
+            note(diagnostic, .turn_sides);
+            graph.turn_side_index = try turn_sides.View.parse(words, @intCast(node_count));
         }
         if (graph.metadata) |records| {
             note(diagnostic, .metadata);
@@ -285,6 +294,13 @@ pub const View = struct {
         return self.turns[@intCast(start)..@intCast(end)];
     }
 
+    pub fn turnSides(self: *const View, id: format.NodeId, from: u5, to: u5) !turn_sides.Sides {
+        const degree = (try self.outEdgeRange(id)).count();
+        if (from >= degree or to >= degree) return error.InvalidLocalEdge;
+        const index = self.turn_side_index orelse return .{};
+        return index.at(@backingInt(id), degree, from, to);
+    }
+
     pub fn coldRecord(self: *const View, id: format.EdgeId) !cold.Record {
         _ = try self.edge(id);
         const table = self.cold_data orelse return error.MissingColdData;
@@ -321,7 +337,7 @@ pub const View = struct {
             note(diagnostic, kind);
             if (deadline.expired()) return error.DeadlineExceeded;
             const bytes: []const u8 = switch (kind) {
-                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata, .components => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
+                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata, .components, .turn_sides => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
                 inline else => |section| std.mem.sliceAsBytes(@field(self, @tagName(section))),
             };
             var hash = std.hash.XxHash3.init(0);

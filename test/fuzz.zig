@@ -94,6 +94,7 @@ fn fuzzGraphBundle(baseline: *const graph.reader.Files, s: *Smith) !void {
         _ = view.edge(@fromBackingInt(@intCast(id))) catch null;
         _ = view.outEdges(@fromBackingInt(@intCast(id))) catch null;
         _ = view.turnRow(@fromBackingInt(@intCast(id)), @truncate(input[input.len - 1])) catch null;
+        _ = view.turnSides(@fromBackingInt(id), @truncate(input[input.len - 1]), @truncate(id)) catch null;
         _ = view.class(@truncate(id)) catch null;
         const edge: graph.format.EdgeId = @fromBackingInt(id);
         _ = view.wayId(edge) catch null;
@@ -415,7 +416,11 @@ pub fn fuzzRequest(_: void, s: *Smith) !void {
             const base = routing.costing.base;
             var warnings: std.ArrayList(base.Warning) = .empty;
             const key = try std.fmt.allocPrint(arena, "/{s}", .{@tagName(fast.ok.costing)});
-            const settings = try base.parse(arena, routing.api.json.pointer(options, key) orelse .null, .{}, &warnings, .none);
+            const input = routing.api.json.pointer(options, key) orelse .null;
+            const settings = if (fast.ok.costing == .pedestrian)
+                (try routing.costing.pedestrian.parse(arena, input, &warnings, .none)).shared
+            else
+                try base.parse(arena, input, .{}, &warnings, .none);
             try std.testing.expect(settings.fixed_speed <= base.fixed_speed_max);
             for (warnings.items) |warning| _ = try warning.description(arena);
         }

@@ -71,11 +71,11 @@ pub const Range = struct {
     default: f32,
     max: f32,
 
-    fn penalty(value: f32) Range {
+    pub fn penalty(value: f32) Range {
         return .{ .min = 0, .default = value, .max = max_penalty };
     }
 
-    fn preference(value: f32) Range {
+    pub fn preference(value: f32) Range {
         return .{ .min = 0, .default = value, .max = 1 };
     }
 };
@@ -194,17 +194,26 @@ pub fn parse(arena: std.mem.Allocator, input: json.Value, config: Config, warnin
     inline for (std.enums.values(FloatOption)) |option| {
         if (option == .height) try parseFixedSpeed(arena, input, warnings, &result);
         if (!config.disabled(option)) {
-            const range = config.ranges.get(option);
-            const value = json.get(f32, input, "/" ++ @tagName(option), range.default);
-            if (value < range.min or value > range.max) {
-                result.floats.set(option, range.default);
-                try warnings.append(arena, .{ .option = @tagName(option), .reset_to = .{ .float = range.default } });
-            } else {
-                result.floats.set(option, if (value == 0) 0 else value);
-            }
+            result.floats.set(option, try rangedFloat(arena, input, @tagName(option), config.ranges.get(option), warnings));
         }
     }
     return result;
+}
+
+pub fn rangedFloat(arena: std.mem.Allocator, input: json.Value, comptime name: []const u8, range: Range, warnings: *std.ArrayList(Warning)) !f32 {
+    const value = json.get(f32, input, "/" ++ name, range.default);
+    if (value < range.min or value > range.max) {
+        try warnings.append(arena, .{ .option = name, .reset_to = .{ .float = range.default } });
+        return range.default;
+    }
+    return if (value == 0) 0 else value;
+}
+
+pub fn rangedUnsigned(arena: std.mem.Allocator, input: json.Value, comptime name: []const u8, default: u32, maximum: u32, warnings: *std.ArrayList(Warning)) !u32 {
+    const value = unsigned(input, "/" ++ name, default);
+    if (value <= maximum) return value;
+    try warnings.append(arena, .{ .option = name, .reset_to = .{ .integer = default } });
+    return default;
 }
 
 fn unsigned(input: json.Value, path: []const u8, default: u32) u32 {
@@ -236,12 +245,7 @@ fn unsignedFloat(value: f64, default: u32) u32 {
 }
 
 fn parseFixedSpeed(arena: std.mem.Allocator, input: json.Value, warnings: *std.ArrayList(Warning), result: *Options) !void {
-    const speed = unsigned(input, "/fixed_speed", 0);
-    if (speed > fixed_speed_max) {
-        try warnings.append(arena, .{ .option = "fixed_speed", .reset_to = .{ .integer = 0 } });
-    } else {
-        result.fixed_speed = speed;
-    }
+    result.fixed_speed = try rangedUnsigned(arena, input, "fixed_speed", 0, fixed_speed_max, warnings);
 }
 
 fn parseFlow(input: ?json.Value, deadline: Deadline) !Flow {
@@ -407,6 +411,10 @@ pub const Shared = struct {
     }
 
     pub fn transition(self: *const Shared, node: *const NodeHot, previous: *const EdgeClass, next: *const EdgeClass, turn: Turn) Cost {
+        return self.modeTransition(false, node, previous, next, turn);
+    }
+
+    pub fn modeTransition(self: *const Shared, comptime pedestrian: bool, node: *const NodeHot, previous: *const EdgeClass, next: *const EdgeClass, turn: Turn) Cost {
         const kind = node.attr.type;
         const node_type = graph.constants.NodeType;
         const use = next.category.use;
@@ -414,20 +422,21 @@ pub const Shared = struct {
         var result: Cost = .{};
         if (kind == @backingInt(node_type.border_control)) result = result.add(self.country_crossing);
         if (kind == @backingInt(node_type.gate) and !node.attr.tagged_access) result = result.add(self.gate);
-        if ((kind == @backingInt(node_type.gate) or kind == @backingInt(node_type.bollard)) and node.attr.private_access)
+        if ((kind == @backingInt(node_type.gate) or (!pedestrian and kind == @backingInt(node_type.bollard))) and node.attr.private_access)
             result = result.add(self.private_access);
         if (kind == @backingInt(node_type.bike_share)) result = result.add(self.bike_share);
-        if (kind == @backingInt(node_type.toll_booth) or (next.flags.toll and !previous.flags.toll))
+        if (!pedestrian and (kind == @backingInt(node_type.toll_booth) or (next.flags.toll and !previous.flags.toll)))
             result = result.add(self.toll_booth);
         if (use == @backingInt(Use.ferry) and prev_use != use) result = result.add(self.ferry);
         if (use == @backingInt(Use.rail_ferry) and prev_use != use) result = result.add(self.rail_ferry);
 
         if (turn.entersDestinationOnly(previous, next)) result.cost += self.destination_only_penalty;
         if (use == @backingInt(Use.alley) and prev_use != use) result.cost += self.alley_penalty;
-        if (!next.flags.link and !turn.nameConsistent()) result.cost += self.maneuver_penalty;
+        const transit_connection = use == @backingInt(Use.egress_connection) or use == @backingInt(Use.platform_connection);
+        if (!next.flags.link and !turn.nameConsistent() and !(pedestrian and transit_connection)) result.cost += self.maneuver_penalty;
         if (use == @backingInt(Use.living_street) and prev_use != use) result.cost += self.living_streets.penalty;
         if (use == @backingInt(Use.track) and prev_use != use) result.cost += self.tracks.penalty;
-        if (use == @backingInt(Use.service_road) and prev_use != use and !next.flags.internal) result.cost += self.service_penalty;
+        if (use == @backingInt(Use.service_road) and prev_use != use and (pedestrian or !next.flags.internal)) result.cost += self.service_penalty;
         if (self.shortest) result.cost = 0;
         return result;
     }
@@ -549,13 +558,17 @@ pub const Permission = struct {
         if (turn.restricted() and !self.flags.contains(.ignore_restrictions) and
             !self.flags.contains(.ignore_non_vehicular_restrictions)) return false;
         if (!self.allow_destination_only and turn.entersDestinationOnly(from, to)) return false;
+        return self.allowedExclusions(from, to) and
+            !(self.flags.contains(.exclude_unpaved) and to.category.surface >= @backingInt(graph.constants.Surface.compacted) and
+                from.category.surface < @backingInt(graph.constants.Surface.compacted));
+    }
+
+    pub fn allowedExclusions(self: Permission, from: *const EdgeClass, to: *const EdgeClass) bool {
         return !(self.flags.contains(.exclude_bridges) and to.flags.bridge and !from.flags.bridge) and
             !(self.flags.contains(.exclude_tunnels) and to.flags.tunnel and !from.flags.tunnel) and
             !(self.flags.contains(.exclude_tolls) and to.flags.toll and !from.flags.toll) and
             !(self.flags.contains(.exclude_highways) and to.category.road_class == 0 and from.category.road_class != 0) and
-            !(self.flags.contains(.exclude_ferries) and isFerry(to.category.use) and !isFerry(from.category.use)) and
-            !(self.flags.contains(.exclude_unpaved) and to.category.surface >= @backingInt(graph.constants.Surface.compacted) and
-                from.category.surface < @backingInt(graph.constants.Surface.compacted));
+            !(self.flags.contains(.exclude_ferries) and isFerry(to.category.use) and !isFerry(from.category.use));
     }
 };
 

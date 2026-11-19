@@ -984,3 +984,60 @@ test "leased compiled classes drive graph-based snapping and the cold permission
     try testing.expect(!costing.Kernel.slowAllowed(lease.tables(), view, ab, Cold{ .blocked = ab }));
     try testing.expect(!costing.Kernel.slowAllowed(lease.tables(), view, bc, Cold{}));
 }
+
+test "pedestrian crossing and elevator turn costs use assembled graph metadata" {
+    const pedestrian = routing.costing.pedestrian;
+    const base = routing.costing.base;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const footway: gurka.Tags = &.{ .{ .key = "highway", .value = "footway" }, .{ .key = "name", .value = "Crossing path" } };
+    const primary: gurka.Tags = &.{.{ .key = "highway", .value = "primary" }};
+    const map = try gurka.mapToCoordinates("    N\n    |\nW---X---E\n    |\n    S", 20);
+    const fixture = try gurka.Map.init(a, map, &.{
+        .{ .label = "NX", .tags = footway },
+        .{ .label = "XS", .tags = footway },
+        .{ .label = "WX", .tags = primary },
+        .{ .label = "XE", .tags = primary },
+    }, &.{}, &.{});
+    var bundle = try Built.assemble(fixture.osm, 1);
+    defer bundle.deinit();
+    const view = &bundle.bundle.view;
+    const x = try at(view, fixture.findNode("X").?.location.toFixed());
+    const in = try directedBetween(view, &fixture, "N", "X");
+    const out = try directedBetween(view, &fixture, "X", "S");
+    const from = try view.class((try view.edge(in)).cls.class_id);
+    const to = try view.class((try view.edge(out)).cls.class_id);
+    const turn = try pedestrian.Turn.read(view, x, in, out);
+    try testing.expect(turn.sides.left and turn.sides.right);
+    try testing.expectEqual(6, turn.base_turn.stopImpact());
+
+    var warnings: std.ArrayList(base.Warning) = .empty;
+    const options = try pedestrian.parse(a, .null, &warnings, .none);
+    var cache = try pedestrian.Cache.init(testing.allocator, view.classes.?, 1);
+    defer cache.deinit();
+    var lease = try cache.acquire(options, .none);
+    defer lease.release();
+    const crossing = pedestrian.Kernel.turnCost(lease.profile(), try view.node(x), from, to, turn);
+    try testing.expectEqual(@as(f32, 5), crossing.secs);
+    try testing.expectEqual(@as(f32, 5), crossing.cost);
+    try testing.expect(pedestrian.Kernel.allowed(lease.profile(), from, to, (try view.edge(out)).*, .{}));
+    const walk = pedestrian.Kernel.edgeCost(lease.profile(), lease.tables(), to, (try view.edge(out)).*, 0, .{});
+    try testing.expect(walk.cost > 0 and walk.secs > 0);
+
+    const elevator = try gurka.Map.init(a, try gurka.mapToCoordinates("A--K--B", 20), &.{
+        .{ .label = "AK", .tags = &.{ footway[0], .{ .key = "level", .value = "2" } } },
+        .{ .label = "KB", .tags = &.{ footway[0], .{ .key = "level", .value = "5" } } },
+    }, &.{.{ .label = "K", .tags = &.{.{ .key = "highway", .value = "elevator" }} }}, &.{});
+    var building = try Built.assemble(elevator.osm, 1);
+    defer building.deinit();
+    const lift_view = &building.bundle.view;
+    const k = try at(lift_view, elevator.findNode("K").?.location.toFixed());
+    const entry = try directedBetween(lift_view, &elevator, "A", "K");
+    const exit = try directedBetween(lift_view, &elevator, "K", "B");
+    const elevator_turn = try pedestrian.Turn.read(lift_view, k, entry, exit);
+    try testing.expectEqual(3, elevator_turn.levels);
+    const elevator_cost = pedestrian.Kernel.turnCost(lease.profile(), try lift_view.node(k), from, to, elevator_turn);
+    try testing.expectEqual(@as(f32, 15), elevator_cost.cost);
+    try testing.expectEqual(@as(f32, 0), elevator_cost.secs);
+}

@@ -2,6 +2,7 @@
 
 pub const base = @import("base.zig");
 pub const compiled = @import("compiled.zig");
+pub const pedestrian = @import("pedestrian.zig");
 
 const std = @import("std");
 

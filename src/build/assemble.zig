@@ -106,9 +106,11 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     defer if (terrain) |*present| present.deinit();
     var turn_pool = turns.Pool.init(gpa);
     defer turn_pool.deinit();
-    try buildTurns(&shared, table.classes, metadata.name_ids.items, &turn_pool);
+    const turn_sides = try buildTurns(&shared, table.classes, metadata.name_ids.items, &turn_pool, gpa);
+    defer gpa.free(turn_sides);
 
     try writeTopology(writer, options.scratch_dir, topology, table.classes, turn_pool.bytes.items, if (terrain) |present| present.slopes.data else null);
+    try writer.write(.turn_sides, turn_sides);
     const topology_ns = timer.read();
     const means: []const i16 = if (terrain) |*present| present.means.data else &.{};
     const cold_bytes = try buildCold(gpa, &shared, &metadata, writer, options.scratch_dir, means);
@@ -248,9 +250,11 @@ pub fn buildStaged(
         const start = io.Timer.start();
         var tx = try session.begin(.turns);
         defer tx.deinit();
-        try buildTurns(&shared, edge_classes.?, metadata.name_ids.items, &turn_pool);
+        const turn_sides = try buildTurns(&shared, edge_classes.?, metadata.name_ids.items, &turn_pool, gpa);
+        defer gpa.free(turn_sides);
         try tx.writeArray(topology.nodes, .nodes);
         try tx.writeArray(turn_pool.bytes.items, .turn_pool);
+        try tx.writeArray(turn_sides, .turn_sides);
         try tx.writeJson(gpa, turn_pool.indices.count(), .turn_stats);
         try session.commit(&tx, topology.nodes.len, start);
     }
@@ -277,6 +281,11 @@ pub fn buildStaged(
         const means = if (means_map) |mapped| try checkpoint.array(i16, mapped) else &.{};
         if (means.len != 0 and means.len != segments.len) return error.InvalidCheckpoint;
         try writeTopology(&writer, options.scratch_dir, topology, edge_classes.?, turn_data.bytes, if (slopes_map) |mapped| try checkpoint.array(u16, mapped) else null);
+        if (saved_turns.manifest.files.get(.turn_sides) != null) {
+            const side_data = try saved_turns.map(.turn_sides, options.deadline);
+            defer side_data.unmap();
+            try writer.write(.turn_sides, try checkpoint.array(u32, side_data));
+        }
         const cold_bytes = try buildCold(gpa, &shared, metadata, &writer, options.scratch_dir, means);
         try tx.writeJson(gpa, cold_bytes, .source_stats);
         try writer.write(.metadata, &.{.{
@@ -1391,10 +1400,13 @@ fn remapEdges(rows: []format.EdgeHot, ids: []const classes.ClassId, deadline: io
     }
 }
 
-fn buildTurns(shared: *const Shared, edge_classes: []const classes.EdgeClass, name_ids: []const tags.names.Id, pool: *turns.Pool) !void {
+fn buildTurns(shared: *const Shared, edge_classes: []const classes.EdgeClass, name_ids: []const tags.names.Id, pool: *turns.Pool, gpa: Allocator) ![]u32 {
     const topo = shared.topology;
+    var side_pool = try turns.SidePool.init(gpa, topo.nodes.len);
+    defer side_pool.deinit();
     var approaches: [max_degree]turns.Approach = undefined;
     var entries: [turns.max_matrix_size]u8 = undefined;
+    var sides: [turns.max_matrix_size]u2 = undefined;
     for (topo.nodes, 0..) |*node, i| {
         try checkDeadline(shared.deadline, i);
         const first = topo.first_edge[i];
@@ -1411,9 +1423,12 @@ fn buildTurns(shared: *const Shared, edge_classes: []const classes.EdgeClass, na
         }
         const matrix = entries[0 .. degree * degree];
         const side: edge_class.DriveSide = if (node.attr.drive_on_left) .left else .right;
-        try turns.matrix(approaches[0..degree], node.attr.signal != 0, side, matrix, shared.deadline);
+        const turn_sides = sides[0..matrix.len];
+        try turns.matrix(approaches[0..degree], node.attr.signal != 0, side, matrix, turn_sides, shared.deadline);
         node.turn_off = try pool.intern(matrix);
+        try side_pool.append(i, turn_sides);
     }
+    return side_pool.finish(shared.deadline);
 }
 
 // Ported from src/mjolnir/osmway.cc GetTaggedValues. Level tags hold
