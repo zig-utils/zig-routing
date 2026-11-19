@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const lz4 = @import("lz4");
+const perf = @import("perf_counters");
 
 fn nowNs() u64 {
     var ts: std.c.timespec = undefined;
@@ -45,12 +46,16 @@ pub fn main(init: std.process.Init) !void {
         gpa.free(zz);
     }
     var best_d: u64 = std.math.maxInt(u64);
-    for (0..10) |_| {
+    const decompressions = 10;
+    var counters = perf.Counters.start();
+    defer if (counters) |*active| active.deinit();
+    for (0..decompressions) |_| {
         const t0 = nowNs();
         const res = try lz4.decompressFrames(z, out);
         best_d = @min(best_d, nowNs() - t0);
         if (res.written != n) return error.Mismatch;
     }
+    const counts = if (counters) |*active| active.finish() else null;
     if (!std.mem.eql(u8, src, out)) return error.Mismatch;
 
     const zn = try lz4.compressAlloc(gpa, src, .{ .content_checksum = false });
@@ -70,6 +75,12 @@ pub fn main(init: std.process.Init) !void {
         mb / (@as(f64, @floatFromInt(best_d)) / 1e9),
         mb / (@as(f64, @floatFromInt(best_n)) / 1e9),
     });
+    if (counts) |total| {
+        const per = total.perUnit(decompressions).?;
+        std.debug.print("checksummed decompression per iteration: {d:.1} cycles, {d:.1} instructions, {d:.1} cache misses, {d:.1} branch misses\n", .{
+            per.cycles, per.instructions, per.cache_misses, per.branch_misses,
+        });
+    }
 
     if (args.len > 1) {
         const f = std.c.fopen(try init.arena.allocator().dupeSentinel(u8, args[1], 0), "wb") orelse return error.Open;

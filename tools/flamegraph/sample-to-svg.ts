@@ -1,6 +1,5 @@
 #!/usr/bin/env bun
-// Turns the call graph of a macOS `sample` report into a flamegraph SVG (and, with
-// --folded, the folded stacks flamegraph.pl reads). No dependencies.
+// Turns macOS sample or Linux perf stacks into a flamegraph SVG or folded stacks.
 //
 //   sample <pid> 10 -file prof.txt
 //   bun tools/flamegraph/sample-to-svg.ts prof.txt out.svg [--title T] [--thread NAME] [--min 0.002]
@@ -15,9 +14,10 @@ const flag = (n: string) => {
   const i = args.indexOf(n)
   return i >= 0 ? args[i + 1] : undefined
 }
-const [input, output] = args.filter((a, i) => !a.startsWith('--') && !(i > 0 && args[i - 1].startsWith('--') && !['--drop-idle', '--folded'].includes(args[i - 1])))
+const switches = new Set(['--drop-idle', '--folded', '--perf'])
+const [input, output] = args.filter((a, i) => !a.startsWith('--') && !(i > 0 && args[i - 1].startsWith('--') && !switches.has(args[i - 1])))
 if (!input || !output) {
-  console.error('usage: sample-to-svg.ts SAMPLE.txt OUT.svg [--title T] [--thread NAME] [--min FRACTION] [--drop-idle] [--folded]')
+  console.error('usage: sample-to-svg.ts PROFILE.txt OUT.{svg,folded} [--perf] [--title T] [--thread NAME] [--min FRACTION] [--drop-idle] [--folded]')
   process.exit(2)
 }
 const title = flag('--title') ?? 'zr'
@@ -29,42 +29,70 @@ const idle = /^(kevent|__semwait_signal|__psynch_cvwait|__workq_kernreturn|mach_
 interface Node { name: string, count: number, children: Map<string, Node> }
 const root: Node = { name: 'all', count: 0, children: new Map() }
 
-const text = readFileSync(input, 'utf8')
-const start = text.indexOf('Call graph:')
-const end = text.indexOf('Total number in stack')
-const lines = text.slice(start, end > 0 ? end : undefined).split('\n').slice(1)
-
-// Each line: tree drawing characters, a count, a frame. Depth is the column of the count.
-const line_re = /^([\s+!:|]*?)(\d+) (.+)$/
-const stack: Array<{ depth: number, node: Node }> = []
-let keepThread = true
-for (const line of lines) {
-  const m = line_re.exec(line)
-  if (!m) continue
-  const depth = m[1].length
-  const count = Number(m[2])
-  let name = m[3].trim()
-  const isThread = /^Thread_\d+/.test(name)
-  if (isThread) {
-    keepThread = !threadFilter || name.includes(threadFilter)
-    name = name.replace(/\s{2,}.*$/, '')
-  }
-  if (!keepThread) continue
-  name = name.replace(/\s+\(in ([^)]+)\).*$/, '').replace(/\s+\+ \d+.*$/, '').replace(/\s+\[0x[0-9a-f]+\]$/, '')
-  if (name === '???' || name.startsWith('??? ')) name = '[unknown]'
-  while (stack.length && stack[stack.length - 1].depth >= depth) stack.pop()
-  const parent = stack.length ? stack[stack.length - 1].node : root
-  // Merge threads with the same work into one tower per thread kind.
-  const key = isThread ? name.replace(/_\d+$/, '') : name
-  let node = parent.children.get(key)
+function addFrame(parent: Node, name: string, count: number): Node {
+  let node = parent.children.get(name)
   if (!node) {
-    node = { name: isThread ? key : name, count: 0, children: new Map() }
-    parent.children.set(key, node)
+    node = { name, count: 0, children: new Map() }
+    parent.children.set(name, node)
   }
   node.count += count
   if (parent === root) root.count += count
-  stack.push({ depth, node })
+  return node
 }
+
+function readSample(text: string): void {
+  const start = text.indexOf('Call graph:')
+  if (start < 0) return
+  const end = text.indexOf('Total number in stack', start)
+  const lines = text.slice(start, end > 0 ? end : undefined).split('\n').slice(1)
+  // Depth is the column of the count, after the tree drawing characters.
+  const lineRe = /^([\s+!:|]*?)(\d+) (.+)$/
+  const stack: Array<{ depth: number, node: Node }> = []
+  let keepThread = true
+  for (const line of lines) {
+    const match = lineRe.exec(line)
+    if (!match) continue
+    const depth = match[1].length
+    const count = Number(match[2])
+    let name = match[3].trim()
+    const isThread = /^Thread_\d+/.test(name)
+    if (isThread) {
+      keepThread = !threadFilter || name.includes(threadFilter)
+      name = name.replace(/\s{2,}.*$/, '')
+    }
+    if (!keepThread) continue
+    name = name.replace(/\s+\(in ([^)]+)\).*$/, '').replace(/\s+\+ \d+.*$/, '').replace(/\s+\[0x[0-9a-f]+\]$/, '')
+    if (name === '???' || name.startsWith('??? ')) name = '[unknown]'
+    while (stack.length && stack[stack.length - 1].depth >= depth) stack.pop()
+    const parent = stack.length ? stack[stack.length - 1].node : root
+    // Merge threads with the same work into one tower per thread kind.
+    const key = isThread ? name.replace(/_\d+$/, '') : name
+    stack.push({ depth, node: addFrame(parent, key, count) })
+  }
+}
+
+function readPerf(text: string): void {
+  const headerRe = /^(.+?)\s+\d+(?:\/\d+)?\s+\d+\.\d+:/
+  const frameRe = /^\s+(?:0x)?[0-9a-f]+\s+(.+)\s+\(.*\)\s*$/i
+  for (const sample of text.trim().split(/\n[ \t]*\n/)) {
+    const [header, ...lines] = sample.trim().split('\n')
+    const command = headerRe.exec(header)?.[1].trim()
+    if (!command || (threadFilter && !command.includes(threadFilter))) continue
+    const frames: string[] = []
+    for (const line of lines) {
+      const match = frameRe.exec(line)
+      if (match) frames.push(match[1].trim().replace(/\+0x[0-9a-f]+$/i, ''))
+    }
+    if (!frames.length) continue
+    let parent = addFrame(root, command, 1)
+    // perf prints the sampled frame first, followed by its callers.
+    for (let i = frames.length - 1; i >= 0; i--) parent = addFrame(parent, frames[i], 1)
+  }
+}
+
+const text = readFileSync(input, 'utf8')
+if (args.includes('--perf')) readPerf(text)
+else readSample(text)
 
 function prune(n: Node): number {
   if (dropIdle && idle.test(n.name)) return 0
@@ -81,17 +109,23 @@ function prune(n: Node): number {
 }
 prune(root)
 root.count = [...root.children.values()].reduce((s, c) => s + c.count, 0)
+if (!root.count) throw new Error('profile contains no matching stack samples')
 
-if (args.includes('--folded')) {
+const foldedOnly = output.endsWith('.folded')
+if (foldedOnly || args.includes('--folded')) {
   const out: string[] = []
   const walk = (n: Node, path: string[]) => {
     const kids = [...n.children.values()]
     const self = n.count - kids.reduce((s, c) => s + c.count, 0)
     if (self > 0 && path.length) out.push(`${path.join(';')} ${self}`)
-    for (const c of kids) walk(c, [...path, c.name])
+    for (const c of kids) walk(c, [...path, c.name.replaceAll(';', ':')])
   }
   walk(root, [])
   writeFileSync(output.replace(/\.svg$/, '.folded'), `${out.join('\n')}\n`)
+}
+if (foldedOnly) {
+  console.log(`${output}: ${root.count} samples`)
+  process.exit(0)
 }
 
 // Layout: one row per depth, widths proportional to samples, bottom-up.

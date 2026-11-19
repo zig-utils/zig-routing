@@ -127,14 +127,14 @@ byte-identical (CI runs it). After changing a generator, refresh the oracle-reje
 with `--validate DATASET=URL` for every dataset with a running oracle, and commit the manifest.
 
 `zig build perf` times /height by stage (parse, sample, serialize per point) on the bulk corpus
-and fails when a stage exceeds `bench/budgets/height.json`. For where the time goes in a running
-server, sample it and render a flamegraph (macOS):
+and fails when a stage exceeds `bench/budgets/height.json`. To capture a flamegraph while
+`zr bench` drives a running server, pass its process ID:
 
 ```bash
-bun tools/flamegraph/sample-to-svg.ts sample.txt out.svg --drop-idle --folded
+scripts/flamegraph.sh out.svg --pid "$PID" 10
 ```
 
-`sample.txt` comes from `sample <pid> 10 -file sample.txt` while `zr bench` drives the server;
+Use `zr bench --counters` for client hardware counters when Linux exposes them.
 `docs/perf/` keeps the reference profiles.
 
 Every parser of untrusted input gets a fuzz target in `test/fuzz.zig` (one byte slice per run,

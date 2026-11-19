@@ -16,7 +16,7 @@ P0.08 | Baseline scoreboard: Valhalla 3.9.3 on the bench box, committed as docs/
 P0.09 | Dedicated bench box and CI perf tracking with a 3% regression gate | infra | perf | M | P0.06 | needs-human
 P0.10 | IO shim: one file wrapping std.Io for accept, read, write, mmap, madvise and clocks | server | new | M | P0.01
 P0.11 | Request arena and counting allocator (zero steady-state allocation test helper) | infra | new | S | P0.01
-P0.12 | Bench tooling: hardware counters and flamegraphs for zr bench | cli | perf | S | P0.06
+P0.12 | Bench tooling: hardware counters and flamegraphs for zr bench | cli | perf | S | P0.06 | needs-human
 
 ## P1 | P1 Foundations | Geometry kernel, codecs, HTTP service skeleton and the test DSL.
 P1.01 | geo: PointLL, AABB2, distance approximator, haversine, headings | geo | port | M | P0.01

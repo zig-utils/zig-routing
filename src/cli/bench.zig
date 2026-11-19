@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const perf = @import("perf_counters");
 const io = @import("../infra/io.zig");
 const json = @import("../api/json.zig");
 const JsonWriter = @import("../api/json_writer.zig").Writer;
@@ -200,6 +201,7 @@ pub const Options = struct {
     /// Stop after this many measured requests instead of after `duration_ns`.
     requests: ?u64 = null,
     timeout_ns: u64 = 30 * ns_per_s,
+    measure_counters: bool = false,
 };
 
 pub const Result = struct {
@@ -214,6 +216,7 @@ pub const Result = struct {
     /// Measurement window: end of warm-up to the last measured completion.
     window_ns: u64 = 0,
     threads: usize = 0,
+    client_counters: ?perf.Counts = null,
 
     pub fn errorCount(self: *const Result) u64 {
         var n = self.transport_errors + self.timeouts;
@@ -273,6 +276,8 @@ const Worker = struct {
     due_seq: u64 = 0,
     last_done_ns: u64 = 0,
     err: ?anyerror = null,
+    counters_pending: bool = false,
+    counters: ?perf.Counters = null,
 
     fn dueAt(self: *const Worker, seq: u64) u64 {
         // Threads interleave: thread t owns global slots t, t+T, t+2T, ...
@@ -301,6 +306,7 @@ const Worker = struct {
         self.loop() catch |e| {
             self.err = e;
         };
+        if (self.counters) |*active| self.result.client_counters = active.finish();
         for (self.conns) |*c| {
             if (c.stream) |s| s.close();
             self.gpa.free(c.buf);
@@ -308,10 +314,16 @@ const Worker = struct {
         self.poller.deinit();
     }
 
+    noinline fn startCounters(self: *Worker) void {
+        self.counters_pending = false;
+        self.counters = perf.Counters.start();
+    }
+
     fn loop(self: *Worker) !void {
         var events: [64]io.Event = undefined;
         while (true) {
             const now = io.monotonicNs();
+            if (self.counters_pending and now >= self.clock.warm_end_ns) self.startCounters();
             if (self.openLoop()) {
                 while (self.dueAt(self.due_seq) <= now and self.mayIssue(self.dueAt(self.due_seq))) {
                     const c = self.idleConn(now) orelse break;
@@ -452,6 +464,7 @@ const Worker = struct {
         if (c.close_after) self.reset(c);
         // Closed loop: the connection goes straight back to work.
         if (!self.openLoop() and self.mayIssue(now) and self.ensureOpen(c, now)) {
+            if (self.counters_pending and now >= self.clock.warm_end_ns) self.startCounters();
             self.send(c, now, now) catch {
                 self.result.transport_errors += 1;
             };
@@ -539,6 +552,7 @@ pub fn run(gpa: Allocator, opts: Options, corpus: *const Corpus) !Result {
         made += 1;
         first_conn += n;
         if (opts.requests) |total| w.quota = total / threads + @intFromBool(t < total % threads);
+        w.counters_pending = opts.measure_counters and w.quota != 0;
     }
     // Connect before the clock starts so connection setup is not measured.
     for (conns) |*c| {
@@ -561,6 +575,7 @@ pub fn run(gpa: Allocator, opts: Options, corpus: *const Corpus) !Result {
     for (handles) |h| h.join();
 
     var result: Result = .{ .threads = threads };
+    var client_counters: ?perf.Counts = if (opts.measure_counters and (opts.requests orelse 1) != 0) .{} else null;
     var last_done: u64 = 0;
     for (workers) |*w| {
         if (w.err) |e| return e;
@@ -571,7 +586,18 @@ pub fn run(gpa: Allocator, opts: Options, corpus: *const Corpus) !Result {
         result.unsent += w.result.unsent;
         result.bytes_in += w.result.bytes_in;
         last_done = @max(last_done, w.last_done_ns);
+        if (w.quota != 0) {
+            if (client_counters) |*total| {
+                if (w.result.client_counters) |counts| {
+                    total.add(counts);
+                } else {
+                    // Partial worker totals would understate work per request.
+                    client_counters = null;
+                }
+            }
+        }
     }
+    result.client_counters = client_counters;
     result.window_ns = last_done -| clock.warm_end_ns;
     return result;
 }
@@ -633,6 +659,22 @@ pub fn writeResult(gpa: Allocator, out: *std.ArrayList(u8), meta: Meta, opts: Op
     try w.field("requests", r.hist.total);
     try w.field("throughput_rps", r.throughput());
     try w.field("bytes_in", r.bytes_in);
+    if (opts.measure_counters) {
+        try w.key("client_hardware_counters");
+        if (r.client_counters) |counts| {
+            try w.beginObject();
+            const fields = .{ "cycles", "instructions", "cache_misses", "branch_misses" };
+            inline for (fields) |field| try w.field(field, @field(counts, field));
+            if (counts.perUnit(r.hist.total)) |per_request| {
+                try w.beginObjectField("per_request");
+                inline for (fields) |field| try w.field(field, @field(per_request, field));
+                try w.endObject();
+            }
+            try w.endObject();
+        } else {
+            try w.null_();
+        }
+    }
     try w.beginObjectField("errors");
     try w.field("total", r.errorCount());
     try w.field("transport", r.transport_errors);
@@ -753,6 +795,7 @@ pub const usage =
     \\  --requests N        stop after N measured requests instead
     \\  --warmup T          excluded warm-up (default 2s)
     \\  --timeout T         per-request timeout (default 30s)
+    \\  --counters          report Linux client hardware counters when available
     \\  --out FILE          write the JSON result here
     \\  --dataset NAME      --commit SHA  --label TEXT   recorded in the result
     \\
@@ -798,10 +841,16 @@ pub fn main(gpa: Allocator, args: []const []const u8) !void {
     var endpoint: []const u8 = "/route";
     var out_path: ?[]const u8 = null;
     var i: usize = 1;
-    while (i < args.len) : (i += 2) {
-        if (i + 1 >= args.len) return usageError();
+    while (i < args.len) {
         const flag = args[i];
-        const v = args[i + 1];
+        i += 1;
+        if (std.mem.eql(u8, flag, "--counters")) {
+            opts.measure_counters = true;
+            continue;
+        }
+        if (i >= args.len) return usageError();
+        const v = args[i];
+        i += 1;
         if (std.mem.eql(u8, flag, "--corpus")) {
             meta.corpus_path = v;
         } else if (std.mem.eql(u8, flag, "--endpoint")) {
@@ -846,6 +895,17 @@ pub fn main(gpa: Allocator, args: []const []const u8) !void {
     result.* = try run(gpa, opts, &corpus);
 
     try writeSummary(&out, arena, result);
+    if (opts.measure_counters) {
+        if (result.client_counters) |counts| {
+            if (counts.perUnit(result.hist.total)) |per| {
+                try out.print(arena, "client per completed request: {d:.1} cycles, {d:.1} instructions, {d:.1} cache misses, {d:.1} branch misses\n", .{
+                    per.cycles, per.instructions, per.cache_misses, per.branch_misses,
+                });
+            }
+        } else {
+            try out.appendSlice(arena, "client hardware counters unavailable\n");
+        }
+    }
     std.debug.print("{s}", .{out.items});
     if (out_path) |path| {
         var file_bytes: std.ArrayList(u8) = .empty;
@@ -991,6 +1051,19 @@ test "closed loop drives a server and counts statuses" {
     try compare(arena_state.allocator(), out.items, out.items, &table);
     try testing.expect(std.mem.indexOf(u8, table.items, "latency p99 us") != null);
     try testing.expect(std.mem.indexOf(u8, table.items, "+0.0%") != null);
+
+    const meta: Meta = .{ .target = host, .corpus_path = "x" };
+    const opts: Options = .{ .target = undefined, .measure_counters = true };
+    out.clearRetainingCapacity();
+    try writeResult(arena_state.allocator(), &out, meta, opts, &corpus, result);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\"client_hardware_counters\":null") != null);
+
+    result.client_counters = .{ .instructions = 12_000, .cache_misses = 1_500 };
+    out.clearRetainingCapacity();
+    try writeResult(arena_state.allocator(), &out, meta, opts, &corpus, result);
+    const measured = try json.parse(arena_state.allocator(), out.items);
+    try testing.expectEqual(12_000, json.get(i64, measured, "/client_hardware_counters/instructions", -1));
+    try testing.expectEqual(5, json.get(f64, measured, "/client_hardware_counters/per_request/cache_misses", -1));
 }
 
 test "open loop holds the requested rate" {

@@ -10,6 +10,7 @@ pub fn build(b: *std.Build) void {
     const zig_config = b.dependency("zig_config", dep_args).module("zig_config");
     const tls = b.dependency("tls", dep_args).module("tls");
     const xml = b.dependency("xml", dep_args).module("xml");
+    const perf_counters = b.dependency("zig_benchmarks", dep_args).module("perf_counters");
 
     // Packages written for this project, each extractable into its own zig-* repo later.
     const lz4 = b.addModule("lz4", .{ .root_source_file = b.path("packages/lz4/lz4.zig"), .target = target, .optimize = optimize });
@@ -26,6 +27,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tls", .module = tls },
             .{ .name = "xml", .module = xml },
             .{ .name = "lz4", .module = lz4 },
+            .{ .name = "perf_counters", .module = perf_counters },
         },
     });
 
@@ -71,7 +73,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
         .link_libc = true,
-        .imports = &.{.{ .name = "lz4", .module = b.createModule(.{ .root_source_file = b.path("packages/lz4/lz4.zig"), .target = target, .optimize = .ReleaseFast }) }},
+        .imports = &.{
+            .{ .name = "lz4", .module = b.createModule(.{ .root_source_file = b.path("packages/lz4/lz4.zig"), .target = target, .optimize = .ReleaseFast }) },
+            .{ .name = "perf_counters", .module = perf_counters },
+        },
     }) });
     const run_bench_lz4 = b.addRunArtifact(bench_lz4);
     run_bench_lz4.addPassthruArgs();
@@ -100,6 +105,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tls", .module = b.dependency("tls", .{ .target = target, .optimize = fuzz_opt }).module("tls") },
             .{ .name = "xml", .module = b.dependency("xml", .{ .target = target, .optimize = fuzz_opt }).module("xml") },
             .{ .name = "lz4", .module = fuzz_lz4 },
+            .{ .name = "perf_counters", .module = perf_counters },
         },
     });
     const fuzz_tests = b.addTest(.{

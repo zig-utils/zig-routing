@@ -39,6 +39,31 @@ zig build test
 zig build run
 ```
 
+## Profiling
+
+`zr bench --counters` records cycles, instructions, cache misses and branch misses for the Linux
+load-generator threads after warm-up. Its JSON includes totals and counts per completed request.
+When counters are unavailable, latency and throughput are still reported and
+`client_hardware_counters` is `null`. `zig build bench-lz4` reports the same counters per
+checksummed decompression iteration when the hardware supports them.
+
+Profile a bench run with Linux `perf` or macOS `sample`. Build `zr` first, then set `URL` to the
+server and `CORPUS` to the request corpus.
+
+```bash
+scripts/flamegraph.sh bench.svg -- zig-out/bin/zr bench "$URL" --corpus "$CORPUS" --duration 10s
+```
+
+To profile the service itself while the load generator runs separately, use its process ID:
+
+```bash
+scripts/flamegraph.sh serve.folded --pid "$PID" 10
+```
+
+Use an output path ending in `.svg` for an SVG or `.folded` for folded stacks. Linux must allow
+user-space `perf` sampling of the process. On macOS, the command needs to run long enough for
+`sample` to attach.
+
 ## License
 
 MIT. See [LICENSE](LICENSE) and [NOTICE](NOTICE) for the Valhalla attribution.
