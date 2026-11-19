@@ -32,6 +32,7 @@ DEFAULT_NODE = {
     "direction": False,
     "tagged_access": False,
     "private_access": False,
+    "cash_only_toll": False,
     "step_count": None,
     "tactile_paving": None,
 }

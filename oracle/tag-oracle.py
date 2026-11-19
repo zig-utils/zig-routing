@@ -5,6 +5,7 @@ import ctypes as c
 import json
 from pathlib import Path
 import re
+import struct
 import sys
 
 
@@ -143,6 +144,7 @@ def node_fields(state, raw):
         ),
         "tagged_access": get(state, b"tagged_access") == b"1",
         "private_access": get(state, b"private") == b"true",
+        "cash_only_toll": node_type == 3 and get(state, b"cash_only_toll") == b"true",
         "tactile_paving": option(raw, "tactile_paving", TACTILE),
     }
     steps = step_count(raw)
@@ -164,6 +166,47 @@ def raw_way_fields(raw):
         "trail_visibility": option(raw, "trail_visibility", VISIBILITY),
         "tactile_paving": option(raw, "tactile_paving", TACTILE),
         "foot": raw.get("foot"),
+    }
+
+
+LIMITS = ("hazmat", "maxheight", "maxwidth", "maxlength", "maxweight", "maxaxleload", "maxaxles")
+
+
+def f32(number):
+    return struct.unpack("<f", struct.pack("<f", number))[0]
+
+
+def motor_way_fields(state):
+    limits = []
+    for direction in ("both", "forward", "backward"):
+        for kind in LIMITS if direction == "both" else LIMITS[:5]:
+            key = kind if direction == "both" else f"{kind}_{direction}"
+            raw = get(state, key.encode())
+            if raw is None:
+                continue
+            value, exemption, _ = raw.partition(b"~")
+            if kind == "hazmat":
+                value = int(value == b"true")
+            else:
+                try:
+                    value = f32(float(value))
+                    if kind != "maxaxles":
+                        value = f32(value * 100)
+                except OverflowError:
+                    continue
+                # Ignore values outside the integer conversion's defined range.
+                if not 0 <= value < 2 ** 64:
+                    continue
+                value = int(value)
+            limits.append({
+                "kind": kind, "direction": direction, "value": value,
+                "except_destination": bool(exemption),
+            })
+    return {
+        "truck_route": get(state, b"truck_route") == b"true",
+        "hov3": get(state, b"hov_type") == b"HOV3",
+        "toll": get(state, b"toll") == b"true",
+        "motor_limits": limits,
     }
 
 
@@ -205,7 +248,7 @@ def dump(state, stream, rows):
                     if record is None or record[0] != identifier:
                         found = record[0] if record else "end of stream"
                         raise ValueError(f"expected ParseWays record {identifier}, saw {found}")
-                    fields = {**record[1], **raw_way_fields(raw)}
+                    fields = {**record[1], **raw_way_fields(raw), **motor_way_fields(state)}
             print(json.dumps({
                 "kind": kind, "id": identifier, "eligible": eligible,
                 "kept": kept, "attributes": fields,

@@ -9,6 +9,7 @@ const access = @import("access.zig");
 const bike_foot = @import("bike_foot.zig");
 const highway = @import("highway.zig");
 const selection = @import("selection.zig");
+const motor = @import("motor.zig");
 pub const speed = @import("speed.zig");
 pub const names = @import("names.zig");
 
@@ -43,6 +44,7 @@ pub fn transformWay(scratch: *Scratch, tags: anytype, deadline: io.Deadline) !?W
     };
     try highway.classify(scratch, selected, deadline, &result);
     try access.applyWay(scratch, selected, deadline, &result);
+    try motor.apply(scratch, deadline, &result);
     try bike_foot.applyWay(&result, scratch, selected, deadline);
     try speed.apply(&result, scratch, selected.road_class, deadline);
     return result;

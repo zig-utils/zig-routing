@@ -42,7 +42,12 @@ jobs:
       - run: zig build -Doptimize=ReleaseFast
       - name: Valhalla tag parity
         if: matrix.os == 'ubuntu-latest'
-        run: oracle/tag-goldens.sh compare
+        run: |
+          oracle/tag-goldens.sh compare
+          fixture=$(mktemp -d)
+          zig build gurka-pbf -- "$fixture/motor-vehicle.osm.pbf" motor-vehicle
+          zig-out/bin/zr tags dump "$fixture/motor-vehicle.osm.pbf" |
+            python3 oracle/tag-compare.py oracle/tag-goldens/motor-vehicle.jsonl.gz
       - name: Validate assembled fixture bundles
         if: matrix.os == 'ubuntu-latest'
         run: |

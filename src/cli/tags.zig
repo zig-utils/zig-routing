@@ -6,6 +6,7 @@ const constants = @import("../graph/constants.zig");
 const osm = @import("../build/osm.zig");
 const pbf = @import("../build/pbf/root.zig");
 const tags = @import("../build/tags/root.zig");
+const restriction = @import("../graph/access_restriction.zig");
 const way_shape = @import("../build/way_shape.zig");
 
 pub fn dump(gpa: std.mem.Allocator, path: []const u8, raw: bool, out: *io.Writer, deadline: io.Deadline) !void {
@@ -42,8 +43,16 @@ const NodeFields = struct {
     direction: bool = false,
     tagged_access: bool = false,
     private_access: bool = false,
+    cash_only_toll: bool = false,
     step_count: ?u32 = null,
     tactile_paving: ?[]const u8 = null,
+};
+
+const WayLimit = struct {
+    kind: restriction.Kind,
+    direction: restriction.Direction,
+    value: u64,
+    except_destination: bool,
 };
 
 const State = struct {
@@ -108,6 +117,7 @@ const State = struct {
             .direction = a.flags.direction,
             .tagged_access = a.flags.tagged_access,
             .private_access = a.flags.private_access,
+            .cash_only_toll = a.flags.cash_only_toll,
             .step_count = a.step_count,
             .tactile_paving = optionalName(a.tactile_paving),
         };
@@ -123,6 +133,15 @@ const State = struct {
         if (result) |selected| {
             const a = selected.attributes;
             const n = selected.names;
+            var limits: [restriction.max_per_way]WayLimit = undefined;
+            for (a.motor_limits.entries(), limits[0..a.motor_limits.len]) |entry, *limit| {
+                limit.* = .{
+                    .kind = entry.attr.kind,
+                    .direction = entry.attr.direction,
+                    .value = entry.value,
+                    .except_destination = entry.attr.except_destination,
+                };
+            }
             try self.record(.{
                 .kind = osm.Kind.way,
                 .id = way.id,
@@ -160,6 +179,10 @@ const State = struct {
                     .indoor = a.flags.indoor,
                     .destination_only = a.flags.destination_only,
                     .destination_only_hgv = a.flags.destination_only_hgv,
+                    .truck_route = a.flags.truck_route,
+                    .hov3 = a.flags.hov3,
+                    .toll = a.flags.toll,
+                    .motor_limits = limits[0..a.motor_limits.len],
                     .no_thru_traffic = a.flags.no_thru_traffic,
                     .tagged_speed = a.flags.tagged_speed,
                     .forward_tagged_speed = a.flags.forward_tagged_speed,

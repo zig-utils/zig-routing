@@ -46,9 +46,12 @@ pub fn fromWay(way: WayAttrs, forward: bool, drive_side: DriveSide) !EdgeClass {
             .use_sidepath = way.bicycle.use_sidepath,
             .shoulder = if (forward == right) way.flags.shoulder_right else way.flags.shoulder_left,
             .destination_only_hgv = way.flags.destination_only_hgv,
+            .truck_route = way.flags.truck_route,
+            .hov3 = way.flags.hov3,
             .indoor = way.flags.indoor,
             .tagged_speed = way.speedType() == .tagged,
         },
+        .detail = .{ .access_restriction = way.motor_limits.modes(forward) },
     };
 }
 

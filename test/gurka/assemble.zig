@@ -828,6 +828,61 @@ fn directedBetween(view: *const graph.reader.View, fixture: *const gurka.Map, fi
     return error.TestEdgeNotFound;
 }
 
+test "assembled motor vehicle limits follow the original way direction" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const fixture = try @import("examples.zig").motorVehicle(arena.allocator());
+    var result = try Built.assemble(fixture.osm, 2);
+    defer result.deinit();
+    const view = &result.bundle.view;
+    try view.verify(.none, null);
+    const ab = try directedBetween(view, &fixture, "A", "B");
+    const ba = try view.oppEdge(ab);
+    try testing.expectEqual(1, (try view.edge(ab)).cls.cold_checks);
+    try testing.expectEqual(0, (try view.edge(ba)).cls.cold_checks);
+    var ba_limits = (try view.coldRecord(ba)).restrictions();
+    try testing.expectEqual(null, ba_limits.next());
+
+    const Kind = graph.cold.access_restriction.Kind;
+    const bc = try directedBetween(view, &fixture, "B", "C");
+    const cb = try view.oppEdge(bc);
+    for ([_]format.EdgeId{ bc, cb }) |id| {
+        const edge = try view.edge(id);
+        const class = try view.class(edge.cls.class_id);
+        try testing.expectEqual(1, edge.cls.cold_checks);
+        try testing.expectEqual(Kind.maxheight.modes(), class.detail.access_restriction);
+        try testing.expect(class.flags.truck_route and class.flags.toll);
+        const record = try view.coldRecord(id);
+        try testing.expectEqual(1, record.indoor.layer);
+        try testing.expectEqualStrings("Restricted Street", (try (try view.names(id)).at(0)).text);
+        var limits = record.restrictions();
+        const expected = [_]struct { kind: Kind, value: u64 }{
+            .{ .kind = .hazmat, .value = 0 },
+            .{ .kind = .maxheight, .value = 500 },
+            .{ .kind = .maxwidth, .value = 300 },
+            .{ .kind = .maxlength, .value = 2500 },
+            .{ .kind = .maxweight, .value = 600 },
+            .{ .kind = .maxaxleload, .value = 1000 },
+            .{ .kind = .maxaxles, .value = 8 },
+            if (id == bc) .{ .kind = .maxheight, .value = 411 } else .{ .kind = .hazmat, .value = 1 },
+        };
+        for (expected) |want| {
+            const limit = limits.next().?;
+            try testing.expectEqual(want.kind, limit.attr.kind);
+            try testing.expectEqual(want.value, limit.value);
+            try testing.expectEqual(want.kind == .maxweight, limit.attr.except_destination);
+        }
+        try testing.expectEqual(null, limits.next());
+    }
+    const cd = try directedBetween(view, &fixture, "C", "D");
+    const hov = try view.class((try view.edge(cd)).cls.class_id);
+    const access: graph.constants.AccessMask = @bitCast(hov.access.forward);
+    try testing.expect(hov.flags.hov3 and hov.flags.destination_only_hgv);
+    try testing.expect(access.hov and !access.auto and access.motorcycle and access.moped);
+    const booth = try view.node(try at(view, fixture.findNode("C").?.location.toFixed()));
+    try testing.expect(booth.attr.cash_only_toll);
+}
+
 test "assembled gates and tolls retain shared costing attributes" {
     const base = routing.costing.base;
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);

@@ -41,6 +41,49 @@ pub fn intersection(arena: Allocator) !gurka.Map {
     });
 }
 
+// Ported from test/gurka/test_truck.cc (Valhalla 3.9.3). The middle
+// restrictions and the one-way clearance exercise storage in both directions.
+pub fn motorVehicle(arena: Allocator) !gurka.Map {
+    return gurka.Map.init(arena, try gurka.mapToCoordinates("A---B---C---D", 10), &.{
+        .{ .label = "AB", .tags = &.{
+            .{ .key = "highway", .value = "residential" },
+            .{ .key = "maxheight:forward", .value = "4" },
+        } },
+        .{ .label = "BC", .tags = &.{
+            .{ .key = "highway", .value = "residential" },
+            .{ .key = "name", .value = "Restricted Street" },
+            .{ .key = "layer", .value = "1" },
+            .{ .key = "maxheight", .value = "5" },
+            .{ .key = "maxheight:forward", .value = "13'6\"" },
+            .{ .key = "maxwidth", .value = "default" },
+            .{ .key = "maxwidth:physical", .value = "300 cm" },
+            .{ .key = "maxlength", .value = "25" },
+            .{ .key = "maxweight", .value = "12000 lb" },
+            .{ .key = "maxweight:conditional", .value = "none @ destination" },
+            .{ .key = "maxaxleload", .value = "10 tonnes" },
+            .{ .key = "maxaxles", .value = "8" },
+            .{ .key = "hazmat", .value = "destination" },
+            .{ .key = "hazmat:water:backward", .value = "yes" },
+            .{ .key = "hgv", .value = "designated" },
+            .{ .key = "toll", .value = "interval" },
+        } },
+        .{ .label = "CD", .tags = &.{
+            .{ .key = "highway", .value = "motorway" },
+            .{ .key = "oneway", .value = "yes" },
+            .{ .key = "hov", .value = "designated" },
+            .{ .key = "hov:minimum", .value = "3" },
+            .{ .key = "hov:lanes", .value = "designated|designated" },
+            .{ .key = "hgv", .value = "destination" },
+            .{ .key = "motorcycle", .value = "designated" },
+            .{ .key = "moped", .value = "designated" },
+        } },
+    }, &.{.{ .label = "C", .tags = &.{
+        .{ .key = "barrier", .value = "toll_booth" },
+        .{ .key = "payment:coins", .value = "yes" },
+        .{ .key = "payment:credit_cards", .value = "no" },
+    } }}, &.{});
+}
+
 test "fixture resolves labels, names and relation references" {
     var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer state.deinit();

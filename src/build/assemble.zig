@@ -393,12 +393,19 @@ const NodeEntry = extern struct {
     hot: format.NodeHot,
 };
 
+const access_restriction = graph.cold.access_restriction;
+const LimitEntry = extern struct {
+    way_id: i64,
+    limit: access_restriction.Entry,
+};
+
 comptime {
     std.debug.assert(@sizeOf(Way) == 72);
     std.debug.assert(@offsetOf(Way, "by_direction") == 0 and @offsetOf(Way, "speeds") == 40 and @offsetOf(Way, "attr") == 44);
     std.debug.assert(@offsetOf(Way, "level_start") == 48 and @offsetOf(Way, "name_end") == 68);
     std.debug.assert(@sizeOf(WayEntry) == 80 and @offsetOf(WayEntry, "way") == 8);
     std.debug.assert(@sizeOf(NodeEntry) == 16 and @offsetOf(NodeEntry, "hot") == 8);
+    std.debug.assert(@sizeOf(LimitEntry) == 24 and @offsetOf(LimitEntry, "way_id") == 0 and @offsetOf(LimitEntry, "limit") == 8);
 }
 
 const Ways = std.AutoHashMapUnmanaged(i64, Way);
@@ -412,6 +419,7 @@ pub const Metadata = struct {
     nodes: std.AutoHashMapUnmanaged(i64, format.NodeHot) = .empty,
     controls: std.AutoHashMapUnmanaged(i64, enhance.NodeControls) = .empty,
     ways: Ways = .empty,
+    motor_limits: std.AutoHashMapUnmanaged(i64, access_restriction.Set) = .empty,
 
     pub fn init(gpa: Allocator, options: Options) Metadata {
         return .{ .gpa = gpa, .drive_side = options.drive_side, .deadline = options.deadline, .strings = .init(gpa) };
@@ -489,6 +497,29 @@ pub const Metadata = struct {
         try names.sync();
         try tx.writeArray(self.name_ids.items, .name_refs);
         try tx.writeArray(self.levels.items, .levels);
+        if (self.motor_limits.count() != 0) try self.saveMotorLimits(tx);
+    }
+
+    fn saveMotorLimits(self: *const Metadata, tx: *checkpoint.Transaction) !void {
+        const file = try tx.create(.motor_limits);
+        defer file.close();
+        var rows: [256]LimitEntry = undefined;
+        var count: usize = 0;
+        var offset: u64 = 0;
+        var iter = self.motor_limits.iterator();
+        while (iter.next()) |entry| {
+            for (entry.value_ptr.entries()) |limit| {
+                rows[count] = .{ .way_id = entry.key_ptr.*, .limit = limit };
+                count += 1;
+                if (count != rows.len) continue;
+                if (self.deadline.expired()) return error.DeadlineExceeded;
+                try file.pwriteAll(std.mem.asBytes(&rows), offset);
+                offset += @sizeOf(@TypeOf(rows));
+                count = 0;
+            }
+        }
+        try file.pwriteAll(std.mem.sliceAsBytes(rows[0..count]), offset);
+        try file.sync();
     }
 
     pub fn loadWays(self: *Metadata, saved: checkpoint.Existing) !void {
@@ -526,12 +557,36 @@ pub const Metadata = struct {
                 return error.InvalidCheckpoint;
             try self.ways.put(self.gpa, entry.id, attrs);
         }
+        if (saved.manifest.files.get(.motor_limits) != null) {
+            const limits = try saved.map(.motor_limits, self.deadline);
+            defer limits.unmap();
+            for (try checkpoint.array(LimitEntry, limits), 0..) |entry, i| {
+                try checkDeadline(self.deadline, i);
+                if (!entry.limit.valid() or !self.ways.contains(entry.way_id)) return error.InvalidCheckpoint;
+                const set = try self.motor_limits.getOrPut(self.gpa, entry.way_id);
+                if (!set.found_existing) set.value_ptr.* = .{};
+                if (set.value_ptr.len == access_restriction.max_per_way) return error.InvalidCheckpoint;
+                set.value_ptr.items[set.value_ptr.len] = entry.limit;
+                set.value_ptr.len += 1;
+            }
+        }
+        var iter = self.ways.iterator();
+        var i: usize = 0;
+        while (iter.next()) |entry| : (i += 1) {
+            try checkDeadline(self.deadline, i);
+            const limits = self.motor_limits.getPtr(entry.key_ptr.*);
+            for (entry.value_ptr.by_direction, 0..) |class, dir| {
+                const modes = if (limits) |set| set.modes(dir == 0) else 0;
+                if (class.detail.access_restriction != modes) return error.InvalidCheckpoint;
+            }
+        }
     }
 
     pub fn deinit(self: *Metadata) void {
         self.nodes.deinit(self.gpa);
         self.controls.deinit(self.gpa);
         self.ways.deinit(self.gpa);
+        self.motor_limits.deinit(self.gpa);
         self.name_ids.deinit(self.gpa);
         self.levels.deinit(self.gpa);
         self.strings.deinit();
@@ -582,6 +637,7 @@ pub const Metadata = struct {
         }
         const entry = try self.ways.getOrPut(self.gpa, id);
         if (entry.found_existing) return error.DuplicateWay;
+        if (attrs.motor_limits.len != 0) try self.motor_limits.put(self.gpa, id, attrs.motor_limits);
         const indexed = try self.strings.indexWay(attrs, raw_tags, .{}, self.deadline);
         const name_start = try self.nameOffset();
         const ref_first = attrs.road_class == .motorway or attrs.road_class == .trunk;
@@ -1022,7 +1078,7 @@ const Job = struct {
                         .class_id = @intCast(@backingInt(try self.interner.intern(class))),
                         .local = @intCast(local),
                         .opp_local = @intCast(opposite.slot - topo.first_edge[opposite.node]),
-                        .cold_checks = 0,
+                        .cold_checks = @intFromBool(class.detail.access_restriction != 0),
                         .pred_speed = 0,
                     },
                     .speed = .{ if (direction == 0) way.speeds.forward else way.speeds.backward, 0, 0, way.speeds.truck },
@@ -1608,7 +1664,11 @@ fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *const Metadata, w
                 };
                 const shape = try segmentShape(shared.shape_points, seg);
                 try coverage.addShape(shape, writer.deadline);
-                break :blk try builder.append(@bitCast(seg.way_id), way.speeds.limit, mean, shape, active, indoor);
+                const limits = metadata.motor_limits.getPtr(seg.way_id);
+                break :blk try builder.appendFull(@bitCast(seg.way_id), way.speeds.limit, mean, shape, active, .{
+                    .indoor = indoor,
+                    .access_limits = if (limits) |set| set.entries() else &.{},
+                });
             } else try builder.append(0, 0, graph.cold.no_elevation, &.{ topo.coordinates[node], topo.coordinates[edge.head] }, &.{}, .{});
             index.data[slot] = graph.cold.directedIndex(record, reverse);
             index.data[opposite] = graph.cold.directedIndex(record, !reverse);

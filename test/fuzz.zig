@@ -14,7 +14,8 @@
 //! `node-store` (the build-time coordinate index format) and `graph-bundle`
 //! (section headers, checksums and typed topology access), and
 //! `build-checkpoint` (restart manifests), `valhalla-tile` (offline tile import),
-//! `costing-reference` (gate A samples and paths), and `speed-config` (default speed tables).
+//! `costing-reference` (gate A samples and paths), `speed-config` (default speed tables),
+//! and `motor-tags` (motor vehicle access and unit normalization).
 //!
 //! The contract for every parser: malformed input returns an error, never
 //! panics, overflows or reads out of bounds. The fuzz step builds ReleaseSafe
@@ -107,6 +108,8 @@ fn fuzzGraphBundle(baseline: *const graph.reader.Files, s: *Smith) !void {
         _ = view.wayId(edge) catch null;
         if (view.coldRecord(edge)) |record| {
             _ = try record.indoor.includes(0.5, .none);
+            var limits = record.restrictions();
+            while (limits.next()) |limit| try std.testing.expect(limit.valid());
         } else |_| {}
         _ = view.edgeSlopes(edge) catch null;
         if (view.shape(edge, gpa)) |shape| gpa.free(shape) else |_| {}
@@ -569,6 +572,33 @@ test "fuzz speed-config" {
         ",\"suburban\":" ++ table ++ ",\"urban\":" ++ table ++ "}]";
     const corpus = try seeds(state.allocator(), &.{ "", "[]", "00:01:30", good, good[0 .. good.len - 1] });
     try std.testing.fuzz({}, fuzzSpeedConfig, .{ .corpus = corpus });
+}
+
+fn fuzzMotorTags(_: void, s: *Smith) !void {
+    var buf: [max_input]u8 = undefined;
+    const input = draw(s, &buf, 0x6d6f_746f);
+    var scratch: routing.build.tags.Scratch = .{};
+    const tags: []const routing.build.osm.Tag = &.{
+        .{ .key = "highway", .value = "residential" },
+        .{ .key = "maxheight", .value = input },
+        .{ .key = "maxheight:forward", .value = input },
+        .{ .key = "maxaxles", .value = input },
+        .{ .key = "maxweight", .value = input },
+        .{ .key = "hazmat", .value = input },
+        .{ .key = "hgv", .value = input },
+    };
+    const way = (try routing.build.tags.transformWay(&scratch, tags, .none)).?;
+    for (way.motor_limits.entries()) |entry| try std.testing.expect(entry.valid());
+}
+
+test "fuzz motor-tags" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const corpus = try seeds(state.allocator(), &.{
+        "",      "3,25",                       "13'6\"",        "3000 l b s",  "5m6feet", "0x1.2p1",
+        "1e999", "99999999999999999999999.00", "no;designated", "destination",
+    });
+    try std.testing.fuzz({}, fuzzMotorTags, .{ .corpus = corpus });
 }
 
 const ProtoChild = protobuf.Message(&.{

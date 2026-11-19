@@ -25,7 +25,11 @@ pub fn applyWay(tags: *const Scratch, selected: Selection, deadline: io.Deadline
     if ((tags.get(.hov) != null and hov != .no) or tags.get(.@"hov:lanes") != null or
         tags.get(.@"hov:minimum") != null)
     {
-        if (try isHovOnly(tags, selected.roundabout, deadline)) {
+        const minimum = try hovMinimum(tags, deadline);
+        way.flags.hov3 = minimum == 3;
+        if (minimum != null and (selected.roundabout or defaults.single(.oneway, tags.id(.oneway)) != false) and
+            tags.get(.@"oneway:conditional") == null and tags.get(.@"access:conditional") == null)
+        {
             if (!selected.explicit.auto) {
                 forward.auto = false;
                 backward.auto = false;
@@ -69,22 +73,19 @@ pub fn applyWay(tags: *const Scratch, selected: Selection, deadline: io.Deadline
     way.backward_access = backward;
 }
 
-fn isHovOnly(tags: *const Scratch, roundabout: bool, deadline: io.Deadline) !bool {
+fn hovMinimum(tags: *const Scratch, deadline: io.Deadline) !?u2 {
     const minimum = tags.id(.@"hov:minimum");
-    if (tags.id(.hov) != .designated or (minimum != .@"2" and minimum != .@"3")) return false;
-    // Lua distinguishes a missing one-way value from the string "false".
-    if ((!roundabout and defaults.single(.oneway, tags.id(.oneway)) == false) or
-        tags.get(.@"oneway:conditional") != null or tags.get(.@"access:conditional") != null)
-        return false;
-    const lanes = tags.text(.@"hov:lanes") orelse return true;
+    if (tags.id(.hov) != .designated or (minimum != .@"2" and minimum != .@"3")) return null;
+    const count: u2 = if (minimum == .@"2") 2 else 3;
+    const lanes = tags.text(.@"hov:lanes") orelse return count;
     var start: usize = 0;
     for (lanes, 0..) |byte, i| {
         if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
         if (byte != '|') continue;
-        if (!std.mem.eql(u8, lanes[start..i], "designated")) return false;
+        if (!std.mem.eql(u8, lanes[start..i], "designated")) return null;
         start = i + 1;
     }
-    return std.mem.eql(u8, lanes[start..], "designated");
+    return if (std.mem.eql(u8, lanes[start..], "designated")) count else null;
 }
 
 /// The parser enables bicycle access for supported MTB grades, or when

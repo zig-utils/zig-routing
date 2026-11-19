@@ -101,7 +101,9 @@ zig-out/bin/zr parity costing BUNDLE costs.bin --out report.json
 ### OSM tag parity
 
 CI compares the normal build tag transform against compressed NDJSON goldens for the
-Liechtenstein and Utrecht extracts pinned in [datasets.tsv](datasets.tsv). To run the same check:
+Liechtenstein and Utrecht extracts pinned in [datasets.tsv](datasets.tsv). It also checks a
+Gurka fixture with directional limits, an HOV lane, and a cash-only toll booth. To compare
+the extracts:
 
 ```bash
 zig build -Doptimize=ReleaseFast
@@ -117,6 +119,8 @@ artifacts in `bench/results/` by default.
 ```bash
 oracle/tag-goldens.sh generate valhalla-3.9.3 liechtenstein oracle/tag-goldens/liechtenstein.jsonl.gz
 oracle/tag-goldens.sh generate valhalla-3.9.3 utrecht oracle/tag-goldens/utrecht.jsonl.gz
+zig build gurka-pbf -- bench/results/motor-vehicle.osm.pbf motor-vehicle
+oracle/tag-goldens.sh generate valhalla-3.9.3 bench/results/motor-vehicle.osm.pbf oracle/tag-goldens/motor-vehicle.jsonl.gz
 oracle/tag-goldens.sh generate valhalla-3.9.3 country.osm.pbf bench/results/country.jsonl.gz
 zig-out/bin/zr tags dump country.osm.pbf | python3 oracle/tag-compare.py bench/results/country.jsonl.gz --keep 10
 ```
@@ -134,6 +138,8 @@ pedestrian areas, and alternate names to exercise those fields. It disables infe
 to compare the explicit tag. The supplemental country speed label, bridge name, international cycle
 network, MTB scales, foot designation, step count, trail visibility, and tactile paving are
 projected from the original OSM tags because Valhalla has no corresponding parser fields.
+Motor limits come from the normalized Lua tags and use the parser's float-to-integer
+conversion. The direction in the dump refers to the original OSM way order.
 
 The comparator reports a count and up to `--keep` OSM IDs for each differing field. Only
 `way.attributes.use` with Valhalla `9` (`culdesac`) and Zig `0` (`road`) is allowed. Valhalla's
@@ -233,6 +239,11 @@ Shapes use E7 coordinate deltas with zigzag varints. The elevation slot starts a
 missing-data value, -500 m. Names and route refs borrow mapped bytes. Shape decoding writes
 in travel order into the caller's arena. Synthetic alias links have two coincident vertices
 and use way ID zero.
+
+An optional trailer holds static vehicle limits as integer centimetres, hundredths of
+the local ton, axle counts, and a hazmat allow flag. General and directional values
+can coexist in one record. The edge class carries the affected mode mask, and
+`EdgeHot.cls.cold_checks` indicates when that direction has limits to read.
 
 The assembly check verifies each opposing pair's cold index and shape endpoints, and reads
 every name reference. `cold_bytes_per_directed_edge` includes both cold section payloads,

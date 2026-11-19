@@ -4,6 +4,7 @@ const std = @import("std");
 const io = @import("../infra/io.zig");
 const point = @import("../geo/point.zig");
 const polyline = @import("../geo/polyline.zig");
+pub const access_restriction = @import("access_restriction.zig");
 const Allocator = std.mem.Allocator;
 
 pub const chunk_size = 256;
@@ -42,6 +43,17 @@ const IndoorHeader = extern struct {
     },
 };
 
+/// A legacy reverse-name header is a bare u32 count in 0..255. The
+/// high bits allow a restriction trailer with either kind of name list.
+const ReverseHeader = extern struct {
+    attr: packed struct(u32) {
+        name_count: u8,
+        reserved: u22 = 0,
+        inherit_names: bool = false,
+        restrictions: bool = false,
+    },
+};
+
 pub const LevelRange = extern struct {
     bounds: packed struct(u64) {
         first: f32,
@@ -70,6 +82,7 @@ comptime {
     std.debug.assert(@import("builtin").target.cpu.arch.endian() == .little);
     std.debug.assert(@sizeOf(IndoorHeader) == 4);
     std.debug.assert(@offsetOf(IndoorHeader, "attributes") == 0);
+    std.debug.assert(@sizeOf(ReverseHeader) == 4 and @offsetOf(ReverseHeader, "attr") == 0);
     std.debug.assert(@sizeOf(LevelRange) == 8);
     std.debug.assert(@offsetOf(LevelRange, "bounds") == 0);
     std.debug.assert(@sizeOf(Header) == 16);
@@ -193,6 +206,7 @@ pub const Record = struct {
     references: []const u8,
     reverse_references: ?[]const u8 = null,
     indoor: Indoor,
+    access_limits: []align(1) const access_restriction.Entry = &.{},
 
     fn parse(bytes: []const u8, reverse: bool) !Record {
         if (bytes.len < @sizeOf(RecordHeader)) return error.TruncatedColdRecord;
@@ -205,18 +219,31 @@ pub const Record = struct {
         const end = @as(usize, header.shape_bytes) + ref_bytes;
         const trailer = data[end..];
         var reverse_references: ?[]const u8 = null;
+        var access_limits: []align(1) const access_restriction.Entry = &.{};
         const indoor: Indoor = if (trailer.len == 0) .{} else blk: {
             if (trailer.len < @sizeOf(IndoorHeader)) return error.InvalidColdIndoorData;
             const info = std.mem.bytesToValue(IndoorHeader, trailer[0..@sizeOf(IndoorHeader)]).attributes;
             const payload = trailer[@sizeOf(IndoorHeader)..];
             const size = @as(usize, info.count) * @sizeOf(LevelRange);
             if (size > payload.len) return error.InvalidColdIndoorData;
-            const reverse_names = payload[size..];
-            if (reverse_names.len != 0) {
-                if (reverse_names.len < @sizeOf(u32)) return error.InvalidColdReverseNames;
-                const count = readInt(u32, reverse_names, 0);
-                if (count > max_names or reverse_names.len != (@as(usize, count) + 1) * @sizeOf(u32)) return error.InvalidColdReverseNames;
-                reverse_references = reverse_names[@sizeOf(u32)..];
+            const extra = payload[size..];
+            if (extra.len != 0) {
+                if (extra.len < @sizeOf(ReverseHeader)) return error.InvalidColdReverseNames;
+                const rev = std.mem.bytesToValue(ReverseHeader, extra[0..@sizeOf(ReverseHeader)]).attr;
+                const refs_end = @sizeOf(ReverseHeader) + @as(usize, rev.name_count) * @sizeOf(u32);
+                if (rev.reserved != 0 or refs_end > extra.len or
+                    (rev.inherit_names and (!rev.restrictions or rev.name_count != 0)))
+                    return error.InvalidColdReverseNames;
+                if (!rev.inherit_names) reverse_references = extra[@sizeOf(ReverseHeader)..refs_end];
+                const limit_bytes = extra[refs_end..];
+                if (rev.restrictions) {
+                    const size_of_entry = @sizeOf(access_restriction.Entry);
+                    if (limit_bytes.len == 0 or limit_bytes.len % size_of_entry != 0 or
+                        limit_bytes.len / size_of_entry > access_restriction.max_per_way)
+                        return error.InvalidColdAccessLimits;
+                    access_limits = std.mem.bytesAsSlice(access_restriction.Entry, limit_bytes);
+                    for (access_limits) |entry| if (!entry.valid()) return error.InvalidColdAccessLimits;
+                } else if (limit_bytes.len != 0) return error.InvalidColdReverseNames;
             }
             break :blk .{ .layer = info.layer, .levels = std.mem.bytesAsSlice(LevelRange, payload[0..size]) };
         };
@@ -227,6 +254,7 @@ pub const Record = struct {
             .references = data[header.shape_bytes..end],
             .reverse_references = reverse_references,
             .indoor = indoor,
+            .access_limits = access_limits,
         };
     }
 
@@ -244,6 +272,24 @@ pub const Record = struct {
 
     pub fn names(self: Record, table: View) Names {
         return .{ .table = table, .references = if (self.reverse) self.reverse_references orelse self.references else self.references };
+    }
+
+    pub const Limits = struct {
+        remaining: []align(1) const access_restriction.Entry,
+        forward: bool,
+
+        pub fn next(self: *Limits) ?access_restriction.Entry {
+            while (self.remaining.len != 0) {
+                const entry = self.remaining[0];
+                self.remaining = self.remaining[1..];
+                if (entry.applies(self.forward)) return entry;
+            }
+            return null;
+        }
+    };
+
+    pub fn restrictions(self: Record) Limits {
+        return .{ .remaining = self.access_limits, .forward = !self.reverse };
     }
 
     pub fn shape(self: Record, arena: Allocator, deadline: io.Deadline) ![]point.FixedLL {
@@ -275,7 +321,22 @@ pub fn appendRecord(out: *std.ArrayList(u8), allocator: Allocator, way_id: u64, 
 /// encoded shape. Such records store a count and references after the
 /// indoor data, including an indoor header when there are no levels.
 pub fn appendDirectionalRecord(out: *std.ArrayList(u8), allocator: Allocator, way_id: u64, speed_limit: u8, mean_elevation: i16, vertices: []const point.FixedLL, refs: []const u32, reverse_refs: ?[]const u32, indoor: Indoor, deadline: io.Deadline) !void {
+    return appendFullRecord(out, allocator, way_id, speed_limit, mean_elevation, vertices, refs, .{
+        .reverse_refs = reverse_refs,
+        .indoor = indoor,
+    }, deadline);
+}
+
+pub const Trailer = struct {
+    reverse_refs: ?[]const u32 = null,
+    indoor: Indoor = .{},
+    access_limits: []const access_restriction.Entry = &.{},
+};
+
+pub fn appendFullRecord(out: *std.ArrayList(u8), allocator: Allocator, way_id: u64, speed_limit: u8, mean_elevation: i16, vertices: []const point.FixedLL, refs: []const u32, trailer: Trailer, deadline: io.Deadline) !void {
     if (vertices.len < 2) return error.IncompleteShape;
+    if (trailer.access_limits.len > access_restriction.max_per_way) return error.InvalidColdAccessLimits;
+    for (trailer.access_limits) |entry| if (!entry.valid()) return error.InvalidColdAccessLimits;
     const point_count = std.math.cast(u32, vertices.len) orelse return error.ShapeTooLarge;
     const name_count = std.math.cast(u8, refs.len) orelse return error.TooManyEdgeNames;
     const start = out.items.len;
@@ -290,7 +351,10 @@ pub fn appendDirectionalRecord(out: *std.ArrayList(u8), allocator: Allocator, wa
     }
     const shape_bytes = std.math.cast(u32, out.items.len - start - @sizeOf(RecordHeader)) orelse return error.ShapeTooLarge;
     try out.appendSlice(allocator, std.mem.sliceAsBytes(refs));
-    if (indoor.layer != 0 or indoor.levels.len != 0 or reverse_refs != null) {
+    const indoor = trailer.indoor;
+    const has_limits = trailer.access_limits.len != 0;
+    const has_reverse_header = trailer.reverse_refs != null or has_limits;
+    if (indoor.layer != 0 or indoor.levels.len != 0 or has_reverse_header) {
         const count = std.math.cast(u24, indoor.levels.len) orelse return error.TooManyLevels;
         const indoor_header: IndoorHeader = .{ .attributes = .{ .layer = indoor.layer, .count = count } };
         try out.appendSlice(allocator, std.mem.asBytes(&indoor_header));
@@ -299,11 +363,16 @@ pub fn appendDirectionalRecord(out: *std.ArrayList(u8), allocator: Allocator, wa
             try out.appendSlice(allocator, std.mem.asBytes(range));
         }
     }
-    if (reverse_refs) |names| {
-        if (names.len > max_names) return error.TooManyEdgeNames;
-        const count: u32 = @intCast(names.len);
-        try out.appendSlice(allocator, std.mem.asBytes(&count));
+    if (has_reverse_header) {
+        const names = trailer.reverse_refs orelse &.{};
+        const reverse_header: ReverseHeader = .{ .attr = .{
+            .name_count = std.math.cast(u8, names.len) orelse return error.TooManyEdgeNames,
+            .inherit_names = trailer.reverse_refs == null,
+            .restrictions = has_limits,
+        } };
+        try out.appendSlice(allocator, std.mem.asBytes(&reverse_header));
         try out.appendSlice(allocator, std.mem.sliceAsBytes(names));
+        try out.appendSlice(allocator, std.mem.sliceAsBytes(trailer.access_limits));
     }
     const header: RecordHeader = .{
         .way_low = @truncate(way_id),
@@ -345,6 +414,36 @@ test "cold record preserves an E7 shape over 64 KiB and 255 name references" {
     defer arena.free(reversed);
     std.mem.reverse(point.FixedLL, reversed);
     try testing.expectEqualSlices(point.FixedLL, vertices, reversed);
+}
+
+test "motor limits share a cold record with independent reverse names" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(allocator);
+    const vertices: [2]point.FixedLL = .{ .{ .lat = 3, .lng = 4 }, .{ .lat = 5, .lng = 6 } };
+    const entries: [2]access_restriction.Entry = .{
+        .{ .value = 380, .attr = .{ .kind = .maxheight, .direction = .both } },
+        .{ .value = 0, .attr = .{ .kind = .hazmat, .direction = .backward } },
+    };
+    try appendFullRecord(&bytes, allocator, 1, 0, no_elevation, &vertices, &.{17}, .{
+        .reverse_refs = &.{23},
+        .access_limits = &entries,
+    }, .none);
+    const forward = try Record.parse(bytes.items, false);
+    const backward = try Record.parse(bytes.items, true);
+    try testing.expectEqual(17, readInt(u32, forward.references, 0));
+    try testing.expectEqual(23, readInt(u32, backward.reverse_references.?, 0));
+    var f = forward.restrictions();
+    var r = backward.restrictions();
+    try testing.expectEqual(entries[0], f.next().?);
+    try testing.expectEqual(null, f.next());
+    try testing.expectEqual(entries[0], r.next().?);
+    try testing.expectEqual(entries[1], r.next().?);
+    try testing.expectEqual(null, r.next());
+    try testing.expectError(error.InvalidColdAccessLimits, Record.parse(bytes.items[0 .. bytes.items.len - 1], false));
+    bytes.items[bytes.items.len - 1] = 0x80;
+    try testing.expectError(error.InvalidColdAccessLimits, Record.parse(bytes.items, false));
 }
 
 test "cold directory locates the last record in a full chunk and the following chunk" {

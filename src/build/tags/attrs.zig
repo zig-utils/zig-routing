@@ -75,6 +75,7 @@ pub const WayAttrs = struct {
     turn_lanes: TurnLanes = .{},
     bicycle: BicycleAttrs = .{},
     pedestrian: PedestrianAttrs = .{},
+    motor_limits: @import("../../graph/access_restriction.zig").Set = .{},
 
     pub const TurnLanes = struct {
         general: ?[]const u8 = null,
@@ -129,7 +130,9 @@ pub const WayAttrs = struct {
         tagged_internal_intersection: bool = false,
         destination_only_hgv: bool = false,
         toll: bool = false,
-        reserved: u3 = 0,
+        truck_route: bool = false,
+        hov3: bool = false,
+        reserved: u1 = 0,
     };
 };
 
