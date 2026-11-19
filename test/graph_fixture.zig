@@ -56,6 +56,7 @@ pub fn records(comptime kind: format.SectionKind) []const kind.Record() {
         .slopes => &slopes,
         .spatial => spatial,
         .metadata => &metadata,
+        .components => &.{ 0, 0 },
     };
 }
 

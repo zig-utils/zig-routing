@@ -97,6 +97,7 @@ pub const SectionKind = enum(u32) {
     slopes = 9,
     spatial = 10,
     metadata = 11,
+    components = 12,
 
     pub fn filename(self: SectionKind) [:0]const u8 {
         return switch (self) {
@@ -111,6 +112,7 @@ pub const SectionKind = enum(u32) {
             .slopes => "slopes.bin",
             .spatial => "spatial.bin",
             .metadata => "metadata.bin",
+            .components => "components.bin",
         };
     }
 
@@ -127,6 +129,7 @@ pub const SectionKind = enum(u32) {
             .slopes => u16,
             .spatial => u8,
             .metadata => Metadata,
+            .components => u32,
         };
     }
 

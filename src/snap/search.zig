@@ -6,6 +6,8 @@ const grid = @import("../geo/grid.zig");
 const meters_per_degree_lat = @import("../geo/constants.zig").meters_per_degree_lat;
 const graph = @import("../graph/root.zig");
 const request = @import("../api/request.zig");
+const Reach = @import("reach.zig");
+const paged = @import("../search/paged.zig");
 const Deadline = @import("../infra/io.zig").Deadline;
 const Allocator = std.mem.Allocator;
 const EdgeId = graph.format.EdgeId;
@@ -14,6 +16,8 @@ const Use = graph.constants.Use;
 pub const Defaults = struct {
     radius: u32 = 0,
     max_radius: u32 = 200,
+    minimum_reachability: u32 = 50,
+    max_reachability: u32 = 100,
     search_cutoff: u32 = 35_000,
     heading_tolerance: i32 = 60,
     node_snap_tolerance: f32 = 5,
@@ -41,6 +45,7 @@ pub const PathEdge = struct {
     distance: f64,
     percent_along: f32,
     heading: f32,
+    reach: Reach.Counts = .{},
     side: Side = .none,
     node: enum { none, begin, end } = .none,
 };
@@ -51,24 +56,7 @@ pub const PathLocation = struct {
     rank_candidates: bool,
 };
 
-pub const DirectedEdge = struct {
-    graph_view: *const graph.reader.View,
-    id: EdgeId,
-    hot: *const graph.format.EdgeHot,
-    class: *const graph.class_table.EdgeClass,
-    reverse: bool,
-
-    fn read(view: *const graph.reader.View, id: EdgeId) !DirectedEdge {
-        const hot = try view.edge(id);
-        return .{
-            .graph_view = view,
-            .id = id,
-            .hot = hot,
-            .class = try view.class(hot.cls.class_id),
-            .reverse = view.cold_idx.?[@backingInt(id)] >> 31 != 0,
-        };
-    }
-};
+pub const DirectedEdge = @import("edge.zig").DirectedEdge;
 
 /// Access-only predicate for graph inspection. Cost models supply their own
 /// concrete allowed predicate. An optional closed method checks active
@@ -80,6 +68,9 @@ pub const Access = struct {
     pub fn allowed(self: Access, edge: DirectedEdge) bool {
         const access = edge.class.access.forward;
         return access & @as(u16, @bitCast(self.mask)) != 0;
+    }
+    pub fn allowedNode(self: Access, node: *const graph.format.NodeHot) bool {
+        return node.attr.access & @as(u16, @bitCast(self.mask)) != 0;
     }
 };
 
@@ -189,6 +180,34 @@ fn incidentRank(edge: DirectedEdge) u5 {
 /// Graph reads and costing are shared with routing. All transient storage
 /// comes from the caller's request arena.
 pub fn search(view: *const graph.reader.View, arena: Allocator, location: request.Location, defaults: Defaults, costing: anytype, deadline: Deadline) !PathLocation {
+    const threshold = thresholds(location, defaults);
+    var finder: Reach.Finder = .{
+        .view = view,
+        .arena = arena,
+        .limit = @max(threshold.inbound, threshold.outbound),
+        .deadline = deadline,
+    };
+    return searchWithReach(&finder, location, defaults, costing);
+}
+
+pub fn thresholds(location: request.Location, defaults: Defaults) Reach.Counts {
+    if (location.minimum_reachability) |common| {
+        const limit = @min(common, defaults.max_reachability);
+        return .{ .inbound = limit, .outbound = limit };
+    }
+    if (location.minimum_inbound_reachability != null or location.minimum_outbound_reachability != null) {
+        return .{
+            .inbound = @min(location.minimum_inbound_reachability orelse 0, defaults.max_reachability),
+            .outbound = @min(location.minimum_outbound_reachability orelse 0, defaults.max_reachability),
+        };
+    }
+    return .{ .inbound = defaults.minimum_reachability, .outbound = defaults.minimum_reachability };
+}
+
+pub fn searchWithReach(finder: *Reach.Finder, location: request.Location, defaults: Defaults, costing: anytype) !PathLocation {
+    const view = finder.view;
+    const arena = finder.arena;
+    const deadline = finder.deadline;
     if (deadline.expired()) return error.DeadlineExceeded;
     if (view.cold_idx == null or view.coordinates == null or view.classes == null) return error.MissingSnapData;
     const index = view.spatial_index orelse return error.MissingSnapData;
@@ -205,8 +224,9 @@ pub fn search(view: *const graph.reader.View, arena: Allocator, location: reques
         .approx = .init(point),
         .cutoff = cutoff,
         .radius = @floatFromInt(@min(location.radius orelse defaults.radius, defaults.max_radius)),
+        .required = thresholds(location, defaults),
     };
-    var work: Work = .{ .query = state };
+    var work: Work = .{ .query = state, .finder = finder };
     defer work.deinit();
     try work.find(index, view, costing);
     return work.finish(costing);
@@ -221,6 +241,7 @@ const Query = struct {
     approx: geo.DistanceApproximator,
     cutoff: f64,
     radius: f64,
+    required: Reach.Counts,
 
     fn check(self: Query) error{DeadlineExceeded}!void {
         if (self.deadline.expired()) return error.DeadlineExceeded;
@@ -280,13 +301,32 @@ const Query = struct {
     }
 };
 
-const Work = struct {
-    query: Query,
-    fixed: std.ArrayList(geo.FixedLL) = .empty,
-    shape: std.ArrayList(geo.PointLL) = .empty,
-    seen: std.AutoHashMapUnmanaged(EdgeId, void) = .empty,
+const Batch = struct {
     hits: std.PriorityQueue(Hit, void, Hit.compare) = .initContext({}),
     nearest: ?Hit = null,
+
+    fn retain(self: *Batch, arena: Allocator, hit: Hit, in_radius: bool) !void {
+        if (in_radius) try self.hits.push(arena, hit);
+        if (self.nearest == null or Hit.compare({}, hit, self.nearest.?) == .lt) self.nearest = hit;
+    }
+
+    fn fillNearest(self: *Batch, arena: Allocator) !void {
+        if (self.hits.peek() == null) if (self.nearest) |nearest| try self.hits.push(arena, nearest);
+    }
+};
+
+const projected_flag = 1;
+const correlated_flag = 2;
+
+const Work = struct {
+    query: Query,
+    finder: *Reach.Finder,
+    fixed: std.ArrayList(geo.FixedLL) = .empty,
+    shape: std.ArrayList(geo.PointLL) = .empty,
+    seen: paged.Array(u8, 0) = .{},
+    eligible: Batch = .{},
+    fallback: Batch = .{},
+    closest_external: f64 = std.math.inf(f64),
     edges: std.ArrayList(PathEdge) = .empty,
     filtered: std.ArrayList(PathEdge) = .empty,
     through_ends: std.ArrayList(PathEdge) = .empty,
@@ -298,8 +338,8 @@ const Work = struct {
         self.through_ends.deinit(arena);
         self.fixed.deinit(arena);
         self.shape.deinit(arena);
-        self.seen.deinit(arena);
-        self.hits.deinit(arena);
+        self.eligible.hits.deinit(arena);
+        self.fallback.hits.deinit(arena);
     }
 
     fn decode(self: *Work, edge: DirectedEdge) ![]const geo.PointLL {
@@ -330,15 +370,16 @@ const Work = struct {
             while (cells.next()) |cell| {
                 try q.check();
                 if (cell.distance <= scanned) continue;
-                if (self.nearest) |nearest| {
+                if (self.eligible.nearest) |nearest| {
                     const needed = @max(q.radius, @sqrt(nearest.projection.squared)) + padding;
                     if (cell.distance > needed) return;
                 }
                 var edges = cell.cell.edges();
                 while (try edges.next()) |id| {
                     try q.check();
-                    const found = try self.seen.getOrPut(q.arena, id);
-                    if (found.found_existing) continue;
+                    const status = try self.seen.at(q.arena, @backingInt(id));
+                    if (status.* & projected_flag != 0) continue;
+                    status.* |= projected_flag;
                     const edge = try DirectedEdge.read(view, id);
                     const opposite = try DirectedEdge.read(view, try view.oppEdge(id));
                     const forward_allowed = try q.allows(costing, edge);
@@ -346,15 +387,41 @@ const Work = struct {
                     if (!forward_allowed and !reverse_allowed) continue;
                     const projection = try project(q.approx, try self.decode(edge), q.deadline);
                     const in_radius = projection.squared < q.radius * q.radius;
-                    if (!in_radius and self.nearest != null and projection.squared > self.nearest.?.projection.squared) continue;
+                    // Reachable candidates outside the retained radius can
+                    // tighten the distance at which an island is discarded.
+                    if (!in_radius and self.eligible.nearest != null and
+                        projection.squared > self.eligible.nearest.?.projection.squared and
+                        (self.fallback.nearest == null or projection.squared >= self.closest_external)) continue;
                     if (q.point.distance(projection.point) > q.cutoff) continue;
-                    const hit = try self.orderHit(projection, edge, opposite, forward_allowed, reverse_allowed);
-                    if (in_radius) try self.hits.push(q.arena, hit);
-                    if (self.nearest == null or Hit.compare({}, hit, self.nearest.?) == .lt) self.nearest = hit;
+                    var hit = try self.orderHit(projection, edge, opposite, forward_allowed, reverse_allowed);
+                    var allowed = (try self.finder.counts(hit.edge.id, costing)).satisfies(q.required);
+                    const twin = if (hit.edge.id == edge.id) opposite else edge;
+                    const twin_allowed = if (hit.edge.id == edge.id) reverse_allowed else forward_allowed;
+                    if (!allowed and twin_allowed and (try self.finder.counts(twin.id, costing)).satisfies(q.required)) {
+                        hit.edge = twin;
+                        allowed = true;
+                    }
+                    if (allowed) {
+                        if (self.eligible.nearest) |nearest| {
+                            const previous = nearest.projection.squared;
+                            if (projection.squared < self.closest_external) {
+                                if (previous >= q.radius * q.radius and projection.squared < previous) {
+                                    self.closest_external = previous;
+                                } else if (!in_radius and projection.squared >= previous) {
+                                    self.closest_external = projection.squared;
+                                }
+                            }
+                        } else {
+                            self.closest_external = projection.squared;
+                        }
+                        try self.eligible.retain(q.arena, hit, in_radius);
+                    } else {
+                        try self.fallback.retain(q.arena, hit, in_radius);
+                    }
                 }
             }
             if (extent == limit) return;
-            if (self.nearest) |nearest| {
+            if (self.eligible.nearest) |nearest| {
                 if (extent >= @max(q.radius, @sqrt(nearest.projection.squared)) + padding) return;
             }
             scanned = extent;
@@ -389,11 +456,14 @@ const Work = struct {
 
     fn finish(self: *Work, costing: anytype) !PathLocation {
         const q = self.query;
-        self.seen.clearRetainingCapacity();
-        if (self.hits.peek() == null) {
-            if (self.nearest) |nearest| try self.hits.push(q.arena, nearest);
+        try self.eligible.fillNearest(q.arena);
+        try self.fallback.fillNearest(q.arena);
+        while (self.fallback.hits.pop()) |hit| {
+            try q.check();
+            if (hit.projection.squared > self.closest_external) break;
+            try self.eligible.hits.push(q.arena, hit);
         }
-        while (self.hits.pop()) |hit| {
+        while (self.eligible.hits.pop()) |hit| {
             try q.check();
             try self.correlate(costing, hit);
         }
@@ -408,10 +478,13 @@ const Work = struct {
         };
     }
 
-    fn append(self: *Work, edge: PathEdge, opposite: DirectedEdge) !void {
+    fn append(self: *Work, input: PathEdge, opposite: DirectedEdge, costing: anytype) !void {
         const q = self.query;
-        const seen = try self.seen.getOrPut(q.arena, edge.id);
-        if (seen.found_existing) return;
+        const status = try self.seen.at(q.arena, @backingInt(input.id));
+        if (status.* & correlated_flag != 0) return;
+        status.* |= correlated_flag;
+        var edge = input;
+        edge.reach = try self.finder.counts(edge.id, costing);
         const output = if (try q.softFilter(edge, opposite)) &self.filtered else if (edge.node == .end and
             q.location.heading != null and (q.location.type == .through or q.location.type == .break_through))
             &self.through_ends
@@ -454,7 +527,7 @@ const Work = struct {
             .percent_along = @floatCast(ratio),
             .heading = angle,
             .side = side,
-        }, opposite);
+        }, opposite, costing);
         if (try q.allows(costing, opposite)) try self.append(.{
             .id = opposite.id,
             .projected = projection.point,
@@ -462,27 +535,12 @@ const Work = struct {
             .percent_along = @floatCast(1 - ratio),
             .heading = reverseHeading(angle),
             .side = side.opposite(),
-        }, edge);
+        }, edge, costing);
     }
 
     fn edgeHeading(deadline: Deadline, edge: DirectedEdge, shape: []const geo.PointLL, segment: usize, projected: geo.PointLL) !f32 {
         const category = edge.class.category;
         return line.tangentAngle(shape, segment, projected, graph.constants.headingOffset(category.road_class, category.use), !edge.reverse, deadline);
-    }
-
-    // Connector arcs join consecutive CSR aliases of a high-degree OSM node.
-    fn alias(view: *const graph.reader.View, node: u32, forward: bool) !?u32 {
-        const range = try view.outEdgeRange(@fromBackingInt(node));
-        if (range.end == range.first) return null;
-        const target = if (forward) node +| 1 else node -| 1;
-        var i = range.end;
-        while (i > range.first) {
-            i -= 1;
-            const edge = try view.edge(@fromBackingInt(i));
-            if (!(try view.class(edge.cls.class_id)).flags.node_connector) return null;
-            if (edge.head == target and target != node) return target;
-        }
-        return null;
     }
 
     const NodeEdge = struct {
@@ -502,7 +560,7 @@ const Work = struct {
         const point = (try view.coordinate(@fromBackingInt(node_id))).toPoint();
         const distance = q.point.distance(point);
         var node = node_id;
-        while (try alias(view, node, false)) |prev| {
+        while (try view.aliasNeighbor(node, false)) |prev| {
             try q.check();
             node = prev;
         }
@@ -517,7 +575,7 @@ const Work = struct {
                 const other_level = hierarchyLevel(edge);
                 try arcs.push(q.arena, .{ .edge = edge, .level = if (level == other_level) 0 else other_level + 1, .rank = incidentRank(edge) });
             }
-            node = (try alias(view, node, true)) orelse break;
+            node = (try view.aliasNeighbor(node, true)) orelse break;
         }
         while (arcs.pop()) |arc| {
             try q.check();
@@ -526,7 +584,7 @@ const Work = struct {
             const outgoing = try q.allows(costing, edge);
             const incoming = try q.allows(costing, opposite);
             if (!outgoing and !incoming) continue;
-            if (self.seen.contains(edge.id) and self.seen.contains(opposite.id)) continue;
+            if (self.seen.get(@backingInt(edge.id)) & self.seen.get(@backingInt(opposite.id)) & correlated_flag != 0) continue;
             const shape = try self.decode(edge);
             const segment = if (edge.reverse) shape.len - 2 else 0;
             const heading = try edgeHeading(q.deadline, edge, shape, segment, projected);
@@ -537,7 +595,7 @@ const Work = struct {
                 .percent_along = 0,
                 .node = .begin,
                 .heading = heading,
-            }, opposite);
+            }, opposite, costing);
             if (incoming) try self.append(.{
                 .id = opposite.id,
                 .projected = point,
@@ -545,7 +603,7 @@ const Work = struct {
                 .percent_along = 1,
                 .node = .end,
                 .heading = reverseHeading(heading),
-            }, edge);
+            }, edge, costing);
         }
     }
 };

@@ -83,6 +83,8 @@ pub const Location = struct {
     preferred_layer: ?i32 = null,
     node_snap_tolerance: ?f32 = null,
     minimum_reachability: ?u32 = null,
+    minimum_inbound_reachability: ?u32 = null,
+    minimum_outbound_reachability: ?u32 = null,
     radius: ?u32 = null,
     accuracy: ?u32 = null,
     time: f64 = -1,
@@ -713,6 +715,8 @@ fn parseLocation(r: json.Value, o: *const Options) ?Location {
     loc.preferred_layer = json.getOptional(i32, r, "/preferred_layer");
     loc.node_snap_tolerance = json.getOptional(f32, r, "/node_snap_tolerance");
     loc.minimum_reachability = json.getOptional(u32, r, "/minimum_reachability");
+    loc.minimum_inbound_reachability = json.getOptional(u32, r, "/minimum_inbound_reachability");
+    loc.minimum_outbound_reachability = json.getOptional(u32, r, "/minimum_outbound_reachability");
     loc.radius = json.getOptional(u32, r, "/radius");
     loc.accuracy = json.getOptional(u32, r, "/accuracy");
     loc.time = json.get(f64, r, "/time", -1);

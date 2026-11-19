@@ -107,6 +107,7 @@ pub const Artifact = enum {
     bundle_slopes,
     bundle_spatial,
     bundle_metadata,
+    bundle_components,
 
     fn filename(self: Artifact) [:0]const u8 {
         return switch (self) {
@@ -130,11 +131,26 @@ pub const Manifest = struct {
 
     pub fn parse(allocator: Allocator, bytes: []const u8) !Manifest {
         if (bytes.len > manifest_limit) return error.InvalidCheckpoint;
-        const decoded = try std.json.parseFromSlice(Manifest, allocator, bytes, .{});
+        const Disk = struct {
+            version: u32,
+            identity: format.DatasetUuid,
+            parent: ?u64,
+            metric: Metric,
+            files: struct { values: []const ?Fingerprint },
+        };
+        const decoded = try std.json.parseFromSlice(Disk, allocator, bytes, .{});
         defer decoded.deinit();
-        const manifest = decoded.value;
-        if (manifest.version != 1 or !std.math.isFinite(manifest.metric.rows_per_second) or manifest.metric.rows_per_second < 0)
+        const stored = decoded.value;
+        if (stored.version != 1 or !std.math.isFinite(stored.metric.rows_per_second) or stored.metric.rows_per_second < 0)
             return error.InvalidCheckpoint;
+        var manifest: Manifest = .{
+            .identity = stored.identity,
+            .parent = stored.parent,
+            .metric = stored.metric,
+            .files = .initFill(null),
+        };
+        if (stored.files.values.len > manifest.files.values.len) return error.InvalidCheckpoint;
+        @memcpy(manifest.files.values[0..stored.files.values.len], stored.files.values);
         return manifest;
     }
 

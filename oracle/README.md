@@ -343,6 +343,14 @@ ReleaseFast). Utrecht's 15 differences involve `motorroad=yes` access, covered b
 | Liechtenstein | 2,404 / 2,404 | 100.00% | 8.291 µs | 41.584 µs | 89.125 µs |
 | Utrecht | 2,406 / 2,421 | 99.38% | 9.083 µs | 22.292 µs | 34.500 µs |
 
+New bundles include `components.bin`, a weak component ID per dense node.
+Snap reach is directional and bounded by the request minimum (50 by default,
+with explicit values capped at 100). The lookup uses request-local paged
+status for directed arcs and logical nodes. The route preflight takes both
+accepted and heading or side fallback candidates into account. It reports
+Valhalla error 171 when a location has no candidate and 170 when the locations
+share no weak component. A shared component still requires a directed path.
+
 ### HTTP and route checks
 
 `compare-height.ts` sends the same random `/height` requests (shapes, encoded polylines at

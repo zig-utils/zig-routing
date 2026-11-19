@@ -72,6 +72,7 @@ pub const View = struct {
     spatial: ?[]const u8,
     spatial_index: ?spatial.View,
     metadata: ?[]const format.Metadata,
+    components: ?[]const u32,
 
     pub fn parse(files: Files, diagnostic: ?*Diagnostic) !View {
         var headers: Headers = .initFill(null);
@@ -140,6 +141,13 @@ pub const View = struct {
             }
         }
 
+        if (headers.get(.components)) |components| {
+            if (components.count != node_count) {
+                note(diagnostic, .components);
+                return error.InvalidComponentCount;
+            }
+        }
+
         var graph: View = .{
             .headers = headers,
             .dataset_uuid = uuid,
@@ -156,6 +164,7 @@ pub const View = struct {
             .spatial = null,
             .spatial_index = null,
             .metadata = null,
+            .components = null,
         };
         inline for (kinds) |kind| {
             if (headers.get(kind)) |present| {
@@ -242,6 +251,30 @@ pub const View = struct {
         return @fromBackingInt(@intCast(range.first + original.cls.opp_local));
     }
 
+    pub fn component(self: *const View, id: format.NodeId) !u32 {
+        _ = try self.node(id);
+        const labels = self.components orelse return error.MissingComponents;
+        const value = labels[@backingInt(id)];
+        if (value > @backingInt(id) or labels[value] != value) return error.InvalidComponentId;
+        return value;
+    }
+
+    /// Connector arcs occupy the last slots and join adjacent aliases of the
+    /// same logical intersection.
+    pub fn aliasNeighbor(self: *const View, id: u32, forward: bool) !?u32 {
+        const range = try self.outEdgeRange(@fromBackingInt(id));
+        const target = if (forward) id +| 1 else id -| 1;
+        if (target == id) return null;
+        var i = range.end;
+        while (i > range.first) {
+            i -= 1;
+            const arc = try self.edge(@fromBackingInt(i));
+            if (!(try self.class(arc.cls.class_id)).flags.node_connector) return null;
+            if (arc.head == target) return target;
+        }
+        return null;
+    }
+
     pub fn turnRow(self: *const View, id: format.NodeId, in_local: u5) ![]const format.TurnEntry {
         const degree = (try self.outEdgeRange(id)).count();
         if (in_local >= degree) return error.InvalidLocalEdge;
@@ -288,7 +321,7 @@ pub const View = struct {
             note(diagnostic, kind);
             if (deadline.expired()) return error.DeadlineExceeded;
             const bytes: []const u8 = switch (kind) {
-                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
+                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata, .components => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
                 inline else => |section| std.mem.sliceAsBytes(@field(self, @tagName(section))),
             };
             var hash = std.hash.XxHash3.init(0);

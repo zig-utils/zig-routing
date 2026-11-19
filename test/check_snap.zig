@@ -12,6 +12,7 @@ pub fn main(init: std.process.Init) !void {
     const bundle_path = args.next() orelse return error.MissingBundle;
     const corpus_path = args.next() orelse return error.MissingCorpus;
     const count = if (args.next()) |arg| try std.fmt.parseInt(usize, arg, 10) else std.math.maxInt(usize);
+    const default_reach = if (args.next()) |arg| try std.fmt.parseInt(u32, arg, 10) else 0;
     if (args.next() != null) return error.TooManyArguments;
     var bundle = try Bundle.open(bundle_path);
     defer bundle.close();
@@ -49,7 +50,9 @@ pub fn main(init: std.process.Init) !void {
             .access = access,
             .max_hiking_difficulty = if (options.costing == .pedestrian) @intCast(@min(hiking_difficulty orelse 1, 6)) else null,
         };
-        for (options.locations) |location| {
+        for (options.locations) |input| {
+            var location = input;
+            location.minimum_reachability = input.minimum_reachability orelse default_reach;
             const timer = io.Timer.start();
             const result = try snap.search(&bundle.view, allocator, location, .{}, costing, .none);
             const ns = timer.read();
@@ -101,6 +104,8 @@ fn writeEdges(json: *std.json.Stringify, bundle: *const Bundle, allocator: std.m
             .distance = edge.distance,
             .percent_along = edge.percent_along,
             .heading = edge.heading,
+            .inbound_reach = edge.reach.inbound,
+            .outbound_reach = edge.reach.outbound,
             .side = @tagName(edge.side),
             .node = @tagName(edge.node),
         });

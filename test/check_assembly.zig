@@ -66,6 +66,7 @@ pub fn main(init: std.process.Init) !void {
         try warm.view.verify(.none, null);
         try build.assemble.validate(warm.view.first_edge, warm.view.edges, warm.view.coordinates.?, warm.view.classes.?, .none);
         try validateTurns(&warm.view, stats.turn_pool_bytes);
+        try validateComponents(&warm.view);
         try validateCold(init.gpa, &warm.view, stats.cold_records, stats.cold_payload_bytes);
         try validateSpatial(&warm.view, stats.spatial);
         try validateElevation(&warm.view, stats.elevation);
@@ -107,6 +108,16 @@ pub fn main(init: std.process.Init) !void {
     if (times[times.len - 1] >= open_budget_ns) return error.BundleOpenTooSlow;
     if (require_sub_byte_turns and stats.turn_pool_bytes >= stats.nodes) return error.TurnPoolTooLarge;
     if (require_spatial_budget and stats.spatial.payload_bytes > 3 * @as(u64, stats.cold_records)) return error.SpatialBudgetExceeded;
+}
+
+fn validateComponents(view: *const graph.reader.View) !void {
+    for (0..view.nodes.len) |i| {
+        const node: graph.format.NodeId = @fromBackingInt(@as(u32, @intCast(i)));
+        const label = try view.component(node);
+        for (try view.outEdges(node)) |edge| {
+            if (try view.component(@fromBackingInt(edge.head)) != label) return error.InconsistentComponent;
+        }
+    }
 }
 
 fn validateTurns(view: *const graph.reader.View, expected_bytes: usize) !void {

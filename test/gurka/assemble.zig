@@ -307,6 +307,10 @@ test "high-degree node aliases reserve both directions and preserve connectivity
     const correlated = try snap.search(view, a, .{ .lat = 0, .lng = 0 }, .{}, access, .none);
     try testing.expectEqual(2 * leaves, correlated.edges.len);
     for (correlated.edges) |edge| try testing.expect(edge.node != .none);
+    var finder: routing.snap.reach.Finder = .{ .view = view, .arena = a, .limit = 100, .deadline = .none };
+    const reach = try finder.counts(correlated.edges[0].id, access);
+    try testing.expectEqual(leaves + 1, reach.outbound);
+    try testing.expectEqual(leaves + 1, reach.inbound);
 }
 
 test "enhancer marks dead-end approaches and directed not-thru branches" {
@@ -738,4 +742,140 @@ test "location search filters levels, classes, steps and mode access and honors 
     try testing.expectEqual(2, (try snap.search(view, a, location, .{}, foot, .none)).edges.len);
     location.search_filter.level = 1.5;
     try testing.expectEqual(0, (try snap.search(view, a, location, .{}, foot, .none)).edges.len);
+}
+
+fn directedBetween(view: *const graph.reader.View, fixture: *const gurka.Map, first: []const u8, last: []const u8) !format.EdgeId {
+    const source = try at(view, fixture.findNode(first).?.location.toFixed());
+    const target = try at(view, fixture.findNode(last).?.location.toFixed());
+    const outgoing = try view.outEdgeRange(source);
+    for (outgoing.first..outgoing.end) |i| {
+        const id: format.EdgeId = @fromBackingInt(@as(u32, @intCast(i)));
+        if ((try view.edge(id)).head == @backingInt(target)) return id;
+    }
+    return error.TestEdgeNotFound;
+}
+
+// Ported from test/gurka/test_reach.cc.
+test "bounded reach matches the nine-node grid and upstream live closure cases" {
+    const snap = routing.snap;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const layout = try gurka.mapToCoordinatesAt("A---B---C\n|   |   |\nD---E---F\n|   |   |\nG---H---I\n\nK--L--M--N--O", 10, .{ .lng = 0.05, .lat = 0.2 });
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "primary" }};
+    var ways: [16]gurka.Way = undefined;
+    for ([_][]const u8{ "AB", "BC", "AD", "BE", "CF", "DE", "EF", "DG", "EH", "FI", "GH", "HI", "KL", "LM", "MN", "NO" }, &ways) |label, *way| {
+        way.* = .{ .label = label, .tags = road };
+    }
+    const fixture = try gurka.Map.init(a, layout, &ways, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const ab = try directedBetween(view, &fixture, "A", "B");
+    const hi = try directedBetween(view, &fixture, "H", "I");
+    const auto: snap.candidates.Access = .{ .mask = .{ .auto = true } };
+
+    var finder: snap.reach.Finder = .{ .view = view, .arena = a, .limit = 50, .deadline = .none };
+    try testing.expectEqual(snap.reach.Counts{ .inbound = 9, .outbound = 9 }, try finder.counts(ab, auto));
+    try testing.expectEqual(snap.reach.Counts{ .inbound = 9, .outbound = 9 }, try finder.counts(hi, auto));
+
+    const Traffic = struct {
+        base: snap.candidates.Access,
+        ids: [4]u64,
+        filter_closures: bool,
+
+        pub fn allowed(self: @This(), arc: snap.candidates.DirectedEdge) bool {
+            return self.base.allowed(arc) and (!self.filter_closures or !self.closed(arc));
+        }
+
+        pub fn closed(self: @This(), arc: snap.candidates.DirectedEdge) bool {
+            const way = arc.graph_view.wayId(arc.id) catch unreachable;
+            return std.mem.indexOfScalar(u64, &self.ids, way) != null;
+        }
+    };
+
+    var traffic: Traffic = .{ .base = auto, .ids = undefined, .filter_closures = true };
+    for ([_][]const u8{ "AB", "BC", "AD", "BE" }, &traffic.ids) |label, *way| {
+        way.* = @intCast(fixture.findWay(label).?.id);
+    }
+    finder = .{ .view = view, .arena = a, .limit = 50, .deadline = .none };
+    try testing.expectEqual(snap.reach.Counts{}, try finder.counts(ab, traffic));
+    try testing.expectEqual(snap.reach.Counts{ .inbound = 7, .outbound = 7 }, try finder.counts(hi, traffic));
+
+    traffic.filter_closures = false;
+    finder = .{ .view = view, .arena = a, .limit = 50, .deadline = .none };
+    try testing.expectEqual(snap.reach.Counts{ .inbound = 8, .outbound = 8 }, try finder.counts(ab, traffic));
+    try testing.expectEqual(snap.reach.Counts{ .inbound = 7, .outbound = 7 }, try finder.counts(hi, traffic));
+
+    finder = .{ .view = view, .arena = a, .limit = 3, .deadline = .none };
+    try testing.expectEqual(snap.reach.Counts{ .inbound = 3, .outbound = 3 }, try finder.counts(ab, auto));
+    finder.deadline = .{ .at_ns = 0 };
+    try testing.expectError(error.DeadlineExceeded, finder.counts(ab, auto));
+}
+
+test "location correlation counts one-way reach and reports unconnected and unsnappable locations" {
+    const snap = routing.snap;
+    const Location = routing.api.request.Location;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const one_way: gurka.Tags = &.{
+        .{ .key = "highway", .value = "residential" },
+        .{ .key = "oneway", .value = "yes" },
+        .{ .key = "bicycle", .value = "no" },
+    };
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "residential" }};
+    const layout = try gurka.mapToCoordinatesAt("A--B--C\n\nK--L--M", 40, .{ .lng = 9.6, .lat = 47.1 });
+    const fixture = try gurka.Map.init(a, layout, &.{
+        .{ .label = "AB", .tags = one_way },
+        .{ .label = "BC", .tags = one_way },
+        .{ .label = "KL", .tags = road },
+        .{ .label = "LM", .tags = road },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const auto: snap.candidates.Access = .{ .mask = .{ .auto = true } };
+    const bike: snap.candidates.Access = .{ .mask = .{ .bicycle = true } };
+    const end = try directedBetween(view, &fixture, "B", "C");
+    var finder: snap.reach.Finder = .{ .view = view, .arena = a, .limit = 10, .deadline = .none };
+    try testing.expectEqual(snap.reach.Counts{ .inbound = 2, .outbound = 1 }, try finder.counts(end, auto));
+    try testing.expectEqual(snap.reach.Counts{}, try finder.counts(try view.oppEdge(end), auto));
+
+    const start = fixture.findNode("A").?.location;
+    const dead_end = fixture.findNode("C").?.location;
+    const island = fixture.findNode("K").?.location;
+    const start_input: Location = .{ .lat = start.lat, .lng = start.lng, .search_cutoff = 5 };
+    const dead_end_input: Location = .{ .lat = dead_end.lat, .lng = dead_end.lng, .search_cutoff = 5 };
+    const island_input: Location = .{ .lat = island.lat, .lng = island.lng, .search_cutoff = 5 };
+    const correlated = try snap.candidates.search(view, a, dead_end_input, .{}, auto, .none);
+    try testing.expectEqual(1, correlated.edges.len);
+    try testing.expectEqual(end, correlated.edges[0].id);
+    try testing.expectEqual(1, correlated.edges[0].reach.outbound);
+
+    const route = try snap.location.route(view, a, &.{ start_input, dead_end_input }, .{}, auto, .none);
+    try testing.expectEqual(2, route.ok.len);
+    const disconnected = try snap.location.route(view, a, &.{ start_input, island_input }, .{}, auto, .none);
+    try testing.expectEqual(170, disconnected.failure.code);
+    try testing.expectEqualStrings("Locations are in unconnected regions. Go check/edit the map at osm.org", disconnected.failure.entry().message);
+    const no_edge = try snap.location.route(view, a, &.{ island_input, dead_end_input }, .{}, bike, .none);
+    try testing.expectEqual(171, no_edge.failure.code);
+    try testing.expectEqualStrings("No suitable edges near location", no_edge.failure.entry().message);
+    var nearby = island_input;
+    nearby.search_cutoff = 120;
+    nearby.radius = 120;
+    nearby.minimum_reachability = 3;
+    const ranked = try snap.candidates.search(view, a, nearby, .{}, auto, .none);
+    try testing.expect(ranked.edges.len >= 2);
+    for (ranked.edges) |candidate| {
+        try testing.expectEqual(snap.reach.Counts{ .inbound = 3, .outbound = 3 }, candidate.reach);
+    }
+    var inbound_only = dead_end_input;
+    inbound_only.minimum_inbound_reachability = 2;
+    try testing.expectEqual(snap.reach.Counts{ .inbound = 2, .outbound = 0 }, snap.candidates.thresholds(inbound_only, .{}));
+    const one_direction = try snap.candidates.search(view, a, inbound_only, .{}, auto, .none);
+    try testing.expectEqual(snap.reach.Counts{ .inbound = 2, .outbound = 1 }, one_direction.edges[0].reach);
+
+    const missing = try snap.location.route(view, a, &.{start_input}, .{}, auto, .none);
+    try testing.expectEqual(120, missing.failure.code);
 }

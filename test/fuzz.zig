@@ -90,6 +90,7 @@ fn fuzzGraphBundle(baseline: *const graph.reader.Files, s: *Smith) !void {
     const arbitrary = if (raw.len >= 4) std.mem.readInt(u32, raw[0..4], .little) else std.math.maxInt(u32);
     for ([_]u32{ 0, 1, arbitrary }) |id| {
         _ = view.node(@fromBackingInt(@intCast(id))) catch null;
+        _ = view.component(@fromBackingInt(id)) catch null;
         _ = view.edge(@fromBackingInt(@intCast(id))) catch null;
         _ = view.outEdges(@fromBackingInt(@intCast(id))) catch null;
         _ = view.turnRow(@fromBackingInt(@intCast(id)), @truncate(input[input.len - 1])) catch null;

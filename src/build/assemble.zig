@@ -15,6 +15,7 @@ const ColdBuilder = @import("cold_builder.zig").Builder;
 const elevation = @import("elevation.zig");
 const dem = @import("../elevation/root.zig");
 const enhance = @import("enhance.zig");
+const components = @import("components.zig");
 const checkpoint = @import("checkpoint.zig");
 const node_order = @import("order.zig");
 
@@ -107,7 +108,7 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     defer turn_pool.deinit();
     try buildTurns(&shared, table.classes, metadata.name_ids.items, &turn_pool);
 
-    try writeTopology(writer, topology, table.classes, turn_pool.bytes.items, if (terrain) |present| present.slopes.data else null);
+    try writeTopology(writer, options.scratch_dir, topology, table.classes, turn_pool.bytes.items, if (terrain) |present| present.slopes.data else null);
     const topology_ns = timer.read();
     const means: []const i16 = if (terrain) |*present| present.means.data else &.{};
     const cold_bytes = try buildCold(gpa, &shared, &metadata, writer, options.scratch_dir, means);
@@ -275,7 +276,7 @@ pub fn buildStaged(
         defer if (slopes_map) |mapped| mapped.unmap();
         const means = if (means_map) |mapped| try checkpoint.array(i16, mapped) else &.{};
         if (means.len != 0 and means.len != segments.len) return error.InvalidCheckpoint;
-        try writeTopology(&writer, topology, edge_classes.?, turn_data.bytes, if (slopes_map) |mapped| try checkpoint.array(u16, mapped) else null);
+        try writeTopology(&writer, options.scratch_dir, topology, edge_classes.?, turn_data.bytes, if (slopes_map) |mapped| try checkpoint.array(u16, mapped) else null);
         const cold_bytes = try buildCold(gpa, &shared, metadata, &writer, options.scratch_dir, means);
         try tx.writeJson(gpa, cold_bytes, .source_stats);
         try writer.write(.metadata, &.{.{
@@ -306,7 +307,7 @@ fn saveAttributes(topology: Topology, edge_classes: []const classes.EdgeClass, t
     try tx.writeArray(edge_classes, .classes);
 }
 
-fn writeTopology(writer: *format.BundleWriter, topology: Topology, edge_classes: []const classes.EdgeClass, turn_data: []const u8, slopes: ?[]const u16) !void {
+fn writeTopology(writer: *format.BundleWriter, scratch_dir: []const u8, topology: Topology, edge_classes: []const classes.EdgeClass, turn_data: []const u8, slopes: ?[]const u16) !void {
     try writer.write(.nodes, topology.nodes);
     try writer.write(.edges, topology.output.data);
     try writer.write(.first_edge, topology.first_edge);
@@ -314,6 +315,10 @@ fn writeTopology(writer: *format.BundleWriter, topology: Topology, edge_classes:
     try writer.write(.coordinates, topology.coordinates);
     try writer.write(.turns, turn_data);
     if (slopes) |data| try writer.write(.slopes, data);
+    const labels = try Scratch(u32).init(topology.nodes.len, scratch_dir);
+    defer labels.deinit();
+    try components.label(labels.data, topology.first_edge, topology.output.data, writer.deadline);
+    try writer.write(.components, labels.data);
 }
 
 pub fn stageWriter(session: checkpoint.Session, tx: checkpoint.Transaction) !format.BundleWriter {
