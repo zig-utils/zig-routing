@@ -43,19 +43,16 @@ pub fn build(b: *std.Build) void {
     };
     version_options.addOption([]const u8, "commit", commit);
 
-    const exe = b.addExecutable(.{
-        .name = "zr",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/cli/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "routing", .module = lib_mod },
-                .{ .name = "zig_cli", .module = zig_cli },
-                .{ .name = "build_options", .module = version_options.createModule() },
-            },
-        }),
-    });
+    const exe = cpuExecutable(b, "zr", b.createModule(.{
+        .root_source_file = b.path("src/cli/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "routing", .module = lib_mod },
+            .{ .name = "zig_cli", .module = zig_cli },
+            .{ .name = "build_options", .module = version_options.createModule() },
+        },
+    }));
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -306,6 +303,14 @@ pub fn build(b: *std.Build) void {
     run_bench_partition.addPassthruArgs();
     b.step("bench-partition", "Report nested-dissection separator sizes, balance and time").dependOn(&run_bench_partition.step);
 
+    const bench_cpu = cpuExecutable(b, "bench-cpu", b.createModule(.{
+        .root_source_file = b.path("test/bench_cpu.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "routing", .module = lib_mod }},
+    }));
+    b.step("bench-cpu", "Time snap projection and polyline encoding").dependOn(&b.addRunArtifact(bench_cpu).step);
+
     // Fuzz targets (test/fuzz.zig). `zig build test` replays their seeds; `zig build fuzz
     // --fuzz` fuzzes, ReleaseSafe by default so bounds and overflow checks stay on.
     const fuzz_filter = b.option([]const u8, "fuzz-target", "Fuzz one target: request, http, polyline, lz4, dem, protobuf, config, osm-pbf, osm-primitives, osm-dense, node-store, graph-bundle, build-checkpoint, valhalla-tile, costing-reference, range-manifest, http-range, usage-directory");
@@ -366,4 +371,24 @@ pub fn build(b: *std.Build) void {
         },
     }) });
     test_step.dependOn(&b.addRunArtifact(smoke_tests).step);
+}
+
+fn cpuExecutable(b: *std.Build, name: []const u8, program: *std.Build.Module) *std.Build.Step.Compile {
+    const target = program.resolved_target.?;
+    const guarded = target.result.cpu.model == &std.Target.x86.cpu.x86_64_v3 and
+        target.query.cpu_features_add.isEmpty() and target.query.cpu_features_sub.isEmpty();
+    const root = if (guarded) blk: {
+        var baseline = target.query;
+        baseline.cpu_model = .baseline;
+        break :blk b.createModule(.{
+            .root_source_file = b.path("src/cli/cpu_entry.zig"),
+            .target = b.resolveTargetQuery(baseline),
+            .optimize = program.optimize,
+            .imports = &.{.{ .name = "program", .module = program }},
+        });
+    } else program;
+    const exe = b.addExecutable(.{ .name = name, .root_module = root });
+    // The pinned Zig Mach-O linker does not support LTO.
+    if (program.optimize == std.builtin.OptimizeMode.fast and target.result.os.tag == .linux) exe.lto = .full;
+    return exe;
 }

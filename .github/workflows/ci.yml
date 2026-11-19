@@ -91,6 +91,65 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: bun tools/proto/valhalla.ts --check zig-out/valhalla-schema-source
 
+  cpu:
+    name: CPU release (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-linux-gnu
+            cpus: baseline x86_64_v3
+          - runner: ubuntu-24.04-arm
+            target: aarch64-linux-gnu
+            cpus: baseline
+          - runner: macos-15-intel
+            target: x86_64-macos
+            cpus: baseline x86_64_v3
+          - runner: macos-latest
+            target: aarch64-macos
+            cpus: baseline
+    env:
+      BUILD_TARGET: ${{ matrix.target }}
+      BUILD_CPUS: ${{ matrix.cpus }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: cpu-${{ matrix.target }}-${{ hashFiles('build.zig.zon') }}
+      - name: Build and test each CPU profile
+        run: |
+          for cpu in $BUILD_CPUS; do
+            zig build test -Dtarget="$BUILD_TARGET" -Dcpu="$cpu" -Doptimize=ReleaseFast --summary all
+          done
+      - name: Compare kernel output and measure each profile
+        run: |
+          if command -v lscpu >/dev/null; then
+            lscpu | awk -F ': *' '/^Model name:/ { print $2 }'
+          else
+            sysctl -n machdep.cpu.brand_string
+          fi
+          for cpu in $BUILD_CPUS; do
+            zig build bench-cpu -Dtarget="$BUILD_TARGET" -Dcpu="$cpu" -Doptimize=ReleaseFast > "$RUNNER_TEMP/cpu-$cpu.json"
+            cat "$RUNNER_TEMP/cpu-$cpu.json"
+          done
+          if [ -f "$RUNNER_TEMP/cpu-x86_64_v3.json" ]; then
+            python3 - "$RUNNER_TEMP/cpu-baseline.json" "$RUNNER_TEMP/cpu-x86_64_v3.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          baseline, v3 = [json.loads(Path(file).read_text()) for file in sys.argv[1:]]
+          for kernel in ("snap_projection", "polyline_encode"):
+              assert baseline[kernel]["digest"] == v3[kernel]["digest"], kernel
+              base_ns = baseline[kernel]["ns_per_item"]
+              v3_ns = v3[kernel]["ns_per_item"]
+              print(f"{kernel} baseline {base_ns:.3f} ns v3 {v3_ns:.3f} ns gain {(1 - v3_ns / base_ns) * 100:.2f}%")
+          PY
+          fi
+
   corpus:
     name: Corpora regenerate byte-identical
     runs-on: ubuntu-latest

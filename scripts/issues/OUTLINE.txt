@@ -117,7 +117,7 @@ P4.17 | Hot reload: atomic bundle swap without dropping requests | server | new 
 P4.18 | Multi-bundle dispatch (US and DACH) and cross-bundle semantics | graph | new | M | P3.13 P3.23 P3.33 P4.17 P4.08 P7.13 P0.05
 P4.19 | Planet-scale build: parallel stages, compact intermediates, rows per second and RSS reporting | build | perf | L | P3.22 P4.04 P0.13 | needs-human
 P4.20 | Deterministic builds: byte-identical output regardless of thread count | build | test | M | P3.22 P0.13
-P4.21 | CPU-feature builds (x86-64-v3, baseline, aarch64) and dispatch for hot kernels | infra | perf | M | P3.29
+P4.21 | CPU-feature builds (x86-64-v3, baseline, aarch64) and dispatch for hot kernels | infra | perf | M | P3.29 P4.04 P10.04
 P4.22 | Binary size budget and instantiation count check in CI | infra | perf | S | P3.29 P0.02
 P4.23 | Potential-context cache for hot targets | accel | perf | S | P4.07
 P4.24 | Soak test: 24 hours of mixed load with flat RSS and no descriptor leaks | infra | test | M | P4.09

@@ -74,7 +74,7 @@ pub const Access = struct {
     }
 };
 
-const Projection = struct {
+pub const Projection = struct {
     point: geo.PointLL,
     squared: f64,
     segment: usize,
@@ -616,7 +616,8 @@ fn reverseHeading(heading: f32) f32 {
     return @mod(heading + 180, 360);
 }
 
-fn project(approx: geo.DistanceApproximator, shape: []const geo.PointLL, deadline: Deadline) !Projection {
+/// Project onto the closest segment while preserving the first tie.
+pub fn project(approx: geo.DistanceApproximator, shape: []const geo.PointLL, deadline: Deadline) !Projection {
     const lanes = std.simd.suggestVectorLength(f64) orelse 4;
     var best: Projection = .{ .point = .invalid, .squared = std.math.inf(f64), .segment = 0 };
     var i: usize = 0;
