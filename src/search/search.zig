@@ -29,6 +29,7 @@ pub const Label = extern struct {
 
     pub const target: u32 = 1;
     const partial_target: u32 = 2;
+    const forbid_uturn: u32 = 4;
 
     pub fn edgeId(self: Label) EdgeId {
         return @fromBackingInt(self.edge);
@@ -55,6 +56,7 @@ pub const PartialRequest = struct {
     starts: []const endpoints.Candidate,
     targets: *const endpoints.Targets,
     direction: Direction = .forward,
+    forbid_initial_uturn: bool = false,
 };
 
 const NodeQuery = struct {
@@ -257,6 +259,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 const exits = try self.view.outEdgeRange(at);
                 const forward_row = if (direction == .forward) try self.view.turnRow(at, geometry.cls.opp_local) else &.{};
                 for (self.view.edges[exits.first..exits.end], exits.first.., 0..) |*outward, index, local| {
+                    if (partial and last.flags & Label.forbid_uturn != 0 and local == geometry.cls.opp_local) continue;
                     const local_id: EdgeId = @fromBackingInt(@as(u32, @intCast(index)));
                     const next_id = if (direction == .forward) local_id else try self.view.oppEdge(local_id);
                     const prior = self.status.get(@backingInt(next_id));
@@ -362,6 +365,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 const geometry = if (direction == .forward) edge else try self.view.edge(try self.view.oppEdge(id));
                 const node: NodeId = @fromBackingInt(geometry.head);
                 const portion: Cut = if (direction == .forward) .{ .begin = candidate.fraction } else .{ .end = candidate.fraction };
+                const at_node = if (direction == .forward) candidate.end_node else candidate.begin_node;
                 const cost = scale(full, @max(portion.end - portion.begin, std.math.floatEps(f32)), candidate.score);
                 try cuts.append(a, portion);
                 try self.offer(pool, labels, pending, potential, null, node, self.status.get(@backingInt(id)), .{
@@ -369,6 +373,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     .cost = cost.cost,
                     .secs = cost.secs,
                     .dist_m = fractionalLength(edge.geom.len_m, portion),
+                    .flags = if (query.forbid_initial_uturn and at_node and portion.begin == portion.end) Label.forbid_uturn else 0,
                     .ctx = std.math.cast(u32, cuts.items.len) orelse return error.TooManySearchLabels,
                 });
                 var dest = query.targets.on(id);

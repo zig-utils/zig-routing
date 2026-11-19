@@ -1349,3 +1349,121 @@ test "ranked endpoint candidates choose between connected alternatives and filte
     try testing.expectEqualDeep([2]bool{ true, false }, promoted.ignored_filter);
     try testing.expectApproxEqAbs(full.cost * 0.25, promoted.cost, 1e-5);
 }
+
+test "multi-location route types split legs and preserve through direction" {
+    const multi = routing.search.multi;
+    var fixture_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer fixture_arena.deinit();
+    const a = fixture_arena.allocator();
+    const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates("A---B", 20), &.{
+        .{ .label = "AB", .tags = &.{.{ .key = "highway", .value = "residential" }} },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const ab = try directedBetween(view, &fixture, "A", "B");
+    const ba = try view.oppEdge(ab);
+    const len: f64 = @floatFromInt((try view.edge(ab)).geom.len_m);
+    var engine = try SearchTest.init(testing.allocator, view);
+    defer engine.deinit();
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+
+    const correlations = [_]routing.snap.candidates.PathLocation{
+        snapLocation(&.{ snapEdge(ab, 0.1, 0), snapEdge(ba, 0.9, 0) }, &.{}),
+        snapLocation(&.{ snapEdge(ab, 0.5, 0), snapEdge(ba, 0.5, 0) }, &.{}),
+        snapLocation(&.{ snapEdge(ab, 0.2, 0), snapEdge(ba, 0.8, 0) }, &.{}),
+    };
+    var locations = [_]routing.api.request.Location{
+        .{ .lat = 0, .lng = 0 },
+        .{ .lat = 0, .lng = 0, .waiting_secs = 25, .date_time = "2026-10-02T12:00" },
+        .{ .lat = 0, .lng = 0 },
+    };
+    const cases = [_]struct { kind: routing.api.request.LocationType, legs: usize, distance: f64 }{
+        .{ .kind = .@"break", .legs = 2, .distance = 0.7 },
+        .{ .kind = .via, .legs = 1, .distance = 0.7 },
+        .{ .kind = .through, .legs = 1, .distance = 1.7 },
+        .{ .kind = .break_through, .legs = 2, .distance = 1.7 },
+    };
+    const kernel: SearchTestCost = .{ .seed = 47 };
+    for ([_]search.Direction{ .forward, .reverse }) |direction| {
+        for (cases) |item| {
+            locations[1].type = item.kind;
+            const route = try multi.route(&engine, &arena, kernel, &locations, &correlations, .{
+                .search = .{ .costing = .pedestrian, .direction = direction },
+            }, .{});
+            try testing.expectEqual(item.legs, route.legs.len);
+            try testing.expectEqual(0, route.legs[0].origin);
+            try testing.expectEqual(2, route.legs[route.legs.len - 1].destination);
+            var distance: f64 = 0;
+            for (route.legs) |leg| distance += @as(f64, leg.length_km) * 1000;
+            try testing.expectApproxEqAbs(item.distance * len, distance, 1e-4);
+            try testing.expectEqual(@as(f32, 25), route.waypoints[1].waiting_secs);
+            try testing.expectEqualStrings("2026-10-02T12:00", route.waypoints[1].date_time.?);
+            try testing.expect(route.waypoints[1].elapsed_secs > 0);
+            try testing.expect(route.waypoints[1].elapsed_secs < route.waypoints[2].elapsed_secs);
+            try testing.expectEqual(route.total.secs, route.waypoints[2].elapsed_secs);
+            arena.reset();
+        }
+
+        const at_end = [_]routing.snap.candidates.PathLocation{
+            correlations[0],
+            snapLocation(&.{ snapEdge(ab, 1, 0), snapEdge(ba, 0, 0) }, &.{}),
+            correlations[2],
+        };
+        const options: multi.Options = .{ .search = .{ .costing = .pedestrian, .direction = direction } };
+        locations[1].type = .through;
+        try testing.expectError(error.NoPath, multi.route(&engine, &arena, kernel, &locations, &at_end, options, .{}));
+        arena.reset();
+        locations[1].type = .via;
+        const via = try multi.route(&engine, &arena, kernel, &locations, &at_end, options, .{});
+        try testing.expectEqual(1, via.legs.len);
+        try testing.expectEqual(2, via.legs[0].segments.len);
+        try testing.expectEqual(ab, via.legs[0].segments[0].edge);
+        try testing.expectEqual(ba, via.legs[0].segments[1].edge);
+        arena.reset();
+    }
+}
+
+test "multi-location continuation retries the route with reachable waypoint candidates" {
+    const multi = routing.search.multi;
+    var fixture_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer fixture_arena.deinit();
+    const a = fixture_arena.allocator();
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "residential" }};
+    const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates("A---B   C---D---E", 20), &.{
+        .{ .label = "AB", .tags = road },
+        .{ .label = "CD", .tags = road },
+        .{ .label = "DE", .tags = road },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const ab = try directedBetween(view, &fixture, "A", "B");
+    const cd = try directedBetween(view, &fixture, "C", "D");
+    const de = try directedBetween(view, &fixture, "D", "E");
+    var engine = try SearchTest.init(testing.allocator, view);
+    defer engine.deinit();
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+
+    var high = snapEdge(cd, 0.5, 20);
+    high.reach = .{ .inbound = 50, .outbound = 50 };
+    const correlations = [_]routing.snap.candidates.PathLocation{
+        snapLocation(&.{ snapEdge(ab, 0.25, 0), snapEdge(cd, 0.25, 10) }, &.{}),
+        snapLocation(&.{ snapEdge(ab, 0.5, 0), high }, &.{}),
+        snapLocation(&.{snapEdge(de, 0.75, 0)}, &.{}),
+    };
+    const locations = [_]routing.api.request.Location{
+        .{ .lat = 0, .lng = 0 },
+        .{ .lat = 0, .lng = 0, .type = .through },
+        .{ .lat = 0, .lng = 0 },
+    };
+    const route = try multi.route(&engine, &arena, SearchTestCost{ .seed = 47 }, &locations, &correlations, .{
+        .search = .{ .costing = .pedestrian },
+    }, .{});
+    try testing.expect(route.retried);
+    try testing.expectEqual(1, route.legs.len);
+    try testing.expectEqual(cd, route.legs[0].segments[0].edge);
+    try testing.expectEqual(de, route.legs[0].segments[route.legs[0].segments.len - 1].edge);
+}

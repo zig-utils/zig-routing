@@ -4,6 +4,7 @@
 const std = @import("std");
 const graph = @import("../graph/root.zig");
 const snap = @import("../snap/search.zig");
+const Reach = @import("../snap/reach.zig").Counts;
 const request = @import("../api/request.zig");
 const core = @import("search.zig");
 const paged = @import("paged.zig");
@@ -16,6 +17,7 @@ pub const Candidate = struct {
     score: f32,
     begin_node: bool,
     end_node: bool,
+    reach: Reach = .{},
 
     pub fn valid(self: Candidate) bool {
         return self.fraction >= 0 and self.fraction <= 1 and
@@ -74,6 +76,7 @@ pub fn rank(arena: std.mem.Allocator, location: snap.PathLocation, costing: requ
                 .score = score,
                 .begin_node = edge.node == .begin,
                 .end_node = edge.node == .end,
+                .reach = edge.reach,
             };
             minimum = @min(minimum, score);
             offset += 1;
@@ -211,23 +214,31 @@ pub const Options = struct {
     /// The consuming worker can supply the selected model's policy. When
     /// omitted the pedestrian and bicycle defaults follow Valhalla.
     allow_filtered_retry: ?bool = null,
+    forbid_initial_uturn: bool = false,
 };
 
 pub fn route(engine: anytype, arena: *Arena, kernel: anytype, origin: snap.PathLocation, destination: snap.PathLocation, options: Options, potential: anytype, control: core.Control) !Path {
     const a = arena.allocator();
     const from = try rank(a, origin, options.costing, control);
     const to = try rank(a, destination, options.costing, control);
+    return routeRanked(engine, arena, kernel, from, to, options, potential, control);
+}
+
+/// Reuse the original score normalization when a waypoint's candidate set
+/// is later narrowed to its arrival edge.
+pub fn routeRanked(engine: anytype, arena: *Arena, kernel: anytype, from: Ranked, to: Ranked, options: Options, potential: anytype, control: core.Control) !Path {
+    const a = arena.allocator();
     const start = if (options.direction == .forward) from else to;
     const goal = if (options.direction == .forward) to else from;
     const point = arena.mark();
     var retried = false;
-    const result = attempt(engine, arena, kernel, start, goal, options.direction, potential, false, control) catch |err| blk: {
+    const result = attempt(engine, arena, kernel, start, goal, options, potential, false, control) catch |err| blk: {
         const allow_retry = options.allow_filtered_retry orelse (options.costing == .pedestrian);
         const has_filtered = start.preferred_count < start.all.len or goal.preferred_count < goal.all.len;
         if (err != error.NoPath or !allow_retry or !has_filtered) return err;
         arena.rewind(point);
         retried = true;
-        break :blk try attempt(engine, arena, kernel, start, goal, options.direction, potential, true, control);
+        break :blk try attempt(engine, arena, kernel, start, goal, options, potential, true, control);
     };
     const segments = try unpack(a, result, options.direction, control);
     const last = result.best();
@@ -241,11 +252,16 @@ pub fn route(engine: anytype, arena: *Arena, kernel: anytype, origin: snap.PathL
     };
 }
 
-fn attempt(engine: anytype, arena: *Arena, kernel: anytype, start: Ranked, goal: Ranked, direction: core.Direction, potential: anytype, filtered: bool, control: core.Control) !core.Result {
+fn attempt(engine: anytype, arena: *Arena, kernel: anytype, start: Ranked, goal: Ranked, options: Options, potential: anytype, filtered: bool, control: core.Control) !core.Result {
     const a = arena.allocator();
-    const targets = try Targets.init(a, goal.candidates(filtered), direction, control);
-    const seeds = try starts(a, start.candidates(filtered), &targets, direction, control);
-    return engine.runPartial(arena, kernel, .{ .starts = seeds, .targets = &targets, .direction = direction }, potential, control);
+    const targets = try Targets.init(a, goal.candidates(filtered), options.direction, control);
+    const seeds = try starts(a, start.candidates(filtered), &targets, options.direction, control);
+    return engine.runPartial(arena, kernel, .{
+        .starts = seeds,
+        .targets = &targets,
+        .direction = options.direction,
+        .forbid_initial_uturn = options.forbid_initial_uturn,
+    }, potential, control);
 }
 
 fn unpack(arena: std.mem.Allocator, result: core.Result, direction: core.Direction, control: core.Control) ![]Segment {
