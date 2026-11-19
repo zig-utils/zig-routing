@@ -149,6 +149,79 @@ test "assemble directs speed and access and preserves node attributes and coordi
     try testing.expect(!(try view.class(reverse.cls.class_id)).forwardAccess().auto);
 }
 
+test "duration sets a ferry's speed across all segments of its OSM way" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const fixture = try gurka.Map.init(arena.allocator(), try gurka.mapToCoordinates("A---B---C\n    |\n    D", 250), &.{
+        .{ .label = "ABC", .tags = &.{ .{ .key = "route", .value = "ferry" }, .{ .key = "duration", .value = "00:03:07" } } },
+        .{ .label = "BD", .tags = &.{.{ .key = "highway", .value = "residential" }} },
+    }, &.{}, &.{});
+    var result = try Built.assemble(fixture.osm, 4);
+    defer result.deinit();
+    const view = &result.bundle.view;
+    try checkOpposites(view, 6);
+    const a = fixture.findNode("A").?.location.toFixed().toPoint();
+    const b = fixture.findNode("B").?.location.toFixed().toPoint();
+    const c = fixture.findNode("C").?.location.toFixed().toPoint();
+    const expected: u8 = @intFromFloat((a.distance(b) + b.distance(c)) * 3.6 / 187);
+    try testing.expect(expected > 20);
+    var ferry_edges: usize = 0;
+    for (view.edges) |edge| {
+        const class = try view.class(edge.cls.class_id);
+        if (class.category.use != @backingInt(graph.constants.Use.ferry)) continue;
+        try testing.expectEqual(expected, edge.speed[0]);
+        try testing.expect(!class.flags.tagged_speed);
+        ferry_edges += 1;
+    }
+    try testing.expectEqual(4, ferry_edges);
+}
+
+test "configured speeds resolve the destination region and directional exit sign" {
+    const Lookup = struct {
+        fn region(context: *const anyopaque, point: format.Coordinate) build.speeds.Region {
+            const destination: *const format.Coordinate = @ptrCast(@alignCast(context));
+            return if (std.meta.eql(destination.*, point)) .{ .country = "US", .state = "PA" } else .{};
+        }
+
+        fn signed(_: *const anyopaque, _: i64, _: i64, forward: bool) bool {
+            return forward;
+        }
+    };
+    const table =
+        \\{"way":[26,26,26,26,26,26,26,26],"link_exiting":[77,77,77,77,77],"link_turning":[51,51,51,51,51],
+        \\"roundabout":[20,20,20,20,20,20,20,20],"driveway":10,"alley":10,"parking_aisle":10,"drive-through":10}
+    ;
+    const config = "[{\"iso3166-1\":\"US\",\"iso3166-2\":\"PA\",\"rural\":" ++ table ++
+        ",\"suburban\":" ++ table ++ ",\"urban\":" ++ table ++ "}]";
+    var rules = try build.speeds.Config.parse(testing.allocator, config, .none);
+    defer rules.deinit(testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const fixture = try gurka.Map.init(arena.allocator(), try gurka.mapToCoordinates("A---B---C", 25), &.{
+        .{ .label = "AB", .tags = &.{ .{ .key = "highway", .value = "motorway_link" }, .{ .key = "maxspeed", .value = "95" } } },
+        .{ .label = "BC", .tags = &.{.{ .key = "highway", .value = "motorway" }} },
+    }, &.{}, &.{});
+    const origin = fixture.findNode("A").?.location.toFixed();
+    const destination = fixture.findNode("B").?.location.toFixed();
+    var result = try Built.assembleWithOptions(fixture.osm, .{
+        .scratch_dir = "",
+        .workers = 4,
+        .speed_rules = &rules,
+        .admin_speed_region = .{ .context = &destination, .resolve = Lookup.region },
+        .exit_signs = .{ .context = &destination, .has = Lookup.signed },
+    });
+    defer result.deinit();
+    const view = &result.bundle.view;
+    const range = try view.outEdgeRange(try at(view, origin));
+    const id: format.EdgeId = @fromBackingInt(range.first);
+    const edge = try view.edge(id);
+    const reverse = try view.edge(try view.oppEdge(id));
+    try testing.expectEqual(77, edge.speed[0]);
+    try testing.expect(!(try view.class(edge.cls.class_id)).flags.tagged_speed);
+    try testing.expectEqual(95, reverse.speed[0]);
+    try testing.expect((try view.class(reverse.cls.class_id)).flags.tagged_speed);
+}
+
 test "assembled turn rows use opposing locals, shared names and class-based stops" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();

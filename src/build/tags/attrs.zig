@@ -61,6 +61,8 @@ pub const WayAttrs = struct {
     forward_speed: u8 = 0,
     backward_speed: u8 = 0,
     truck_speed: u8 = 0,
+    ferry_duration_s: u32 = 0,
+    ferry_speed: ?u8 = null,
     /// The implicit limit label, such as DE:urban. It borrows the input.
     speed_zone: ?[]const u8 = null,
     lanes: u4 = 0,

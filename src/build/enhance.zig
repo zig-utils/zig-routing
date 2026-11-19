@@ -9,6 +9,7 @@ const format = @import("../graph/format.zig");
 const graph = @import("../graph/constants.zig");
 const EdgeClass = @import("../graph/class_table.zig").EdgeClass;
 const DriveSide = @import("edge_class.zig").DriveSide;
+const turns = @import("turns.zig");
 const Allocator = std.mem.Allocator;
 
 const max_expansions = 256;
@@ -81,6 +82,203 @@ pub fn intersection(network: Network, node: u32, deadline: io.Deadline) !graph.I
     if (degree > 2 and driveforward > 1 and (links == degree or
         (motorway and (links == 0 or (links == driveforward and degree == links + 1))))) return .fork;
     return .regular;
+}
+
+const internal_length = 32;
+const stored_headings = 8;
+
+pub fn intersectionInternal(network: Network, source: u32, slot: u32, headings: anytype, deadline: io.Deadline) !bool {
+    const edge = network.edges[slot];
+    const class = network.class(edge);
+    if (edge.geom.len_m > internal_length or class.flags.roundabout or class.category.use > @backingInt(graph.Use.cycleway))
+        return false;
+
+    const incoming = try orderedEdges(network, source, deadline);
+    var bearing: u16 = 0;
+    for (incoming, 0..) |other, i| {
+        try check(deadline, i);
+        if (other != slot) {
+            if (incoming.len == 2 and network.canonical(network.edges[other].head) == network.canonical(edge.head))
+                return false;
+        } else if (i < stored_headings) {
+            bearing = turns.storedHeading(try headings.rawHeading(slot));
+        }
+    }
+    const before = (try internalTurns(network, incoming, slot, bearing, true, headings, deadline)) orelse return false;
+    if (!before.oneway) return false;
+
+    const opposite = network.first_edge[edge.head] + edge.cls.opp_local;
+    const arrival = (try headings.rawHeading(opposite) + 180) % 360;
+    const outgoing = try orderedEdges(network, edge.head, deadline);
+    const after = (try internalTurns(network, outgoing, opposite, arrival, false, headings, deadline)) orelse return false;
+    return after.oneway and !(before.left and after.right) and !(before.right and after.left) and !(after.left and after.right);
+}
+
+fn orderedEdges(network: Network, node: u32, deadline: io.Deadline) ![]const u32 {
+    const first = network.canonical(node);
+    const end = try network.endAlias(first, deadline);
+    return network.walk_order[network.first_edge[first]..network.first_edge[end]];
+}
+
+pub const NodeControls = packed struct(u32) {
+    stop: bool = false,
+    yield: bool = false,
+    minor: bool = false,
+    reserved: u29 = 0,
+};
+
+pub const Signs = struct {
+    stop: bool = false,
+    yield: bool = false,
+    signal: bool = false,
+};
+
+fn isRoad(class: EdgeClass) bool {
+    const use = class.category.use;
+    return !class.flags.node_connector and (use == @backingInt(graph.Use.road) or use == @backingInt(graph.Use.service_road));
+}
+
+fn isRampOrChannel(class: EdgeClass) bool {
+    const use = class.category.use;
+    return use == @backingInt(graph.Use.ramp) or use == @backingInt(graph.Use.turn_channel);
+}
+
+pub fn signs(network: Network, source: u32, edge: format.EdgeHot, start: NodeControls, end: NodeControls, deadline: io.Deadline) !Signs {
+    const class = network.class(edge);
+    if (!class.forwardAccess().auto) return .{};
+    var result: Signs = .{ .stop = class.flags.stop_sign, .yield = class.flags.yield_sign, .signal = class.flags.traffic_signal };
+    const rc = class.category.road_class;
+    if (start.minor and (result.stop or result.yield)) {
+        const approaches = try orderedEdges(network, source, deadline);
+        for (approaches[0..@min(approaches.len, stored_headings)]) |slot| {
+            const approach = network.class(network.edges[slot]);
+            if (approach.flags.node_connector) continue;
+            const other_rc = approach.category.road_class;
+            if (other_rc > rc or (other_rc == rc and isRampOrChannel(approach)))
+                return .{ .signal = result.signal };
+        }
+    }
+    if (!end.stop and !end.yield) return result;
+    if (end.minor) {
+        const approaches = try orderedEdges(network, edge.head, deadline);
+        var best = rc;
+        for (approaches, 0..) |slot, i| {
+            try check(deadline, i);
+            const approach = network.class(network.edges[slot]);
+            if (isRoad(approach) and approach.reverseAccess().auto) best = @min(best, approach.category.road_class);
+        }
+        if (rc == best and !isRampOrChannel(class)) return result;
+    }
+    result.stop = end.stop;
+    result.yield = end.yield;
+    return result;
+}
+
+test "Valhalla minor stop signs apply to lower-priority incoming roads" {
+    const testing = std.testing;
+    const access: u16 = @bitCast(graph.AccessMask{ .auto = true });
+    const classes = [_]EdgeClass{
+        .{ .category = .{ .road_class = @backingInt(graph.RoadClass.residential) }, .access = .{ .forward = access } },
+        .{ .category = .{ .road_class = @backingInt(graph.RoadClass.primary) }, .access = .{ .forward = access, .reverse = access } },
+        .{ .flags = .{ .stop_sign = true, .traffic_signal = true } },
+    };
+    const local: format.EdgeHot = .{
+        .head = 1,
+        .geom = .{ .len_m = 50, .grade = 6, .curvature = 0 },
+        .cls = .{ .class_id = 0, .local = 0, .opp_local = 0, .cold_checks = 0, .pred_speed = 0 },
+        .speed = @splat(0),
+    };
+    var main = local;
+    main.head = 0;
+    main.cls.class_id = 1;
+    const network: Network = .{
+        .nodes = &.{},
+        .coordinates = &.{},
+        .first_edge = &.{ 0, 1, 2 },
+        .edges = &.{ local, main },
+        .classes = &classes,
+        .walk_order = &.{ 0, 1 },
+    };
+    const minor: NodeControls = .{ .stop = true, .minor = true };
+    try testing.expect((try signs(network, 0, local, .{}, minor, .none)).stop);
+    var primary = local;
+    primary.cls.class_id = 1;
+    try testing.expect(!(try signs(network, 0, primary, .{}, minor, .none)).stop);
+    var footway = local;
+    footway.cls.class_id = 2;
+    try testing.expectEqual(Signs{}, try signs(network, 0, footway, .{}, minor, .none));
+}
+
+const InternalTurns = struct {
+    left: bool = false,
+    right: bool = false,
+    oneway: bool = false,
+};
+
+fn internalTurns(network: Network, approaches: []const u32, selected: u32, bearing: u16, comptime incoming: bool, headings: anytype, deadline: io.Deadline) !?InternalTurns {
+    var result: InternalTurns = .{};
+    for (approaches, 0..) |slot, i| {
+        try check(deadline, i);
+        if (slot == selected) continue;
+        const class = network.class(network.edges[slot]);
+        if (!isRoad(class)) continue;
+        const forward = class.forwardAccess().auto;
+        const reverse = class.reverseAccess().auto;
+        if (!(if (incoming) reverse else forward)) continue;
+        if (class.flags.roundabout) return null;
+        const heading = if (incoming)
+            if (i < stored_headings) turns.storedHeading(try headings.rawHeading(slot)) else 0
+        else
+            try headings.rawHeading(slot);
+        const degrees = if (incoming) (bearing + 540 - heading) % 360 else (heading + 360 - bearing) % 360;
+        const kind = turns.turnType(degrees);
+        result.left = result.left or kind == .left or kind == .sharp_left;
+        result.right = result.right or kind == .right or kind == .sharp_right;
+        result.oneway = result.oneway or
+            (!(if (incoming) forward else reverse) and !class.flags.link and degrees >= 30 and degrees <= 330);
+    }
+    return result;
+}
+
+test "Valhalla internal intersections require compatible one-way approaches" {
+    const Headings = struct {
+        values: [6]u16,
+
+        pub fn rawHeading(self: @This(), slot: u32) !u16 {
+            return self.values[slot];
+        }
+    };
+    const auto: u16 = @bitCast(graph.AccessMask{ .auto = true });
+    const classes = [_]EdgeClass{
+        .{ .access = .{ .forward = auto } },
+        .{ .access = .{ .reverse = auto } },
+        .{ .access = .{ .forward = auto, .reverse = auto } },
+    };
+    var edges: [6]format.EdgeHot = @splat(.{
+        .head = 0,
+        .geom = .{ .len_m = 12, .grade = 6, .curvature = 0 },
+        .cls = .{ .class_id = 0, .local = 0, .opp_local = 0, .cold_checks = 0, .pred_speed = 0 },
+        .speed = @splat(0),
+    });
+    for (&edges, [_]u32{ 1, 0, 2, 1, 3, 2 }, [_]u2{ 0, 1, 2, 2, 0, 1 }) |*edge, head, class| {
+        edge.head = head;
+        edge.cls.class_id = class;
+    }
+    const network: Network = .{
+        .nodes = &.{},
+        .coordinates = &.{},
+        .first_edge = &.{ 0, 1, 3, 5, 6 },
+        .edges = &edges,
+        .classes = &classes,
+        .walk_order = &.{ 0, 1, 2, 3, 4, 5 },
+    };
+    const left: Headings = .{ .values = .{ 180, 0, 90, 270, 0, 180 } };
+    var opposed = left;
+    opposed.values[4] = 180;
+    try std.testing.expect(try intersectionInternal(network, 1, 2, left, .none));
+    try std.testing.expect(!try intersectionInternal(network, 1, 2, opposed, .none));
+    edges[2].geom.len_m = 33;
+    try std.testing.expect(!try intersectionInternal(network, 1, 2, left, .none));
 }
 
 pub const Search = struct {

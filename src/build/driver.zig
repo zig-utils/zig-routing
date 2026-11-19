@@ -5,6 +5,7 @@ const graph = @import("../graph/root.zig");
 const hgt = @import("../elevation/hgt.zig");
 const checkpoint = @import("checkpoint.zig");
 const assemble = @import("assemble.zig");
+const speeds = @import("speeds.zig");
 const edges = @import("edges.zig");
 const node_store = @import("node_store.zig");
 const usage = @import("node_store/usage.zig");
@@ -19,6 +20,9 @@ pub const Options = struct {
     output: ?[]const u8 = null,
     work_dir: []const u8,
     dem_dir: ?[]const u8 = null,
+    default_speeds_config: ?[]const u8 = null,
+    infer_turn_channels: ?bool = null,
+    infer_internal_intersections: ?bool = null,
     drive_side: ?@import("edge_class.zig").DriveSide = null,
     order: ?graph.format.OrderingKind = null,
     workers: usize = 0,
@@ -52,6 +56,9 @@ const Inputs = struct {
     sources: []const Source,
     dem_dir: ?[]const u8,
     dem_digest: ?[32]u8 = null,
+    speed_digest: ?[32]u8 = null,
+    infer_turn_channels: bool = true,
+    infer_internal_intersections: bool = true,
     drive_side: @import("edge_class.zig").DriveSide,
     order: graph.format.OrderingKind,
 
@@ -69,6 +76,12 @@ const Inputs = struct {
             hash.update(path);
             hash.update(&.{0});
         }
+        if (self.speed_digest) |digest| {
+            hash.update("default-speed-config");
+            hash.update(&digest);
+        }
+        if (!self.infer_turn_channels) hash.update("turn-channels-off");
+        if (!self.infer_internal_intersections) hash.update("internal-intersections-off");
         for (self.sources) |source| {
             hash.update(std.mem.asBytes(&source.digest.bytes));
             hash.update(std.mem.asBytes(&source.digest.xxh3));
@@ -104,10 +117,28 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
     } else .{
         .sources = try fingerprintInputs(a, options, diagnostic),
         .dem_dir = options.dem_dir,
+        .infer_turn_channels = options.infer_turn_channels orelse true,
+        .infer_internal_intersections = options.infer_internal_intersections orelse true,
         .drive_side = options.drive_side orelse .right,
         .order = options.order orelse .hilbert,
     };
     if (previous != null) try checkOptions(a, &inputs, options, diagnostic);
+    var speed_mapping: ?io.Mapping = null;
+    defer if (speed_mapping) |mapping| mapping.unmap();
+    var speed_input = if (options.default_speeds_config) |path| try openDefaultSpeeds(a, path, options.deadline) else null;
+    defer if (speed_input) |*input| input.rules.deinit(a);
+    if (previous) |saved| {
+        if (options.default_speeds_config != null and !std.meta.eql(inputs.speed_digest, speedDigest(speed_input)))
+            return error.CheckpointInputMismatch;
+        if (speed_input == null and inputs.speed_digest != null) {
+            speed_mapping = try saved.map(.default_speeds, options.deadline);
+            const bytes = speed_mapping.?.bytes;
+            speed_input = .{ .bytes = bytes, .rules = try speeds.Config.parse(a, bytes, options.deadline) };
+            if (!std.meta.eql(inputs.speed_digest, speedDigest(speed_input))) return error.CheckpointChecksumMismatch;
+        }
+    } else {
+        inputs.speed_digest = speedDigest(speed_input);
+    }
     var tiles: ?hgt.Tiles = null;
     defer if (tiles) |*catalog| catalog.deinit();
     const stamps_elevation = @backingInt(options.from) <= @backingInt(Stage.elevation) and
@@ -150,11 +181,15 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
         .drive_side = inputs.drive_side,
         .ordering = .{ .kind = inputs.order },
         .dem_source = if (tiles) |*catalog| .{ .catalog = catalog } else null,
+        .speed_rules = if (speed_input) |*input| &input.rules else null,
+        .infer_turn_channels = inputs.infer_turn_channels,
+        .infer_internal_intersections = inputs.infer_internal_intersections,
     };
     if (session.runs(.read)) {
         var tx = try session.begin(.read);
         defer tx.deinit();
         try tx.writeJson(gpa, inputs, .inputs);
+        if (speed_input) |input| try tx.write(.default_speeds, input.bytes);
         try session.commit(&tx, inputs.sources.len, read_timer);
     }
     if (@backingInt(options.to) >= @backingInt(Stage.tags) and @backingInt(options.from) <= @backingInt(Stage.spatial)) {
@@ -194,6 +229,33 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
     return result;
 }
 
+const SpeedInput = struct {
+    bytes: []const u8,
+    rules: speeds.Config,
+};
+
+fn speedDigest(input: ?SpeedInput) ?[32]u8 {
+    const present = input orelse return null;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(present.bytes, &digest, .{});
+    return digest;
+}
+
+fn openDefaultSpeeds(a: Allocator, path: []const u8, deadline: io.Deadline) !?SpeedInput {
+    if (deadline.expired()) return error.DeadlineExceeded;
+    const bytes = io.readFileAlloc(a, path, 16 * 1024 * 1024) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        std.log.warn("default speed configuration disabled ({s})", .{@errorName(err)});
+        return null;
+    };
+    const rules = speeds.Config.parse(a, bytes, deadline) catch |err| {
+        if (err == error.OutOfMemory or err == error.DeadlineExceeded) return err;
+        std.log.warn("default speed configuration disabled ({s})", .{@errorName(err)});
+        return null;
+    };
+    return .{ .bytes = bytes, .rules = rules };
+}
+
 fn fingerprintInputs(a: Allocator, options: Options, diagnostic: *Diagnostic) ![]const Source {
     if (options.inputs.len == 0) return error.MissingOsmInput;
     const rows = try a.alloc(Source, options.inputs.len);
@@ -212,6 +274,8 @@ fn fingerprintInputs(a: Allocator, options: Options, diagnostic: *Diagnostic) ![
 fn checkOptions(a: Allocator, inputs: *Inputs, options: Options, diagnostic: *Diagnostic) !void {
     if (options.drive_side) |side| if (side != inputs.drive_side) return error.CheckpointInputMismatch;
     if (options.order) |order| if (order != inputs.order) return error.CheckpointInputMismatch;
+    if (options.infer_turn_channels) |infer| if (infer != inputs.infer_turn_channels) return error.CheckpointInputMismatch;
+    if (options.infer_internal_intersections) |infer| if (infer != inputs.infer_internal_intersections) return error.CheckpointInputMismatch;
     if (options.dem_dir) |dir| {
         const saved = inputs.dem_dir orelse return error.CheckpointInputMismatch;
         if (inputs.dem_digest == null and !std.mem.eql(u8, dir, saved)) return error.CheckpointInputMismatch;

@@ -42,16 +42,21 @@ pub fn encode(kind: Type, stop: u3, consistent: bool) u8 {
 /// Turn headings are stored and recovered using Valhalla's NodeInfo byte
 /// quantization, even though the bundle only retains the resulting turn.
 pub fn heading(points: []const geo.FixedLL, forward: bool, class: *const EdgeClass, deadline: io.Deadline) !u16 {
+    return storedHeading(try rawHeading(points, forward, class, deadline));
+}
+
+pub fn rawHeading(points: []const geo.FixedLL, forward: bool, class: *const EdgeClass, deadline: io.Deadline) !u16 {
     if (points.len < 2) return error.InvalidSegmentShape;
     const dist = constants.headingOffset(class.category.road_class, class.category.use);
-    const start = points[if (forward) 0 else points.len - 1].toPoint();
-    var target = points[if (forward) points.len - 1 else 0].toPoint();
+    // GraphEnhancer reads the edge-info shape after the E6 tile encoding.
+    const start = points[if (forward) 0 else points.len - 1].toTilePoint();
+    var target = points[if (forward) points.len - 1 else 0].toTilePoint();
     var previous = start;
     var travelled: f64 = 0;
     for (1..points.len) |i| {
         if (points.len == 2 or travelled >= dist) break;
         if ((i - 1) % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
-        const next = points[if (forward) i else points.len - 1 - i].toPoint();
+        const next = points[if (forward) i else points.len - 1 - i].toTilePoint();
         const length = previous.distanceWith(next, math);
         if (travelled + length > dist) {
             const fraction = (dist - travelled) / length;
@@ -64,7 +69,10 @@ pub fn heading(points: []const geo.FixedLL, forward: bool, class: *const EdgeCla
         travelled += length;
         previous = next;
     }
-    const rounded = @as(u16, @intFromFloat(@round(start.headingWith(target, math)))) % 360;
+    return @as(u16, @intFromFloat(@round(start.headingWith(target, math)))) % 360;
+}
+
+pub fn storedHeading(rounded: u16) u16 {
     const shrink: f32 = 255.0 / 359.0;
     const expand: f32 = 359.0 / 255.0;
     const stored: f32 = @round(@as(f32, @floatFromInt(rounded)) * shrink);
@@ -73,6 +81,7 @@ pub fn heading(points: []const geo.FixedLL, forward: bool, class: *const EdgeCla
 
 pub const Approach = struct {
     bearing: u16,
+    length: u24,
     class: *const EdgeClass,
     names: []const names.Id,
 };
@@ -103,9 +112,16 @@ pub fn matrix(approaches: []const Approach, signal: bool, side: DriveSide, out: 
             }
             const degrees = (to.bearing + 360 - from_heading) % 360;
             const kind = turnType(degrees);
-            const stop = stopImpact(approaches, in_local, out_local, kind, signal, all_links, physical_count, side);
-            entry.* = encode(kind, stop, try sameNames(from.names, to.names, deadline));
-            sides[index] = @bitCast(edgeSides(approaches, physical_count, in_local, out_local, from_heading, degrees));
+            const consistent = try sameNames(from.names, to.names, deadline);
+            const crossing = edgeSides(approaches, physical_count, in_local, out_local, from_heading, degrees);
+            const stop = if (from.class.flags.roundabout and to.class.flags.roundabout)
+                0
+            else if (uTurnStop(from, to, degrees, side, crossing, consistent))
+                7
+            else
+                stopImpact(approaches, in_local, out_local, kind, signal, all_links, physical_count, side);
+            entry.* = encode(kind, stop, consistent);
+            sides[index] = @bitCast(crossing);
         }
     }
 }
@@ -146,12 +162,26 @@ fn isUse(class: *const EdgeClass, use: constants.Use) bool {
     return class.category.use == @backingInt(use);
 }
 
+fn uTurnStop(from: Approach, to: Approach, degrees: u16, side: DriveSide, crossing: turn_sides.Sides, consistent: bool) bool {
+    const short = from.length < 50 or to.length < 50;
+    const angle_matches = switch (side) {
+        .right => degrees >= 180 and degrees < @as(u16, if (short) 226 else 211),
+        .left => degrees > @as(u16, if (short) 134 else 149) and degrees <= 180,
+    };
+    if (!angle_matches) return false;
+    if (isUse(from.class, .cycleway) and isUse(to.class, .cycleway) and crossing.left and crossing.right) return true;
+    const across = switch (side) {
+        .right => crossing.right and !crossing.left,
+        .left => crossing.left and !crossing.right,
+    };
+    return across and consistent and
+        !from.class.forwardAccess().auto and from.class.reverseAccess().auto and
+        to.class.forwardAccess().auto and !to.class.reverseAccess().auto;
+}
+
 fn stopImpact(approaches: []const Approach, from: usize, to: usize, kind: Type, signal: bool, all_links: bool, physical_count: usize, side: DriveSide) u3 {
     const entry = approaches[from].class;
     const exit = approaches[to].class;
-    if (entry.flags.roundabout and exit.flags.roundabout) return 0;
-
-    // Pencil-point and cycleway U-turn refinements need the later costing data.
 
     const unclassified = @backingInt(constants.RoadClass.unclassified);
     var best: u8 = unclassified;
@@ -199,6 +229,37 @@ fn stopImpact(approaches: []const Approach, from: usize, to: usize, kind: Type, 
         }
     }
     return @intCast(@min(7, stop));
+}
+
+test "Valhalla pencil-point and cycleway U-turn stop impacts" {
+    const testing = std.testing;
+    const enter: EdgeClass = .{ .access = .{ .reverse = @bitCast(constants.AccessMask{ .auto = true }) } };
+    const exit: EdgeClass = .{ .access = .{ .forward = @bitCast(constants.AccessMask{ .auto = true }) } };
+    const crossing: EdgeClass = .{ .access = .{ .forward = @bitCast(constants.AccessMask{ .auto = true }) } };
+    var approaches = [_]Approach{
+        .{ .bearing = 0, .length = 40, .class = &enter, .names = &.{} },
+        .{ .bearing = 39, .length = 70, .class = &exit, .names = &.{} },
+        .{ .bearing = 90, .length = 70, .class = &crossing, .names = &.{} },
+    };
+    var entries: [9]u8 = undefined;
+    var sides: [9]u2 = undefined;
+    try matrix(&approaches, false, .right, &entries, &sides, .none);
+    try testing.expectEqual(7, (entries[1] >> 3) & 7);
+    approaches[0].length = 50;
+    try matrix(&approaches, false, .right, &entries, &sides, .none);
+    try testing.expectEqual(4, (entries[1] >> 3) & 7);
+
+    const cycleway: EdgeClass = .{ .category = .{ .use = @backingInt(constants.Use.cycleway) } };
+    const cycleways = [_]Approach{
+        .{ .bearing = 0, .length = 40, .class = &cycleway, .names = &.{} },
+        .{ .bearing = 39, .length = 70, .class = &cycleway, .names = &.{} },
+        .{ .bearing = 90, .length = 70, .class = &crossing, .names = &.{} },
+        .{ .bearing = 8, .length = 70, .class = &crossing, .names = &.{} },
+    };
+    var cycle_entries: [16]u8 = undefined;
+    var cycle_sides: [16]u2 = undefined;
+    try matrix(&cycleways, false, .right, &cycle_entries, &cycle_sides, .none);
+    try testing.expectEqual(7, (cycle_entries[1] >> 3) & 7);
 }
 
 pub const Pool = struct {

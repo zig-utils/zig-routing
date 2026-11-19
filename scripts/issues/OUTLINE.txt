@@ -125,7 +125,7 @@ P4.25 | Overload test: admission control, load shedding and tail latency | serve
 P4.26 | Phase 4 gate: foot and bike at least 5x Valhalla, experiments resolved, 16 GB budget met | accel | gate | M | P4.09 P4.10 P4.11 P4.12 P4.13 P4.14 P4.15 P4.18
 
 ## P5 | P5 Motor vehicle costing and restrictions | Auto, truck and friends, restrictions, time-dependent routing.
-P5.01 | Enhance (full): port of graphenhancer.cc (speed assignment, density, turn types, stop impact) | build | port | L | P3.19 P3.16
+P5.01 | Enhance (full): port of graphenhancer.cc (speed assignment, density, turn types, stop impact) | build | port | L | P3.19 P3.16 P5.04 P6.02
 P5.02 | Link reclassification and name consistency (linkclassification.cc) | build | port | M | P5.01
 P5.03 | Tag transform: truck attributes, hazmat, tolls, HOV, motorcycle and moped tags | build | port | M | P3.07 P3.08
 P5.04 | Admins: boundary relations to polygons, packed polygon index, admin lookup | build | new | L | P1.05 P3.02

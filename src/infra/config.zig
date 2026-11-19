@@ -14,7 +14,16 @@ pub const Config = struct {
     httpd: struct { service: HttpService = .{} } = .{},
     additional_data: struct { elevation: ?[]const u8 = null } = .{},
     loki: struct { actions: []const service.Action = &service.action_order } = .{},
+    mjolnir: Mjolnir = .{},
     zig_routing: ZigRouting = .{},
+
+    pub const Mjolnir = struct {
+        default_speeds_config: ?[]const u8 = null,
+        data_processing: struct {
+            infer_turn_channels: ?bool = null,
+            infer_internal_intersections: ?bool = null,
+        } = .{},
+    };
 
     pub const ServiceLimits = struct {
         skadi: struct {
@@ -142,9 +151,9 @@ test "configuration defaults match Valhalla's generated service limits" {
     try testing.expectEqualDeep(defaults.config.httpd.service, generated.config.httpd.service);
     try testing.expectEqualSlices(service.Action, &service.action_order, generated.config.loki.actions);
     try testing.expect(generated.config.additional_data.elevation != null);
-    for (generated.ignored_keys) |key| {
-        if (std.mem.eql(u8, key, "mjolnir")) break;
-    } else return error.TestExpectedEqual;
+    try testing.expectEqual(null, generated.config.mjolnir.default_speeds_config);
+    try testing.expectEqual(true, generated.config.mjolnir.data_processing.infer_turn_channels.?);
+    try testing.expectEqual(true, generated.config.mjolnir.data_processing.infer_internal_intersections.?);
 }
 
 test "environment overrides file, which overrides typed defaults" {

@@ -111,6 +111,7 @@ pub const Artifact = enum {
     turn_sides,
     bundle_turn_sides,
     bundle_coverage,
+    default_speeds,
 
     fn filename(self: Artifact) [:0]const u8 {
         return switch (self) {

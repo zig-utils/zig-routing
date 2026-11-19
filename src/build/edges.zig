@@ -3,6 +3,7 @@
 const std = @import("std");
 const geo = @import("../geo/root.zig");
 const math = @import("../geo/build_math.zig");
+const graph = @import("../graph/constants.zig");
 const io = @import("../infra/io.zig");
 const node_store = @import("node_store.zig");
 const pbf = @import("pbf/root.zig");
@@ -218,7 +219,7 @@ fn shapeOf(refs: []const i64) way_shape.Shape {
     return if (refs[0] == refs[refs.len - 1]) .closed else .open;
 }
 
-const ControlEntry = extern struct {
+pub const ControlEntry = extern struct {
     id: i64,
     flags: u16,
     reserved: u16 = 0,
@@ -494,7 +495,7 @@ const Worker = struct {
 
     fn process(self: *Worker, gpa: Allocator, shared: *const Shared, ways: []const pbf.block.Way) !void {
         for (ways) |way| {
-            const attrs = try transform(&self.scratch, way, shared.options) orelse continue;
+            var attrs = try transform(&self.scratch, way, shared.options) orelse continue;
             try loadRefs(gpa, &self.refs, way);
             const refs = self.refs.items;
             if (!try way_shape.accepts(shapeOf(refs), way.tags)) continue;
@@ -524,6 +525,15 @@ const Worker = struct {
             for (points, locations, 0..) |*point, loc, i| {
                 try checkDeadline(deadline, i);
                 point.* = .{ .lat = loc.?.lat, .lng = loc.?.lon };
+            }
+            if (attrs.ferry_duration_s != 0) {
+                var length: f64 = 0;
+                for (points[0 .. points.len - 1], points[1..], 0..) |from, to, i| {
+                    try checkDeadline(deadline, i);
+                    length += from.toPoint().distanceWith(to.toPoint(), math);
+                }
+                const seconds: f64 = @floatFromInt(attrs.ferry_duration_s);
+                attrs.ferry_speed = @intFromFloat(std.math.clamp(length * 3.6 / seconds, 1, graph.max_assumed_speed));
             }
             try self.split(gpa, shared, way.id, base);
             if (start_edge == self.edges.items.len) {

@@ -193,6 +193,7 @@ pub const Key = enum(u8) {
     @"shoulder:both",
     @"shoulder:left",
     @"shoulder:right",
+    duration,
 };
 
 pub const Value = enum(u8) {

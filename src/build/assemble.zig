@@ -16,6 +16,7 @@ const ColdBuilder = @import("cold_builder.zig").Builder;
 const elevation = @import("elevation.zig");
 const dem = @import("../elevation/root.zig");
 const enhance = @import("enhance.zig");
+const speeds = @import("speeds.zig");
 const components = @import("components.zig");
 const checkpoint = @import("checkpoint.zig");
 const node_order = @import("order.zig");
@@ -23,6 +24,17 @@ const node_order = @import("order.zig");
 const Allocator = std.mem.Allocator;
 const max_degree = turns.max_degree;
 const max_workers = 16;
+
+pub const AdminSpeedRegion = struct {
+    context: *const anyopaque,
+    resolve: *const fn (*const anyopaque, geo.FixedLL) speeds.Region,
+};
+
+pub const ExitSigns = struct {
+    context: *const anyopaque,
+    /// Parameters after the context are OSM way ID, source node ID and way direction.
+    has: *const fn (*const anyopaque, i64, i64, bool) bool,
+};
 
 pub const Options = struct {
     scratch_dir: []const u8,
@@ -32,6 +44,11 @@ pub const Options = struct {
     include_platforms: bool = false,
     dem_source: ?elevation.Source = null,
     admin_drive_side: ?enhance.AdminDriveSide = null,
+    admin_speed_region: ?AdminSpeedRegion = null,
+    exit_signs: ?ExitSigns = null,
+    speed_rules: ?*const speeds.Config = null,
+    infer_turn_channels: bool = true,
+    infer_internal_intersections: bool = true,
     ordering: node_order.Ordering = .{},
     deadline: io.Deadline = .none,
 };
@@ -355,7 +372,8 @@ const Way = extern struct {
         importance: u3,
         has_names: bool,
         layer: i8,
-        reserved: u19 = 0,
+        ferry_duration: bool = false,
+        reserved: u18 = 0,
     },
     level_start: u32,
     level_count: u32,
@@ -392,6 +410,7 @@ pub const Metadata = struct {
     name_ids: std.ArrayList(tags.names.Id) = .empty,
     levels: std.ArrayList(graph.cold.LevelRange) = .empty,
     nodes: std.AutoHashMapUnmanaged(i64, format.NodeHot) = .empty,
+    controls: std.AutoHashMapUnmanaged(i64, enhance.NodeControls) = .empty,
     ways: Ways = .empty,
 
     pub fn init(gpa: Allocator, options: Options) Metadata {
@@ -425,6 +444,15 @@ pub const Metadata = struct {
         for (try checkpoint.array(NodeEntry, mapped), 0..) |entry, i| {
             try checkDeadline(self.deadline, i);
             try self.nodes.put(self.gpa, entry.id, entry.hot);
+        }
+        if (saved.manifest.files.get(.controls) != null) {
+            const controls = try saved.map(.controls, self.deadline);
+            defer controls.unmap();
+            for (try checkpoint.array(edges.ControlEntry, controls), 0..) |entry, i| {
+                try checkDeadline(self.deadline, i);
+                if (entry.reserved != 0 or entry.padding != 0) return error.InvalidCheckpoint;
+                try self.storeControls(entry.id, @bitCast(entry.flags));
+            }
         }
     }
 
@@ -502,6 +530,7 @@ pub const Metadata = struct {
 
     pub fn deinit(self: *Metadata) void {
         self.nodes.deinit(self.gpa);
+        self.controls.deinit(self.gpa);
         self.ways.deinit(self.gpa);
         self.name_ids.deinit(self.gpa);
         self.levels.deinit(self.gpa);
@@ -509,6 +538,7 @@ pub const Metadata = struct {
     }
 
     pub fn node(self: *Metadata, id: i64, attrs: tags.NodeAttrs) !void {
+        try self.storeControls(id, attrs.flags);
         const hot: format.NodeHot = .{
             .turn_off = 0,
             .attr = .{
@@ -522,6 +552,15 @@ pub const Metadata = struct {
             },
         };
         if (!std.meta.eql(hot, neutral_node)) try self.nodes.put(self.gpa, id, hot);
+    }
+
+    fn storeControls(self: *Metadata, id: i64, flags: tags.NodeAttrs.Flags) !void {
+        const sign = flags.stop_sign != flags.yield_sign;
+        if (sign or flags.minor) try self.controls.put(self.gpa, id, .{
+            .stop = sign and flags.stop_sign,
+            .yield = sign and flags.yield_sign,
+            .minor = flags.minor,
+        });
     }
 
     pub fn way(self: *Metadata, id: i64, attrs: tags.WayAttrs, raw_tags: pbf.block.TagIterator) !void {
@@ -560,13 +599,14 @@ pub const Metadata = struct {
         entry.value_ptr.* = .{
             .by_direction = pair,
             .speeds = .{
-                .forward = if (attrs.flags.forward_tagged_speed) attrs.forward_speed else attrs.speed,
-                .backward = if (attrs.flags.backward_tagged_speed) attrs.backward_speed else attrs.speed,
+                .forward = attrs.ferry_speed orelse if (attrs.flags.forward_tagged_speed) attrs.forward_speed else attrs.speed,
+                .backward = attrs.ferry_speed orelse if (attrs.flags.backward_tagged_speed) attrs.backward_speed else attrs.speed,
                 .truck = attrs.truck_speed,
                 .limit = attrs.speed_limit,
             },
             .attr = .{
                 .oneway = attrs.flags.oneway,
+                .ferry_duration = attrs.ferry_speed != null,
                 .importance = @intCast(@backingInt(attrs.road_class)),
                 .has_names = name_start != name_end,
                 .layer = attrs.layer,
@@ -608,7 +648,7 @@ const Node = extern struct {
     degree: u32 = 0,
     first_alias: u32 = 0,
     placed: u32 = 0,
-    reserved: u32 = 0,
+    controls: enhance.NodeControls = .{},
 };
 
 const LayoutStats = struct { node_count: u32, split_nodes: u32, connectors: u32, order_hash: u64 };
@@ -672,7 +712,8 @@ const Layout = struct {
         var total: u32 = 0;
         for (self.nodes.items, 0..) |node, i| {
             try checkDeadline(deadline, i);
-            if (node.reserved != 0 or node.placed != 0 or node.degree == 0 or node.first_alias != total) return error.InvalidCheckpoint;
+            if (node.controls.reserved != 0 or (node.controls.stop and node.controls.yield) or
+                node.placed != 0 or node.degree == 0 or node.first_alias != total) return error.InvalidCheckpoint;
             total = std.math.add(u32, total, aliasCount(node.degree)) catch return error.InvalidCheckpoint;
             try self.by_id.putNoClobber(gpa, node.osm_id, @intCast(i));
         }
@@ -715,7 +756,12 @@ const Layout = struct {
         const entry = try self.by_id.getOrPut(gpa, id);
         if (!entry.found_existing) {
             entry.value_ptr.* = std.math.cast(u32, self.nodes.items.len) orelse return error.TooManyNodes;
-            try self.nodes.append(gpa, .{ .osm_id = id, .point = point, .hot = metadata.nodes.get(id) orelse neutral_node });
+            try self.nodes.append(gpa, .{
+                .osm_id = id,
+                .point = point,
+                .hot = metadata.nodes.get(id) orelse neutral_node,
+                .controls = metadata.controls.get(id) orelse .{},
+            });
         }
         const node = &self.nodes.items[entry.value_ptr.*];
         if (node.point.lat != point.lat or node.point.lng != point.lng) return error.InconsistentCoordinates;
@@ -763,7 +809,7 @@ comptime {
     std.debug.assert(@import("builtin").target.cpu.arch.endian() == .little);
     std.debug.assert(@sizeOf(Node) == 40 and @offsetOf(Node, "osm_id") == 0);
     std.debug.assert(@offsetOf(Node, "point") == 8 and @offsetOf(Node, "hot") == 16);
-    std.debug.assert(@offsetOf(Node, "degree") == 24 and @offsetOf(Node, "reserved") == 36);
+    std.debug.assert(@offsetOf(Node, "degree") == 24 and @offsetOf(Node, "controls") == 36);
     std.debug.assert(@sizeOf(Placement) == 8 and @offsetOf(Placement, "node") == 0 and @offsetOf(Placement, "slot") == 4);
 }
 
@@ -1116,13 +1162,21 @@ const NodeEnhanceJob = struct {
     }
 };
 
+const not_thru_flag = 1;
+const configured_speed_flag = 2;
+const internal_flag = 4;
+const stop_flag = 8;
+const yield_flag = 16;
+const signal_flag = 32;
+
 const EdgeEnhanceJob = struct {
     gpa: Allocator,
+    shared: *const Shared,
     network: enhance.Network,
-    flags: []u8,
-    start: usize,
-    end: usize,
-    deadline: io.Deadline,
+    controls: []const u8,
+    derived: []u16,
+    nodes: []const u32,
+    options: Options,
     result: anyerror!void = {},
 
     fn run(self: *EdgeEnhanceJob) void {
@@ -1132,14 +1186,71 @@ const EdgeEnhanceJob = struct {
     fn emit(self: *EdgeEnhanceJob) !void {
         var search = try enhance.Search.init(self.gpa);
         defer search.deinit(self.gpa);
-        for (self.start..self.end) |id| {
-            try checkDeadline(self.deadline, id - self.start);
+        const deadline = self.options.deadline;
+        for (self.nodes, 0..) |id, i| {
+            try checkDeadline(deadline, i);
             const first = self.network.first_edge[id];
             const end = self.network.first_edge[id + 1];
-            for (self.network.edges[first..end], self.flags[first..end]) |edge, *flag| {
-                flag.* = @intFromBool(try search.notThru(self.network, @intCast(id), edge, self.deadline));
+            const density = self.network.nodes[id].attr.density;
+            for (self.network.edges[first..end], self.derived[first..end], first..end) |edge, *derived, slot| {
+                const class = self.network.classes[edge.cls.class_id];
+                if (class.flags.node_connector) {
+                    derived.* = 0;
+                    continue;
+                }
+                const configured = if (self.options.speed_rules) |rules| configured: {
+                    const region: speeds.Region = if (self.options.admin_speed_region) |admin|
+                        admin.resolve(admin.context, self.network.coordinates[edge.head])
+                    else
+                        .{};
+                    const signed = if (class.flags.link) self.hasExitSign(@intCast(slot)) else false;
+                    break :configured rules.speed(region, class, density, signed);
+                } else null;
+                const ferry_duration = if (class.category.use == @backingInt(graph.constants.Use.ferry)) ferry: {
+                    const segment = self.shared.segments[self.shared.topology.slot_refs.data[slot] / 2];
+                    const way = self.shared.ways.get(segment.way_id) orelse return error.MissingWayAttributes;
+                    break :ferry way.attr.ferry_duration;
+                } else false;
+                const speed = configured orelse speeds.defaultSpeed(class, edge.speed[0], edge.geom.len_m, density, .{
+                    .infer_turn_channels = self.options.infer_turn_channels,
+                    .ferry_duration = ferry_duration,
+                });
+                const not_thru = try search.notThru(self.network, id, edge, deadline);
+                const internal = self.options.infer_internal_intersections and
+                    try enhance.intersectionInternal(self.network, id, @intCast(slot), self, deadline);
+                const signs = try enhance.signs(
+                    self.network,
+                    id,
+                    edge,
+                    @bitCast(@as(u32, self.controls[id])),
+                    @bitCast(@as(u32, self.controls[edge.head])),
+                    deadline,
+                );
+                derived.* = (@as(u16, speed) << 8) |
+                    (if (not_thru) @as(u16, not_thru_flag) else 0) |
+                    (if (configured != null) @as(u16, configured_speed_flag) else 0) |
+                    (if (internal) @as(u16, internal_flag) else 0) |
+                    (if (signs.stop) @as(u16, stop_flag) else 0) |
+                    (if (signs.yield) @as(u16, yield_flag) else 0) |
+                    (if (signs.signal) @as(u16, signal_flag) else 0);
             }
         }
+    }
+
+    pub fn rawHeading(self: *const EdgeEnhanceJob, slot: u32) !u16 {
+        const ref = self.shared.topology.slot_refs.data[slot];
+        const segment = self.shared.segments[ref / 2];
+        const shape = try segmentShape(self.shared.shape_points, segment);
+        const class = &self.network.classes[self.network.edges[slot].cls.class_id];
+        return turns.rawHeading(shape, ref & 1 == 0, class, self.options.deadline);
+    }
+
+    fn hasExitSign(self: *const EdgeEnhanceJob, slot: u32) bool {
+        const signs = self.options.exit_signs orelse return false;
+        const ref = self.shared.topology.slot_refs.data[slot];
+        const segment = self.shared.segments[ref / 2];
+        const forward = ref & 1 == 0;
+        return signs.has(signs.context, segment.way_id, if (forward) segment.from else segment.to, forward);
     }
 };
 
@@ -1148,24 +1259,28 @@ fn enhanceGraph(gpa: Allocator, shared: *const Shared, plan: *const Layout, base
     const deadline = options.deadline;
     const aliases = try Scratch(u32).init(if (plan.split_nodes == 0) 0 else topo.nodes.len, options.scratch_dir);
     defer aliases.deinit();
-    if (aliases.data.len != 0) {
-        for (plan.nodes.items, 0..) |node, i| {
-            try checkDeadline(deadline, i);
-            const count = aliasCount(node.degree);
-            var remaining = aliases.data[node.first_alias..][0..count];
-            while (remaining.len != 0) {
-                if (deadline.expired()) return error.DeadlineExceeded;
-                const n = @min(remaining.len, 1024);
-                @memset(remaining[0..n], node.first_alias);
-                remaining = remaining[n..];
-            }
+    const controls = try Scratch(u8).init(topo.nodes.len, options.scratch_dir);
+    defer controls.deinit();
+    for (plan.nodes.items, 0..) |node, i| {
+        try checkDeadline(deadline, i);
+        const raw: u32 = @bitCast(node.controls);
+        if (raw == 0 and aliases.data.len == 0) continue;
+        const end = node.first_alias + aliasCount(node.degree);
+        var start = node.first_alias;
+        while (start < end) {
+            if (deadline.expired()) return error.DeadlineExceeded;
+            const count = @min(end - start, 1024);
+            if (raw != 0) @memset(controls.data[start..][0..count], @truncate(raw));
+            if (aliases.data.len != 0) @memset(aliases.data[start..][0..count], node.first_alias);
+            start += count;
         }
     }
     const order = try Scratch(u32).init(topo.output.data.len, options.scratch_dir);
     defer order.deinit();
-    const flags = try Scratch(u8).init(topo.output.data.len, options.scratch_dir);
-    defer flags.deinit();
-    try orderWalks(shared, plan, base, order.data, flags.data);
+    // Reuse the walk ranks after sorting for edge speed and not-thru results.
+    const derived = try Scratch(u16).init(topo.output.data.len, options.scratch_dir);
+    defer derived.deinit();
+    try orderWalks(shared, plan, base, order.data, derived.data);
     const network: enhance.Network = .{
         .nodes = topo.nodes,
         .coordinates = topo.coordinates,
@@ -1176,9 +1291,9 @@ fn enhanceGraph(gpa: Allocator, shared: *const Shared, plan: *const Layout, base
         .aliases = aliases.data,
     };
     const workers = if (options.workers == 0) std.Thread.getCpuCount() catch 1 else options.workers;
+    const tile_order = try Scratch(u32).init(topo.nodes.len, options.scratch_dir);
+    defer tile_order.deinit();
     {
-        const tile_order = try Scratch(u32).init(topo.nodes.len, options.scratch_dir);
-        defer tile_order.deinit();
         var tiles = try enhance.TileIndex.init(gpa, topo.coordinates, tile_order.data, deadline);
         defer tiles.deinit(gpa);
         const active = tiles.active.items;
@@ -1198,14 +1313,17 @@ fn enhanceGraph(gpa: Allocator, shared: *const Shared, plan: *const Layout, base
     }
     const count = @max(1, @min(workers, max_workers, (topo.nodes.len + 255) / 256));
     var jobs: [max_workers]EdgeEnhanceJob = undefined;
+    // Keep geographic order and split large tiles across workers. Results
+    // are still indexed by CSR slot and interned in one fixed order.
     for (jobs[0..count], 0..) |*job, i| {
         job.* = .{
             .gpa = gpa,
+            .shared = shared,
             .network = network,
-            .flags = flags.data,
-            .start = topo.nodes.len * i / count,
-            .end = topo.nodes.len * (i + 1) / count,
-            .deadline = deadline,
+            .controls = controls.data,
+            .derived = derived.data,
+            .nodes = tile_order.data[topo.nodes.len * i / count .. topo.nodes.len * (i + 1) / count],
+            .options = options,
         };
     }
     try runJobs(jobs[0..count]);
@@ -1216,13 +1334,19 @@ fn enhanceGraph(gpa: Allocator, shared: *const Shared, plan: *const Layout, base
         try checkDeadline(deadline, i);
         const first = topo.first_edge[i];
         const end = topo.first_edge[i + 1];
-        for (topo.output.data[first..end], flags.data[first..end]) |*edge, not_thru| {
+        for (topo.output.data[first..end], derived.data[first..end]) |*edge, result| {
             var class = base[edge.cls.class_id];
             const target = topo.nodes[edge.head];
             class.category.density = @intCast((@as(u8, node.attr.density) + target.attr.density) / 2);
             if (!class.flags.node_connector) {
-                class.flags.not_thru = not_thru != 0;
+                class.flags.not_thru = result & not_thru_flag != 0;
+                class.flags.internal = class.flags.internal or result & internal_flag != 0;
+                class.flags.stop_sign = result & stop_flag != 0;
+                class.flags.yield_sign = result & yield_flag != 0;
+                class.flags.traffic_signal = result & signal_flag != 0;
+                if (result & configured_speed_flag != 0) class.flags.tagged_speed = false;
                 class.flags.dead_end = target.attr.intersection == .dead_end;
+                edge.speed[0] = @truncate(result >> 8);
             }
             const interned = @backingInt(try interner.intern(class));
             edge.cls.class_id = std.math.cast(classes.ClassId, interned) orelse return error.TooManyClasses;
@@ -1237,7 +1361,7 @@ fn enhanceGraph(gpa: Allocator, shared: *const Shared, plan: *const Layout, base
 /// Valhalla visits outbound arcs by auto driveability, raw way class, names
 /// and then segment encounter order. The expansion cap depends on that order,
 /// so keep a separate ordering for the walk and preserve CSR local indices.
-fn orderWalks(shared: *const Shared, plan: *const Layout, base: []const classes.EdgeClass, order: []u32, ranks: []u8) !void {
+fn orderWalks(shared: *const Shared, plan: *const Layout, base: []const classes.EdgeClass, order: []u32, ranks: []u16) !void {
     const topo = shared.topology;
     const connector_rank = 32;
     for (plan.nodes.items, 0..) |node, i| {
@@ -1414,7 +1538,7 @@ fn buildTurns(shared: *const Shared, edge_classes: []const classes.EdgeClass, na
         const degree = topo.first_edge[i + 1] - first;
         for (approaches[0..degree], topo.output.data[first..][0..degree], 0..) |*approach, edge, local| {
             const class = &edge_classes[edge.cls.class_id];
-            approach.* = .{ .bearing = 0, .class = class, .names = &.{} };
+            approach.* = .{ .bearing = 0, .length = edge.geom.len_m, .class = class, .names = &.{} };
             if (class.flags.node_connector) continue;
             const ref = topo.slot_refs.data[first + local];
             const segment = shared.segments[ref / 2];

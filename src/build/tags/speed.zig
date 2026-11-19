@@ -47,6 +47,38 @@ pub fn laneCount(text: []const u8, deadline: io.Deadline) DeadlineError!?u4 {
     return if (count <= constants.max_lane_count) @intCast(count) else null;
 }
 
+/// Valhalla reads colon-delimited ferry durations as hours and minutes,
+/// with an optional seconds field.
+pub fn ferryDuration(text: []const u8, deadline: io.Deadline) DeadlineError!u32 {
+    var delimiters: usize = 0;
+    for (text, 0..) |c, i| {
+        if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
+        delimiters += @intFromBool(c == ':');
+        if (delimiters > 2) return 0;
+    }
+    if (delimiters == 0) return 0;
+    const units = [_]u32{ 3600, 60, 1 };
+    var rest = text;
+    var seconds: u32 = 0;
+    for (units[0 .. delimiters + 1]) |unit| {
+        rest = std.mem.trimStart(u8, rest, &std.ascii.whitespace);
+        if (rest.len == 0) break;
+        const signed = rest[0] == '-' or rest[0] == '+';
+        const negative = rest[0] == '-';
+        const digits = try defaults.numericPrefix(rest[@intFromBool(signed)..], false, deadline);
+        if (digits.len == 0) break;
+        const value = std.fmt.parseInt(u32, digits, 10) catch {
+            seconds +%= std.math.maxInt(u32) *% unit;
+            break;
+        };
+        seconds +%= (if (negative) 0 -% value else value) *% unit;
+        const end = digits.len + @as(usize, @intFromBool(signed));
+        if (end == rest.len) break;
+        rest = rest[end + 1 ..];
+    }
+    return seconds;
+}
+
 fn clamped(value: f32) u8 {
     return @intFromFloat(@min(constants.max_assumed_speed, value + 0.5));
 }
@@ -65,6 +97,9 @@ fn classifiedSpeed(tags: *const Scratch, road_class: constants.RoadClass) u8 {
 }
 
 pub fn apply(way: *attrs.WayAttrs, tags: *const Scratch, road_class: constants.RoadClass, deadline: io.Deadline) DeadlineError!void {
+    if (way.flags.ferry) {
+        if (tags.text(.duration)) |text| way.ferry_duration_s = try ferryDuration(text, deadline);
+    }
     const base = classifiedSpeed(tags, road_class);
     const limit = try parseLimit(tags.text(.maxspeed) orelse "", deadline);
     const tagged_limit: ?f32 = if (limit) |limit_value| switch (limit_value) {
@@ -125,6 +160,16 @@ pub fn apply(way: *attrs.WayAttrs, tags: *const Scratch, road_class: constants.R
         .forward = tags.text(.@"turn:lanes:forward"),
         .backward = tags.text(.@"turn:lanes:backward"),
     };
+}
+
+test "Valhalla ferry durations accept hours, minutes and optional seconds" {
+    const testing = std.testing;
+    try testing.expectEqual(5400, try ferryDuration("01:30", .none));
+    try testing.expectEqual(5415, try ferryDuration("01:30:15", .none));
+    try testing.expectEqual(300, try ferryDuration("0:5", .none));
+    try testing.expectEqual(3600, try ferryDuration("01:", .none));
+    try testing.expectEqual(0, try ferryDuration("30", .none));
+    try testing.expectEqual(0, try ferryDuration("0:1:2:3", .none));
 }
 
 test "Valhalla maxspeed formats" {

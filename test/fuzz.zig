@@ -14,7 +14,7 @@
 //! `node-store` (the build-time coordinate index format) and `graph-bundle`
 //! (section headers, checksums and typed topology access), and
 //! `build-checkpoint` (restart manifests), `valhalla-tile` (offline tile import),
-//! and `costing-reference` (gate A samples and paths).
+//! `costing-reference` (gate A samples and paths), and `speed-config` (default speed tables).
 //!
 //! The contract for every parser: malformed input returns an error, never
 //! panics, overflows or reads out of bounds. The fuzz step builds ReleaseSafe
@@ -540,6 +540,35 @@ test "fuzz config" {
         \\{"service_limits":{"skadi":{"max_shape":18446744073709551616.0,"min_resample":1e100}}}
         ,
     }) });
+}
+
+fn fuzzSpeedConfig(_: void, s: *Smith) !void {
+    const allocator = std.testing.allocator;
+    var buf: [max_input]u8 = undefined;
+    const input = draw(s, &buf, 0x7370_6564);
+    _ = try routing.build.tags.speed.ferryDuration(input, .none);
+    var config = routing.build.speeds.Config.parse(allocator, input, .none) catch return;
+    defer config.deinit(allocator);
+    const drive: routing.graph.constants.AccessMask = .{ .auto = true };
+    const class: routing.graph.class_table.EdgeClass = .{ .access = .{ .forward = @bitCast(drive) } };
+    for (0..16) |density| {
+        if (config.speed(.{ .country = "US", .state = "PA" }, class, @intCast(density), false)) |speed| {
+            try std.testing.expect(speed <= routing.graph.constants.max_assumed_speed);
+        }
+    }
+}
+
+test "fuzz speed-config" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const table =
+        \\{"way":[89,73,57,49,40,35,30,null],"link_exiting":[9,10,11,12,13],"link_turning":[15,16,17,18,19],
+        \\"roundabout":[21,22,23,24,25,26,27,28],"driveway":29,"alley":30,"parking_aisle":31,"drive-through":32}
+    ;
+    const good = "[{\"iso3166-1\":\"US\",\"iso3166-2\":\"PA\",\"rural\":" ++ table ++
+        ",\"suburban\":" ++ table ++ ",\"urban\":" ++ table ++ "}]";
+    const corpus = try seeds(state.allocator(), &.{ "", "[]", "00:01:30", good, good[0 .. good.len - 1] });
+    try std.testing.fuzz({}, fuzzSpeedConfig, .{ .corpus = corpus });
 }
 
 const ProtoChild = protobuf.Message(&.{
