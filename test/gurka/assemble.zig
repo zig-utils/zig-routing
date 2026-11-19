@@ -985,13 +985,18 @@ test "leased compiled classes drive graph-based snapping and the cold permission
     try testing.expect(!costing.Kernel.slowAllowed(lease.tables(), view, bc, Cold{}));
 }
 
-test "pedestrian crossing and elevator turn costs use assembled graph metadata" {
+test "pedestrian and bicycle turns use assembled crossing and elevator metadata" {
     const pedestrian = routing.costing.pedestrian;
+    const bicycle = routing.costing.bicycle;
     const base = routing.costing.base;
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const footway: gurka.Tags = &.{ .{ .key = "highway", .value = "footway" }, .{ .key = "name", .value = "Crossing path" } };
+    const footway: gurka.Tags = &.{
+        .{ .key = "highway", .value = "footway" },
+        .{ .key = "name", .value = "Crossing path" },
+        .{ .key = "bicycle", .value = "yes" },
+    };
     const primary: gurka.Tags = &.{.{ .key = "highway", .value = "primary" }};
     const map = try gurka.mapToCoordinates("    N\n    |\nW---X---E\n    |\n    S", 20);
     const fixture = try gurka.Map.init(a, map, &.{
@@ -1024,6 +1029,15 @@ test "pedestrian crossing and elevator turn costs use assembled graph metadata" 
     try testing.expect(pedestrian.Kernel.allowed(lease.profile(), from, to, (try view.edge(out)).*, .{}));
     const walk = pedestrian.Kernel.edgeCost(lease.profile(), lease.tables(), to, (try view.edge(out)).*, 0, .{});
     try testing.expect(walk.cost > 0 and walk.secs > 0);
+    var bike_cache = try bicycle.Cache.init(testing.allocator, view.classes.?, 1);
+    defer bike_cache.deinit();
+    var bike = try bike_cache.acquire(try bicycle.parse(a, .null, &warnings, .none), .none);
+    defer bike.release();
+    const bike_turn = try bicycle.Turn.read(view, x, in, out);
+    try testing.expect(bicycle.Kernel.allowed(bike.profile(), from, to, bike_turn.base_turn, .{}));
+    const bicycle_crossing = bicycle.Kernel.turnCost(bike.profile(), try view.node(x), from, to, bike_turn);
+    try testing.expectEqual(@as(f32, 4.5), bicycle_crossing.secs);
+    try testing.expectApproxEqAbs(@as(f32, 10.4625), bicycle_crossing.cost, 1e-5);
 
     const elevator = try gurka.Map.init(a, try gurka.mapToCoordinates("A--K--B", 20), &.{
         .{ .label = "AK", .tags = &.{ footway[0], .{ .key = "level", .value = "2" } } },

@@ -58,10 +58,6 @@ fn sharedConfig() base.Config {
     return config;
 }
 
-fn factorRange(default: f32) base.Range {
-    return .{ .min = 0.1, .default = default, .max = 100_000 };
-}
-
 /// ParsePedestrianCostOptions. The input is costing_options.pedestrian.
 pub fn parse(arena: std.mem.Allocator, input: json.Value, warnings: *std.ArrayList(base.Warning), deadline: Deadline) !Options {
     const shared = try base.parse(arena, input, sharedConfig(), warnings, deadline);
@@ -81,11 +77,11 @@ pub fn parse(arena: std.mem.Allocator, input: json.Value, warnings: *std.ArrayLi
         .step_penalty = try base.rangedFloat(arena, input, "step_penalty", .penalty(if (chair) 600 else 30), warnings),
         .max_grade = try base.rangedUnsigned(arena, input, "max_grade", if (chair) 12 else 90, 90, warnings),
         .max_hiking_difficulty = @intCast(try base.rangedUnsigned(arena, input, "max_hiking_difficulty", 1, 6, warnings)),
-        .mode_factor = try base.rangedFloat(arena, input, "mode_factor", factorRange(1.5), warnings),
-        .walkway_factor = try base.rangedFloat(arena, input, "walkway_factor", factorRange(1), warnings),
-        .sidewalk_factor = try base.rangedFloat(arena, input, "sidewalk_factor", factorRange(1), warnings),
-        .alley_factor = try base.rangedFloat(arena, input, "alley_factor", factorRange(2), warnings),
-        .driveway_factor = try base.rangedFloat(arena, input, "driveway_factor", factorRange(5), warnings),
+        .mode_factor = try base.rangedFloat(arena, input, "mode_factor", .factor(1.5), warnings),
+        .walkway_factor = try base.rangedFloat(arena, input, "walkway_factor", .factor(1), warnings),
+        .sidewalk_factor = try base.rangedFloat(arena, input, "sidewalk_factor", .factor(1), warnings),
+        .alley_factor = try base.rangedFloat(arena, input, "alley_factor", .factor(2), warnings),
+        .driveway_factor = try base.rangedFloat(arena, input, "driveway_factor", .factor(5), warnings),
         .transit_start_end_max_distance = try base.rangedUnsigned(arena, input, "transit_start_end_max_distance", 2415, 100_000, warnings),
         .transit_transfer_max_distance = try base.rangedUnsigned(arena, input, "transit_transfer_max_distance", 805, 50_000, warnings),
         .bss_rent_cost = try base.rangedFloat(arena, input, "bss_rent_cost", .penalty(120), warnings),
@@ -124,12 +120,10 @@ pub const Profile = struct {
     }
 
     pub fn allowedCandidate(self: *const Profile, edge: *const EdgeClass, state: base.EdgeState, disallow: base.Disallow, project_on_bss: bool) bool {
-        var mask = disallow;
-        mask.closure = false;
         return edge.category.use < @backingInt(Use.rail_ferry) and
             edge.category.sac_scale <= self.max_hiking_difficulty and
             (!edge.flags.bike_share_connection or project_on_bss) and
-            self.permission.allowedEdge(edge, state, mask);
+            self.permission.allowedCandidate(edge, state, disallow);
     }
 
     fn pathClassAllowed(self: *const Profile, edge: *const EdgeClass) bool {
@@ -283,17 +277,10 @@ pub const Turn = struct {
 
     /// Uses the incoming opposing local even during reverse traversal.
     pub fn read(view: *const graph.reader.View, node: graph.format.NodeId, incoming: graph.format.EdgeId, outgoing: graph.format.EdgeId) !Turn {
-        const previous = try view.edge(incoming);
-        const next = try view.edge(outgoing);
-        const range = try view.outEdgeRange(node);
-        const index = @backingInt(outgoing);
-        if (previous.head != @backingInt(node) or index < range.first or index >= range.end or index - range.first != next.cls.local)
-            return error.InvalidTransition;
-        const row = try view.turnRow(node, previous.cls.opp_local);
-        if (next.cls.local >= row.len) return error.InvalidLocalEdge;
+        const common = try base.IntersectionTurn.read(view, node, incoming, outgoing);
         return .{
-            .base_turn = .{ .row = row[next.cls.local] },
-            .sides = try view.turnSides(node, previous.cls.opp_local, next.cls.local),
+            .base_turn = common.base_turn,
+            .sides = common.sides,
             .levels = if ((try view.node(node)).attr.type == @backingInt(graph.constants.NodeType.elevator))
                 try elevatorLevels(view, incoming, outgoing)
             else

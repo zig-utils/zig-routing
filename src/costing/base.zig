@@ -78,6 +78,10 @@ pub const Range = struct {
     pub fn preference(value: f32) Range {
         return .{ .min = 0, .default = value, .max = 1 };
     }
+
+    pub fn factor(value: f32) Range {
+        return .{ .min = 0.1, .default = value, .max = 100_000 };
+    }
 };
 
 pub const Config = struct {
@@ -488,6 +492,26 @@ pub const Turn = struct {
     }
 };
 
+pub const IntersectionTurn = struct {
+    base_turn: Turn,
+    sides: graph.turn_sides.Sides = .{},
+
+    pub fn read(view: *const graph.reader.View, node: graph.format.NodeId, incoming: graph.format.EdgeId, outgoing: graph.format.EdgeId) !IntersectionTurn {
+        const previous = try view.edge(incoming);
+        const next = try view.edge(outgoing);
+        const range = try view.outEdgeRange(node);
+        const index = @backingInt(outgoing);
+        if (previous.head != @backingInt(node) or index < range.first or index >= range.end or index - range.first != next.cls.local)
+            return error.InvalidTransition;
+        const row = try view.turnRow(node, previous.cls.opp_local);
+        if (next.cls.local >= row.len) return error.InvalidLocalEdge;
+        return .{
+            .base_turn = .{ .row = row[next.cls.local] },
+            .sides = try view.turnSides(node, previous.cls.opp_local, next.cls.local),
+        };
+    }
+};
+
 pub const Disallow = packed struct(u8) {
     start_restriction: bool = false,
     end_restriction: bool = false,
@@ -553,10 +577,19 @@ pub const Permission = struct {
                 (self.filter_closures or disallow.closure));
     }
 
+    pub fn allowedCandidate(self: Permission, edge: *const EdgeClass, state: EdgeState, disallow: Disallow) bool {
+        var mask = disallow;
+        mask.closure = false;
+        return self.allowedEdge(edge, state, mask);
+    }
+
+    pub fn allowsTurnRestriction(self: Permission, turn: Turn) bool {
+        return !turn.restricted() or self.flags.contains(.ignore_restrictions) or self.flags.contains(.ignore_non_vehicular_restrictions);
+    }
+
     /// Check a transition in travel order. Reverse search swaps its operands.
     pub fn allowedTransition(self: Permission, from: *const EdgeClass, to: *const EdgeClass, turn: Turn) bool {
-        if (turn.restricted() and !self.flags.contains(.ignore_restrictions) and
-            !self.flags.contains(.ignore_non_vehicular_restrictions)) return false;
+        if (!self.allowsTurnRestriction(turn)) return false;
         if (!self.allow_destination_only and turn.entersDestinationOnly(from, to)) return false;
         return self.allowedExclusions(from, to) and
             !(self.flags.contains(.exclude_unpaved) and to.category.surface >= @backingInt(graph.constants.Surface.compacted) and
