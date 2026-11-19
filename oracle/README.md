@@ -70,6 +70,34 @@ on the default server and a different, cheaper route on the opt-in server.
 
 ## Checks
 
+### Costing parity (gate A)
+
+Build `zr` in ReleaseFast and generate the route corpora. Run the gate against
+a pinned extract with the following commands.
+
+```bash
+zig build -Doptimize=ReleaseFast
+bun tools/corpus/generate.ts
+oracle/costing-parity.sh liechtenstein bench/results/costing-liechtenstein.json
+```
+
+The runner imports the oracle's local tiles into a native bundle and gives
+Valhalla the same level-2 graph. It samples admissible traversal and turn
+calls across 64 legal-range profiles per mode and the exact production
+profiles from the corpus. It also requests routes for the production
+profiles and compares their edge-by-edge recosts at the oracle's fractions.
+The C++ sampler links the pinned Valhalla library inside the oracle container.
+
+The JSON report carries counts and maximum relative errors by cost call and
+profile. Gate A requires 10 million calls per mode, a path recost for each
+mode, relative error of at most `1e-5` per call and `1e-4` per path. The
+runner keeps the reference file and diagnostic log under `bench/results/`.
+Each failing call lists the options and both native and Valhalla edge IDs.
+
+```bash
+zig-out/bin/zr parity costing BUNDLE costs.bin --out report.json
+```
+
 ### OSM tag parity
 
 CI compares the normal build tag transform against compressed NDJSON goldens for the

@@ -12,7 +12,8 @@
 //! `osm-pbf` (file framing, block inflation and OSM primitives), and
 //! `node-store` (the build-time coordinate index format) and `graph-bundle`
 //! (section headers, checksums and typed topology access), and
-//! `build-checkpoint` (restart manifests) and `valhalla-tile` (offline tile import).
+//! `build-checkpoint` (restart manifests), `valhalla-tile` (offline tile import),
+//! and `costing-reference` (gate A samples and paths).
 //!
 //! The contract for every parser: malformed input returns an error, never
 //! panics, overflows or reads out of bounds. The fuzz step builds ReleaseSafe
@@ -230,6 +231,40 @@ test "Valhalla importer preserves cross-tile edge pairs and cold data" {
     try std.testing.expectEqual(graph.turn_sides.Sides{ .right = true }, try b.view.turnSides(@fromBackingInt(0), 0, 0));
     try std.testing.expectEqual(@as(usize, 0), std.mem.indexOfScalar(u32, b.view.components.?, 0).?);
     try std.testing.expectEqual(@as(u32, 0), try b.view.component(@fromBackingInt(1)));
+}
+
+const costing_reference = routing.cli.parity_costing.Reference;
+
+fn fuzzCostingReference(_: void, s: *Smith) !void {
+    var buf: [max_input]u8 = undefined;
+    const input = draw(s, &buf, 0x636f_7374);
+    var reference = costing_reference.init(input) catch return;
+    while (reference.nextProfile() catch return) |profile| {
+        for (0..profile.paths) |_| _ = reference.nextPath() catch return;
+    }
+}
+
+test "fuzz costing-reference" {
+    var valid: [142]u8 = @splat(0);
+    @memcpy(valid[0..8], "ZRCOST01");
+    @memset(valid[8..40], '0');
+    valid[40] = 2; // nodes
+    valid[44] = 2; // directed edge IDs
+    valid[68] = 1; // tuple count
+    valid[72] = 1; // path count
+    valid[76] = 2; // profile JSON length
+    @memcpy(valid[80..82], "{}");
+    valid[86] = 1; // outgoing edge
+    valid[114] = 1; // one path segment
+    var reference = try costing_reference.init(&valid);
+    const profile = (try reference.nextProfile()).?;
+    try std.testing.expectEqualStrings("{}", profile.options);
+    try std.testing.expectEqual(@as(u32, 1), profile.calls[0].outgoing);
+    try std.testing.expectEqual(@as(usize, 1), (try reference.nextPath()).segments.len);
+    try std.testing.expectEqual(null, try reference.nextProfile());
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    try std.testing.fuzz({}, fuzzCostingReference, .{ .corpus = try seeds(state.allocator(), &.{ &.{}, &valid, valid[0..16], valid[0..131] }) });
 }
 
 fn fuzzBuildCheckpoint(_: void, smith: *Smith) !void {

@@ -152,6 +152,11 @@ fn createCommands(a: Allocator) !*Command {
     _ = try command(root, "import-valhalla", "Import local Valhalla tiles into a test graph bundle", importValhalla, &.{
         option("output", "Publish the graph bundle at this path", .string).withRequired(true),
     }, &.{arg("TILES", "Valhalla tile directory, .gph file or indexed tiles.tar").withVariadic(true)});
+    const parity = try command(root, "parity", "Run same-graph oracle parity checks", null, &.{}, &.{});
+    _ = try command(parity, "costing", "Compare native and Valhalla costing calls and path recosts", compareCosting, &.{
+        option("out", "Write the gate A JSON report", .string),
+        option("minimum-calls", "Required calls per mode (default 10000000)", .int),
+    }, &.{ arg("BUNDLE", "Bundle imported from the oracle tiles"), arg("REFERENCE", "Valhalla costing reference binary") });
     _ = try command(root, "version", "Show version, commit, toolchain and CPU features", version, &.{}, &.{});
     return root;
 }
@@ -480,6 +485,30 @@ fn importValhalla(ctx: *Context) !u8 {
         try ctx.out.?.print("imported {d} nodes and {d} directed edges from {d} local Valhalla tiles\n", .{ stats.nodes, stats.edges, stats.tiles });
     }
     return 0;
+}
+
+fn compareCosting(ctx: *Context) !u8 {
+    const parity = routing.cli.parity_costing;
+    const minimum = (try unsigned(ctx, u64, "minimum-calls")) orelse parity.minimum_calls;
+    var bundle = try routing.graph.reader.Bundle.open(ctx.getArgument(0).?);
+    defer bundle.close();
+    const reference = try io.Mapping.mapFile(ctx.getArgument(1).?, .read_only);
+    defer reference.unmap();
+    const app = App.from(ctx);
+    const report = try parity.run(ctx.allocator, &bundle.view, reference.bytes, minimum, app.stderr, .none);
+    if (ctx.getOption("out")) |destination| {
+        const payload = try std.json.Stringify.valueAlloc(ctx.allocator, report, .{ .whitespace = .indent_2 });
+        try io.writeFile(destination, payload);
+    }
+    if (ctx.wantsJson()) {
+        try ctx.writeJson(report);
+    } else {
+        try ctx.out.?.print("costing parity {s}: pedestrian {d} calls and {d} paths, bicycle {d} calls and {d} paths, {d} failures\n", .{
+            if (report.passed) "passed" else "failed", report.pedestrian.calls(),     report.pedestrian.recost.samples,
+            report.bicycle.calls(),                    report.bicycle.recost.samples, report.pedestrian.failures() + report.bicycle.failures(),
+        });
+    }
+    return if (report.passed) 0 else 1;
 }
 
 fn graphDiagnostic(ctx: *Context, action: []const u8, diagnostic: routing.graph.reader.Diagnostic, err: anyerror) anyerror {

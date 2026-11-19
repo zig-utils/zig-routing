@@ -5,6 +5,7 @@ const geo = @import("../geo/root.zig");
 const graph = @import("../graph/root.zig");
 const snap = @import("../snap/search.zig");
 const Cost = @import("../costing/compiled.zig").Cost;
+const Segment = @import("endpoints.zig").Segment;
 const multi = @import("multi.zig");
 const search = @import("search.zig");
 const EdgeId = graph.format.EdgeId;
@@ -46,6 +47,52 @@ pub const Trip = struct {
     summary: Summary,
 };
 
+/// Recompute traversal and transition cost along a path in travel order.
+pub const Recost = struct {
+    elapsed: Cost = .{},
+    previous: search.Label = .{},
+
+    pub const Step = struct {
+        length_m: f32,
+        transition: Cost,
+    };
+
+    pub fn add(self: *Recost, view: *const View, kernel: anytype, segment: Segment, edge: *const graph.format.EdgeHot, starts_pair: bool) !Step {
+        if (!(segment.begin >= 0 and segment.end >= segment.begin and segment.end <= 1)) return error.InvalidRoute;
+        var transition: Cost = .{};
+        if (starts_pair) self.previous = .{};
+        if (self.previous.edge != search.no_index) {
+            const incoming = try view.edge(self.previous.edgeId());
+            const node: graph.format.NodeId = @fromBackingInt(incoming.head);
+            const row = try view.turnRow(node, incoming.cls.opp_local);
+            const range = try view.outEdgeRange(node);
+            if (edge.cls.local >= row.len or range.first + edge.cls.local != @backingInt(segment.edge)) return error.DisconnectedPath;
+            transition = try kernel.turnCost(view, .{
+                .node = node,
+                .incoming = self.previous.edgeId(),
+                .incoming_edge = incoming,
+                .outgoing = segment.edge,
+                .outgoing_edge = edge,
+                .row = row[edge.cls.local],
+            }, self.previous, .forward);
+        }
+        const full = try kernel.edgeCost(view, segment.edge, edge, .forward);
+        if (full.cost == std.math.inf(f32) or transition.cost == std.math.inf(f32)) return error.InvalidRouteCost;
+        const fraction = segment.end - segment.begin;
+        const scale = @max(fraction, std.math.floatEps(f32));
+        self.elapsed = self.elapsed.add(transition.add(.{ .cost = full.cost * scale, .secs = full.secs * scale }));
+        const length = @as(f32, @floatFromInt(edge.geom.len_m)) * fraction;
+        self.previous = .{
+            .edge = @backingInt(segment.edge),
+            .cost = self.elapsed.cost,
+            .secs = self.elapsed.secs,
+            .dist_m = self.previous.dist_m +| @as(u32, @intFromFloat(@round(length))),
+            .tcost = transition.cost,
+        };
+        return .{ .length_m = length, .transition = transition };
+    }
+};
+
 /// Assemble the selected path in travel order. The allocator and correlations
 /// come from the same request that produced the route.
 pub fn build(a: std.mem.Allocator, view: *const View, kernel: anytype, route: multi.Route, correlations: []const snap.PathLocation, control: search.Control) !Trip {
@@ -81,17 +128,14 @@ fn buildLeg(a: std.mem.Allocator, view: *const View, kernel: anytype, leg: multi
     const edges = try a.alloc(Edge, leg.segments.len);
     var shape: std.ArrayList(geo.PointLL) = .empty;
     var summary: Summary = .{ .bounds = undefined };
-    var elapsed: Cost = .{};
-    var previous: search.Label = .{};
+    var recost: Recost = .{};
     for (leg.segments, leg.segment_contexts, edges, 0..) |segment, context, *output, i| {
         try control.check();
-        if (context.pair < leg.origin or context.pair >= leg.destination or
-            !(segment.begin >= 0 and segment.end >= segment.begin and segment.end <= 1)) return error.InvalidRoute;
+        if (context.pair < leg.origin or context.pair >= leg.destination) return error.InvalidRoute;
         const edge = try view.edge(segment.edge);
         const class = try view.class(edge.cls.class_id);
+        const step = try recost.add(view, kernel, segment, edge, context.starts_pair);
         const metres: f32 = @floatFromInt(edge.geom.len_m);
-        const fraction = segment.end - segment.begin;
-        const length = metres * fraction;
 
         const record = try view.coldRecord(segment.edge);
         if (record.header.point_count < 2) return error.IncompleteShape;
@@ -118,39 +162,11 @@ fn buildLeg(a: std.mem.Allocator, view: *const View, kernel: anytype, leg: multi
             _ = summary.bounds.expandPoint(point);
         }
 
-        var transition: Cost = .{};
-        if (context.starts_pair) previous = .{};
-        if (previous.edge != search.no_index) {
-            const incoming = try view.edge(previous.edgeId());
-            const node: graph.format.NodeId = @fromBackingInt(incoming.head);
-            const row = try view.turnRow(node, incoming.cls.opp_local);
-            const range = try view.outEdgeRange(node);
-            if (edge.cls.local >= row.len or range.first + edge.cls.local != @backingInt(segment.edge)) return error.DisconnectedPath;
-            transition = try kernel.turnCost(view, .{
-                .node = node,
-                .incoming = previous.edgeId(),
-                .incoming_edge = incoming,
-                .outgoing = segment.edge,
-                .outgoing_edge = edge,
-                .row = row[edge.cls.local],
-            }, previous, .forward);
-        }
-        const full = try kernel.edgeCost(view, segment.edge, edge, .forward);
-        if (full.cost == std.math.inf(f32) or transition.cost == std.math.inf(f32)) return error.InvalidRouteCost;
-        const scale = @max(fraction, std.math.floatEps(f32));
-        elapsed = elapsed.add(transition.add(.{ .cost = full.cost * scale, .secs = full.secs * scale }));
-        previous = .{
-            .edge = @backingInt(segment.edge),
-            .cost = elapsed.cost,
-            .secs = elapsed.secs,
-            .dist_m = previous.dist_m +| @as(u32, @intFromFloat(@round(length))),
-            .tcost = transition.cost,
-        };
         output.* = .{
             .id = segment.edge,
-            .length_m = length,
-            .elapsed = elapsed,
-            .transition = transition,
+            .length_m = step.length_m,
+            .elapsed = recost.elapsed,
+            .transition = step.transition,
             .shape_begin = shape_begin,
             .shape_end = shape.items.len - 1,
         };
@@ -159,8 +175,8 @@ fn buildLeg(a: std.mem.Allocator, view: *const View, kernel: anytype, leg: multi
         summary.has_ferry = summary.has_ferry or class.category.use == @backingInt(graph.constants.Use.ferry);
     }
     summary.length_m = @as(f64, leg.length_km) * 1000;
-    summary.time = elapsed.secs;
-    summary.cost = elapsed.cost;
+    summary.time = recost.elapsed.secs;
+    summary.cost = recost.elapsed.cost;
     const encoded = try a.alloc(u8, geo.polyline.maxEncodedLen(.polyline, shape.items.len));
     const size = try geo.polyline.encodeWithDeadline(.polyline, 6, shape.items, encoded, control.deadline);
     try control.check();

@@ -67,7 +67,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     const help_test = b.addRunArtifact(exe);
     help_test.addArg("--help");
-    for ([_][]const u8{ "serve", "build", "route", "bench", "diff", "inspect", "tags", "config", "dem", "import-valhalla" }) |name| {
+    for ([_][]const u8{ "serve", "build", "route", "bench", "diff", "inspect", "tags", "config", "dem", "import-valhalla", "parity" }) |name| {
         help_test.expectStdOutMatch(name);
     }
     test_step.dependOn(&help_test.step);
@@ -285,7 +285,7 @@ pub fn build(b: *std.Build) void {
 
     // Fuzz targets (test/fuzz.zig). `zig build test` replays their seeds; `zig build fuzz
     // --fuzz` fuzzes, ReleaseSafe by default so bounds and overflow checks stay on.
-    const fuzz_filter = b.option([]const u8, "fuzz-target", "Fuzz one target: request, http, polyline, lz4, dem, protobuf, config, osm-pbf, node-store, graph-bundle, build-checkpoint, valhalla-tile");
+    const fuzz_filter = b.option([]const u8, "fuzz-target", "Fuzz one target: request, http, polyline, lz4, dem, protobuf, config, osm-pbf, node-store, graph-bundle, build-checkpoint, valhalla-tile, costing-reference");
     const fuzz_opt: @TypeOf(optimize) = .ReleaseSafe;
     const seed_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("test/fuzz.zig"),
