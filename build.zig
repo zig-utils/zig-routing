@@ -283,6 +283,16 @@ pub fn build(b: *std.Build) void {
     run_bench_costing.addPassthruArgs();
     b.step("bench-costing", "Measure compile cache hits and misses over a graph bundle").dependOn(&run_bench_costing.step);
 
+    const bench_search = b.addExecutable(.{ .name = "bench-search", .root_module = b.createModule(.{
+        .root_source_file = b.path("test/bench_search.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{ .{ .name = "routing", .module = lib_mod }, .{ .name = "perf_counters", .module = perf_counters } },
+    }) });
+    const run_bench_search = b.addRunArtifact(bench_search);
+    run_bench_search.addPassthruArgs();
+    b.step("bench-search", "Measure edge-based Dijkstra throughput and counters on a graph bundle").dependOn(&run_bench_search.step);
+
     // Fuzz targets (test/fuzz.zig). `zig build test` replays their seeds; `zig build fuzz
     // --fuzz` fuzzes, ReleaseSafe by default so bounds and overflow checks stay on.
     const fuzz_filter = b.option([]const u8, "fuzz-target", "Fuzz one target: request, http, polyline, lz4, dem, protobuf, config, osm-pbf, node-store, graph-bundle, build-checkpoint, valhalla-tile, costing-reference");
