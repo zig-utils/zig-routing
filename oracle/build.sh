@@ -3,17 +3,11 @@
 source "$(dirname "$0")/lib.sh"
 name="${1:?usage: build.sh <dataset>}"
 dir="$ORACLE_DATA/$name"
-[ -f "$dir/extract.osm.pbf" ] || "$ORACLE_DIR/fetch.sh" "$name"
+key=$(build_key "$name")
+"$ORACLE_DIR/fetch.sh" "$name"
 start=$(date +%s)
-docker run --rm --platform "$ORACLE_PLATFORM" -v "$dir:/data" "$ORACLE_IMAGE" bash -euo pipefail -c '
-  rm -rf /data/tiles /data/tiles.tar
-  valhalla_build_config \
-    --mjolnir-tile-dir /data/tiles \
-    --mjolnir-tile-extract /data/tiles.tar \
-    --additional-data-elevation /data/elevation \
-    --loki-use-connectivity false \
-    > /data/valhalla.json
-  valhalla_build_tiles -c /data/valhalla.json /data/extract.osm.pbf
-  valhalla_build_extract -c /data/valhalla.json -v
-'
+rm -f "$dir/build.key"
+oracle_compose "$name" default 8102 run --rm -T build
+[ -s "$dir/tiles.tar" ] || die "build did not produce a tile extract for '$name'"
+printf '%s\n' "$key" > "$dir/build.key"
 echo "oracle: built $name in $(( $(date +%s) - start ))s ($(du -sh "$dir" | cut -f1) on disk)"

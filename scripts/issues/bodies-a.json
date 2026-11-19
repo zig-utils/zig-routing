@@ -82,7 +82,7 @@
   },
   {
     "key": "P0.04",
-    "goal": "A reproducible Valhalla 3.9.3 oracle in Docker that builds tiles for our test extracts and for US+DACH and serves them, used only at development time for parity and baseline numbers.",
+    "goal": "A reproducible Valhalla 3.9.3 oracle in Docker that builds and serves test extracts for development-time parity checks.",
     "upstream": [
       "docker/",
       "scripts/valhalla_build_config",
@@ -92,13 +92,14 @@
     ],
     "scope": [
       "oracle/ directory with a compose file pinning the Valhalla image by digest for release 3.9.3",
-      "Scripts to download and checksum the PBF extracts (small fixtures, Germany, US+DACH) and elevation tiles",
-      "Tile build with the same config keys as production (from P0.03 when available, upstream defaults otherwise)",
+      "Scripts to download and checksum the fixture PBFs and elevation tiles",
+      "Tile build with upstream defaults and production settings from P0.03 where applicable",
       "A second oracle config with hierarchy pruning disabled; confirm the exact option and service-limit names in 3.9.3 and document them",
       "`oracle/up.sh <dataset>` starts a server on a local port; `oracle/down.sh` stops it",
       "Document disk, memory and time needed per dataset"
     ],
     "out_of_scope": [
+      "Germany and US+DACH tile builds (P0.13)",
       "Request corpora (P0.05)",
       "Running upstream Lua for tag goldens (P3.10)"
     ],
@@ -109,8 +110,24 @@
     ],
     "accept": [
       "`oracle/up.sh utrecht` (or another small fixture) serves /route, /height and /status locally",
-      "The image digest, PBF checksums and config are committed so two machines build identical tiles",
+      "The image digest, PBF and elevation checksums and config inputs are committed so two machines can reproduce the graph",
       "The pruning-disabled config is verified to change at least one known pruned route"
+    ]
+  },
+  {
+    "key": "P0.13",
+    "goal": "Build and serve Germany and the production-scale US+DACH dataset with the pinned Valhalla 3.9.3 oracle.",
+    "scope": [
+      "Pin dated Geofabrik PBFs and a manifest of SRTM tiles by URL and SHA-256",
+      "Verify the inputs and pass both regional PBFs to one US+DACH build",
+      "Use the production build settings from P0.03 and the pruning-opt-in configuration from P0.04",
+      "Document peak scratch disk, memory and build time for both datasets"
+    ],
+    "accept": [
+      "A build host or volume has capacity for the inputs, scratch files, unpacked tiles and tar extract",
+      "The checked-in manifests let a clean host fetch and verify the same input bytes",
+      "The Germany and US+DACH oracles serve status, routing and elevation across their intended regions",
+      "The validated US+DACH setup is available for corpus replay and baseline measurements"
     ]
   },
   {

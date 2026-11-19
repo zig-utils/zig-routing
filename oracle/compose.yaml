@@ -1,0 +1,27 @@
+x-valhalla: &valhalla
+  # Valhalla 3.9.3 (multi-arch manifest).
+  image: ghcr.io/valhalla/valhalla@sha256:cf618ccafdead96829282acc81a70aa00947c2f28ddcf118f0194acf2fbc7e9d
+  platform: ${ORACLE_PLATFORM:-linux/amd64}
+
+services:
+  oracle:
+    <<: *valhalla
+    command: [valhalla_service, "/data/${ORACLE_CONFIG:-valhalla.json}", "2"]
+    ports: ["127.0.0.1:${ORACLE_PORT:-8102}:8002"]
+    volumes:
+      - type: bind
+        source: ${ORACLE_DATASET_DIR:?set ORACLE_DATASET_DIR}
+        target: /data
+        read_only: true
+  build:
+    <<: *valhalla
+    profiles: [build]
+    entrypoint: [bash, /build-tiles.sh]
+    volumes:
+      - type: bind
+        source: ${ORACLE_DATASET_DIR:?set ORACLE_DATASET_DIR}
+        target: /data
+      - type: bind
+        source: ./build-tiles.sh
+        target: /build-tiles.sh
+        read_only: true

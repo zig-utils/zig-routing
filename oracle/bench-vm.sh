@@ -17,8 +17,9 @@ corpus="${2:?usage: bench-vm.sh <dataset> <corpus> [label]}"
 label="${3:-$(git -C "$ORACLE_DIR/.." rev-parse --short HEAD)}"
 repo="$(cd "$ORACLE_DIR/.." && pwd)"
 dir="$ORACLE_DATA/$name"
-[ -f "$dir/tiles.tar" ] || "$ORACLE_DIR/build.sh" "$name"
 [ -f "$corpus" ] || die "no corpus $corpus (bun tools/corpus/generate.ts)"
+ensure_built "$name"
+ORACLE_IMAGE=$(oracle_compose "$name" default 8102 config --images oracle)
 platform=linux/arm64
 cpus=$(docker info --format '{{.NCPU}}')
 workers=$(( cpus > 2 ? cpus - 2 : 1 ))   # leave the client two CPUs
