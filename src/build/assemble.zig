@@ -506,6 +506,9 @@ pub const Metadata = struct {
                 .type = @backingInt(attrs.type),
                 .density = 0,
                 .signal = @intFromBool(attrs.flags.traffic_signal),
+                .tagged_access = attrs.flags.tagged_access,
+                .private_access = attrs.flags.private_access,
+                .cash_only_toll = attrs.flags.cash_only_toll,
             },
         };
         if (!std.meta.eql(hot, neutral_node)) try self.nodes.put(self.gpa, id, hot);

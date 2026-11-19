@@ -121,7 +121,15 @@ fn floatToInt(comptime T: type, f: f64) ?T {
 
 fn parseFloatStrict(comptime T: type, s: []const u8) ?T {
     if (s.len == 0) return null;
-    return std.fmt.parseFloat(T, s) catch null;
+    if (std.mem.indexOfAny(u8, s, "_xX \t\r\n") != null) return null;
+    const value = std.fmt.parseFloat(T, s) catch return null;
+    if (std.math.isFinite(value)) return value;
+    const word = if (s[0] == '-' or s[0] == '+') s[1..] else s;
+    // Lexical conversion accepts explicit infinity and NaN, and rejects
+    // decimal strings whose numeric value overflows the target type.
+    if (std.ascii.eqlIgnoreCase(word, "inf") or std.ascii.eqlIgnoreCase(word, "infinity") or
+        std.ascii.eqlIgnoreCase(word, "nan")) return value;
+    return null;
 }
 
 /// An array at `path`, if there is one.

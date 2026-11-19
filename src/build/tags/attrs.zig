@@ -126,7 +126,8 @@ pub const WayAttrs = struct {
         shoulder_right: bool = false,
         tagged_internal_intersection: bool = false,
         destination_only_hgv: bool = false,
-        reserved: u4 = 0,
+        toll: bool = false,
+        reserved: u3 = 0,
     };
 };
 
@@ -155,6 +156,7 @@ pub const NodeAttrs = struct {
         direction: bool = false,
         tagged_access: bool = false,
         private_access: bool = false,
-        reserved: u2 = 0,
+        cash_only_toll: bool = false,
+        reserved: u1 = 0,
     };
 };

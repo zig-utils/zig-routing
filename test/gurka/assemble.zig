@@ -755,6 +755,65 @@ fn directedBetween(view: *const graph.reader.View, fixture: *const gurka.Map, fi
     return error.TestEdgeNotFound;
 }
 
+test "assembled gates and tolls retain shared costing attributes" {
+    const base = routing.costing.base;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "residential" }};
+    const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates("A--G--B--T--C", 20), &.{
+        .{ .label = "AG", .tags = road },
+        .{ .label = "GB", .tags = road },
+        .{ .label = "BT", .tags = &.{ road[0], .{ .key = "toll", .value = "yes" } } },
+        .{ .label = "TC", .tags = road },
+    }, &.{
+        .{ .label = "G", .tags = &.{
+            .{ .key = "barrier", .value = "gate" },
+            .{ .key = "access", .value = "private" },
+        } },
+        .{ .label = "T", .tags = &.{
+            .{ .key = "barrier", .value = "toll_booth" },
+            .{ .key = "payment:notes", .value = "yes" },
+            .{ .key = "payment:credit_cards", .value = "no" },
+        } },
+    }, &.{});
+    var result = try Built.assemble(fixture.osm, 1);
+    defer result.deinit();
+    const view = &result.bundle.view;
+    const gate = try view.node(try at(view, fixture.findNode("G").?.location.toFixed()));
+    const booth = try view.node(try at(view, fixture.findNode("T").?.location.toFixed()));
+    try testing.expect(gate.attr.tagged_access);
+    try testing.expect(gate.attr.private_access);
+    try testing.expect(booth.attr.cash_only_toll);
+
+    const approach = try view.class((try view.edge(try directedBetween(view, &fixture, "A", "G"))).cls.class_id);
+    const exit = try view.class((try view.edge(try directedBetween(view, &fixture, "G", "B"))).cls.class_id);
+    const toll_id = try directedBetween(view, &fixture, "B", "T");
+    const toll = try view.class((try view.edge(toll_id)).cls.class_id);
+    const toll_reverse = try view.class((try view.edge(try view.oppEdge(toll_id))).cls.class_id);
+    try testing.expect(!approach.flags.toll);
+    try testing.expect(toll.flags.toll);
+    try testing.expect(toll_reverse.flags.toll);
+
+    var warnings: std.ArrayList(base.Warning) = .empty;
+    const object = try routing.api.json.parse(a,
+        \\{"exclude_cash_only_tolls":true,"exclude_tolls":true}
+    );
+    const options = try base.parse(a, object, .{}, &warnings, .none);
+    const shared: base.Shared = .init(options);
+    const turn: base.Turn = .{ .row = 0x40 };
+    const gate_cost = shared.transition(gate, approach, exit, turn);
+    try testing.expectEqual(@as(f32, 480), gate_cost.cost);
+    try testing.expectEqual(@as(f32, 30), gate_cost.secs);
+    const junction = try view.node(try at(view, fixture.findNode("B").?.location.toFixed()));
+    const toll_cost = shared.transition(junction, exit, toll, turn);
+    try testing.expectEqual(@as(f32, 15), toll_cost.cost);
+    try testing.expectEqual(@as(f32, 15), toll_cost.secs);
+    const permission: base.Permission = .init(options, .{ .auto = true }, true);
+    try testing.expect(!permission.allowedNode(booth));
+    try testing.expect(!permission.allowedTransition(exit, toll, turn));
+}
+
 // Ported from test/gurka/test_reach.cc.
 test "bounded reach matches the nine-node grid and upstream live closure cases" {
     const snap = routing.snap;

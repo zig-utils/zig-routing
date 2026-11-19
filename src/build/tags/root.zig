@@ -35,6 +35,7 @@ pub fn transformWay(scratch: *Scratch, tags: anytype, deadline: io.Deadline) !?W
             .ferry = selected.ferry,
             .rail = selected.rail,
             .pedestrian_area = selected.pedestrian_area,
+            .toll = isToll(scratch.text(.toll) orelse ""),
         },
         .layer = @truncate(if (scratch.text(.layer)) |layer| std.fmt.parseInt(i32, layer, 10) catch 0 else @as(i32, 0)),
         .level = scratch.text(.level),
@@ -45,6 +46,13 @@ pub fn transformWay(scratch: *Scratch, tags: anytype, deadline: io.Deadline) !?W
     try bike_foot.applyWay(&result, scratch, selected, deadline);
     try speed.apply(&result, scratch, selected.road_class, deadline);
     return result;
+}
+
+fn isToll(value: []const u8) bool {
+    inline for (.{ "yes", "true", "1", "interval", "snowmobile" }) |yes| {
+        if (std.mem.eql(u8, yes, value)) return true;
+    }
+    return false;
 }
 
 pub const IndexedWay = struct {
@@ -71,7 +79,29 @@ pub fn transformNode(scratch: *Scratch, tags: anytype, deadline: io.Deadline) !?
     var result: NodeAttrs = .{ .name = scratch.text(.name), .ref = scratch.text(.ref), .exit_to = scratch.text(.exit_to) };
     try access.applyNode(scratch, deadline, &result);
     try bike_foot.applyNode(&result, scratch, deadline);
+    if (result.type == .toll_booth)
+        result.flags.cash_only_toll = scratch.id(.cash_only_toll) == .true or try cashOnly(tags, deadline);
     return result;
+}
+
+// Ported from lua/graph.lua is_cash_only_payment. Payment tags other than
+// cash, notes and coins count as noncash unless the value is "no".
+fn cashOnly(tags: anytype, deadline: io.Deadline) !bool {
+    var iter = @import("input.zig").Iterator.init(tags, deadline);
+    var cash = false;
+    var noncash = false;
+    var count: usize = 0;
+    while (try iter.next()) |tag| : (count += 1) {
+        if (count % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+        if (!std.mem.startsWith(u8, tag.key, "payment:") or std.ascii.eqlIgnoreCase(tag.value, "no")) continue;
+        const method = tag.key["payment:".len..];
+        if (std.mem.eql(u8, method, "cash") or std.mem.eql(u8, method, "notes") or std.mem.eql(u8, method, "coins")) {
+            cash = true;
+        } else {
+            noncash = true;
+        }
+    }
+    return cash and !noncash;
 }
 
 /// Selection callback for the node store's way usage pass.

@@ -40,7 +40,10 @@ pub const NodeHot = extern struct {
         signal: u1,
         intersection: constants.IntersectionType = .regular,
         drive_on_left: bool = false,
-        _pad: u4 = 0,
+        tagged_access: bool = false,
+        private_access: bool = false,
+        cash_only_toll: bool = false,
+        _pad: u1 = 0,
     },
 };
 

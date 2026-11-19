@@ -167,6 +167,7 @@ pub const Key = enum(u8) {
     backward_stop,
     forward_yield,
     backward_yield,
+    toll,
     toll_booth,
     border_control,
     toll_gantry,

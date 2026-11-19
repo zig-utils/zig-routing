@@ -32,6 +32,7 @@ pub fn fromWay(way: WayAttrs, forward: bool, drive_side: DriveSide) !EdgeClass {
         },
         .access = .{ .forward = @bitCast(fwd), .reverse = @bitCast(rev) },
         .flags = .{
+            .toll = way.flags.toll,
             .tunnel = way.flags.tunnel,
             .bridge = way.flags.bridge,
             .roundabout = way.flags.roundabout,
