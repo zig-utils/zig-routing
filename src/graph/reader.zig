@@ -5,6 +5,7 @@ const io = @import("../infra/io.zig");
 const format = @import("format.zig");
 const class_table = @import("class_table.zig");
 const cold = @import("cold.zig");
+const spatial = @import("spatial.zig");
 const Kind = format.SectionKind;
 const Header = format.SectionHeader;
 const kinds = std.enums.values(Kind);
@@ -68,6 +69,8 @@ pub const View = struct {
     cold: ?[]const u8,
     cold_data: ?cold.View,
     slopes: ?[]const u16,
+    spatial: ?[]const u8,
+    spatial_index: ?spatial.View,
 
     pub fn parse(files: Files, diagnostic: ?*Diagnostic) !View {
         var headers: Headers = .initFill(null);
@@ -143,6 +146,8 @@ pub const View = struct {
             .cold = null,
             .cold_data = null,
             .slopes = null,
+            .spatial = null,
+            .spatial_index = null,
         };
         inline for (kinds) |kind| {
             if (headers.get(kind)) |present| {
@@ -155,6 +160,10 @@ pub const View = struct {
             note(diagnostic, .cold);
             graph.cold_data = try cold.View.parse(bytes);
             if (graph.cold_data.?.header.record_count != edge_count / 2) return error.InvalidColdRecordCount;
+        }
+        if (graph.spatial) |bytes| {
+            note(diagnostic, .spatial);
+            graph.spatial_index = try spatial.View.parse(bytes, @intCast(edge_count));
         }
         note(diagnostic, null);
         return graph;
@@ -267,7 +276,7 @@ pub const View = struct {
             note(diagnostic, kind);
             if (deadline.expired()) return error.DeadlineExceeded;
             const bytes: []const u8 = switch (kind) {
-                inline .classes, .coordinates, .cold_idx, .cold, .slopes => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
+                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
                 inline else => |section| std.mem.sliceAsBytes(@field(self, @tagName(section))),
             };
             var hash = std.hash.XxHash3.init(0);

@@ -57,7 +57,7 @@ jobs:
             https://download.geofabrik.de/europe/luxembourg-260101.osm.pbf \
             "$work/luxembourg.osm.pbf" \
             d8f3e1dabb4d9d5489500c35432eb393089c32222cfff8cf50706852f0696a80
-          zig build check-assembly -Doptimize=ReleaseFast -- "$work/luxembourg.osm.pbf" "$work/luxembourg" "$work" 4 right --sub-byte-turns
+          zig build check-assembly -Doptimize=ReleaseFast -- "$work/luxembourg.osm.pbf" "$work/luxembourg" "$work" 4 right --sub-byte-turns --spatial-budget
       - uses: actions/checkout@v6
         if: matrix.os == 'ubuntu-latest'
         with:

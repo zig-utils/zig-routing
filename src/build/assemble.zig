@@ -43,6 +43,7 @@ pub const Stats = struct {
     cold_records: u32,
     cold_payload_bytes: u64,
     elevation: elevation.Coverage,
+    spatial: graph.spatial.Stats,
     assembly_ns: u64,
 };
 
@@ -118,6 +119,7 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     const topology_ns = timer.read();
     const means: []const i16 = if (terrain) |*present| present.means.data else &.{};
     const cold_bytes = try buildCold(gpa, &shared, &metadata, writer, options.scratch_dir, means);
+    const spatial = try buildSpatial(gpa, &shared, writer, options.scratch_dir, options.workers);
     return .{
         .source = source_stats,
         .nodes = @intCast(topology.nodes.len),
@@ -130,6 +132,7 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
         .cold_records = @intCast(topology.output.data.len / 2),
         .cold_payload_bytes = cold_bytes,
         .elevation = if (terrain) |present| present.coverage else .{ .total_edges = segments.len },
+        .spatial = spatial,
         .assembly_ns = topology_ns,
     };
 }
@@ -975,6 +978,74 @@ fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *const Metadata, w
     if (builder.record_count != topo.output.data.len / 2) return error.InvalidColdRecordCount;
     try writer.write(.cold_idx, index.data);
     return builder.write(writer);
+}
+
+const SpatialJob = struct {
+    gpa: Allocator,
+    shared: *const Shared,
+    start: usize,
+    end: usize,
+    pairs: std.ArrayList(graph.spatial.Pair) = .empty,
+    result: anyerror!void = {},
+
+    fn run(self: *SpatialJob) void {
+        self.result = self.emit();
+    }
+
+    fn emit(self: *SpatialJob) !void {
+        const shared = self.shared;
+        for (self.start..self.end) |i| {
+            try checkDeadline(shared.deadline, i - self.start);
+            const slots = shared.topology.placements.data[2 * i ..][0..2];
+            const representative = @min(slots[0].slot, slots[1].slot);
+            const shape = try segmentShape(shared.shape_points, shared.segments[i]);
+            try graph.spatial.addShape(self.gpa, &self.pairs, representative, shape, shared.deadline);
+        }
+    }
+};
+
+fn buildSpatial(gpa: Allocator, shared: *const Shared, writer: *format.BundleWriter, scratch_dir: []const u8, requested: usize) !graph.spatial.Stats {
+    const topo = shared.topology;
+    const workers = if (requested == 0) std.Thread.getCpuCount() catch 1 else requested;
+    const segments = shared.segments.len;
+    const count = @max(1, @min(workers, max_workers, (segments + 255) / 256));
+    var jobs: [max_workers]SpatialJob = undefined;
+    const active = jobs[0..count];
+    for (active, 0..) |*job, i| {
+        job.* = .{ .gpa = gpa, .shared = shared, .start = segments * i / count, .end = segments * (i + 1) / count };
+    }
+    defer for (active) |*job| job.pairs.deinit(gpa);
+    try runJobs(active);
+
+    // Synthetic alias arcs share their endpoint coordinates. They have a
+    // representative as well, so every stored shape has a spatial entry.
+    for (topo.groups, 0..) |group, i| {
+        try checkDeadline(shared.deadline, i);
+        if (!group.has_right) continue;
+        const slot = topo.first_edge[i + 1] - 1;
+        try graph.spatial.addShape(gpa, &active[0].pairs, slot, &.{ topo.coordinates[i], topo.coordinates[i + 1] }, shared.deadline);
+    }
+
+    var total: usize = 0;
+    for (active) |job| total = std.math.add(usize, total, job.pairs.items.len) catch return error.SpatialIndexTooLarge;
+    const pairs = try Scratch(graph.spatial.Pair).init(total, scratch_dir);
+    defer pairs.deinit();
+    const scratch = try Scratch(graph.spatial.Pair).init(total, scratch_dir);
+    defer scratch.deinit();
+    var written: usize = 0;
+    for (active) |*job| {
+        var remaining = job.pairs.items;
+        while (remaining.len != 0) {
+            if (shared.deadline.expired()) return error.DeadlineExceeded;
+            const n = @min(remaining.len, 64 * 1024);
+            @memcpy(pairs.data[written..][0..n], remaining[0..n]);
+            written += n;
+            remaining = remaining[n..];
+        }
+        job.pairs.deinit(gpa);
+        job.pairs = .empty;
+    }
+    return graph.spatial.write(gpa, pairs.data, scratch.data, scratch_dir, writer, shared.deadline);
 }
 
 fn checkDeadline(deadline: io.Deadline, index: usize) !void {

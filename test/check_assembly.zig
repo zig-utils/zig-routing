@@ -4,6 +4,7 @@ const io = routing.infra.io;
 const build = routing.build;
 const graph = routing.graph;
 const dem = routing.elevation;
+const geo = routing.geo;
 const open_budget_ns = 50 * std.time.ns_per_ms;
 
 pub fn main(init: std.process.Init) !void {
@@ -18,12 +19,15 @@ pub fn main(init: std.process.Init) !void {
     else
         .right;
     var require_sub_byte_turns = false;
+    var require_spatial_budget = false;
     var dem_dir: ?[]const u8 = null;
     var pack: ?dem.@"packed".Pack = null;
     defer if (pack) |*present| present.close();
     while (args.next()) |flag| {
         if (std.mem.eql(u8, flag, "--sub-byte-turns")) {
             require_sub_byte_turns = true;
+        } else if (std.mem.eql(u8, flag, "--spatial-budget")) {
+            require_spatial_budget = true;
         } else if (std.mem.eql(u8, flag, "--dem") and dem_dir == null and pack == null) {
             dem_dir = args.next() orelse return usage();
         } else if (std.mem.eql(u8, flag, "--dem-pack") and dem_dir == null and pack == null) {
@@ -59,6 +63,7 @@ pub fn main(init: std.process.Init) !void {
         try build.assemble.validate(warm.view.first_edge, warm.view.edges, warm.view.coordinates.?, warm.view.classes.?, .none);
         try validateTurns(&warm.view, stats.turn_pool_bytes);
         try validateCold(init.gpa, &warm.view, stats.cold_records, stats.cold_payload_bytes);
+        try validateSpatial(&warm.view, stats.spatial);
         try validateElevation(&warm.view, stats.elevation);
         try validateEnhancement(&warm.view, drive_side);
     }
@@ -81,6 +86,7 @@ pub fn main(init: std.process.Init) !void {
         .edges_per_second = rate(stats.directed_edges, stats.assembly_ns),
         .turn_bytes_per_node = @as(f64, @floatFromInt(stats.turn_pool_bytes)) / @as(f64, @floatFromInt(@max(stats.nodes, 1))),
         .cold_bytes_per_directed_edge = @as(f64, @floatFromInt(cold_bytes)) / @as(f64, @floatFromInt(@max(stats.directed_edges, 1))),
+        .spatial_bytes_per_undirected_edge = @as(f64, @floatFromInt(stats.spatial.payload_bytes)) / @as(f64, @floatFromInt(@max(stats.cold_records, 1))),
         .peak_rss_bytes = try io.peakRssBytes(),
         .warm_open_median_ns = times[times.len / 2],
         .warm_open_max_ns = times[times.len - 1],
@@ -90,6 +96,7 @@ pub fn main(init: std.process.Init) !void {
     try stdout.interface.flush();
     if (times[times.len - 1] >= open_budget_ns) return error.BundleOpenTooSlow;
     if (require_sub_byte_turns and stats.turn_pool_bytes >= stats.nodes) return error.TurnPoolTooLarge;
+    if (require_spatial_budget and stats.spatial.payload_bytes > 3 * @as(u64, stats.cold_records)) return error.SpatialBudgetExceeded;
 }
 
 fn validateTurns(view: *const graph.reader.View, expected_bytes: usize) !void {
@@ -108,6 +115,7 @@ fn validateTurns(view: *const graph.reader.View, expected_bytes: usize) !void {
 
 fn validateCold(allocator: std.mem.Allocator, view: *const graph.reader.View, records: u32, payload_bytes: u64) !void {
     const table = view.cold_data orelse return error.MissingColdData;
+    const spatial = view.spatial_index orelse return error.MissingSpatialIndex;
     if (table.header.record_count != records or table.bytes.len != payload_bytes) return error.ColdSizeMismatch;
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
@@ -124,9 +132,45 @@ fn validateCold(allocator: std.mem.Allocator, view: *const graph.reader.View, re
             const head: graph.format.NodeId = @fromBackingInt((try view.edge(id)).head);
             if (!std.meta.eql(points[0], try view.coordinate(node)) or
                 !std.meta.eql(points[points.len - 1], try view.coordinate(head))) return error.ColdShapeEndpointMismatch;
+            try validateSpatialPoint(spatial, points[0].toPoint(), id);
+            for (points[0 .. points.len - 1], points[1..]) |previous, point| {
+                const a = previous.toPoint();
+                const b = point.toPoint();
+                var lng = b.lng - a.lng;
+                if (lng > 180) lng -= 360;
+                if (lng < -180) lng += 360;
+                const midpoint: geo.PointLL = .{ .lng = @mod(a.lng + lng / 2 + 180, 360) - 180, .lat = (a.lat + b.lat) / 2 };
+                try validateSpatialPoint(spatial, midpoint, id);
+                try validateSpatialPoint(spatial, b, id);
+            }
             const names = try view.names(id);
             for (0..names.count()) |name| _ = try names.at(name);
             _ = arena.reset(.retain_capacity);
+        }
+    }
+}
+
+fn validateSpatialPoint(index: graph.spatial.View, point: geo.PointLL, representative: graph.format.EdgeId) !void {
+    const cell = (try index.lookup(geo.grid.snapCell(point))) orelse return error.MissingShapeCell;
+    var edges = cell.edges();
+    while (try edges.next()) |edge| {
+        if (edge == representative) return;
+        if (@backingInt(edge) > @backingInt(representative)) break;
+    }
+    return error.MissingSpatialEdge;
+}
+
+fn validateSpatial(view: *const graph.reader.View, stats: graph.spatial.Stats) !void {
+    const index = view.spatial_index orelse return error.MissingSpatialIndex;
+    if (view.spatial.?.len != stats.payload_bytes or index.directory.len != stats.cells) return error.SpatialSizeMismatch;
+    var previous: ?u32 = null;
+    for (0..index.directory.len) |i| {
+        const cell = try index.at(i);
+        if (previous) |last| if (cell.id <= last) return error.UnsortedSpatialCells;
+        previous = cell.id;
+        var edges = cell.edges();
+        while (try edges.next()) |edge| {
+            if (@backingInt(edge) >= @backingInt(try view.oppEdge(edge))) return error.NonCanonicalSpatialEdge;
         }
     }
 }
@@ -178,6 +222,6 @@ fn rate(count: u32, ns: u64) f64 {
 }
 
 fn usage() error{InvalidArguments} {
-    std.debug.print("usage: zig build check-assembly -- INPUT.osm.pbf OUTPUT_BUNDLE SCRATCH_DIR [WORKERS] [right|left] [--sub-byte-turns] [--dem DIR | --dem-pack FILE]\n", .{});
+    std.debug.print("usage: zig build check-assembly -- INPUT.osm.pbf OUTPUT_BUNDLE SCRATCH_DIR [WORKERS] [right|left] [--sub-byte-turns] [--spatial-budget] [--dem DIR | --dem-pack FILE]\n", .{});
     return error.InvalidArguments;
 }

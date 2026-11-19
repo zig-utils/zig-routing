@@ -407,3 +407,47 @@ test "cul-de-sac loop classification counts only contacts with other roads" {
         try testing.expect(count >= 4);
     }
 }
+
+test "mapped spatial index covers the curve and enumerates occupied cells by distance" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const layout = try gurka.mapToCoordinatesAt("A-----B\n      |\n      |\n      C", 260, .{ .lng = 9.6, .lat = 47.1 });
+    const fixture = try gurka.Map.init(gpa, layout, &.{
+        .{ .label = "ABC", .tags = &.{.{ .key = "highway", .value = "residential" }} },
+    }, &.{}, &.{});
+    var result = try Built.assemble(fixture.osm, 4);
+    defer result.deinit();
+    const view = &result.bundle.view;
+    const spatial = view.spatial_index.?;
+    const geo = routing.geo;
+    const representative: format.EdgeId = @fromBackingInt(@as(u32, 0));
+    const shape = try view.shape(representative, gpa);
+    try testing.expectEqual(3, shape.len);
+    for (shape[0..2], shape[1..3]) |previous, point| {
+        const a = previous.toPoint();
+        const b = point.toPoint();
+        const along = try spatial.cellsAlong(gpa, a, b, .none);
+        try testing.expect(along.len >= 2);
+        for (0..257) |sample| {
+            const t = @as(f64, @floatFromInt(sample)) / 256;
+            const p: geo.PointLL = .{ .lng = a.lng + (b.lng - a.lng) * t, .lat = a.lat + (b.lat - a.lat) * t };
+            const cell = (try spatial.lookup(geo.grid.snapCell(p))) orelse return error.MissingTestCell;
+            var edges = cell.edges();
+            try testing.expectEqual(@as(?format.EdgeId, representative), try edges.next());
+            try testing.expectEqual(null, try edges.next());
+        }
+    }
+
+    var rings = try spatial.rings(gpa, shape[1].toPoint(), 2500, .none);
+    defer rings.deinit();
+    var count: usize = 0;
+    var previous: f64 = 0;
+    while (rings.next()) |hit| {
+        try testing.expect(hit.distance >= previous);
+        try testing.expect(hit.distance <= 2500);
+        previous = hit.distance;
+        count += 1;
+    }
+    try testing.expectEqual(spatial.directory.len, count);
+}

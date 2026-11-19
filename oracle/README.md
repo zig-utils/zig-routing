@@ -267,6 +267,30 @@ density and intersection type agreed. Edge density, dead-end and not-thru also a
 on every matched edge, including 862 edges entering dead ends. Edge matches use the
 way ID and full travel-direction shape at E6 precision.
 
+### Spatial index
+
+The `spatial.bin` payload holds an eight-byte header, a sorted directory of (cell ID,
+list offset) pairs, and unsigned delta-varint lists. Each undirected edge is represented
+by the smaller of its two directed CSR indices. The opposing index gives the other
+direction. The builder traverses every segment of every shape at 1/256 degree resolution
+and covers both sides of cell boundaries and the antimeridian. Memberships are sorted
+and deduplicated before the section is written.
+
+The mapped reader looks up cells without allocating. Segment queries return occupied
+cells along the walk. Radius queries bound the scan on the sphere and return occupied
+cells in increasing distance to their closed cell rectangles, with cell ID as the tie
+break. Both allocate temporary results from the caller's arena.
+
+| Extract | Undirected edges | Occupied cells | Payload bytes | Bytes per undirected edge |
+| --- | ---: | ---: | ---: | ---: |
+| Liechtenstein | 7,880 | 1,166 | 24,263 | 3.08 |
+| Utrecht | 42,668 | 881 | 66,214 | 1.55 |
+| Luxembourg 2026-01-01 | 237,668 | 22,258 | 655,990 | 2.76 |
+
+The byte counts include the spatial directory and lists. CI enforces at most three
+payload bytes per undirected edge on the pinned Luxembourg extract. The assembly check
+looks up every stored vertex and segment midpoint and checks every encoded edge list.
+
 ### HTTP and route checks
 
 `compare-height.ts` sends the same random `/height` requests (shapes, encoded polylines at

@@ -13,6 +13,7 @@ const PointLL = @import("point.zig").PointLL;
 const AABB = @import("aabb.zig").AABB;
 const DistanceApproximator = @import("point.zig").DistanceApproximator;
 const line_ops = @import("line.zig");
+const io = @import("../infra/io.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Neighbor = enum(u3) { bottom_left = 0, left = 1, top_left = 2, top = 3, top_right = 4, right = 5, bottom_right = 6, bottom = 7 };
@@ -530,12 +531,104 @@ fn mercatorLat(frac: f64) f64 {
 
 /// The spatial index grid: 1/256 degree cells over the world.
 pub const snap_cells_per_degree = 256;
+pub const snap_columns = 360 * snap_cells_per_degree;
+pub const snap_rows = 180 * snap_cells_per_degree;
 
 pub fn snapCell(p: PointLL) u32 {
-    const cols: u32 = 360 * snap_cells_per_degree;
-    const x: u32 = @intFromFloat(std.math.clamp(@floor((p.lng + 180.0) * snap_cells_per_degree), 0, @as(f64, @floatFromInt(cols - 1))));
-    const y: u32 = @intFromFloat(std.math.clamp(@floor((p.lat + 90.0) * snap_cells_per_degree), 0, 180 * snap_cells_per_degree - 1));
-    return y * cols + x;
+    const x: u32 = @intFromFloat(std.math.clamp(@floor((p.lng + 180.0) * snap_cells_per_degree), 0, snap_columns - 1));
+    const y: u32 = @intFromFloat(std.math.clamp(@floor((p.lat + 90.0) * snap_cells_per_degree), 0, snap_rows - 1));
+    return y * snap_columns + x;
+}
+
+/// Visit the supercover of a shape segment on the native snap grid. The
+/// segment interpolates its latitude and takes the shorter longitude span.
+/// Boundary contacts cover both incident cells, with longitude wrapping.
+pub fn visitSnapSegment(a: PointLL, b: PointLL, sink: anytype, deadline: io.Deadline) !void {
+    if (!a.inRange() or !b.inRange()) return error.InvalidCoordinate;
+    if (deadline.expired()) return error.DeadlineExceeded;
+    const x0 = (a.lng + 180) * snap_cells_per_degree;
+    const y0 = (a.lat + 90) * snap_cells_per_degree;
+    const x1 = (b.lng + 180) * snap_cells_per_degree;
+    const y1 = (b.lat + 90) * snap_cells_per_degree;
+    var dx = x1 - x0;
+    if (dx > snap_columns / 2) dx -= snap_columns;
+    if (dx < -snap_columns / 2) dx += snap_columns;
+    const dy = y1 - y0;
+    const sx: i32 = if (dx < 0) -1 else 1;
+    const sy: i32 = if (dy < 0) -1 else 1;
+    var x = @as(i32, @intFromFloat(@floor(x0)));
+    var y = @as(i32, @intFromFloat(@floor(y0)));
+    const vertical_boundary = dx == 0 and @floor(x0) == x0;
+    const horizontal_boundary = dy == 0 and @floor(y0) == y0;
+    try emitSnapCover(sink, x, y, @floor(x0) == x0, @floor(y0) == y0);
+    var steps: usize = 0;
+    while (true) : (steps += 1) {
+        if (steps % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
+        const tx = nextCrossing(x0, dx, x, sx);
+        const ty = nextCrossing(y0, dy, y, sy);
+        if (@min(tx, ty) > 1) break;
+        if (tx == ty) {
+            try emitSnapCell(sink, x + sx, y);
+            try emitSnapCell(sink, x, y + sy);
+        }
+        if (tx <= ty) x += sx;
+        if (ty <= tx) y += sy;
+        try emitSnapCover(sink, x, y, vertical_boundary, horizontal_boundary);
+    }
+    // Endpoint arithmetic can round to either side of a crossing at t=1.
+    try emitSnapCover(sink, @intFromFloat(@floor(x1)), @intFromFloat(@floor(y1)), @floor(x1) == x1, @floor(y1) == y1);
+}
+
+fn nextCrossing(start: f64, delta: f64, cell: i32, step: i32) f64 {
+    if (delta == 0) return std.math.inf(f64);
+    const line: f64 = @floatFromInt(cell + @max(0, step));
+    return (line - start) / delta;
+}
+
+fn emitSnapCover(sink: anytype, x: i32, y: i32, vertical: bool, horizontal: bool) !void {
+    try emitSnapCell(sink, x, y);
+    if (vertical) try emitSnapCell(sink, x - 1, y);
+    if (horizontal) try emitSnapCell(sink, x, y - 1);
+    if (vertical and horizontal) try emitSnapCell(sink, x - 1, y - 1);
+}
+
+fn emitSnapCell(sink: anytype, x: i32, y: i32) !void {
+    if (y < 0 or y >= snap_rows) return;
+    const col: u32 = @intCast(@mod(x, snap_columns));
+    try sink.emit(@as(u32, @intCast(y)) * snap_columns + col);
+}
+
+test "snap supercover contains densely sampled points on ordinary and wrapped segments" {
+    const Sink = struct {
+        cells: std.AutoHashMapUnmanaged(u32, void) = .empty,
+
+        pub fn emit(self: *@This(), cell: u32) !void {
+            try self.cells.put(testing.allocator, cell, {});
+        }
+    };
+    var sink: Sink = .{};
+    defer sink.cells.deinit(testing.allocator);
+    var random_state = std.Random.DefaultPrng.init(66);
+    const random = random_state.random();
+    for (0..256) |i| {
+        sink.cells.clearRetainingCapacity();
+        const a: PointLL = if (i % 8 == 0)
+            .init(179.99, random.float(f64) * 178 - 89)
+        else
+            .init(random.float(f64) * 360 - 180, random.float(f64) * 178 - 89);
+        const dlng = if (i % 8 == 0) 0.13 else random.float(f64) * 0.4 - 0.2;
+        const dlat = random.float(f64) * 0.4 - 0.2;
+        const b: PointLL = .init(@mod(a.lng + dlng + 180, 360) - 180, a.lat + dlat);
+        try visitSnapSegment(a, b, &sink, .none);
+        for (0..193) |sample| {
+            const t = @as(f64, @floatFromInt(sample)) / 192;
+            const p: PointLL = .init(@mod(a.lng + dlng * t + 180, 360) - 180, a.lat + dlat * t);
+            try testing.expect(sink.cells.contains(snapCell(p)));
+        }
+    }
+    sink.cells.clearRetainingCapacity();
+    try visitSnapSegment(.init(0, 0), .init(0, 0), &sink, .none);
+    try testing.expectEqual(4, sink.cells.count());
 }
 
 /// The 1 degree elevation tile (SRTM naming: south-west corner) of a point.

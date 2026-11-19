@@ -76,6 +76,16 @@ fn fuzzGraphBundle(baseline: *const graph.reader.Files, s: *Smith) !void {
     const view = graph.reader.View.parse(files, null) catch return;
     view.verify(.none, null) catch {};
     const gpa = std.testing.allocator;
+    if (view.spatial_index) |spatial| {
+        for (0..@min(4, spatial.directory.len)) |i| {
+            const cell = spatial.at(i) catch continue;
+            _ = spatial.lookup(cell.id) catch null;
+            var list = cell.edges();
+            while (list.next() catch null) |representative| {
+                try std.testing.expect(@backingInt(representative) < view.edges.len);
+            }
+        }
+    }
     const arbitrary = if (raw.len >= 4) std.mem.readInt(u32, raw[0..4], .little) else std.math.maxInt(u32);
     for ([_]u32{ 0, 1, arbitrary }) |id| {
         _ = view.node(@fromBackingInt(@intCast(id))) catch null;
