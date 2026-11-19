@@ -40,6 +40,9 @@ jobs:
       - run: zig build
       - run: zig build test --summary all
       - run: zig build -Doptimize=ReleaseFast
+      - name: Valhalla tag parity
+        if: matrix.os == 'ubuntu-latest'
+        run: oracle/tag-goldens.sh compare
       - uses: actions/checkout@v6
         if: matrix.os == 'ubuntu-latest'
         with:

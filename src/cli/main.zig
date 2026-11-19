@@ -123,6 +123,10 @@ fn createCommands(a: Allocator) !*Command {
         option("label", "Label recorded in the report", .string),
     }, &.{ arg("A_URL", "First server"), arg("B_URL", "Second server") });
     _ = try command(root, "inspect", "Inspect a graph bundle", stub, &.{}, &.{});
+    const tagging = try command(root, "tags", "Inspect OSM tag transformations", null, &.{}, &.{});
+    _ = try command(tagging, "dump", "Dump OSM node and way tag fields as JSON lines", dumpTags, &.{
+        option("raw", "Dump input tags for the Valhalla oracle", .bool),
+    }, &.{arg("PBF", "Source OSM PBF file")});
     const conf = try command(root, "config", "Inspect service configuration", null, &.{}, &.{});
     _ = try command(conf, "check", "Print effective settings and ignored keys", checkConfig, &.{}, &.{arg("FILE", "Valhalla JSON config")});
     const elevation = try command(root, "dem", "Pack, verify, and inspect elevation tiles", null, &.{}, &.{});
@@ -377,6 +381,12 @@ fn compareServers(ctx: *Context) !u8 {
         .label = ctx.getOption("label") orelse "",
     }, ctx.getOption("endpoint") orelse "/route", ctx.getOption("out"), ctx.getOption("worst"), ctx.wantsJson());
     return if (ok) 0 else 1;
+}
+
+fn dumpTags(ctx: *Context) !u8 {
+    const raw = std.mem.eql(u8, ctx.getOption("raw") orelse "false", "true");
+    try routing.cli.tags.dump(std.heap.c_allocator, ctx.getArgument(0).?, raw, ctx.out.?, .none);
+    return 0;
 }
 
 fn packDem(ctx: *Context) !u8 {

@@ -70,6 +70,54 @@ on the default server and a different, cheaper route on the opt-in server.
 
 ## Checks
 
+### OSM tag parity
+
+CI compares the normal build tag transform against compressed NDJSON goldens for the
+Liechtenstein and Utrecht extracts pinned in [datasets.tsv](datasets.tsv). To run the same check:
+
+```bash
+zig build -Doptimize=ReleaseFast
+oracle/tag-goldens.sh compare
+```
+
+To regenerate a golden, use a clean Valhalla 3.9.3 checkout at
+`5c7f918e61306521d79cc4496d40c19c5305fa4b`, Docker, and a host C++20 compiler for the test-only
+`OSMWay` artifact reader. The generator uses the pinned image in [compose.yaml](compose.yaml).
+Pass the dataset name or the path to a local country PBF. The script leaves disk-backed parser
+artifacts in `bench/results/` by default.
+
+```bash
+oracle/tag-goldens.sh generate valhalla-3.9.3 liechtenstein oracle/tag-goldens/liechtenstein.jsonl.gz
+oracle/tag-goldens.sh generate valhalla-3.9.3 utrecht oracle/tag-goldens/utrecht.jsonl.gz
+oracle/tag-goldens.sh generate valhalla-3.9.3 country.osm.pbf bench/results/country.jsonl.gz
+zig-out/bin/zr tags dump country.osm.pbf | python3 oracle/tag-compare.py bench/results/country.jsonl.gz --keep 10
+```
+
+`zr tags dump` writes one record per OSM node and way in PBF order. Each record has its OSM ID,
+kind, input shape eligibility, tag selection, and normalized attributes. A node with default
+attributes has a null attribute object. For dropped ways and ways that fail Valhalla's input shape
+filter, the attribute object is also null. The filter excludes ways with fewer than two references
+and closed ways tagged `building`, `landuse`, `leisure`, or `natural`.
+
+For regeneration, `zr tags dump --raw` supplies source tags. The oracle runs Valhalla's unmodified
+`ways_proc` and `nodes_proc` under LuaJIT for every record. Way fields finalized in C++ come from
+`valhalla_build_tiles --end parseways`. The parser enables construction, platforms, driveways,
+pedestrian areas, and alternate names to exercise those fields. It disables inferred turn channels
+to compare the explicit tag. The supplemental country speed label, bridge name, international cycle
+network, MTB scales, foot designation, step count, trail visibility, and tactile paving are
+projected from the original OSM tags because Valhalla has no corresponding parser fields.
+
+The comparator reports a count and up to `--keep` OSM IDs for each differing field. Only
+`way.attributes.use` with Valhalla `9` (`culdesac`) and Zig `0` (`road`) is allowed. Valhalla's
+`clarify_and_fix` geometry pass changes the use from road after tag parsing. The golden covers
+the tag transform before that geometry pass. The checked-in extracts have 3 such ways in
+Liechtenstein and 34 in Utrecht.
+
+The fixtures derive from OpenStreetMap data © OpenStreetMap contributors, under the
+[Open Database License](https://www.openstreetmap.org/copyright).
+
+### HTTP and route checks
+
 `compare-height.ts` sends the same random `/height` requests (shapes, encoded polylines at
 precision 5 and 6, ranges, resampling, every height precision, ids) to two servers and reports how
 many responses are byte-identical:

@@ -67,7 +67,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     const help_test = b.addRunArtifact(exe);
     help_test.addArg("--help");
-    for ([_][]const u8{ "serve", "build", "route", "bench", "diff", "inspect", "config", "dem", "import-valhalla" }) |name| {
+    for ([_][]const u8{ "serve", "build", "route", "bench", "diff", "inspect", "tags", "config", "dem", "import-valhalla" }) |name| {
         help_test.expectStdOutMatch(name);
     }
     test_step.dependOn(&help_test.step);
@@ -137,6 +137,14 @@ pub fn build(b: *std.Build) void {
     const emit_pbf = b.addRunArtifact(gurka_emit);
     emit_pbf.addPassthruArgs();
     b.step("gurka-pbf", "Emit the Gurka intersection fixture as OSM PBF").dependOn(&emit_pbf.step);
+
+    const tag_fixture = b.addRunArtifact(gurka_emit).addOutputFileArg("intersection.osm.pbf");
+    const tag_dump = b.addRunArtifact(exe);
+    tag_dump.addArgs(&.{ "tags", "dump" });
+    tag_dump.addFileArg(tag_fixture);
+    tag_dump.expectStdOutMatch("{\"kind\":\"way\",\"id\":9001,\"eligible\":true,\"kept\":true,");
+    tag_dump.expectStdOutMatch("\"name\":\"Main Street\"");
+    test_step.dependOn(&tag_dump.step);
 
     // Stage timings (ReleaseFast): zig build perf
     const perf = b.addTest(.{ .root_module = b.createModule(.{
