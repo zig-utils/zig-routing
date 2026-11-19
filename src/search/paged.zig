@@ -1,5 +1,57 @@
 //! Arena-backed sparse status arrays indexed by dense u32 graph IDs.
 const std = @import("std");
+const memory = @import("../infra/arena.zig");
+
+/// Dense IDs with sparse 16 KiB pages. Only the directory is worker-owned.
+/// Touched slots must be cleared before the request memory is rewound.
+pub fn EdgeStatus(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        const page_shift = 12;
+        const per_page = 1 << page_shift;
+        const Pool = memory.PagePool(16 * 1024);
+        const Page = [per_page]T;
+
+        comptime {
+            std.debug.assert(@sizeOf(T) == 4 and @alignOf(T) <= 64);
+        }
+
+        slots: []?*align(64) Page,
+        touched: std.ArrayList(u32) = .empty,
+
+        pub fn init(gpa: std.mem.Allocator, count: usize) !Self {
+            const len = count / per_page + @intFromBool(count % per_page != 0);
+            const slots = try gpa.alloc(?*align(64) Page, len);
+            @memset(slots, null);
+            return .{ .slots = slots };
+        }
+
+        pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
+            gpa.free(self.slots);
+            self.* = undefined;
+        }
+
+        pub fn get(self: *const Self, id: u32) T {
+            const page = self.slots[id >> page_shift] orelse return @bitCast(@as(u32, 0));
+            return page[id & (per_page - 1)];
+        }
+
+        pub fn at(self: *Self, pool: *Pool, id: u32) !*T {
+            const index = id >> page_shift;
+            const slot = &self.slots[index];
+            if (slot.* == null) {
+                try self.touched.append(pool.arena.allocator(), index);
+                slot.* = @ptrCast(try pool.get());
+            }
+            return &slot.*.?[id & (per_page - 1)];
+        }
+
+        pub fn clear(self: *Self) void {
+            for (self.touched.items) |index| self.slots[index] = null;
+            self.touched = .empty;
+        }
+    };
+}
 
 pub fn Array(comptime T: type, comptime empty: T) type {
     return struct {
@@ -44,4 +96,28 @@ test "paged status distinguishes high and low dense IDs" {
     try std.testing.expectEqual(1, status.get(1));
     try std.testing.expectEqual(0, status.get(16777217));
     try std.testing.expectEqual(5, status.get(std.math.maxInt(u32)));
+}
+
+test "edge status allocates only touched 16 KiB pages and clears their directory slots" {
+    const t = std.testing;
+    var arena = memory.Arena.init(t.allocator, .{});
+    defer arena.deinit();
+    var pool = memory.PagePool(16 * 1024).init(&arena);
+    var status = try EdgeStatus(u32).init(t.allocator, 4096 * 128);
+    defer status.deinit(t.allocator);
+    const high: u32 = 4096 * 125 + 17;
+    try t.expectEqual(0, status.get(high));
+    (try status.at(&pool, 4095)).* = 3;
+    (try status.at(&pool, high)).* = 5;
+    try t.expectEqual(3, status.get(4095));
+    try t.expectEqual(5, status.get(high));
+    try t.expectEqual(0, status.get(4096));
+    try t.expectEqual(2, status.touched.items.len);
+    status.clear();
+    arena.reset();
+    try t.expectEqual(0, status.get(4095));
+    try t.expectEqual(0, status.get(high));
+    (try status.at(&pool, high)).* = 7;
+    try t.expectEqual(7, status.get(high));
+    status.clear();
 }

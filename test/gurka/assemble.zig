@@ -1055,3 +1055,181 @@ test "pedestrian and bicycle turns use assembled crossing and elevator metadata"
     try testing.expectEqual(@as(f32, 15), elevator_cost.cost);
     try testing.expectEqual(@as(f32, 0), elevator_cost.secs);
 }
+
+const search = routing.search.search;
+const Cost = routing.costing.compiled.Cost;
+const SearchTestCost = struct {
+    seed: u32,
+    omit: bool = false,
+
+    fn lengthCost(kernel: SearchTestCost, edge: format.EdgeId, len: u24) Cost {
+        const weight = (@backingInt(edge) *% 2_654_435_761 +% kernel.seed) % 43;
+        if (kernel.omit and weight < 6) return .forbidden;
+        return .{ .cost = @floatFromInt(@as(u32, len) + weight), .secs = @floatFromInt(len) };
+    }
+
+    fn transitionCost(kernel: SearchTestCost, first: format.EdgeId, second: format.EdgeId, row: format.TurnEntry) Cost {
+        const a = @backingInt(first);
+        const b = @backingInt(second);
+        const penalty = (a *% 951_177 +% b *% 37_157 +% kernel.seed) % 103;
+        return .{ .cost = @floatFromInt(penalty), .secs = @floatFromInt((row >> 3) & 7) };
+    }
+
+    pub fn edgeCost(kernel: SearchTestCost, _: *const graph.reader.View, edge: format.EdgeId, hot: *const format.EdgeHot, _: search.Direction) !Cost {
+        return kernel.lengthCost(edge, hot.geom.len_m);
+    }
+
+    pub fn turnCost(kernel: SearchTestCost, _: *const graph.reader.View, turn: search.Transition, _: search.Label, _: search.Direction) !Cost {
+        return kernel.transitionCost(turn.incoming, turn.outgoing, turn.row);
+    }
+};
+
+const SearchTest = search.Search(SearchTestCost, routing.search.queue.Heap);
+
+/// Array-scan Dijkstra over explicit directed-edge states. The reference
+/// precomputes transitions by checking endpoints of every edge pair.
+fn referenceSearch(a: std.mem.Allocator, view: *const graph.reader.View, kernel: SearchTestCost, request: search.Request) !?f32 {
+    const reverse = request.direction == .reverse;
+    const origin = @backingInt(if (reverse) request.destination else request.origin);
+    const destination = @backingInt(if (reverse) request.origin else request.destination);
+    if (origin == destination) return 0;
+    const starts = try a.alloc(u32, view.edges.len);
+    defer a.free(starts);
+    for (0..view.nodes.len) |i| {
+        const range = try view.outEdgeRange(@fromBackingInt(@as(u32, @intCast(i))));
+        @memset(starts[range.first..range.end], @intCast(i));
+    }
+    const weights = try a.alloc(f32, view.edges.len);
+    defer a.free(weights);
+    const done = try a.alloc(bool, view.edges.len);
+    defer a.free(done);
+    @memset(done, false);
+    const infinity = std.math.inf(f32);
+    for (view.edges, starts, weights, 0..) |edge, start, *weight, i| {
+        const begins_at = if (reverse) edge.head else start;
+        weight.* = if (begins_at == origin) kernel.lengthCost(@fromBackingInt(@as(u32, @intCast(i))), edge.geom.len_m).cost else infinity;
+    }
+    while (true) {
+        var best: ?usize = null;
+        var distance = infinity;
+        for (weights, done, 0..) |cost, settled, i| {
+            if (!settled and cost < distance) {
+                best = i;
+                distance = cost;
+            }
+        }
+        const index = best orelse return null;
+        const current = view.edges[index];
+        const node = if (reverse) starts[index] else current.head;
+        if (node == destination) return distance;
+        done[index] = true;
+        for (view.edges, starts, weights, done, 0..) |next, start, *weight, settled, j| {
+            if (settled or node != (if (reverse) next.head else start)) continue;
+            const from = if (reverse) next else current;
+            const to = if (reverse) current else next;
+            const row = try view.turnRow(@fromBackingInt(node), from.cls.opp_local);
+            if (row[to.cls.local] & 0x80 != 0) continue;
+            const incoming: format.EdgeId = @fromBackingInt(@as(u32, @intCast(if (reverse) j else index)));
+            const outgoing: format.EdgeId = @fromBackingInt(@as(u32, @intCast(if (reverse) index else j)));
+            const candidate: format.EdgeId = @fromBackingInt(@as(u32, @intCast(j)));
+            const delay = kernel.transitionCost(incoming, outgoing, row[to.cls.local]);
+            const step = kernel.lengthCost(candidate, next.geom.len_m);
+            weight.* = @min(weight.*, distance + (step.cost + delay.cost));
+        }
+    }
+}
+
+test "forward and reverse A* match reference Dijkstra on random ASCII maps" {
+    const map_memory = routing.infra.arena;
+    const template = "A---B---C\n|   |   |\nD---E---F\n|   |   |\nG---H---I";
+    const links = [_][]const u8{ "AB", "BC", "AD", "BE", "CF", "DE", "EF", "DG", "EH", "FI", "GH", "HI" };
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "residential" }};
+    var prng = std.Random.DefaultPrng.init(0x320f1c6a);
+    const random = prng.random();
+    for (0..24) |_| {
+        var fixture_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer fixture_arena.deinit();
+        const a = fixture_arena.allocator();
+        var ways: [links.len]gurka.Way = undefined;
+        var count: usize = 0;
+        for (links) |link| {
+            if (count > 0 and random.uintLessThan(u8, 4) == 0) continue;
+            ways[count] = .{ .label = link, .tags = road };
+            count += 1;
+        }
+        const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates(template, 20), ways[0..count], &.{}, &.{});
+        var built = try Built.assemble(fixture.osm, 1);
+        defer built.deinit();
+        const view = &built.bundle.view;
+        var engine = try SearchTest.init(testing.allocator, view);
+        defer engine.deinit();
+        var arena = map_memory.Arena.init(testing.allocator, .{});
+        defer arena.deinit();
+        for (0..8) |_| {
+            const from: format.NodeId = @fromBackingInt(random.uintLessThan(u32, @intCast(view.nodes.len)));
+            const to: format.NodeId = @fromBackingInt(random.uintLessThan(u32, @intCast(view.nodes.len)));
+            const kernel: SearchTestCost = .{ .seed = random.int(u32), .omit = true };
+            for ([_]search.Direction{ .forward, .reverse }) |direction| {
+                const request: search.Request = .{ .origin = from, .destination = to, .direction = direction };
+                const target = if (direction == .forward) to else from;
+                const potential = try search.L2.init(view, target, 1);
+                const expected = try referenceSearch(a, view, kernel, request);
+                const actual = engine.run(&arena, kernel, request, potential, .{});
+                if (expected) |cost| {
+                    const result = try actual;
+                    try testing.expectEqual(cost, result.best().cost);
+                    var label = result.best();
+                    while (label.pred != search.no_index) {
+                        const predecessor = &result.labels[label.pred];
+                        const before = if (direction == .forward) predecessor else label;
+                        const after = if (direction == .forward) label else predecessor;
+                        const before_edge = try view.edge(before.edgeId());
+                        const after_opp = try view.edge(try view.oppEdge(after.edgeId()));
+                        try testing.expectEqual(before_edge.head, after_opp.head);
+                        label = predecessor;
+                    }
+                } else {
+                    try testing.expectError(error.NoPath, actual);
+                }
+                arena.reset();
+            }
+        }
+    }
+}
+
+test "edge search reuses worker request memory and observes cancellation" {
+    const mem = routing.infra.arena;
+    var fixture_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer fixture_arena.deinit();
+    const a = fixture_arena.allocator();
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "residential" }};
+    const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates("A---B---C", 20), &.{
+        .{ .label = "AB", .tags = road },
+        .{ .label = "BC", .tags = road },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const origin = try at(view, fixture.findNode("A").?.location.toFixed());
+    const destination = try at(view, fixture.findNode("C").?.location.toFixed());
+    var counting = mem.CountingAllocator.init(testing.allocator);
+    var engine = try SearchTest.init(counting.allocator(), view);
+    defer engine.deinit();
+    var arena = mem.Arena.init(counting.allocator(), .{});
+    defer arena.deinit();
+    const request: search.Request = .{ .origin = origin, .destination = destination };
+    const potential = try search.L2.init(view, destination, 1);
+    const result = try engine.run(&arena, .{ .seed = 42 }, request, potential, .{});
+    const cost = result.best().cost;
+    arena.reset();
+    counting.resetCounts();
+    for (0..8) |_| {
+        const label = (try engine.run(&arena, .{ .seed = 42 }, request, potential, .{})).best();
+        try testing.expectEqual(cost, label.cost);
+        arena.reset();
+    }
+    try testing.expectEqual(0, counting.calls());
+    const cancel: std.atomic.Value(bool) = .init(true);
+    try testing.expectError(error.Cancelled, engine.run(&arena, .{ .seed = 42 }, request, potential, .{ .cancel = &cancel }));
+    try testing.expectError(error.Cancelled, engine.run(&arena, .{ .seed = 42 }, request, potential, .{ .deadline = .{ .at_ns = 0 } }));
+}
