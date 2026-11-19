@@ -10,7 +10,8 @@
 //! `dem` (the packed elevation block decoder), and `protobuf` (wire records
 //! and generated message views), `config` (Valhalla JSON settings), and
 //! `osm-pbf` (file framing, block inflation and OSM primitives), and
-//! `node-store` (the build-time coordinate index format).
+//! `node-store` (the build-time coordinate index format) and `graph-bundle`
+//! (section headers, checksums and typed topology access).
 //!
 //! The contract for every parser: malformed input returns an error, never
 //! panics, overflows or reads out of bounds. The fuzz step builds ReleaseSafe
@@ -49,6 +50,65 @@ fn seeds(gpa: std.mem.Allocator, raw: []const []const u8) ![]const []const u8 {
     const out = try gpa.alloc([]const u8, raw.len);
     for (out, raw) |*o, r| o.* = try seed(gpa, r);
     return out;
+}
+
+const graph = routing.graph;
+const graph_fixture = @import("graph_fixture.zig");
+const graph_kinds = std.enums.values(graph.format.SectionKind);
+const graph_header_size = @sizeOf(graph.format.SectionHeader);
+
+fn fuzzGraphBundle(baseline: *const graph.reader.Files, s: *Smith) !void {
+    var buf: [max_input]u8 = undefined;
+    const input = draw(s, &buf, 0x6772_6170);
+    if (input.len == 0) return;
+    const kind = graph_kinds[input[0] % graph_kinds.len];
+    const raw = input[1..];
+    var files = baseline.*;
+    var section: [graph.format.payload_offset + max_input]u8 align(8) = undefined;
+    if (raw.len < graph_header_size) {
+        files.set(kind, raw);
+    } else {
+        const payload = raw[graph_header_size..];
+        @memcpy(section[0..graph_header_size], raw[0..graph_header_size]);
+        @memcpy(section[graph.format.payload_offset..][0..payload.len], payload);
+        files.set(kind, section[0 .. graph.format.payload_offset + payload.len]);
+    }
+    const view = graph.reader.View.parse(files, null) catch return;
+    view.verify(.none, null) catch {};
+    const arbitrary = if (raw.len >= 4) std.mem.readInt(u32, raw[0..4], .little) else std.math.maxInt(u32);
+    for ([_]u32{ 0, 1, arbitrary }) |id| {
+        _ = view.node(@fromBackingInt(@intCast(id))) catch null;
+        _ = view.edge(@fromBackingInt(@intCast(id))) catch null;
+        _ = view.outEdges(@fromBackingInt(@intCast(id))) catch null;
+        _ = view.turnRow(@fromBackingInt(@intCast(id)), @truncate(input[input.len - 1])) catch null;
+        if (view.oppEdge(@fromBackingInt(@intCast(id)))) |other| {
+            try std.testing.expect(@backingInt(other) < view.edges.len);
+        } else |_| {}
+    }
+}
+
+test "fuzz graph-bundle" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const a = state.allocator();
+    var baseline: graph.reader.Files = .initFill(&.{});
+    var candidates: [graph_kinds.len + 1][]const u8 = undefined;
+    candidates[0] = &.{};
+    inline for (graph_kinds, 0..) |kind, i| {
+        const data = std.mem.sliceAsBytes(graph_fixture.records(kind));
+        const header = graph_fixture.header(kind);
+        const prefix = std.mem.asBytes(&header);
+        const section = try a.alignedAlloc(u8, .of(u64), graph.format.payload_offset + data.len);
+        @memcpy(section[0..prefix.len], prefix);
+        @memcpy(section[graph.format.payload_offset..], data);
+        baseline.set(kind, section);
+        const raw = try a.alloc(u8, 1 + prefix.len + data.len);
+        raw[0] = i;
+        @memcpy(raw[1..][0..prefix.len], prefix);
+        @memcpy(raw[1 + prefix.len ..], data);
+        candidates[i + 1] = raw;
+    }
+    try std.testing.fuzz(&baseline, fuzzGraphBundle, .{ .corpus = try seeds(a, &candidates) });
 }
 
 fn fuzzOsmPbf(_: void, s: *Smith) !void {

@@ -114,6 +114,34 @@ pub fn build(b: *std.Build) void {
     const lib_tests = b.addTest(.{ .root_module = lib_mod });
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
 
+    const graph_imports: []const std.Build.Module.Import = &.{.{ .name = "routing", .module = lib_mod }};
+    const graph_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("test/graph_reader.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = graph_imports,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(graph_tests).step);
+    const graph_fixture = b.addExecutable(.{
+        .name = "graph-fixture",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/graph_fixture.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = graph_imports,
+        }),
+    });
+    const graph_fixture_dir = b.addRunArtifact(graph_fixture).addOutputDirectoryArg2("graph-fixture", .{});
+    const graph_inspect = b.addRunArtifact(exe);
+    graph_inspect.addArgs(&.{ "inspect", "--verify", "--json", "--edge", "0", "--node", "1" });
+    graph_inspect.addDirectoryArg2(graph_fixture_dir.path(b, "bundle"), .{});
+    graph_inspect.expectStdOutMatch("\"verified\":true");
+    graph_inspect.expectStdOutMatch("\"file\":\"edges.bin\",\"count\":2");
+    graph_inspect.expectStdOutMatch("\"edge\":{\"id\":0,\"head\":1,\"opposing\":1");
+    graph_inspect.expectStdOutMatch("\"speeds\":{\"speed\":140");
+    graph_inspect.expectStdOutMatch("\"node\":{\"id\":1,\"first_edge\":1,\"degree\":1");
+    test_step.dependOn(&graph_inspect.step);
+
     const gurka_imports: []const std.Build.Module.Import = &.{
         .{ .name = "routing", .module = lib_mod },
         .{ .name = "protobuf", .module = protobuf },
@@ -226,7 +254,7 @@ pub fn build(b: *std.Build) void {
 
     // Fuzz targets (test/fuzz.zig). `zig build test` replays their seeds; `zig build fuzz
     // --fuzz` fuzzes, ReleaseSafe by default so bounds and overflow checks stay on.
-    const fuzz_filter = b.option([]const u8, "fuzz-target", "Fuzz one target: request, http, polyline, lz4, dem, protobuf, config, osm-pbf, node-store");
+    const fuzz_filter = b.option([]const u8, "fuzz-target", "Fuzz one target: request, http, polyline, lz4, dem, protobuf, config, osm-pbf, node-store, graph-bundle");
     const fuzz_opt: @TypeOf(optimize) = .ReleaseSafe;
     const seed_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("test/fuzz.zig"),

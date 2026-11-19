@@ -319,7 +319,7 @@ pub const Directory = struct {
 
     pub fn readFile(self: Directory, name: [:0]const u8) Error!File {
         try checkChildName(name);
-        const flags: c.O = .{ .CLOEXEC = true, .ACCMODE = .RDONLY, .NOFOLLOW = true };
+        const flags: c.O = .{ .CLOEXEC = true, .ACCMODE = .RDONLY, .NOFOLLOW = true, .NONBLOCK = true };
         return .{ .fd = try checkInt(c.openat(self.fd, name, flags)) };
     }
 

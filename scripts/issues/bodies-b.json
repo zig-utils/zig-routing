@@ -259,9 +259,8 @@
       "The reader is immutable and shared by all threads; no per-thread caches."
     ],
     "out_of_scope": ["Huge pages and warm-up: P4.15.", "Lazy range-fetch loading: P4.16.", "Multiple bundles: P4.18."],
-    "notes": ["Startup checks headers only; hashing is offline (`--verify`).", "docs/upstream/valhalla-perf-issues.md: #3953 and #3117 for the startup problem being solved."],
+    "notes": ["Startup checks headers only; hashing is offline (`--verify`).", "Measure warm-cache startup on the first assembled country bundle in P3.15.", "docs/upstream/valhalla-perf-issues.md: #3953 and #3117 for the startup problem being solved."],
     "accept": [
-      "Open time under 50 ms for a country bundle on a warm page cache (measured in a test).",
       "Corrupt or truncated sections are rejected with a specific error.",
       "`zr inspect --verify` passes on a freshly built bundle.",
       "`zig build test` green."
@@ -304,6 +303,7 @@
       "Round trip: build an ASCII-map fixture, read it with P3.13, and check adjacency and opposing edges.",
       "Validation pass reports zero errors on the test extracts.",
       "Edges per second and peak RSS reported for a country extract.",
+      "The reader opens the assembled country bundle in under 50 ms on a warm page cache, measured in a test.",
       "`zig build test` green."
     ]
   },

@@ -122,7 +122,11 @@ fn createCommands(a: Allocator) !*Command {
         option("keep", "Worst cases per scorer (default 10)", .int),
         option("label", "Label recorded in the report", .string),
     }, &.{ arg("A_URL", "First server"), arg("B_URL", "Second server") });
-    _ = try command(root, "inspect", "Inspect a graph bundle", stub, &.{}, &.{});
+    _ = try command(root, "inspect", "Inspect a graph bundle", inspectGraph, &.{
+        option("verify", "Verify every section payload checksum", .bool),
+        option("edge", "Print a directed edge by ID", .int),
+        option("node", "Print a node by ID", .int),
+    }, &.{arg("BUNDLE", "Graph bundle directory")});
     const tagging = try command(root, "tags", "Inspect OSM tag transformations", null, &.{}, &.{});
     _ = try command(tagging, "dump", "Dump OSM node and way tag fields as JSON lines", dumpTags, &.{
         option("raw", "Dump input tags for the Valhalla oracle", .bool),
@@ -381,6 +385,28 @@ fn compareServers(ctx: *Context) !u8 {
         .label = ctx.getOption("label") orelse "",
     }, ctx.getOption("endpoint") orelse "/route", ctx.getOption("out"), ctx.getOption("worst"), ctx.wantsJson());
     return if (ok) 0 else 1;
+}
+
+fn inspectGraph(ctx: *Context) !u8 {
+    const edge_id = try unsigned(ctx, u32, "edge");
+    const node_id = try unsigned(ctx, u32, "node");
+    const verify = std.mem.eql(u8, ctx.getOption("verify") orelse "false", "true");
+    const path = ctx.getArgument(0).?;
+    var diagnostic: routing.graph.reader.Diagnostic = .{};
+    var bundle = routing.graph.reader.Bundle.openDescribed(path, &diagnostic) catch |err|
+        return graphDiagnostic(ctx, "open", diagnostic, err);
+    defer bundle.close();
+    if (verify) bundle.view.verify(.none, &diagnostic) catch |err|
+        return graphDiagnostic(ctx, "verify", diagnostic, err);
+    try routing.cli.inspect.write(&bundle.view, ctx.out.?, ctx.wantsJson(), verify, edge_id, node_id);
+    return 0;
+}
+
+fn graphDiagnostic(ctx: *Context, action: []const u8, diagnostic: routing.graph.reader.Diagnostic, err: anyerror) anyerror {
+    const subject = if (diagnostic.section) |section| section.filename() else "graph bundle";
+    const message = std.fmt.allocPrint(ctx.allocator, "could not {s} {s} ({t})", .{ action, subject, err }) catch return err;
+    ctx.setDiagnostic(message);
+    return err;
 }
 
 fn dumpTags(ctx: *Context) !u8 {

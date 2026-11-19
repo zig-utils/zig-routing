@@ -48,6 +48,10 @@ zig build run
 the request from a file, run `zr --config valhalla.json route --action height --file height.json`.
 Successful responses go to stdout. Valhalla error bodies go to stderr with a failing exit code.
 
+`zr inspect BUNDLE` reports a graph bundle's sections, counts and sizes. Add `--verify` to
+check every payload checksum, `--edge ID` or `--node ID` to print a record, and `--json` for
+machine-readable output.
+
 ## Configuration
 
 `zr serve --config valhalla.json` reads Valhalla JSON settings. Use

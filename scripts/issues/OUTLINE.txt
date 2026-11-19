@@ -67,7 +67,7 @@ P3.11 | Ways to edges: intersection detection, splitting, shape capture, loops a
 P3.12 | Graph format v1: section headers, extern structs, writer, comptime layout assertions | graph | new | M | P0.10
 P3.13 | Graph reader: mmap a bundle, validate headers, typed accessors, zr inspect | graph | new | M | P3.12
 P3.14 | Edge class table: deduplicated categorical tuples and class ids | graph | new | M | P3.12
-P3.15 | Graph assembly: CSR adjacency, opposing edges, local edge indices, node attributes | build | port | L | P3.11 P3.12 P3.14
+P3.15 | Graph assembly: CSR adjacency, opposing edges, local edge indices, node attributes | build | port | L | P3.11 P3.12 P3.13 P3.14
 P3.16 | Turn tables: per-node turn type, stop impact, name consistency, deduplicated pool | build | port | M | P3.15
 P3.17 | Cold data: way ids, shapes, name table, chunking | graph | new | M | P3.15
 P3.18 | Elevation stamping: weighted grade, max slopes, mean elevation | build | port | M | P3.15 P2.02
