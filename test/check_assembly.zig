@@ -20,6 +20,7 @@ pub fn main(init: std.process.Init) !void {
         .right;
     var require_sub_byte_turns = false;
     var require_spatial_budget = false;
+    var ordering: build.order.Ordering = .{};
     var dem_dir: ?[]const u8 = null;
     var pack: ?dem.@"packed".Pack = null;
     defer if (pack) |*present| present.close();
@@ -28,6 +29,8 @@ pub fn main(init: std.process.Init) !void {
             require_sub_byte_turns = true;
         } else if (std.mem.eql(u8, flag, "--spatial-budget")) {
             require_spatial_budget = true;
+        } else if (std.mem.eql(u8, flag, "--order")) {
+            ordering.kind = std.meta.stringToEnum(graph.format.OrderingKind, args.next() orelse return usage()) orelse return usage();
         } else if (std.mem.eql(u8, flag, "--dem") and dem_dir == null and pack == null) {
             dem_dir = args.next() orelse return usage();
         } else if (std.mem.eql(u8, flag, "--dem-pack") and dem_dir == null and pack == null) {
@@ -43,7 +46,7 @@ pub fn main(init: std.process.Init) !void {
 
     const file = try io.File.open(input, .read_only);
     defer file.close();
-    const uuid = try datasetId(file, drive_side, dem_source != null);
+    const uuid = try datasetId(file, drive_side, dem_source != null, ordering.kind);
     var writer = try graph.format.BundleWriter.init(output, uuid, .none);
     defer writer.deinit();
 
@@ -53,10 +56,11 @@ pub fn main(init: std.process.Init) !void {
         .drive_side = drive_side,
         .workers = workers,
         .dem_source = dem_source,
+        .ordering = ordering,
     });
     try writer.commit();
     const elapsed_ns = timer.read();
-    {
+    const locality = blk: {
         var warm = try graph.reader.Bundle.open(output);
         defer warm.close();
         try warm.view.verify(.none, null);
@@ -66,7 +70,10 @@ pub fn main(init: std.process.Init) !void {
         try validateSpatial(&warm.view, stats.spatial);
         try validateElevation(&warm.view, stats.elevation);
         try validateEnhancement(&warm.view, drive_side);
-    }
+        const metadata = (warm.view.metadata orelse return error.MissingOrderMetadata)[0];
+        if (metadata.ordering() != ordering.kind) return error.OrderingMismatch;
+        break :blk .{ .metadata = metadata, .median_distance = try medianAdjacentIdDistance(init.gpa, &warm.view) };
+    };
 
     var times: [32]u64 = undefined;
     for (&times) |*sample| {
@@ -87,6 +94,9 @@ pub fn main(init: std.process.Init) !void {
         .turn_bytes_per_node = @as(f64, @floatFromInt(stats.turn_pool_bytes)) / @as(f64, @floatFromInt(@max(stats.nodes, 1))),
         .cold_bytes_per_directed_edge = @as(f64, @floatFromInt(cold_bytes)) / @as(f64, @floatFromInt(@max(stats.directed_edges, 1))),
         .spatial_bytes_per_undirected_edge = @as(f64, @floatFromInt(stats.spatial.payload_bytes)) / @as(f64, @floatFromInt(@max(stats.cold_records, 1))),
+        .ordering = @tagName(ordering.kind),
+        .order_xxh3 = std.fmt.bytesToHex(std.mem.toBytes(std.mem.nativeToBig(u64, locality.metadata.order_hash)), .lower),
+        .median_adjacent_id_distance = locality.median_distance,
         .peak_rss_bytes = try io.peakRssBytes(),
         .warm_open_median_ns = times[times.len / 2],
         .warm_open_max_ns = times[times.len - 1],
@@ -202,12 +212,35 @@ fn validateEnhancement(view: *const graph.reader.View, drive_side: build.edge_cl
     }
 }
 
-fn datasetId(file: io.File, side: build.edge_class.DriveSide, has_dem: bool) !graph.format.DatasetUuid {
+fn medianAdjacentIdDistance(allocator: std.mem.Allocator, view: *const graph.reader.View) !f64 {
+    const distances = try allocator.alloc(u32, view.edges.len / 2);
+    defer allocator.free(distances);
+    var count: usize = 0;
+    for (0..view.nodes.len) |i| {
+        const node: u32 = @intCast(i);
+        const range = try view.outEdgeRange(@fromBackingInt(node));
+        for (range.first..range.end) |j| {
+            const id: graph.format.EdgeId = @fromBackingInt(@as(u32, @intCast(j)));
+            if (j >= @backingInt(try view.oppEdge(id))) continue;
+            const head = view.edges[j].head;
+            distances[count] = @max(node, head) - @min(node, head);
+            count += 1;
+        }
+    }
+    if (count != distances.len) return error.InvalidOpposingCount;
+    if (count == 0) return 0;
+    std.mem.sortUnstable(u32, distances, {}, std.sort.asc(u32));
+    const middle = @as(u64, distances[(count - 1) / 2]) + distances[count / 2];
+    return @as(f64, @floatFromInt(middle)) / 2;
+}
+
+fn datasetId(file: io.File, side: build.edge_class.DriveSide, has_dem: bool, ordering: graph.format.OrderingKind) !graph.format.DatasetUuid {
     const mapped = try io.Mapping.mapFd(file, .read_only);
     defer mapped.unmap();
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update(@tagName(side));
     if (has_dem) hash.update("\x00elevation");
+    hash.update(@tagName(ordering));
     hash.update(mapped.bytes);
     var digest: [32]u8 = undefined;
     hash.final(&digest);
@@ -222,6 +255,6 @@ fn rate(count: u32, ns: u64) f64 {
 }
 
 fn usage() error{InvalidArguments} {
-    std.debug.print("usage: zig build check-assembly -- INPUT.osm.pbf OUTPUT_BUNDLE SCRATCH_DIR [WORKERS] [right|left] [--sub-byte-turns] [--spatial-budget] [--dem DIR | --dem-pack FILE]\n", .{});
+    std.debug.print("usage: zig build check-assembly -- INPUT.osm.pbf OUTPUT_BUNDLE SCRATCH_DIR [WORKERS] [right|left] [--order encounter|hilbert] [--sub-byte-turns] [--spatial-budget] [--dem DIR | --dem-pack FILE]\n", .{});
     return error.InvalidArguments;
 }

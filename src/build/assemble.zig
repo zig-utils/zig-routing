@@ -15,6 +15,7 @@ const ColdBuilder = @import("cold_builder.zig").Builder;
 const elevation = @import("elevation.zig");
 const dem = @import("../elevation/root.zig");
 const enhance = @import("enhance.zig");
+const node_order = @import("order.zig");
 
 const Allocator = std.mem.Allocator;
 const max_degree = turns.max_degree;
@@ -28,6 +29,7 @@ pub const Options = struct {
     include_platforms: bool = false,
     dem_source: ?elevation.Source = null,
     admin_drive_side: ?enhance.AdminDriveSide = null,
+    ordering: node_order.Ordering = .{},
     deadline: io.Deadline = .none,
 };
 
@@ -80,7 +82,7 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     const segments = try edge_map.slice(edges.Edge, 0, @intCast(source_stats.edges));
     const shape_points = try shape_map.slice(geo.FixedLL, 0, @intCast(source_stats.shape_points));
 
-    var plan = try Layout.plan(gpa, segments, shape_points, &metadata, options.deadline);
+    var plan = try Layout.plan(gpa, segments, shape_points, &metadata, options);
     defer plan.deinit(gpa);
     if (plan.nodes.items.len != source_stats.nodes) return error.NodeCountMismatch;
 
@@ -120,6 +122,11 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     const means: []const i16 = if (terrain) |*present| present.means.data else &.{};
     const cold_bytes = try buildCold(gpa, &shared, &metadata, writer, options.scratch_dir, means);
     const spatial = try buildSpatial(gpa, &shared, writer, options.scratch_dir, options.workers);
+    const bundle_metadata = [_]format.Metadata{.{
+        .ordering_kind = @backingInt(options.ordering.kind),
+        .order_hash = plan.order_hash,
+    }};
+    try writer.write(.metadata, &bundle_metadata);
     return .{
         .source = source_stats,
         .nodes = @intCast(topology.nodes.len),
@@ -270,8 +277,10 @@ const Layout = struct {
     node_count: u32 = 0,
     split_nodes: u32 = 0,
     connectors: u32 = 0,
+    order_hash: u64 = 0,
 
-    fn plan(gpa: Allocator, segments: []const edges.Edge, points: []const geo.FixedLL, metadata: *const Metadata, deadline: io.Deadline) !Layout {
+    fn plan(gpa: Allocator, segments: []const edges.Edge, points: []const geo.FixedLL, metadata: *const Metadata, options: Options) !Layout {
+        const deadline = options.deadline;
         var self: Layout = .{};
         errdefer self.deinit(gpa);
         for (segments, 0..) |segment, i| {
@@ -281,6 +290,7 @@ const Layout = struct {
             try self.countNode(gpa, metadata, segment.from, shape[0]);
             try self.countNode(gpa, metadata, segment.to, shape[shape.len - 1]);
         }
+        try self.applyOrder(gpa, options);
         for (self.nodes.items, 0..) |*node, i| {
             try checkDeadline(deadline, i);
             const aliases = aliasCount(node.degree);
@@ -292,6 +302,37 @@ const Layout = struct {
         if (2 * (@as(u64, segments.len) + self.connectors) > std.math.maxInt(u32))
             return error.TooManyDirectedEdges;
         return self;
+    }
+
+    fn applyOrder(self: *Layout, gpa: Allocator, options: Options) !void {
+        const coordinates = try Scratch(geo.FixedLL).init(self.nodes.items.len, options.scratch_dir);
+        defer coordinates.deinit();
+        for (self.nodes.items, coordinates.data, 0..) |node, *point, i| {
+            try checkDeadline(options.deadline, i);
+            point.* = node.point;
+        }
+        const permutation = try options.ordering.permutation(gpa, coordinates.data, options.deadline);
+        defer gpa.free(permutation);
+        self.order_hash = try node_order.hash(permutation, options.deadline);
+        if (options.ordering.kind == .encounter) return;
+
+        const previous_to_next = try Scratch(u32).init(permutation.len, options.scratch_dir);
+        defer previous_to_next.deinit();
+        const next_nodes = try gpa.alloc(Node, permutation.len);
+        errdefer gpa.free(next_nodes);
+        for (permutation, next_nodes, 0..) |previous, *node, next| {
+            try checkDeadline(options.deadline, next);
+            node.* = self.nodes.items[previous];
+            previous_to_next.data[previous] = @intCast(next);
+        }
+        var references = self.by_id.valueIterator();
+        var i: usize = 0;
+        while (references.next()) |id| : (i += 1) {
+            try checkDeadline(options.deadline, i);
+            id.* = previous_to_next.data[id.*];
+        }
+        self.nodes.deinit(gpa);
+        self.nodes = .fromOwnedSlice(next_nodes);
     }
 
     fn countNode(self: *Layout, gpa: Allocator, metadata: *const Metadata, id: i64, point: geo.FixedLL) !void {

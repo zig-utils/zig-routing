@@ -103,12 +103,17 @@ pub fn write(graph: *const reader.View, out: *io.Writer, json: bool, verified: b
     const uuid = std.fmt.bytesToHex(graph.dataset_uuid, .lower);
     const edge_record = if (edge_id) |id| try Edge.read(graph, id) else null;
     const node_record = if (node_id) |id| try Node.read(graph, id) else null;
+    const ordering = if (graph.metadata) |metadata| .{
+        .kind = metadata[0].ordering().?,
+        .xxh3 = std.fmt.bytesToHex(std.mem.toBytes(std.mem.nativeToBig(u64, metadata[0].order_hash)), .lower),
+    } else null;
 
     if (json) {
         try std.json.Stringify.value(.{
             .version = format.version,
             .dataset_uuid = uuid,
             .verified = verified,
+            .ordering = ordering,
             .sections = sections[0..count],
             .edge = edge_record,
             .node = node_record,
@@ -118,6 +123,7 @@ pub fn write(graph: *const reader.View, out: *io.Writer, json: bool, verified: b
     }
 
     try out.print("Graph bundle v{d}  {s}\n", .{ format.version, uuid });
+    if (ordering) |value| try out.print("Ordering {s}  {s}\n", .{ @tagName(value.kind), value.xxh3 });
     try out.print("{s: <16} {s: >12} {s: >11} {s: >14}  {s}\n", .{ "File", "Records", "Record size", "File bytes", "XXH3-64" });
     for (sections[0..count]) |section| {
         try out.print("{s: <16} {d: >12} {d: >11} {d: >14}  {s}\n", .{

@@ -3,6 +3,7 @@
 const std = @import("std");
 const wire = @import("protobuf").wire;
 const io = @import("../infra/io.zig");
+const radix = @import("../infra/radix.zig");
 const geo = @import("../geo/point.zig");
 const grid = @import("../geo/grid.zig");
 const constants = @import("../geo/constants.zig");
@@ -262,7 +263,7 @@ pub const Stats = struct {
 
 pub fn write(gpa: Allocator, pairs: []Pair, scratch: []Pair, dir: []const u8, bundle: *format.BundleWriter, deadline: io.Deadline) !Stats {
     if (pairs.len != scratch.len) return error.InvalidSpatialScratch;
-    try radixSort(gpa, pairs, scratch, deadline);
+    try radix.sortByU64(Pair, gpa, pairs, scratch, {}, pairKey, deadline);
     const file = try io.File.temporary(dir);
     defer file.close();
     var directory: std.ArrayList(Entry) = .empty;
@@ -322,34 +323,8 @@ const Payload = struct {
     }
 };
 
-fn radixSort(gpa: Allocator, values: []Pair, scratch: []Pair, deadline: io.Deadline) !void {
-    if (values.len < 2) return;
-    const counts = try gpa.alloc(usize, 1 << 16);
-    defer gpa.free(counts);
-    var source = values;
-    var target = scratch;
-    for (0..4) |pass| {
-        const shift: u6 = @intCast(pass * 16);
-        @memset(counts, 0);
-        for (source, 0..) |key, i| {
-            if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
-            counts[@as(u16, @truncate(key >> shift))] += 1;
-        }
-        var start: usize = 0;
-        for (counts, 0..) |*bin, i| {
-            if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
-            const count = bin.*;
-            bin.* = start;
-            start += count;
-        }
-        for (source, 0..) |key, i| {
-            if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
-            const bin = &counts[@as(u16, @truncate(key >> shift))];
-            target[bin.*] = key;
-            bin.* += 1;
-        }
-        std.mem.swap([]Pair, &source, &target);
-    }
+fn pairKey(_: void, pair: Pair) u64 {
+    return pair;
 }
 
 test "zero-radius rings contain both sides of the seam and all occupied polar cells" {

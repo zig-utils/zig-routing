@@ -71,6 +71,7 @@ pub const View = struct {
     slopes: ?[]const u16,
     spatial: ?[]const u8,
     spatial_index: ?spatial.View,
+    metadata: ?[]const format.Metadata,
 
     pub fn parse(files: Files, diagnostic: ?*Diagnostic) !View {
         var headers: Headers = .initFill(null);
@@ -132,6 +133,12 @@ pub const View = struct {
                 return error.InvalidSlopeCount;
             }
         }
+        if (headers.get(.metadata)) |metadata| {
+            if (metadata.count != 1) {
+                note(diagnostic, .metadata);
+                return error.InvalidMetadataCount;
+            }
+        }
 
         var graph: View = .{
             .headers = headers,
@@ -148,6 +155,7 @@ pub const View = struct {
             .slopes = null,
             .spatial = null,
             .spatial_index = null,
+            .metadata = null,
         };
         inline for (kinds) |kind| {
             if (headers.get(kind)) |present| {
@@ -164,6 +172,10 @@ pub const View = struct {
         if (graph.spatial) |bytes| {
             note(diagnostic, .spatial);
             graph.spatial_index = try spatial.View.parse(bytes, @intCast(edge_count));
+        }
+        if (graph.metadata) |records| {
+            note(diagnostic, .metadata);
+            if (records[0].reserved != 0 or records[0].ordering() == null) return error.InvalidBundleMetadata;
         }
         note(diagnostic, null);
         return graph;
@@ -276,7 +288,7 @@ pub const View = struct {
             note(diagnostic, kind);
             if (deadline.expired()) return error.DeadlineExceeded;
             const bytes: []const u8 = switch (kind) {
-                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
+                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
                 inline else => |section| std.mem.sliceAsBytes(@field(self, @tagName(section))),
             };
             var hash = std.hash.XxHash3.init(0);

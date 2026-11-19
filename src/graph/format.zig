@@ -73,6 +73,18 @@ pub const Slopes = struct {
     }
 };
 
+pub const OrderingKind = enum(u32) { encounter = 0, hilbert = 1 };
+
+pub const Metadata = extern struct {
+    order_hash: u64,
+    ordering_kind: u32,
+    reserved: u32 = 0,
+
+    pub fn ordering(self: Metadata) ?OrderingKind {
+        return std.enums.fromInt(OrderingKind, self.ordering_kind);
+    }
+};
+
 pub const SectionKind = enum(u32) {
     nodes = 1,
     edges = 2,
@@ -84,6 +96,7 @@ pub const SectionKind = enum(u32) {
     cold = 8,
     slopes = 9,
     spatial = 10,
+    metadata = 11,
 
     pub fn filename(self: SectionKind) [:0]const u8 {
         return switch (self) {
@@ -97,6 +110,7 @@ pub const SectionKind = enum(u32) {
             .cold => "cold.bin",
             .slopes => "slopes.bin",
             .spatial => "spatial.bin",
+            .metadata => "metadata.bin",
         };
     }
 
@@ -112,6 +126,7 @@ pub const SectionKind = enum(u32) {
             .cold => u8,
             .slopes => u16,
             .spatial => u8,
+            .metadata => Metadata,
         };
     }
 
@@ -163,6 +178,8 @@ comptime {
     std.debug.assert(@offsetOf(Coordinate, "lng") == 0 and @offsetOf(Coordinate, "lat") == 4);
     std.debug.assert(@sizeOf(FirstEdge) == 4 and @sizeOf(TurnEntry) == 1);
     std.debug.assert(@sizeOf(SectionKind.slopes.Record()) == 2);
+    std.debug.assert(@sizeOf(Metadata) == 16 and @offsetOf(Metadata, "order_hash") == 0);
+    std.debug.assert(@offsetOf(Metadata, "ordering_kind") == 8 and @offsetOf(Metadata, "reserved") == 12);
     std.debug.assert(payload_offset % @alignOf(EdgeHot) == 0);
     std.debug.assert(payload_offset % @alignOf(NodeHot) == 0);
 }

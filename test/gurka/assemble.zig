@@ -451,3 +451,103 @@ test "mapped spatial index covers the curve and enumerates occupied cells by dis
     }
     try testing.expectEqual(spatial.directory.len, count);
 }
+
+test "Hilbert and encounter bundles preserve the graph and the same shortest route" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const layout = try gurka.mapToCoordinatesAt("A---B-------C\n|           |\n|           |\nD-----------E", 115, .{ .lng = 9.6, .lat = 47.1 });
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "residential" }};
+    const fixture = try gurka.Map.init(gpa, layout, &.{
+        .{ .label = "DE", .tags = road },
+        .{ .label = "CE", .tags = road },
+        .{ .label = "BC", .tags = road },
+        .{ .label = "AD", .tags = road },
+        .{ .label = "AB", .tags = road },
+    }, &.{}, &.{});
+    var original = try Built.assembleWithOptions(fixture.osm, .{ .scratch_dir = "", .workers = 1, .ordering = .{ .kind = .encounter } });
+    defer original.deinit();
+    var reordered = try Built.assemble(fixture.osm, 4);
+    defer reordered.deinit();
+    const before = &original.bundle.view;
+    const after = &reordered.bundle.view;
+    try checkOpposites(before, 10);
+    try checkOpposites(after, 10);
+    try testing.expectEqual(format.OrderingKind.encounter, before.metadata.?[0].ordering().?);
+    try testing.expectEqual(format.OrderingKind.hilbert, after.metadata.?[0].ordering().?);
+    try testing.expect(before.metadata.?[0].order_hash != after.metadata.?[0].order_hash);
+    for (before.coordinates.?, 0..) |point, i| {
+        const old: format.NodeId = @fromBackingInt(@as(u32, @intCast(i)));
+        const new = try at(after, point);
+        try testing.expectEqual((try before.node(old)).attr, (try after.node(new)).attr);
+        const a = try before.outEdgeRange(old);
+        const b = try after.outEdgeRange(new);
+        try testing.expectEqual(a.count(), b.count());
+        for (0..a.count()) |local| {
+            const id1: format.EdgeId = @fromBackingInt(@as(u32, @intCast(a.first + local)));
+            const id2: format.EdgeId = @fromBackingInt(@as(u32, @intCast(b.first + local)));
+            const e1 = try before.edge(id1);
+            const e2 = try after.edge(id2);
+            const old_head = try before.coordinate(@fromBackingInt(e1.head));
+            try testing.expectEqual(old_head, try after.coordinate(@fromBackingInt(e2.head)));
+            try testing.expectEqual(e1.geom, e2.geom);
+            try testing.expectEqual(e1.speed, e2.speed);
+            try testing.expectEqual((try before.class(e1.cls.class_id)).*, (try after.class(e2.cls.class_id)).*);
+            try testing.expectEqualSlices(u8, try before.turnRow(old, @intCast(local)), try after.turnRow(new, @intCast(local)));
+            try testing.expectEqual(try before.wayId(id1), try after.wayId(id2));
+            const way1 = try before.shape(id1, gpa);
+            const way2 = try after.shape(id2, gpa);
+            try testing.expectEqualSlices(format.Coordinate, way1, way2);
+        }
+    }
+    const start = fixture.findNode("B").?.location.toFixed();
+    const end = fixture.findNode("E").?.location.toFixed();
+    const route1 = try fixtureRoute(gpa, before, try at(before, start), try at(before, end));
+    const route2 = try fixtureRoute(gpa, after, try at(after, start), try at(after, end));
+    try testing.expectEqualSlices(u64, route1, route2);
+    try testing.expectEqualSlices(u64, &.{
+        @intCast(fixture.findWay("BC").?.id), @intCast(fixture.findWay("CE").?.id),
+    }, route2);
+}
+
+fn fixtureRoute(arena: std.mem.Allocator, view: *const graph.reader.View, source: format.NodeId, target: format.NodeId) ![]u64 {
+    const limit = std.math.maxInt(u64);
+    const distances = try arena.alloc(u64, view.nodes.len);
+    @memset(distances, limit);
+    const visited = try arena.alloc(bool, view.nodes.len);
+    @memset(visited, false);
+    const parents = try arena.alloc(?format.EdgeId, view.nodes.len);
+    @memset(parents, null);
+    distances[@backingInt(source)] = 0;
+    while (true) {
+        var best: u64 = limit;
+        var next: usize = 0;
+        for (distances, visited, 0..) |d, done, i| {
+            if (!done and d < best) {
+                next = i;
+                best = d;
+            }
+        }
+        if (best == limit) return error.MissingFixtureRoute;
+        if (next == @backingInt(target)) break;
+        visited[next] = true;
+        const node: format.NodeId = @fromBackingInt(@as(u32, @intCast(next)));
+        const range = try view.outEdgeRange(node);
+        for (view.edges[range.first..range.end], range.first..range.end) |edge, i| {
+            const candidate = best + edge.geom.len_m;
+            if (candidate >= distances[edge.head]) continue;
+            distances[edge.head] = candidate;
+            parents[edge.head] = @fromBackingInt(@as(u32, @intCast(i)));
+        }
+    }
+
+    var way_ids: std.ArrayList(u64) = .empty;
+    var node = target;
+    while (node != source) {
+        const step = parents[@backingInt(node)] orelse return error.MissingFixtureRoute;
+        try way_ids.append(arena, try view.wayId(step));
+        node = @fromBackingInt((try view.edge(try view.oppEdge(step))).head);
+    }
+    std.mem.reverse(u64, way_ids.items);
+    return try way_ids.toOwnedSlice(arena);
+}

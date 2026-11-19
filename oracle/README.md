@@ -164,8 +164,8 @@ ReleaseFast on an Apple M3 Pro with four workers produced these results from the
 | Liechtenstein | 6,280 | 15,760 | 2.89 million | 57.0 MiB | 0.096 ms | 0 |
 | Utrecht | 30,638 | 85,336 | 5.80 million | 85.5 MiB | 0.149 ms | 0 |
 
-The assembler assigns dense IDs in segment encounter order and groups outgoing arcs by source
-node. It retains up to 32 arcs at each node. Higher-degree junctions use co-located aliases
+The assembler assigns provisional IDs in segment encounter order and groups outgoing arcs by
+final source node. It retains up to 32 arcs at each node. Higher-degree junctions use co-located aliases
 linked by zero-length arcs, with slots reserved at both ends of each link. The class table marks
 these arcs explicitly. All real segments use Valhalla's minimum stored length of one metre.
 
@@ -287,9 +287,30 @@ break. Both allocate temporary results from the caller's arena.
 | Utrecht | 42,668 | 881 | 66,214 | 1.55 |
 | Luxembourg 2026-01-01 | 237,668 | 22,258 | 655,990 | 2.76 |
 
-The byte counts include the spatial directory and lists. CI enforces at most three
+The byte counts use encounter order and include the spatial directory and lists. CI enforces at most three
 payload bytes per undirected edge on the pinned Luxembourg extract. The assembly check
 looks up every stored vertex and segment midpoint and checks every encoded edge list.
+
+### Node ordering
+
+The assembler defaults to Hilbert order over logical node coordinates. It applies
+the permutation before assigning alias and edge IDs, so adjacency, opposing arcs,
+turn offsets, cold indexes, elevations and spatial lists all reference final IDs.
+Equal Hilbert keys follow provisional ID order. Aliases of a logical node occupy
+consecutive slots. The metadata section stores the ordering kind and XXH3-64 of the
+little-endian provisional IDs in final logical node order. `zr inspect --json`
+reports both fields.
+
+Build the same input with `check-assembly --order encounter` and `--order hilbert`
+to compare the median absolute ID gap between adjacent nodes. A route fixture
+checks the mapped graph and reconstructs the same shortest-length route after
+the permutation.
+
+| Extract | Median ID gap, encounter | Median ID gap, Hilbert | Spatial bytes per undirected edge, Hilbert |
+| --- | ---: | ---: | ---: |
+| Liechtenstein | 10 | 3 | 2.86 |
+| Utrecht | 21 | 3 | 1.43 |
+| Luxembourg 2026-01-01 | 19 | 2 | 2.32 |
 
 ### HTTP and route checks
 
