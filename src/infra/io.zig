@@ -342,7 +342,7 @@ pub fn typedSlice(comptime T: type, bytes: []const u8, offset: usize, count: usi
 }
 
 // ---------------------------------------------------------------------------
-// Sockets
+// Standard streams and sockets
 // ---------------------------------------------------------------------------
 
 fn writeAllFd(fd: c.fd_t, bytes: []const u8) Error!void {
@@ -352,6 +352,10 @@ fn writeAllFd(fd: c.fd_t, bytes: []const u8) Error!void {
         if (rc < 0 and c.errno(rc) == .INTR) continue;
         done += try checkSize(rc);
     }
+}
+
+pub fn writeStdout(bytes: []const u8) Error!void {
+    return writeAllFd(c.STDOUT_FILENO, bytes);
 }
 
 pub const Address = struct {

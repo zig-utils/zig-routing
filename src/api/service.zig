@@ -38,6 +38,7 @@ pub const action_order = [_]Action{ .locate, .route, .height, .sources_to_target
 
 pub const Service = struct {
     limits: Limits = .{},
+    actions: []const Action = &action_order,
     handlers: [14]?ActionFn = @splat(null),
     /// Opaque per-service state handlers can reach (elevation tiles, graph, ...).
     state: ?*anyopaque = null,
@@ -73,7 +74,8 @@ pub const Service = struct {
             .failure => |f| return writeError(a, res, f, .json),
             .ok => |o| o,
         };
-        if (options.action == .no_action) return writeError(a, res, .{ .code = 106, .extra = try supportedList(a) }, options.format);
+        if (std.mem.indexOfScalar(Action, self.actions, options.action) == null)
+            return writeError(a, res, .{ .code = 106, .extra = try supportedList(a, self.actions) }, options.format);
         const f = self.handlers[@backingInt(options.action)] orelse
             return writeError(a, res, .{ .code = 107, .extra = @tagName(options.action) }, options.format);
         if (try f(self, ctx, &options, res)) |failure| {
@@ -84,9 +86,9 @@ pub const Service = struct {
     }
 };
 
-fn supportedList(a: Allocator) Allocator.Error![]const u8 {
+fn supportedList(a: Allocator, actions: []const Action) Allocator.Error![]const u8 {
     var s: std.ArrayList(u8) = .empty;
-    for (action_order) |act| try s.print(a, "'/{s}' ", .{@tagName(act)});
+    for (actions) |act| try s.print(a, "'/{s}' ", .{@tagName(act)});
     return s.items;
 }
 

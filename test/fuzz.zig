@@ -8,7 +8,7 @@
 //! string, percent decoding), `polyline` (polyline 5/6/7 and varint
 //! decoders), `lz4` (block and frame decoders, plus a compress round trip),
 //! `dem` (the packed elevation block decoder), and `protobuf` (wire records
-//! and generated message views).
+//! and generated message views), and `config` (Valhalla JSON settings).
 //!
 //! The contract for every parser: malformed input returns an error, never
 //! panics, overflows or reads out of bounds. The fuzz step builds ReleaseSafe
@@ -47,6 +47,30 @@ fn seeds(gpa: std.mem.Allocator, raw: []const []const u8) ![]const []const u8 {
     const out = try gpa.alloc([]const u8, raw.len);
     for (out, raw) |*o, r| o.* = try seed(gpa, r);
     return out;
+}
+
+fn fuzzConfig(_: void, s: *Smith) !void {
+    var buf: [max_input]u8 = undefined;
+    const input = draw(s, &buf, 0x636f_6e66);
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const loaded = routing.infra.config.decode(state.allocator(), input, "", null, null) catch return;
+    _ = try loaded.config.httpConfig();
+    try std.testing.expect(loaded.config.loki.actions.len != 0);
+}
+
+test "fuzz config" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    try std.testing.fuzz({}, fuzzConfig, .{ .corpus = try seeds(state.allocator(), &.{
+        "",
+        "[]",
+        "{}",
+        \\{"httpd":{"service":{"listen":"tcp://*:0","timeout_seconds":5}},"loki":{"actions":["height"]}}
+        ,
+        \\{"service_limits":{"skadi":{"max_shape":18446744073709551616.0,"min_resample":1e100}}}
+        ,
+    }) });
 }
 
 const ProtoChild = protobuf.Message(&.{

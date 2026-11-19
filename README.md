@@ -39,6 +39,25 @@ zig build test
 zig build run
 ```
 
+## Configuration
+
+`zr serve --config valhalla.json` reads Valhalla JSON settings. Use
+`zr config check valhalla.json` to print the effective settings and the ignored keys. Startup
+also lists ignored keys, with each unsupported subtree listed by its parent path.
+
+Environment variables override file values. Use the `ZR_` prefix and uppercase key paths
+joined by underscores, for example `ZR_SERVICE_LIMITS_SKADI_MAX_SHAPE=100000` or
+`ZR_LOKI_ACTIONS=height,status`. Explicit `serve` flags take precedence over both sources.
+
+`httpd.service.listen` accepts `tcp://*:PORT`, an IPv4 address, or `localhost` in the same
+URI form. `timeout_seconds` sets the processing deadline (`-1` disables it), and
+`drain_seconds` bounds draining on shutdown. The service uses `service_limits.skadi`,
+`additional_data.elevation` and `loki.actions`.
+
+`zig_routing.threads` defaults to one worker per CPU when set to zero.
+`request_memory_bytes`, `max_header_bytes` and `max_body_bytes` set the corresponding
+server limits. The schema includes `bundle_path` and `metric_cache_bytes` for the graph and metric cache.
+
 ## Profiling
 
 `zr bench --counters` records cycles, instructions, cache misses and branch misses for the Linux

@@ -84,7 +84,9 @@ pub const Config = struct {
     /// Time to finish reading a request after its first byte. Zero disables it.
     read_timeout_ms: u32 = 30_000,
     /// Per-request processing budget handed to handlers as a deadline.
-    request_timeout_ms: u32 = 120_000,
+    request_timeout_ms: ?u64 = 120_000,
+    /// Time to drain writes at shutdown. Null uses the idle timeout.
+    drain_timeout_ms: ?u64 = null,
     arena_cap_bytes: usize = 512 * 1024 * 1024,
     max_connections_per_worker: usize = 8192,
 };
@@ -374,7 +376,8 @@ const Worker = struct {
                     if (self.listener) |listener| listener.close();
                     self.listener = null;
                     self.closeAfterPending();
-                    shutdown = io.Deadline.fromNowMs(self.server.config.idle_timeout_ms);
+                    const config = self.server.config;
+                    shutdown = io.Deadline.fromNowMs(config.drain_timeout_ms orelse config.idle_timeout_ms);
                 }
                 if (self.live == 0 or shutdown.?.expired()) return;
             }
@@ -581,7 +584,12 @@ const Worker = struct {
             .keep_alive = head.keep_alive,
         };
         var res: Response = .{ .gpa = a };
-        var ctx: Ctx = .{ .worker_id = self.id, .arena = &self.arena, .stream = conn.stream, .deadline = io.Deadline.fromNowMs(self.server.config.request_timeout_ms) };
+        var ctx: Ctx = .{
+            .worker_id = self.id,
+            .arena = &self.arena,
+            .stream = conn.stream,
+            .deadline = if (self.server.config.request_timeout_ms) |ms| io.Deadline.fromNowMs(ms) else .none,
+        };
         self.server.handler.handle(self.server.handler.context, &ctx, &req, &res);
         if (self.arena.cap_exceeded) {
             res = .{ .gpa = a, .status = 413 };

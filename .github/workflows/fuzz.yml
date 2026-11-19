@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        target: [request, http, polyline, lz4, dem, protobuf]
+        target: [request, http, polyline, lz4, dem, protobuf, config]
       fail-fast: false
     steps:
       - uses: actions/checkout@v6
