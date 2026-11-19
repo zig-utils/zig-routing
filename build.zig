@@ -67,6 +67,18 @@ pub fn build(b: *std.Build) void {
     }) });
     b.step("perf", "Stage timings for bulk requests").dependOn(&b.addRunArtifact(perf).step);
 
+    const echo_server = b.addExecutable(.{
+        .name = "echo-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/bench_http_echo.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "routing", .module = lib_mod }},
+        }),
+    });
+    const install_echo = b.addInstallArtifact(echo_server, .{});
+    b.step("echo-server", "Install the standalone HTTP benchmark fixture").dependOn(&install_echo.step);
+
     for ([_]*std.Build.Module{ lz4, protobuf }) |pkg| test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = pkg })).step);
 
     // Package benchmarks (always ReleaseFast).

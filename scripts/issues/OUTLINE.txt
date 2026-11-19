@@ -30,7 +30,7 @@ P1.08 | Valhalla API protos as comptime schemas (all 14 .proto files) | api | po
 P1.09 | LZ4 block and frame codec | lib | new | S | P0.01
 P1.10 | Streaming JSON writer with fixed-precision numbers and no allocation | api | new | S | P0.11
 P1.11 | JSON request scanner straight into structs (no DOM) | api | new | M | P0.11
-P1.12 | HTTP/1.1 server: thread per core, keep-alive, pipelining, SO_REUSEPORT, writev | server | new | L | P0.10 P0.11
+P1.12 | HTTP/1.1 server: thread per core, keep-alive, pipelining, SO_REUSEPORT, writev | server | new | L | P0.10 P0.11 | needs-human
 P1.13 | Service skeleton: action routing, GET ?json= and POST, Valhalla error codes, service limits | api | port | M | P1.10 P1.11 P1.12
 P1.14 | Config: load a valhalla.json-compatible config through zig-config with typed access | infra | new | S | P0.01
 P1.15 | CLI skeleton: zr serve, build, route, bench, diff, inspect via zig-cli | cli | new | S | P0.01

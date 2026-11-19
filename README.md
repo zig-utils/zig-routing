@@ -64,6 +64,25 @@ Use an output path ending in `.svg` for an SVG or `.folded` for folded stacks. L
 user-space `perf` sampling of the process. On macOS, the command needs to run long enough for
 `sample` to attach.
 
+### HTTP echo benchmark
+
+Build the client and the standalone loopback echo server in ReleaseFast:
+
+```bash
+zig build -Doptimize=ReleaseFast
+zig build echo-server -Doptimize=ReleaseFast
+zig-out/bin/echo-server "$PORT" "$WORKERS"
+```
+
+In another terminal, generate the request and run the benchmark. Use the same worker and
+connection counts for comparative measurements.
+
+```bash
+mkdir -p bench/results
+printf '/echo\t{"message":"hello"}\n' > bench/results/echo.tsv
+zig-out/bin/zr bench "http://127.0.0.1:$PORT" --corpus bench/results/echo.tsv --connections "$WORKERS" --warmup 2s --duration 10s --label zig-routing-echo --commit "$(git rev-parse HEAD)" --out bench/results/echo.json
+```
+
 ## License
 
 MIT. See [LICENSE](LICENSE) and [NOTICE](NOTICE) for the Valhalla attribution.

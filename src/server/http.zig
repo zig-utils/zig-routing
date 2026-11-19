@@ -5,8 +5,9 @@
 //! listener, a readiness poller and a request arena; the kernel spreads
 //! connections across workers. Requests are parsed in place from the
 //! connection's read buffer, keep-alive and pipelining are supported, and
-//! responses are written with writev straight from the arena. Limits on
-//! header size, body size and idle time produce clean 4xx responses.
+//! responses are written with writev straight from arena buffers. Partial
+//! responses retain their arena until their last byte is sent. A read
+//! deadline bounds the time allowed to finish a request.
 
 const std = @import("std");
 const io = @import("../infra/io.zig");
@@ -80,6 +81,8 @@ pub const Config = struct {
     max_header_bytes: usize = 16 * 1024,
     max_body_bytes: usize = 64 * 1024 * 1024,
     idle_timeout_ms: u32 = 60_000,
+    /// Time to finish reading a request after its first byte. Zero disables it.
+    read_timeout_ms: u32 = 30_000,
     /// Per-request processing budget handed to handlers as a deadline.
     request_timeout_ms: u32 = 120_000,
     arena_cap_bytes: usize = 512 * 1024 * 1024,
@@ -237,13 +240,38 @@ fn writeHead(arena: Allocator, res: *const Response, keep_alive: bool) Allocator
 // Server
 // ---------------------------------------------------------------------------
 
+const Pending = struct {
+    // At most one interim response followed by one final header and body.
+    parts: [3][]const u8 = undefined,
+    count: usize = 0,
+    arena: ?arena_mod.Arena = null,
+
+    fn append(self: *Pending, buffers: []const []const u8) void {
+        for (buffers) |bytes| {
+            if (bytes.len == 0) continue;
+            self.parts[self.count] = bytes;
+            self.count += 1;
+        }
+    }
+
+    fn consume(self: *Pending, bytes: usize) void {
+        var remaining = bytes;
+        var complete: usize = 0;
+        while (complete < self.count and remaining >= self.parts[complete].len) : (complete += 1) {
+            remaining -= self.parts[complete].len;
+        }
+        if (complete < self.count) self.parts[complete] = self.parts[complete][remaining..];
+        self.count -= complete;
+        std.mem.copyForwards([]const u8, self.parts[0..self.count], self.parts[complete..][0..self.count]);
+    }
+};
+
 const Conn = struct {
     stream: io.Stream,
     in: std.ArrayList(u8) = .empty,
-    /// Response bytes that did not fit in the socket yet.
-    pending: std.ArrayList(u8) = .empty,
-    pending_off: usize = 0,
+    pending: Pending = .{},
     last_active_ns: u64,
+    read_deadline: io.Deadline = .none,
     close_after_flush: bool = false,
     sent_continue: bool = false,
 };
@@ -258,7 +286,6 @@ pub const Server = struct {
     threads: std.ArrayList(std.Thread) = .empty,
     /// The bound port (useful when listening on port 0).
     port: u16 = 0,
-    ready: std.atomic.Value(usize) = .init(0),
 
     pub fn init(gpa: Allocator, config: Config, handler: Handler) Server {
         return .{ .gpa = gpa, .config = config, .handler = handler };
@@ -266,17 +293,29 @@ pub const Server = struct {
 
     /// Starts the workers. Each binds its own SO_REUSEPORT listener.
     pub fn start(self: *Server) !void {
+        if (self.threads.items.len != 0) return error.AlreadyRunning;
         const n = if (self.config.threads == 0) std.Thread.getCpuCount() catch 1 else self.config.threads;
+        try self.threads.ensureTotalCapacity(self.gpa, n);
+        self.stopping.store(false, .release);
+        errdefer self.stop();
         // Bind the first listener here so port 0 resolves to one port for all workers.
-        const first = try io.Listener.listen(self.config.address, .{ .reuse_port = true, .nonblocking = true });
-        self.port = try first.port();
+        var first: ?io.Listener = try io.Listener.listen(self.config.address, .{ .reuse_port = true, .nonblocking = true });
+        defer if (first) |listener| listener.close();
+        self.port = try first.?.port();
         var addr = self.config.address;
         addr.port = self.port;
         for (0..n) |i| {
-            const listener = if (i == 0) first else try io.Listener.listen(addr, .{ .reuse_port = true, .nonblocking = true });
-            try self.threads.append(self.gpa, try std.Thread.spawn(.{}, workerMain, .{ self, i, listener }));
+            const listener = if (first) |initial| owned: {
+                first = null;
+                break :owned initial;
+            } else try io.Listener.listen(addr, .{ .reuse_port = true, .nonblocking = true });
+            var worker = Worker.init(self, i, listener) catch |err| {
+                listener.close();
+                return err;
+            };
+            errdefer worker.deinit();
+            self.threads.appendAssumeCapacity(try std.Thread.spawn(.{}, workerMain, .{worker}));
         }
-        while (self.ready.load(.acquire) < n) std.atomic.spinLoopHint();
     }
 
     /// Stops accepting, finishes in-flight requests, closes connections.
@@ -284,18 +323,14 @@ pub const Server = struct {
         self.stopping.store(true, .release);
         for (self.threads.items) |t| t.join();
         self.threads.deinit(self.gpa);
+        self.threads = .empty;
     }
 };
 
-fn workerMain(server: *Server, id: usize, listener: io.Listener) void {
-    var w = Worker.init(server, id, listener) catch |e| {
-        std.debug.print("worker {d} failed to start: {s}\n", .{ id, @errorName(e) });
-        _ = server.ready.fetchAdd(1, .release);
-        return;
-    };
-    defer w.deinit();
-    _ = server.ready.fetchAdd(1, .release);
-    w.run();
+fn workerMain(initial: Worker) void {
+    var worker = initial;
+    defer worker.deinit();
+    worker.run();
 }
 
 const Worker = struct {
@@ -304,6 +339,7 @@ const Worker = struct {
     listener: ?io.Listener,
     poller: io.Poller,
     arena: arena_mod.Arena,
+    spare_arenas: std.ArrayList(arena_mod.Arena) = .empty,
     conns: std.ArrayList(?*Conn) = .empty,
     free_slots: std.ArrayList(usize) = .empty,
     live: usize = 0,
@@ -322,21 +358,27 @@ const Worker = struct {
         if (self.listener) |l| l.close();
         self.poller.deinit();
         self.arena.deinit();
+        for (self.spare_arenas.items) |*arena| arena.deinit();
+        self.spare_arenas.deinit(self.server.gpa);
     }
 
     fn run(self: *Worker) void {
         var events: [64]io.Event = undefined;
-        var last_sweep = io.monotonicNs();
+        const sweep_ms = 100;
+        const sweep_ns = sweep_ms * std.time.ns_per_ms;
+        var next_sweep = io.monotonicNs() +| sweep_ns;
+        var shutdown: ?io.Deadline = null;
         while (true) {
             if (self.server.stopping.load(.acquire)) {
-                if (self.listener) |l| {
-                    l.close();
+                if (shutdown == null) {
+                    if (self.listener) |listener| listener.close();
                     self.listener = null;
+                    self.closeAfterPending();
+                    shutdown = io.Deadline.fromNowMs(self.server.config.idle_timeout_ms);
                 }
-                self.closeIdle();
-                if (self.live == 0) return;
+                if (self.live == 0 or shutdown.?.expired()) return;
             }
-            const ready = self.poller.wait(&events, 200) catch continue;
+            const ready = self.poller.wait(&events, sweep_ms) catch continue;
             for (ready) |ev| {
                 if (ev.token == listener_token) {
                     self.acceptAll();
@@ -347,16 +389,17 @@ const Worker = struct {
                 self.service(slot, conn, ev);
             }
             const now = io.monotonicNs();
-            if (now - last_sweep > std.time.ns_per_s) {
-                last_sweep = now;
-                self.sweepIdle(now);
+            if (now >= next_sweep) {
+                next_sweep = now +| sweep_ns;
+                self.sweepConnections(now);
             }
         }
     }
 
     fn acceptAll(self: *Worker) void {
         const l = self.listener orelse return;
-        while (true) {
+        for (0..64) |_| {
+            if (self.server.stopping.load(.acquire)) break;
             const stream = l.accept() catch |e| switch (e) {
                 error.WouldBlock => break,
                 else => break,
@@ -399,33 +442,48 @@ const Worker = struct {
     fn closeConn(self: *Worker, conn: *Conn) void {
         conn.stream.close();
         conn.in.deinit(self.server.gpa);
-        conn.pending.deinit(self.server.gpa);
+        self.recyclePending(conn);
         self.server.gpa.destroy(conn);
     }
 
-    fn closeIdle(self: *Worker) void {
+    fn closeAfterPending(self: *Worker) void {
         for (self.conns.items, 0..) |slot_conn, slot| if (slot_conn) |c| {
-            if (c.pending.items.len == c.pending_off and c.in.items.len == 0) self.drop(slot, c);
+            c.close_after_flush = true;
+            if (c.pending.count == 0) self.drop(slot, c);
         };
     }
 
-    fn sweepIdle(self: *Worker, now: u64) void {
+    fn sweepConnections(self: *Worker, now: u64) void {
         const limit = @as(u64, self.server.config.idle_timeout_ms) * std.time.ns_per_ms;
         for (self.conns.items, 0..) |slot_conn, slot| if (slot_conn) |c| {
-            if (now - c.last_active_ns > limit) self.drop(slot, c);
+            if (!c.close_after_flush and c.pending.arena == null and now >= c.read_deadline.at_ns) {
+                self.expireRead(slot, c);
+            } else if (now -| c.last_active_ns > limit) {
+                self.drop(slot, c);
+            }
         };
+    }
+
+    noinline fn expireRead(self: *Worker, slot: usize, conn: *Conn) void {
+        conn.read_deadline = .none;
+        conn.in.clearRetainingCapacity();
+        conn.close_after_flush = true;
+        self.respondStatic(conn, 408) catch return self.drop(slot, conn);
+        if (conn.pending.count == 0) return self.drop(slot, conn);
+        self.poller.arm(conn.stream.fd, slot, .write) catch self.drop(slot, conn);
     }
 
     fn service(self: *Worker, slot: usize, conn: *Conn, ev: io.Event) void {
         conn.last_active_ns = io.monotonicNs();
-        if (conn.pending.items.len > conn.pending_off) {
+        if (conn.pending.count != 0) {
             if (!self.flush(conn)) return self.drop(slot, conn);
-            if (conn.pending.items.len > conn.pending_off) {
+            if (conn.pending.count != 0) {
                 self.poller.arm(conn.stream.fd, slot, .write) catch self.drop(slot, conn);
                 return;
             }
             if (conn.close_after_flush) return self.drop(slot, conn);
         }
+        if (conn.last_active_ns >= conn.read_deadline.at_ns) return self.expireRead(slot, conn);
         if (ev.readable or ev.hangup or !ev.writable) {
             if (!self.readAvailable(conn)) {
                 // Peer closed: still answer what is already buffered, then close.
@@ -435,7 +493,7 @@ const Worker = struct {
         self.processRequests(conn) catch {
             conn.close_after_flush = true;
         };
-        if (conn.pending.items.len > conn.pending_off) {
+        if (conn.pending.count != 0) {
             self.poller.arm(conn.stream.fd, slot, .write) catch self.drop(slot, conn);
             return;
         }
@@ -445,17 +503,22 @@ const Worker = struct {
 
     /// Reads everything available. Returns false once the peer has closed.
     fn readAvailable(self: *Worker, conn: *Conn) bool {
-        const cap = self.server.config.max_header_bytes + self.server.config.max_body_bytes;
+        const cfg = self.server.config;
+        const cap = cfg.max_header_bytes +| cfg.max_body_bytes +| 1;
         while (true) {
-            conn.in.ensureUnusedCapacity(self.server.gpa, 16 * 1024) catch return false;
-            const room = conn.in.allocatedSlice()[conn.in.items.len..];
+            const available = cap -| conn.in.items.len;
+            if (available == 0) return true;
+            conn.in.ensureUnusedCapacity(self.server.gpa, @min(16 * 1024, available)) catch return false;
+            const unused = conn.in.allocatedSlice()[conn.in.items.len..];
+            const room = unused[0..@min(available, unused.len)];
             const n = conn.stream.read(room) catch |e| switch (e) {
                 error.WouldBlock => return true,
                 else => return false,
             };
             if (n == 0) return false;
+            if (conn.in.items.len == 0 and cfg.read_timeout_ms != 0)
+                conn.read_deadline = .fromNowMs(cfg.read_timeout_ms);
             conn.in.items.len += n;
-            if (conn.in.items.len > cap) return true;
             // A short read drained the socket: skip the read that would only
             // return EAGAIN. Anything arriving later wakes the re-armed poller.
             if (n < room.len) return true;
@@ -465,7 +528,7 @@ const Worker = struct {
     /// Answers every complete request in the read buffer (pipelining).
     fn processRequests(self: *Worker, conn: *Conn) !void {
         const cfg = self.server.config;
-        while (conn.in.items.len > 0 and conn.pending.items.len == conn.pending_off) {
+        while (conn.in.items.len > 0 and conn.pending.count == 0) {
             const head = parseHead(conn.in.items, cfg.max_header_bytes, cfg.max_body_bytes) catch |e| {
                 const status: u16 = switch (e) {
                     error.HeaderTooLarge => 431,
@@ -483,7 +546,7 @@ const Worker = struct {
             if (conn.in.items.len < total) {
                 if (head.expect_continue and !conn.sent_continue) {
                     conn.sent_continue = true;
-                    try self.queue(conn, &.{"HTTP/1.1 100 Continue\r\n\r\n"});
+                    try self.queue(conn, &.{"HTTP/1.1 100 Continue\r\n\r\n"}, false);
                 }
                 return;
             }
@@ -491,7 +554,11 @@ const Worker = struct {
             try self.handleOne(conn, head);
             std.mem.copyForwards(u8, conn.in.items[0 .. conn.in.items.len - total], conn.in.items[total..]);
             conn.in.items.len -= total;
-            if (!head.keep_alive) {
+            conn.read_deadline = if (conn.in.items.len == 0 or cfg.read_timeout_ms == 0)
+                .none
+            else
+                .fromNowMs(cfg.read_timeout_ms);
+            if (!head.keep_alive or self.server.stopping.load(.acquire)) {
                 conn.close_after_flush = true;
                 conn.in.clearRetainingCapacity();
                 return;
@@ -522,7 +589,7 @@ const Worker = struct {
         }
         const keep = head.keep_alive and !self.server.stopping.load(.acquire);
         const head_bytes = try writeHead(a, &res, keep);
-        try self.queue(conn, &.{ head_bytes, if (req.method == .HEAD) "" else res.body.items });
+        try self.queue(conn, &.{ head_bytes, if (req.method == .HEAD) "" else res.body.items }, true);
         if (!keep) conn.close_after_flush = true;
     }
 
@@ -531,65 +598,51 @@ const Worker = struct {
         const a = self.arena.allocator();
         var res: Response = .{ .gpa = a, .status = status, .content_type = "text/plain" };
         try res.writeBody(reason(status));
-        try self.queue(conn, &.{ try writeHead(a, &res, false), res.body.items });
+        try self.queue(conn, &.{ try writeHead(a, &res, false), res.body.items }, true);
     }
 
-    /// Writes buffers now; whatever the socket does not take is copied into
-    /// the connection's pending buffer and flushed when writable.
-    fn queue(self: *Worker, conn: *Conn, buffers: []const []const u8) !void {
-        var total: usize = 0;
-        for (buffers) |b| total += b.len;
-        var written: usize = 0;
-        if (conn.pending.items.len == conn.pending_off) {
-            while (written < total) {
-                var parts: [8][]const u8 = undefined;
-                var n: usize = 0;
-                var skip = written;
-                for (buffers) |b| {
-                    if (skip >= b.len) {
-                        skip -= b.len;
-                        continue;
-                    }
-                    parts[n] = b[skip..];
-                    skip = 0;
-                    n += 1;
-                }
-                const w = conn.stream.writev(parts[0..n]) catch |e| switch (e) {
-                    error.WouldBlock => break,
-                    else => return e,
-                };
-                if (w == 0) break;
-                written += w;
-            }
+    /// Keep the response slices themselves until the socket takes them.
+    fn queue(self: *Worker, conn: *Conn, buffers: []const []const u8, from_arena: bool) !void {
+        std.debug.assert(conn.pending.arena == null);
+        conn.pending.append(buffers);
+        if (!self.flush(conn)) {
+            conn.pending.count = 0;
+            return error.BrokenPipe;
         }
-        if (written == total) return;
-        if (conn.pending.items.len == conn.pending_off) {
-            conn.pending.clearRetainingCapacity();
-            conn.pending_off = 0;
-        }
-        var skip = written;
-        for (buffers) |b| {
-            if (skip >= b.len) {
-                skip -= b.len;
-                continue;
-            }
-            try conn.pending.appendSlice(self.server.gpa, b[skip..]);
-            skip = 0;
+        if (from_arena and conn.pending.count != 0) {
+            conn.pending.arena = self.arena;
+            self.arena = self.spare_arenas.pop() orelse
+                arena_mod.Arena.init(self.server.gpa, .{ .cap_bytes = self.server.config.arena_cap_bytes });
         }
     }
 
     /// Writes pending bytes. Returns false on a broken connection.
-    fn flush(_: *Worker, conn: *Conn) bool {
-        while (conn.pending_off < conn.pending.items.len) {
-            const n = conn.stream.write(conn.pending.items[conn.pending_off..]) catch |e| switch (e) {
+    fn flush(self: *Worker, conn: *Conn) bool {
+        while (conn.pending.count != 0) {
+            const n = conn.stream.writev(conn.pending.parts[0..conn.pending.count]) catch |e| switch (e) {
                 error.WouldBlock => return true,
                 else => return false,
             };
-            conn.pending_off += n;
+            if (n == 0) return true;
+            conn.pending.consume(n);
         }
-        conn.pending.clearRetainingCapacity();
-        conn.pending_off = 0;
+        self.recyclePending(conn);
         return true;
+    }
+
+    fn recyclePending(self: *Worker, conn: *Conn) void {
+        if (conn.pending.arena) |owned| {
+            conn.pending.arena = null;
+            var arena = owned;
+            arena.reset();
+            if (self.arena.used == 0 and self.arena.reserved < arena.reserved)
+                std.mem.swap(arena_mod.Arena, &self.arena, &arena);
+            if (arena.reserved == 0) {
+                arena.deinit();
+                return;
+            }
+            self.spare_arenas.append(self.server.gpa, arena) catch arena.deinit();
+        }
     }
 };
 
@@ -613,18 +666,27 @@ const Echo = struct {
 };
 
 fn startEcho(server: *Server) !void {
-    var dummy: u8 = 0;
-    server.* = Server.init(testing.allocator, .{ .address = .loopback_any_port, .threads = 2, .max_header_bytes = 1024, .max_body_bytes = 1 << 20 }, .{ .context = &dummy, .handle = Echo.handle });
+    server.* = Server.init(testing.allocator, .{ .address = .loopback_any_port, .threads = 2, .max_header_bytes = 1024, .max_body_bytes = 1 << 20 }, .{ .context = server, .handle = Echo.handle });
     try server.start();
 }
 
 fn readResponse(stream: io.Stream, buf: []u8) ![]const u8 {
+    const poller = try io.Poller.init();
+    defer poller.deinit();
+    const deadline = io.Deadline.fromNowMs(5000);
     var got: usize = 0;
     while (true) {
+        if (deadline.expired()) return error.ResponseTimedOut;
+        if (got == buf.len) return error.ResponseTooLarge;
+        try poller.arm(stream.fd, 1, .read);
+        var events: [1]io.Event = undefined;
+        const wait_ms: u32 = @intCast(@max(1, deadline.remainingNs() / std.time.ns_per_ms));
+        if ((try poller.wait(&events, wait_ms)).len == 0) continue;
         const n = try stream.read(buf[got..]);
         if (n == 0) return buf[0..got];
         got += n;
         if (std.mem.indexOf(u8, buf[0..got], "\r\n\r\n")) |he| {
+            if (std.mem.startsWith(u8, buf[0..he], "HTTP/1.1 100 ")) return buf[0 .. he + 4];
             const cl_at = std.mem.indexOf(u8, buf[0..he], "Content-Length: ").?;
             const cl_end = std.mem.indexOfScalarPos(u8, buf, cl_at, '\r').?;
             const cl = try std.fmt.parseInt(usize, buf[cl_at + 16 .. cl_end], 10);
@@ -717,6 +779,111 @@ test "server: keep-alive, pipelining, partial writes, limits" {
         var tail: [16]u8 = undefined;
         try testing.expectEqual(@as(usize, 0), try s.read(&tail));
     }
+}
+
+test "server sends 100 Continue before reading the body" {
+    var server: Server = undefined;
+    try startEcho(&server);
+    defer server.stop();
+    const stream = try io.Stream.connect(.loopback(server.port));
+    defer stream.close();
+    try stream.writeAll("POST /echo HTTP/1.1\r\nContent-Length: 4\r\nExpect: 100-continue\r\n\r\n");
+    var buf: [512]u8 = undefined;
+    try testing.expectEqualStrings("HTTP/1.1 100 Continue\r\n\r\n", try readResponse(stream, &buf));
+    try stream.writeAll("body");
+    const response = try readResponse(stream, &buf);
+    try testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200"));
+    try testing.expect(std.mem.endsWith(u8, response, "body=body"));
+}
+
+test "server gives incomplete bodies a read deadline even before idle timeout" {
+    var server: Server = undefined;
+    server = Server.init(testing.allocator, .{
+        .threads = 1,
+        .address = .loopback_any_port,
+        .read_timeout_ms = 80,
+        .idle_timeout_ms = 20_000,
+    }, .{ .context = &server, .handle = Echo.handle });
+    try server.start();
+    defer server.stop();
+    const stream = try io.Stream.connect(.loopback(server.port));
+    defer stream.close();
+    try stream.writeAll("POST /echo HTTP/1.1\r\nContent-Length: 5\r\n\r\na");
+    var buf: [512]u8 = undefined;
+    const response = try readResponse(stream, &buf);
+    try testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 408"));
+    try testing.expect(std.mem.indexOf(u8, response, "Connection: close") != null);
+}
+
+test "backpressure preserves arena bytes while the same worker serves another connection" {
+    var server: Server = undefined;
+    server = Server.init(testing.allocator, .{
+        .threads = 1,
+        .address = .loopback_any_port,
+        .idle_timeout_ms = 5_000,
+    }, .{ .context = &server, .handle = Echo.handle });
+    try server.start();
+    var draining = false;
+    defer if (!draining) server.stop();
+    const address = io.Address.loopback(server.port);
+    const large = try io.Stream.connect(address);
+    defer large.close();
+    try large.writeAll("GET /big HTTP/1.1\r\n\r\n");
+
+    // Let the large response begin without consuming its bytes.
+    const poller = try io.Poller.init();
+    defer poller.deinit();
+    try poller.arm(large.fd, 1, .read);
+    var events: [1]io.Event = undefined;
+    try testing.expect((try poller.wait(&events, 5000)).len == 1);
+    const small = try io.Stream.connect(address);
+    defer small.close();
+    try small.writeAll("GET /echo?worker=one HTTP/1.1\r\n\r\n");
+    var buf: [512]u8 = undefined;
+    try testing.expect(std.mem.endsWith(u8, try readResponse(small, &buf), "GET /echo q=1 worker=one"));
+    const body_storage = try testing.allocator.alloc(u8, 5 << 20);
+    defer testing.allocator.free(body_storage);
+    const stop_thread = try std.Thread.spawn(.{}, Server.stop, .{&server});
+    draining = true;
+    defer stop_thread.join();
+    const response = try readResponse(large, body_storage);
+    const header_end = std.mem.indexOf(u8, response, "\r\n\r\n").? + 4;
+    try testing.expectEqual(4 << 20, response.len - header_end);
+    try testing.expect(std.mem.allEqual(u8, response[header_end..], 'x'));
+}
+
+test "worker serves warmed keep-alive requests with zero backing allocations" {
+    const Check = struct {
+        counter: *arena_mod.CountingAllocator,
+        requests: usize = 0,
+        warm_calls: usize = 0,
+        stable: bool = true,
+
+        fn handle(context: *anyopaque, ctx: *Ctx, req: *const Request, res: *Response) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.requests == 1) self.warm_calls = self.counter.calls();
+            if (self.requests > 1) self.stable = self.stable and self.warm_calls == self.counter.calls();
+            self.requests += 1;
+            Echo.handle(context, ctx, req, res);
+        }
+    };
+    var count = arena_mod.CountingAllocator.init(testing.allocator);
+    var check: Check = .{ .counter = &count };
+    var server = Server.init(count.allocator(), .{ .threads = 1, .address = .loopback_any_port }, .{ .context = &check, .handle = Check.handle });
+    try server.start();
+    {
+        defer server.stop();
+        const stream = try io.Stream.connect(.loopback(server.port));
+        defer stream.close();
+        var buf: [512]u8 = undefined;
+        for (0..20) |_| {
+            try stream.writeAll("POST /echo?keep=1 HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}");
+            try testing.expect(std.mem.endsWith(u8, try readResponse(stream, &buf), "POST /echo q=1 keep=1 body={}"));
+        }
+    }
+    // Check the worker's snapshots only after joining its thread.
+    try testing.expectEqual(20, check.requests);
+    try testing.expect(check.stable);
 }
 
 fn rep(comptime ch: u8, comptime n: usize) *const [n]u8 {
