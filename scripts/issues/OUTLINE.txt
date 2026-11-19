@@ -112,7 +112,7 @@ P4.12 | Experiment E3: L1 scaling at walkway_factor 0.6 | accel | experiment | S
 P4.13 | Experiment E4: ordering and customisation time at US+DACH scale | accel | experiment | S | P4.04
 P4.14 | Experiment E5: memory budget of the full bundle under mixed load with three metrics | accel | experiment | S | P4.08
 P4.15 | Memory placement: huge pages, mlock, madvise classes and startup warm-up | graph | perf | M | P3.13 P4.02 P4.05 P7.13 P3.33 P0.05
-P4.16 | Lazy loading: range-fetchable bundles with sparse local fill over HTTP(S) | graph | new | L | P3.13
+P4.16 | Lazy loading: range-fetchable bundles with sparse local fill over HTTP(S) | graph | new | L | P3.13 P3.33 P4.02 P4.15
 P4.17 | Hot reload: atomic bundle swap without dropping requests | server | new | M | P3.13 P1.12
 P4.18 | Multi-bundle dispatch (US and DACH) and cross-bundle semantics | graph | new | M | P3.13 P3.23
 P4.19 | Planet-scale build: parallel stages, compact intermediates, rows per second and RSS reporting | build | perf | L | P3.22

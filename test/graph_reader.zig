@@ -196,3 +196,151 @@ test "startup skips hashing while accessors safely reject corrupt payloads" {
     try testing.expectError(error.InvalidEdgeClass, bundle.view.class(0));
     try testing.expectError(error.InvalidCoordinate, bundle.view.coordinate(@fromBackingInt(0)));
 }
+
+const range_cache = routing.graph.range_cache;
+const range_manifest = routing.graph.range_manifest;
+const range_http = routing.graph.range_http;
+const http = routing.server.http;
+
+const RangeServer = struct {
+    bundle: *const reader.Bundle,
+    calls: std.atomic.Value(u32) = .init(0),
+    corrupt_edge: std.atomic.Value(bool) = .init(true),
+    stall: std.atomic.Value(bool) = .init(false),
+
+    fn handle(context: *anyopaque, _: *http.Ctx, req: *const http.Request, res: *http.Response) void {
+        const self: *RangeServer = @ptrCast(@alignCast(context));
+        self.reply(req, res) catch {
+            res.status = 400;
+            res.body.clearRetainingCapacity();
+            res.extra_headers.clearRetainingCapacity();
+        };
+    }
+
+    fn reply(self: *RangeServer, req: *const http.Request, res: *http.Response) !void {
+        if (req.method != .GET) return error.InvalidMethod;
+        const path = std.fs.path.basename(req.path);
+        const kind = for (std.enums.values(format.SectionKind)) |kind| {
+            if (std.mem.eql(u8, kind.filename(), path)) break kind;
+        } else return error.MissingSection;
+        const bytes = self.bundle.mappings.get(kind).bytes;
+        const range = req.header("range") orelse return error.MissingRange;
+        if (!std.mem.startsWith(u8, range, "bytes=")) return error.InvalidRange;
+        const separator = std.mem.indexOfScalar(u8, range, '-') orelse return error.InvalidRange;
+        const start = try std.fmt.parseUnsigned(usize, range[6..separator], 10);
+        const end = try std.fmt.parseUnsigned(usize, range[separator + 1 ..], 10);
+        if (start > end or end >= bytes.len) return error.InvalidRange;
+        _ = self.calls.fetchAdd(1, .monotonic);
+        if (self.stall.load(.acquire)) io.sleepMs(150);
+        res.status = 206;
+        res.content_type = "application/octet-stream";
+        const header = try std.fmt.allocPrint(res.gpa, "Content-Range: bytes {d}-{d}/{d}", .{ start, end, bytes.len });
+        try res.addHeader(header);
+        try res.writeBody(bytes[start .. end + 1]);
+        if (kind == .edges and self.corrupt_edge.swap(false, .acq_rel)) {
+            io.sleepMs(10);
+            res.body.items[0] ^= 1;
+        }
+    }
+};
+
+const ReadRange = struct {
+    cache: *const range_cache.Cache,
+    range: range_cache.Range,
+    result: anyerror![]const u8 = undefined,
+
+    fn run(self: *ReadRange) void {
+        self.result = self.cache.read(self.range, .fromNowMs(2000));
+    }
+};
+
+fn removeRangeCache(root: io.Directory, key: [:0]const u8) void {
+    const cache = root.child(key) catch return;
+    for (std.enums.values(format.SectionKind)) |kind| {
+        cache.deleteFile(kind.filename()) catch {};
+        var name_buf: [64]u8 = undefined;
+        const bitmap = std.fmt.bufPrintSentinel(&name_buf, "{s}.fill", .{kind.filename()}, 0) catch unreachable;
+        cache.deleteFile(bitmap) catch {};
+    }
+    cache.close();
+    root.deleteDir(key) catch {};
+}
+
+test "HTTP range cache shares a verified retry, bounds stalled transfers and recovers across restarts" {
+    const fixture = try Fixture.create();
+    defer fixture.deinit();
+    const original = try fixture.root.child("bundle");
+    defer original.close();
+    var bundle = try reader.Bundle.openInDir(original, null);
+    defer bundle.close();
+    const bytes = try range_manifest.encode(testing.allocator, &bundle, .none);
+    defer testing.allocator.free(bytes);
+
+    // The cache directory begins empty. Cleanup removes the one known
+    // content-addressed child and the section files created for this test.
+    const parent = try fixture.root.createChild("range-cache");
+    defer fixture.root.deleteDir("range-cache") catch {};
+    defer parent.close();
+    var name: [65]u8 = @splat(0);
+    name[0..64].* = std.fmt.bytesToHex(range_manifest.digest(bytes), .lower);
+    defer removeRangeCache(parent, name[0..64 :0]);
+
+    var handler: RangeServer = .{ .bundle = &bundle };
+    var server = http.Server.init(testing.allocator, .{ .address = .loopback_any_port, .threads = 1 }, .{ .context = &handler, .handle = RangeServer.handle });
+    try server.start();
+    defer server.stop();
+    var url_buf: [80]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/bundle", .{server.port});
+    var origin = try range_http.Origin.open(testing.allocator, url);
+    defer origin.close(testing.allocator);
+    const extent: range_cache.Range = .{ .kind = .edges, .offset = format.payload_offset + 7, .len = 16 };
+    {
+        var cache = try range_cache.Cache.open(testing.allocator, parent, bytes, origin.source(), .{}, .none);
+        defer cache.close();
+        var first: ReadRange = .{ .cache = &cache, .range = extent };
+        var second: ReadRange = first;
+        const t1 = try std.Thread.spawn(.{}, ReadRange.run, .{&first});
+        const t2 = std.Thread.spawn(.{}, ReadRange.run, .{&second}) catch |err| {
+            t1.join();
+            return err;
+        };
+        t1.join();
+        t2.join();
+        const expected = bundle.mappings.get(.edges).bytes[extent.offset..][0..extent.len];
+        try testing.expectEqualSlices(u8, expected, try first.result);
+        try testing.expectEqualSlices(u8, expected, try second.result);
+        try testing.expectEqual(@as(u32, 2), handler.calls.load(.acquire));
+
+        handler.stall.store(true, .release);
+        const timer = io.Timer.start();
+        try testing.expectError(error.DeadlineExceeded, cache.read(.{ .kind = .nodes, .offset = 0, .len = 1 }, .fromNowMs(25)));
+        try testing.expect(timer.read() < std.time.ns_per_s);
+        handler.stall.store(false, .release);
+
+        const recent = [_]range_cache.Range{.{ .kind = .cold, .offset = format.payload_offset, .len = 4 }};
+        try cache.fill(&recent, .fromNowMs(4000));
+        var restored = try reader.Bundle.openInDir(cache.dir, null);
+        defer restored.close();
+        try restored.view.verify(.none, null);
+        for (std.enums.values(format.SectionKind)) |kind| {
+            try testing.expectEqualSlices(u8, bundle.mappings.get(kind).bytes, restored.mappings.get(kind).bytes);
+        }
+        try testing.expectEqual(1234, (try restored.view.edge(@fromBackingInt(@as(u32, 0)))).geom.len_m);
+    }
+
+    // Keep the persisted fill bit and damage its covering bytes. Reopening
+    // must verify the remembered extent, fetch it again and repair the file.
+    {
+        const cache = try parent.child(name[0..64 :0]);
+        defer cache.close();
+        const file = try cache.openOrCreateFile(format.SectionKind.edges.filename());
+        defer file.close();
+        const expected = bundle.mappings.get(.edges).bytes[extent.offset];
+        try file.pwriteAll(&.{expected ^ 1}, extent.offset);
+    }
+    const calls = handler.calls.load(.acquire);
+    var cache = try range_cache.Cache.open(testing.allocator, parent, bytes, origin.source(), .{}, .none);
+    defer cache.close();
+    try cache.fill(&.{}, .fromNowMs(3000));
+    try testing.expectEqual(calls + 1, handler.calls.load(.acquire));
+}

@@ -19,8 +19,8 @@
             .hash = "zig_bench-0.2.2-FoCM-3LkAwDmeHO3OUQLTmMKcKwLINmVD6FTf4Y8ZbIS",
         },
         .tls = .{
-            .url = "git+https://github.com/zig-utils/zig-tls.git#58809e04c0d1d1e510fe8c14f47d709229f0adca",
-            .hash = "zig_tls-0.1.1-CwcE5LFDKABKOOG5PgAOMEywgTuq_RqlKn93CEoN3pam",
+            .url = "git+https://github.com/zig-utils/zig-tls.git#b13b9316b1f9e2d5cd5e50b353df530fbed58e3f",
+            .hash = "zig_tls-0.1.1-CwcE5G1cKAB3esEwd6YFF9qeu0GgH3UlH9XJRGg0HNwt",
         },
         .xml = .{
             .url = "git+https://github.com/zig-utils/zig-xml.git#93784e79d9590a2a5baf85886d22178391a511c9",

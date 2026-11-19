@@ -334,6 +334,12 @@ pub const Directory = struct {
         return .{ .fd = try checkInt(c.openat(self.fd, name, flags, @as(c.mode_t, 0o644))) };
     }
 
+    pub fn openOrCreateFile(self: Directory, name: [:0]const u8) Error!File {
+        try checkChildName(name);
+        const flags: c.O = .{ .CLOEXEC = true, .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true, .NONBLOCK = true };
+        return .{ .fd = try checkInt(c.openat(self.fd, name, flags, @as(c.mode_t, 0o644))) };
+    }
+
     pub fn readFile(self: Directory, name: [:0]const u8) Error!File {
         try checkChildName(name);
         const flags: c.O = .{ .CLOEXEC = true, .ACCMODE = .RDONLY, .NOFOLLOW = true, .NONBLOCK = true };
@@ -615,6 +621,7 @@ pub fn writeStdout(bytes: []const u8) Error!void {
     return writeAllFd(c.STDOUT_FILENO, bytes);
 }
 
+pub const Reader = std.Io.Reader;
 pub const Writer = std.Io.Writer;
 
 pub fn stdoutWriter(system: std.Io, buffer: []u8) std.Io.File.Writer {
@@ -648,6 +655,20 @@ pub const Condition = struct {
         self.inner.broadcast(std.Io.Threaded.global_single_threaded.io());
     }
 };
+
+pub fn waitAtomic(word: *const std.atomic.Value(u32), expected: u32, deadline: Deadline) void {
+    const time = deadline.remainingNs();
+    if (time == 0) return;
+    const timeout: std.Io.Timeout = if (deadline.at_ns == Deadline.none.at_ns)
+        .none
+    else
+        .{ .duration = .{ .clock = .awake, .raw = .{ .nanoseconds = time } } };
+    std.Io.Threaded.global_single_threaded.io().futexWaitTimeout(u32, &word.raw, expected, timeout) catch {};
+}
+
+pub fn wakeAtomic(word: *const std.atomic.Value(u32)) void {
+    std.Io.Threaded.global_single_threaded.io().futexWake(u32, &word.raw, std.math.maxInt(u32));
+}
 
 pub const InflateError = error{ CorruptZlib, InflateSizeMismatch, DeadlineExceeded };
 
@@ -891,6 +912,192 @@ pub const Event = struct {
     readable: bool,
     writable: bool,
     hangup: bool,
+};
+
+pub const TcpPeer = union(enum) {
+    ip4: c.sockaddr.in,
+    ip6: c.sockaddr.in6,
+
+    /// Resolve once at startup. A range miss never does a DNS lookup.
+    pub fn resolve(a: std.mem.Allocator, hostname: []const u8, port: u16) ![]TcpPeer {
+        var host_buf: [255]u8 = @splat(0);
+        if (hostname.len == 0 or hostname.len >= host_buf.len - 1 or
+            std.mem.indexOfScalar(u8, hostname, 0) != null) return error.InvalidHostname;
+        @memcpy(host_buf[0..hostname.len], hostname);
+        var port_buf: [6]u8 = undefined;
+        const service = try std.fmt.bufPrintSentinel(&port_buf, "{d}", .{port}, 0);
+        var hints = std.mem.zeroes(c.addrinfo);
+        hints.socktype = c.SOCK.STREAM;
+        hints.protocol = c.IPPROTO.TCP;
+        var head: ?*c.addrinfo = null;
+        if (@backingInt(c.getaddrinfo(host_buf[0..hostname.len :0], service, &hints, &head)) != 0) return error.HostLookupFailed;
+        const first = head orelse return error.HostLookupFailed;
+        defer c.freeaddrinfo(first);
+        var peers: std.ArrayList(TcpPeer) = .empty;
+        errdefer peers.deinit(a);
+        while (head) |item| : (head = item.next) {
+            const address = item.addr orelse continue;
+            const peer: TcpPeer = switch (item.family) {
+                c.AF.INET => .{ .ip4 = @as(*const c.sockaddr.in, @ptrCast(@alignCast(address))).* },
+                c.AF.INET6 => .{ .ip6 = @as(*const c.sockaddr.in6, @ptrCast(@alignCast(address))).* },
+                else => continue,
+            };
+            try peers.append(a, peer);
+        }
+        if (peers.items.len == 0) return error.HostLookupFailed;
+        return peers.toOwnedSlice(a);
+    }
+
+    pub fn connect(self: *const TcpPeer, deadline: Deadline) !DeadlineStream {
+        return switch (self.*) {
+            .ip4 => |*address| DeadlineStream.connect(c.AF.INET, @ptrCast(address), @sizeOf(c.sockaddr.in), deadline),
+            .ip6 => |*address| DeadlineStream.connect(c.AF.INET6, @ptrCast(address), @sizeOf(c.sockaddr.in6), deadline),
+        };
+    }
+};
+
+pub const DeadlineStream = struct {
+    fd: c.fd_t,
+    deadline: Deadline,
+
+    fn connect(family: c_uint, address: *const c.sockaddr, len: c.socklen_t, deadline: Deadline) !DeadlineStream {
+        if (deadline.expired()) return error.DeadlineExceeded;
+        const fd = try checkInt(c.socket(family, c.SOCK.STREAM, c.IPPROTO.TCP));
+        errdefer _ = c.close(fd);
+        _ = try checkInt(c.fcntl(fd, c.F.SETFD, @as(c_int, c.FD_CLOEXEC)));
+        try setFdNonblocking(fd);
+        if (is_darwin) try setOpt(fd, c.SOL.SOCKET, c.SO.NOSIGPIPE, 1);
+        const self: DeadlineStream = .{ .fd = fd, .deadline = deadline };
+        const rc = c.connect(fd, address, len);
+        if (rc < 0) {
+            switch (c.errno(rc)) {
+                .INPROGRESS, .INTR => {},
+                else => |err| return failErrno(err),
+            }
+            try self.wait(c.POLL.OUT);
+            var status: c_int = 0;
+            var status_len: c.socklen_t = @sizeOf(c_int);
+            _ = try checkInt(c.getsockopt(fd, c.SOL.SOCKET, c.SO.ERROR, &status, &status_len));
+            if (status != 0) return failErrno(@fromBackingInt(@intCast(status)));
+        }
+        try setOpt(fd, c.IPPROTO.TCP, c.TCP.NODELAY, 1);
+        return self;
+    }
+
+    pub fn close(self: DeadlineStream) void {
+        _ = c.close(self.fd);
+    }
+
+    pub fn read(self: DeadlineStream, bytes: []u8) !usize {
+        while (true) {
+            if (self.deadline.expired()) return error.DeadlineExceeded;
+            const rc = c.recv(self.fd, bytes.ptr, bytes.len, 0);
+            if (rc >= 0) return @intCast(rc);
+            switch (c.errno(rc)) {
+                .INTR => continue,
+                .AGAIN => try self.wait(c.POLL.IN),
+                else => |err| return failErrno(err),
+            }
+        }
+    }
+
+    pub fn write(self: DeadlineStream, bytes: []const u8) !usize {
+        while (true) {
+            if (self.deadline.expired()) return error.DeadlineExceeded;
+            const rc = c.send(self.fd, bytes.ptr, bytes.len, if (is_linux) c.MSG.NOSIGNAL else 0);
+            if (rc >= 0) return @intCast(rc);
+            switch (c.errno(rc)) {
+                .INTR => continue,
+                .AGAIN => try self.wait(c.POLL.OUT),
+                else => |err| return failErrno(err),
+            }
+        }
+    }
+
+    fn wait(self: DeadlineStream, events: i16) !void {
+        var descriptor: [1]c.pollfd = .{.{ .fd = self.fd, .events = events, .revents = 0 }};
+        while (true) {
+            const left = self.deadline.remainingNs();
+            if (left == 0) return error.DeadlineExceeded;
+            const ms: c_int = @intCast(@min((left +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms, std.math.maxInt(c_int)));
+            const rc = c.poll(&descriptor, 1, ms);
+            if (rc > 0) return;
+            if (rc == 0 or c.errno(rc) == .INTR) continue;
+            return fail(rc);
+        }
+    }
+};
+
+/// Adapt a short-read source such as the deadline socket or a TLS connection
+/// to the buffered reader used by Zig's HTTP framing and the TLS handshake.
+pub fn BufferedReader(comptime Context: type) type {
+    return struct {
+        context: Context,
+        failure: ?anyerror = null,
+        interface: Reader,
+
+        const Self = @This();
+
+        pub fn init(context: Context, buffer: []u8) Self {
+            return .{
+                .context = context,
+                .interface = .{ .buffer = buffer, .seek = 0, .end = 0, .vtable = &.{ .stream = stream } },
+            };
+        }
+
+        fn stream(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
+            if (limit == .nothing) return 0;
+            const self: *Self = @fieldParentPtr("interface", r);
+            const output = limit.slice(try w.writableSliceGreedy(1));
+            const n = self.context.read(output) catch |err| {
+                self.failure = err;
+                return error.ReadFailed;
+            };
+            if (n == 0) return error.EndOfStream;
+            w.advance(n);
+            return n;
+        }
+    };
+}
+
+pub const SocketWriter = struct {
+    socket: DeadlineStream,
+    failure: ?anyerror = null,
+    interface: Writer,
+
+    pub fn init(socket: DeadlineStream, buffer: []u8) SocketWriter {
+        return .{ .socket = socket, .interface = .{ .buffer = buffer, .vtable = &.{ .drain = drain } } };
+    }
+
+    fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
+        const self: *SocketWriter = @fieldParentPtr("interface", w);
+        self.writeAll(w.buffered()) catch |err| {
+            self.failure = err;
+            return error.WriteFailed;
+        };
+        w.end = 0;
+        var total: usize = 0;
+        for (data[0 .. data.len - 1]) |part| total += try self.writePart(part);
+        for (0..splat) |_| total += try self.writePart(data[data.len - 1]);
+        return total;
+    }
+
+    fn writePart(self: *SocketWriter, part: []const u8) Writer.Error!usize {
+        self.writeAll(part) catch |err| {
+            self.failure = err;
+            return error.WriteFailed;
+        };
+        return part.len;
+    }
+
+    fn writeAll(self: *SocketWriter, data: []const u8) !void {
+        var done: usize = 0;
+        while (done < data.len) {
+            const written = try self.socket.write(data[done..]);
+            if (written == 0) return error.BrokenPipe;
+            done += written;
+        }
+    }
 };
 
 pub const Poller = struct {

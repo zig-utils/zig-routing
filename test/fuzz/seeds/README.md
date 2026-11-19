@@ -13,3 +13,9 @@ each big-endian header-length prefix.
 
 The framing target uses the compressed bytes. The primitive and dense-node
 targets inflate the same seeds during setup.
+
+`range-manifest.bin` is the version 1 range manifest exported from
+`test/graph_fixture.zig` by `zr bundle-manifest`. It contains 1,488 bytes
+and all 13 section kinds, including both a full 64 KiB extent and a short
+final extent for each nonempty section. SHA-256
+`f5f6a09fb9d537ed174e063b3627c6620b93eea8b4fc8cbd79c1282000145734`.

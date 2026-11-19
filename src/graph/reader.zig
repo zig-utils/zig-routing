@@ -39,6 +39,10 @@ pub const Bundle = struct {
         note(diagnostic, null);
         const dir = try io.Directory.open(path);
         defer dir.close();
+        return openInDir(dir, diagnostic);
+    }
+
+    pub fn openInDir(dir: io.Directory, diagnostic: ?*Diagnostic) !Bundle {
         var result: Bundle = .{ .mappings = .initFill(.{ .bytes = &.{} }), .view = undefined };
         errdefer result.close();
         var files: Files = .initFill(null);

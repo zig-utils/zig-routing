@@ -887,3 +887,43 @@ test "fuzz dem" {
 test {
     _ = @import("fuzz/regressions.zig");
 }
+
+fn fuzzRangeManifest(_: void, s: *Smith) !void {
+    var buf: [max_input]u8 = undefined;
+    const bytes = draw(s, &buf, 0x7261_6e67);
+    const manifest = graph.range_manifest.Manifest.parse(bytes, .none) catch return;
+    for (graph_kinds) |kind| {
+        const section = manifest.sections.get(kind) orelse continue;
+        try std.testing.expect(section.extent(section.extents.len) == null);
+        const first = section.extent(0).?;
+        const last = section.extent(section.extents.len - 1).?;
+        try std.testing.expectEqual(@as(usize, 0), first.offset);
+        try std.testing.expect(last.len > 0 and last.len <= graph.range_manifest.extent_size);
+        try std.testing.expectEqual(section.size, last.offset + last.len);
+    }
+}
+
+test "fuzz range-manifest" {
+    var running: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer running.deinit();
+    const good = @embedFile("fuzz/seeds/range-manifest.bin");
+    const corpus = try seeds(running.allocator(), &.{ good, good[0..32], "" });
+    try std.testing.fuzz({}, fuzzRangeManifest, .{ .corpus = corpus });
+}
+
+fn fuzzRangeResponse(_: void, s: *Smith) !void {
+    var buf: [max_input]u8 = undefined;
+    const raw = draw(s, &buf, 0x6874_7472);
+    const head = graph.range_http.parseHead(raw, 0, 65_568, 65_536) catch return;
+    try std.testing.expectEqual(std.http.Status.partial_content, head.status);
+    try std.testing.expectEqual(std.http.ContentEncoding.identity, head.content_encoding);
+}
+
+test "fuzz http-range" {
+    var running: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer running.deinit();
+    const good = "HTTP/1.1 206 Partial Content\r\nContent-Length: 65536\r\nContent-Range: bytes 0-65535/65568\r\n\r\n";
+    const chunked = "HTTP/1.1 206 Partial Content\r\nTransfer-Encoding: chunked\r\nContent-Range: bytes 0-65535/65568\r\n\r\n";
+    const corpus = try seeds(running.allocator(), &.{ good, chunked, "" });
+    try std.testing.fuzz({}, fuzzRangeResponse, .{ .corpus = corpus });
+}

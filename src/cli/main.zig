@@ -135,6 +135,12 @@ fn createCommands(a: Allocator) !*Command {
         option("edge", "Print a directed edge by ID", .int),
         option("node", "Print a node by ID", .int),
     }, &.{arg("BUNDLE", "Graph bundle directory")});
+    _ = try command(root, "bundle-manifest", "Write range hashes for a graph bundle", bundleManifest, &.{
+        option("output", "Range manifest output file", .string).withRequired(true),
+    }, &.{arg("BUNDLE", "Graph bundle directory")});
+    _ = try command(root, "fetch-bundle", "Fill a verified graph bundle from HTTP ranges", fetchBundle, &.{
+        option("timeout", "Time limit for completing the bundle", .string),
+    }, &.{ arg("URL", "Bundle origin directory"), arg("MANIFEST", "Trusted range manifest file"), arg("CACHE", "Existing local cache directory") });
     const tagging = try command(root, "tags", "Inspect OSM tag transformations", null, &.{}, &.{});
     _ = try command(tagging, "dump", "Dump OSM node and way tag fields as JSON lines", dumpTags, &.{
         option("raw", "Dump input tags for the Valhalla oracle", .bool),
@@ -489,6 +495,47 @@ fn inspectGraph(ctx: *Context) !u8 {
         Bundle.openDescribed(path, &diagnostic) catch |err| return graphDiagnostic(ctx, "open", diagnostic, err);
     defer bundle.close();
     try routing.cli.inspect.write(&bundle, ctx.out.?, ctx.wantsJson(), verify, edge_id, node_id);
+    return 0;
+}
+
+fn bundleManifest(ctx: *Context) !u8 {
+    var diagnostic: routing.graph.reader.Diagnostic = .{};
+    var bundle = routing.graph.reader.Bundle.openVerified(ctx.getArgument(0).?, .none, &diagnostic) catch |err|
+        return graphDiagnostic(ctx, "verify", diagnostic, err);
+    defer bundle.close();
+    const manifest = try routing.graph.range_manifest.encode(ctx.allocator, &bundle, .none);
+    defer ctx.allocator.free(manifest);
+    const path = ctx.getOption("output").?;
+    const dir = try io.Directory.open(std.fs.path.dirname(path) orelse ".");
+    defer dir.close();
+    const name = try ctx.allocator.dupeSentinel(u8, std.fs.path.basename(path), 0);
+    defer ctx.allocator.free(name);
+    try dir.writeAtomic(name, manifest);
+    return 0;
+}
+
+fn fetchBundle(ctx: *Context) !u8 {
+    const a = ctx.allocator;
+    const deadline: io.Deadline = if (try duration(ctx, "timeout")) |span| io.Deadline.fromNow(span) else .none;
+    const manifest = try io.Mapping.mapFile(ctx.getArgument(1).?, .read_only);
+    defer manifest.unmap();
+    const path = ctx.getArgument(2).?;
+    const root = try io.Directory.open(path);
+    defer root.close();
+    var origin = try routing.graph.range_http.Origin.open(a, ctx.getArgument(0).?);
+    defer origin.close(a);
+    var cache = try routing.graph.range_cache.Cache.open(a, root, manifest.bytes, origin.source(), .{}, deadline);
+    defer cache.close();
+    try cache.fill(&.{}, deadline);
+    var diagnostic: routing.graph.reader.Diagnostic = .{};
+    var bundle = routing.graph.reader.Bundle.openInDir(cache.dir, &diagnostic) catch |err|
+        return graphDiagnostic(ctx, "open", diagnostic, err);
+    defer bundle.close();
+    bundle.view.verify(deadline, &diagnostic) catch |err| return graphDiagnostic(ctx, "verify", diagnostic, err);
+    if (!std.mem.eql(u8, &bundle.view.dataset_uuid, &cache.manifest.dataset_uuid)) return error.DatasetUuidMismatch;
+    const result = try std.fs.path.join(a, &.{ path, &cache.key });
+    defer a.free(result);
+    if (ctx.wantsJson()) try ctx.writeJson(.{ .bundle = result }) else try ctx.out.?.print("{s}\n", .{result});
     return 0;
 }
 
