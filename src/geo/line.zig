@@ -10,6 +10,7 @@ const std = @import("std");
 const libm = @import("libm.zig");
 const k = @import("constants.zig");
 const point = @import("point.zig");
+const Deadline = @import("../infra/io.zig").Deadline;
 const PointLL = point.PointLL;
 const Allocator = std.mem.Allocator;
 
@@ -332,6 +333,126 @@ pub fn douglasPeucker(gpa: Allocator, polyline: *std.ArrayList(PointLL), epsilon
         w += 1;
     }
     polyline.shrinkRetainingCapacity(w);
+}
+
+/// Topology-aware Douglas-Peucker for contours, from
+/// src/midgard/polyline2.cc's avoid-self-intersections variant. Search the
+/// retained vertices inside each swept triangle before replacing an arc.
+pub fn generalizeContour(
+    gpa: Allocator,
+    polyline: *std.ArrayList(PointLL),
+    epsilon_m: f64,
+    deadline: Deadline,
+) !void {
+    const pts = polyline.items;
+    if (epsilon_m <= 0 or pts.len < 3) return;
+    const epsilon_sq = epsilon_m * epsilon_m;
+    const keep = try gpa.alloc(bool, pts.len);
+    defer gpa.free(keep);
+    @memset(keep, true);
+
+    const Range = struct { start: usize, end: usize };
+    const vertex_order = try gpa.alloc(usize, pts.len);
+    defer gpa.free(vertex_order);
+    for (vertex_order, 0..) |*index, i| {
+        if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
+        index.* = i;
+    }
+    std.mem.sortUnstable(usize, vertex_order, @as([]const PointLL, pts), vertexLongitudeLess);
+    var stack: std.ArrayList(Range) = .empty;
+    defer stack.deinit(gpa);
+    try stack.append(gpa, .{ .start = 0, .end = pts.len - 1 });
+    while (stack.pop()) |range| {
+        if (deadline.expired()) return error.DeadlineExceeded;
+        const a = pts[range.start];
+        const b = pts[range.end];
+        var distance_sq: f64 = -1;
+        var split = range.start + 1;
+        for (range.start + 1..range.end) |mid| {
+            if (mid % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
+            const d = segmentDistanceSquared(a, b, pts[mid]).distance_sq;
+            if (d > distance_sq) {
+                distance_sq = d;
+                split = mid;
+            }
+        }
+        if (distance_sq < epsilon_sq and
+            !try sweepsVertex(pts, keep, vertex_order, range.start, range.end, deadline))
+        {
+            @memset(keep[range.start + 1 .. range.end], false);
+            continue;
+        }
+        // Visit right first, like Valhalla's topology-preserving generalizer.
+        if (split - range.start > 1) try stack.append(gpa, .{ .start = range.start, .end = split });
+        if (range.end - split > 1) try stack.append(gpa, .{ .start = split, .end = range.end });
+    }
+    var count: usize = 0;
+    for (pts, keep, 0..) |coordinate, retained, i| {
+        if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
+        if (!retained) continue;
+        pts[count] = coordinate;
+        count += 1;
+    }
+    polyline.shrinkRetainingCapacity(count);
+}
+
+fn vertexLongitudeLess(points: []const PointLL, a: usize, b: usize) bool {
+    return points[a].lng < points[b].lng;
+}
+
+fn sweepsVertex(
+    points: []const PointLL,
+    keep: []const bool,
+    vertex_order: []const usize,
+    start: usize,
+    end: usize,
+    deadline: Deadline,
+) !bool {
+    const a = points[start];
+    const b = points[end];
+    if (a.eql(b)) return false;
+    for (points[start + 1 .. end], 0..) |c, i| {
+        if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
+        if (a.isLeft(b, c) == 0) continue;
+        const lo = PointLL.init(@min(a.lng, b.lng, c.lng), @min(a.lat, b.lat, c.lat));
+        const hi = PointLL.init(@max(a.lng, b.lng, c.lng), @max(a.lat, b.lat, c.lat));
+        var left: usize = 0;
+        var right = vertex_order.len;
+        while (left < right) {
+            const mid = left + (right - left) / 2;
+            if (points[vertex_order[mid]].lng < lo.lng) left = mid + 1 else right = mid;
+        }
+        for (vertex_order[left..], 0..) |index, j| {
+            if (j % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
+            const candidate = points[index];
+            if (candidate.lng > hi.lng) break;
+            if (!keep[index] or (index >= start and index <= end)) continue;
+            if (candidate.lat < lo.lat or candidate.lat > hi.lat) continue;
+            if (triangleContains(a, c, b, candidate)) return true;
+        }
+    }
+    return false;
+}
+
+// Ported from src/midgard/util.cc's triangle_contains. Endpoints and the
+// opposite edge do not count as interior swept vertices.
+fn triangleContains(a: PointLL, b: PointLL, c: PointLL, candidate: PointLL) bool {
+    const x0 = c.lng - a.lng;
+    const y0 = c.lat - a.lat;
+    const x1 = b.lng - a.lng;
+    const y1 = b.lat - a.lat;
+    const x2 = candidate.lng - a.lng;
+    const y2 = candidate.lat - a.lat;
+    const d00 = x0 * x0 + y0 * y0;
+    const d01 = x0 * x1 + y0 * y1;
+    const d02 = x0 * x2 + y0 * y2;
+    const d11 = x1 * x1 + y1 * y1;
+    const d12 = x1 * x2 + y1 * y2;
+    const denominator = d00 * d11 - d01 * d01;
+    if (@abs(denominator) < 1e-20) return false;
+    const u = (d11 * d02 - d01 * d12) / denominator;
+    const v = (d00 * d12 - d01 * d02) / denominator;
+    return u >= 1e-16 and v >= 1e-16 and u + v < 1;
 }
 
 /// Squared planar distances (degrees, longitude scaled by `lon_scale`) from

@@ -288,11 +288,7 @@ const Boundary = struct {
 
     fn vertex(self: *Boundary, point: PointLL) !usize {
         if (!finite(point)) return error.InvalidGeometry;
-        const key = [2]u64{
-            if (point.lng == 0) 0 else @bitCast(point.lng),
-            if (point.lat == 0) 0 else @bitCast(point.lat),
-        };
-        const entry = try self.by_point.getOrPut(self.gpa, key);
+        const entry = try self.by_point.getOrPut(self.gpa, point.exactKey());
         if (!entry.found_existing) {
             entry.value_ptr.* = self.vertices.items.len;
             try self.vertices.append(self.gpa, .{ .point = point });
@@ -465,6 +461,18 @@ const Boundary = struct {
             }
         }
     }
+
+    fn extractDirected(
+        self: *Boundary,
+        output: Allocator,
+        rings: *std.ArrayList(BuiltRing),
+        deadline: Deadline,
+    ) !void {
+        for (self.vertices.items, 0..) |v, id| {
+            try checkAt(deadline, id);
+            if (v.head != null) try self.walk(id, output, rings, null, false, deadline);
+        }
+    }
 };
 
 /// Join unordered, arbitrarily oriented fragments. Equal coordinates form
@@ -495,6 +503,27 @@ pub fn assemble(gpa: Allocator, fragments: []const Fragment, deadline: Deadline)
     }
     output.polygons = try groupRings(temp, owned, rings.items, .counterclockwise, deadline);
     return output;
+}
+
+/// Nest preassembled CCW shells and CW holes, splitting rings that touch at
+/// repeated vertices. Temporary storage uses the scratch arena and the
+/// returned rings and polygons use the result arena.
+pub fn nestOrientedRings(temp: Allocator, owned: Allocator, input: []const Ring, deadline: Deadline) ![]const Polygon {
+    var boundary: Boundary = .{ .gpa = temp };
+    for (input, 0..) |line, i| {
+        try checkAt(deadline, i);
+        const ring = vertices(line);
+        if (ring.len < 3) continue;
+        var prev = ring[ring.len - 1];
+        for (ring, 0..) |next, j| {
+            try checkAt(deadline, j);
+            try boundary.add(prev, next, true);
+            prev = next;
+        }
+    }
+    var rings: std.ArrayList(BuiltRing) = .empty;
+    try boundary.extractDirected(owned, &rings, deadline);
+    return groupRings(temp, owned, rings.items, .counterclockwise, deadline);
 }
 
 fn groupRings(
@@ -693,10 +722,7 @@ pub fn clipPolygon(gpa: Allocator, poly: Polygon, box: AABB, deadline: Deadline)
     for (events, 0..) |side_events, i|
         try addBoxEdges(&boundary, box, @fromBackingInt(@intCast(i)), side_events.items, deadline);
     var rings: std.ArrayList(BuiltRing) = .empty;
-    for (boundary.vertices.items, 0..) |v, id| {
-        try checkAt(deadline, id);
-        if (v.head != null) try boundary.walk(id, owned, &rings, null, false, deadline);
-    }
+    try boundary.extractDirected(owned, &rings, deadline);
     output.polygons = try groupRings(temp, owned, rings.items, shell_winding, deadline);
     return output;
 }

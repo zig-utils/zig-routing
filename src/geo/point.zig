@@ -36,6 +36,14 @@ pub const PointLL = struct {
         return self.lng == other.lng and self.lat == other.lat;
     }
 
+    /// Exact key for finite points. Equal signed zeros use the same key.
+    pub fn exactKey(self: PointLL) [2]u64 {
+        return .{
+            if (self.lng == 0) 0 else @bitCast(self.lng),
+            if (self.lat == 0) 0 else @bitCast(self.lat),
+        };
+    }
+
     /// point2.h ApproximatelyEqual with the default LL_EPSILON.
     pub fn approxEql(self: PointLL, other: PointLL) bool {
         return self.approxEqlWithin(other, k.ll_epsilon);
