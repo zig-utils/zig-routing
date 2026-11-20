@@ -65,7 +65,7 @@ pub fn main(init: std.process.Init) !void {
         defer warm.close();
         try warm.view.verify(.none, null);
         try build.assemble.validate(warm.view.first_edge, warm.view.edges, warm.view.coordinates.?, warm.view.classes.?, .none);
-        try validateTurns(&warm.view, stats.turn_pool_bytes);
+        try validateTurns(&warm.view, stats.turn_pool_bytes, stats.simple_turns.resolved != 0);
         try validateComponents(&warm.view);
         try validateCold(init.gpa, &warm.view, stats.cold_records, stats.cold_payload_bytes);
         try validateSpatial(&warm.view, stats.spatial);
@@ -120,15 +120,17 @@ fn validateComponents(view: *const graph.reader.View) !void {
     }
 }
 
-fn validateTurns(view: *const graph.reader.View, expected_bytes: usize) !void {
+fn validateTurns(view: *const graph.reader.View, expected_bytes: usize, has_resolved_restrictions: bool) !void {
     if (view.turns.len != expected_bytes) return error.TurnPoolSizeMismatch;
     for (0..view.nodes.len) |i| {
         const node: graph.format.NodeId = @fromBackingInt(@as(u32, @intCast(i)));
         const degree = (try view.outEdgeRange(node)).count();
         for (0..degree) |local| {
             const row = try view.turnRow(node, @intCast(local));
-            for (row) |entry| {
-                if (entry & 0x80 != 0) return error.UnexpectedTurnRestriction;
+            if (!has_resolved_restrictions) {
+                for (row) |entry| {
+                    if (entry & 0x80 != 0) return error.UnexpectedTurnRestriction;
+                }
             }
         }
     }
