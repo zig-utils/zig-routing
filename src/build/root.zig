@@ -27,6 +27,12 @@ pub const name_details = @import("name_details.zig");
 pub const restriction_automaton = @import("restriction_automaton.zig");
 pub const time_parsing = @import("time_parsing.zig");
 pub const gtfs = @import("gtfs/root.zig");
+pub const transit_calendar = @import("transit_calendar.zig");
+pub const transit_connections = @import("transit_connections.zig");
+pub const transit_stop_times = @import("transit_stop_times.zig");
+pub const transit_timetable = @import("transit_timetable.zig");
+pub const transit_places = @import("transit_places.zig");
+pub const transit_links = @import("transit_links.zig");
 
 test {
     std.testing.refAllDecls(@This());

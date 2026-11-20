@@ -34,6 +34,9 @@ const lane_build = @import("lanes.zig");
 const name_details = @import("name_details.zig");
 const link_classification = @import("link_classification.zig");
 const grid = @import("../geo/grid.zig");
+const transit_stage = @import("transit_stage.zig");
+const transit_connections = @import("transit_connections.zig");
+const gtfs = @import("gtfs/root.zig");
 
 const Allocator = std.mem.Allocator;
 const max_degree = turns.max_degree;
@@ -77,6 +80,59 @@ pub const Stats = struct {
     assembly_ns: u64,
     simple_turns: turn_restrictions.Stats,
 };
+
+pub const TransitInput = struct { saved: *const checkpoint.Existing, node_base: i64 };
+
+pub fn prepareTransit(gpa: Allocator, tx: *checkpoint.Transaction, dir: []const u8, feeds: []const gtfs.Feed, files: edges.Output, metadata: *const Metadata, source: edges.Stats) !transit_stage.Layout {
+    const edge_map = try io.Mapping.mapFd(files.edges, .read_only);
+    defer edge_map.unmap();
+    const shape_map = try io.Mapping.mapFd(files.shapes, .read_only);
+    defer shape_map.unmap();
+    const road: TransitStreets = .{
+        .segments = try checkpoint.array(edges.Edge, edge_map),
+        .points = try checkpoint.array(geo.FixedLL, shape_map),
+        .ways = &metadata.ways,
+        .min_node = try lowestOsmId(&metadata.nodes, tx.deadline),
+        .min_way = try lowestOsmId(&metadata.ways, tx.deadline),
+    };
+    if (road.segments.len != source.edges or road.points.len != source.shape_points or road.segments.len > std.math.maxInt(u32) / 2)
+        return error.InvalidSegmentCheckpoint;
+    return transit_stage.prepare(gpa, tx, dir, feeds, files, road, source);
+}
+
+const TransitStreets = struct {
+    segments: []const edges.Edge,
+    points: []const geo.FixedLL,
+    ways: *const Ways,
+    min_node: i64,
+    min_way: i64,
+
+    pub fn shape(self: TransitStreets, id: u32) !?[]const geo.FixedLL {
+        if (try self.access(id) == null) return null;
+        return try segmentShape(self.points, self.segments[id]);
+    }
+
+    pub fn access(self: TransitStreets, id: u32) !?[2]graph.constants.AccessMask {
+        const way = self.ways.get(self.segments[id].way_id) orelse return error.MissingWayAttributes;
+        var allowed: [2]graph.constants.AccessMask = @splat(.{});
+        for (way.by_direction, &allowed) |class, *mask| {
+            const use = std.enums.fromInt(graph.constants.Use, class.category.use) orelse return error.InvalidClass;
+            if (transit_connections.streetUse(use)) mask.* = class.forwardAccess();
+        }
+        return if (allowed[0].pedestrian or allowed[1].pedestrian) allowed else null;
+    }
+};
+
+fn lowestOsmId(map: anytype, deadline: io.Deadline) !i64 {
+    var minimum: i64 = 0;
+    var keys = map.keyIterator();
+    var i: usize = 0;
+    while (keys.next()) |id| : (i += 1) {
+        try checkDeadline(deadline, i);
+        minimum = @min(minimum, id.*);
+    }
+    return minimum;
+}
 
 /// Build the topology, validate it, and write it to the caller's staging
 /// bundle. The caller commits the writer after all build stages succeed.
@@ -169,7 +225,7 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     if (restriction_program.states.len != 0) try writer.write(.restriction_automaton, restriction_program.states);
     if (restriction_program.conditions.len != 0) try writer.write(.restriction_conditions, restriction_program.conditions);
     try writeAdmins(writer, options.admin_index, shared.admin_ids);
-    if (options.timezone_source) |source_tz| try writeTimezones(gpa, writer, source_tz, topology.coordinates, options.scratch_dir);
+    if (options.timezone_source) |source_tz| try writeTimezones(gpa, writer, source_tz, topology.coordinates, options.scratch_dir, &plan, &metadata);
     const topology_ns = timer.read();
     const means: []const i16 = if (terrain) |*present| present.means.data else &.{};
     const cold_bytes = try buildCold(gpa, &shared, &metadata, &plan, table.classes, writer, options.scratch_dir, means);
@@ -207,6 +263,7 @@ pub fn buildStaged(
     shape_file: io.File,
     options: Options,
     restrictions: turn_restrictions.Source,
+    transit: ?TransitInput,
 ) !void {
     const gpa = session.gpa;
     const edge_map = try io.Mapping.mapFd(edge_file, .read_only);
@@ -217,6 +274,7 @@ pub fn buildStaged(
     const points = try checkpoint.array(geo.FixedLL, shape_map);
     if (segments.len != source_stats.edges or points.len != source_stats.shape_points or segments.len > std.math.maxInt(u32) / 2)
         return error.InvalidSegmentCheckpoint;
+    if (transit) |input| try metadata.loadTransit(input.saved);
 
     var plan = blk: {
         if (session.runs(.order)) {
@@ -263,6 +321,7 @@ pub fn buildStaged(
         .countries = country_table,
         .apply_country_overrides = options.apply_country_overrides,
         .deadline = options.deadline,
+        .transit = transit,
     };
     var edge_classes: ?[]const classes.EdgeClass = null;
     defer if (edge_classes) |owned| gpa.free(owned);
@@ -393,7 +452,7 @@ noinline fn saveColdStage(session: *checkpoint.Session, shared: *const Shared, m
     const slopes = if (slopes_map) |mapped| try checkpoint.array(u16, mapped) else null;
     try writeTopology(&writer, options.scratch_dir, shared.topology, edge_classes, turn_data.bytes, slopes);
     try writeAdmins(&writer, options.admin_index, shared.admin_ids);
-    if (options.timezone_source) |source| try writeTimezones(gpa, &writer, source, shared.topology.coordinates, options.scratch_dir);
+    if (options.timezone_source) |source| try writeTimezones(gpa, &writer, source, shared.topology.coordinates, options.scratch_dir, plan, metadata);
     if (saved_turns.manifest.files.get(.turn_sides) != null) {
         const side_data = try saved_turns.map(.turn_sides, options.deadline);
         defer side_data.unmap();
@@ -543,6 +602,9 @@ pub const Metadata = struct {
     nodes: std.AutoHashMapUnmanaged(i64, format.NodeHot) = .empty,
     controls: std.AutoHashMapUnmanaged(i64, enhance.NodeControls) = .empty,
     ways: Ways = .empty,
+    transit_ways: std.AutoHashMapUnmanaged(i64, u64) = .empty,
+    transit_timezones: std.AutoHashMapUnmanaged(i64, graph.transit.Text) = .empty,
+    transit_names: std.ArrayList(tags.names.Id) = .empty,
     access_limits: std.AutoHashMapUnmanaged(i64, std.ArrayList(access_restriction.Entry)) = .empty,
     access_scratch: std.ArrayList(access_restriction.Entry) = .empty,
     conditional: conditional_access.Parser,
@@ -644,16 +706,7 @@ pub const Metadata = struct {
         try file.sync();
         const names = try tx.create(.names);
         defer names.close();
-        offset = 0;
-        for (self.strings.strings.items, 0..) |text, i| {
-            try checkDeadline(self.deadline, i);
-            const size = std.math.cast(u32, text.len) orelse return error.NameTooLarge;
-            try names.pwriteAll(std.mem.asBytes(&size), offset);
-            offset += @sizeOf(u32);
-            try names.pwriteAll(text, offset);
-            offset += size;
-        }
-        try names.sync();
+        try self.strings.save(names, self.deadline);
         try tx.writeArray(self.name_ids.items, .name_refs);
         try tx.writeArray(self.levels.items, .levels);
         if (self.access_limits.count() != 0) try self.saveAccessLimits(tx);
@@ -684,16 +737,8 @@ pub const Metadata = struct {
     pub fn loadWays(self: *Metadata, saved: *const checkpoint.Existing) !void {
         const names = try saved.map(.names, self.deadline);
         defer names.unmap();
-        var remaining: []const u8 = names.bytes;
-        while (remaining.len != 0) {
-            if (self.deadline.expired()) return error.DeadlineExceeded;
-            if (remaining.len < @sizeOf(u32)) return error.InvalidCheckpoint;
-            const len = std.mem.readInt(u32, remaining[0..@sizeOf(u32)], .little);
-            remaining = remaining[@sizeOf(u32)..];
-            if (len == 0 or len > remaining.len) return error.InvalidCheckpoint;
-            _ = try self.strings.intern(remaining[0..len]);
-            remaining = remaining[len..];
-        }
+        var stored: tags.names.StoredNames = .{ .remaining = names.bytes };
+        while (try stored.next(self.deadline)) |name| _ = try self.strings.intern(name);
         try self.signs.loadWays(self.gpa, saved, &self.strings, self.deadline);
         try self.lanes.loadWays(saved, &self.strings);
         try self.name_tags.load(saved, &self.strings);
@@ -748,6 +793,9 @@ pub const Metadata = struct {
         self.nodes.deinit(self.gpa);
         self.controls.deinit(self.gpa);
         self.ways.deinit(self.gpa);
+        self.transit_ways.deinit(self.gpa);
+        self.transit_timezones.deinit(self.gpa);
+        self.transit_names.deinit(self.gpa);
         var sets = self.access_limits.valueIterator();
         while (sets.next()) |set| set.deinit(self.gpa);
         self.access_limits.deinit(self.gpa);
@@ -759,6 +807,68 @@ pub const Metadata = struct {
         self.name_ids.deinit(self.gpa);
         self.levels.deinit(self.gpa);
         self.strings.deinit();
+    }
+
+    fn loadTransit(self: *Metadata, saved: *const checkpoint.Existing) !void {
+        const nodes = try saved.map(.transit_nodes, self.deadline);
+        defer nodes.unmap();
+        for (try checkpoint.array(transit_stage.Node, nodes), 0..) |row, i| {
+            try checkDeadline(self.deadline, i);
+            if (row.attr.reserved != 0) return error.InvalidCheckpoint;
+            var hot = neutral_node;
+            hot.attr.access = @bitCast(row.attr.access);
+            hot.attr.type = @backingInt(row.attr.kind);
+            try self.nodes.putNoClobber(self.gpa, row.id, hot);
+            if (row.timezone != .none) try self.transit_timezones.putNoClobber(self.gpa, row.id, row.timezone);
+        }
+        const ways = try saved.map(.transit_ways, self.deadline);
+        defer ways.unmap();
+        for (try checkpoint.array(transit_stage.Way, ways), 0..) |row, i| {
+            try checkDeadline(self.deadline, i);
+            if (row.attr.reserved != 0) return error.InvalidCheckpoint;
+            const source = if (row.source_way_id != 0) self.ways.get(@bitCast(row.source_way_id)) else null;
+            const service: u3 = @backingInt(graph.constants.RoadClass.service_other);
+            var imported: Way = .{
+                .by_direction = undefined,
+                .speeds = .{ .forward = 5, .backward = 5, .truck = 0, .limit = 0 },
+                .attr = .{
+                    .oneway = row.access.forward.pedestrian != row.access.backward.pedestrian,
+                    .importance = service,
+                    .has_names = if (source) |street| street.attr.has_names else false,
+                    .layer = 0,
+                },
+                .level_start = 0,
+                .level_count = 0,
+                .name_start = if (source) |street| street.name_start else 0,
+                .names = .{ .count = 0, .ref_start = 0, .ref_count = 0 },
+                .name_tags = if (source) |street| street.name_tags else .{},
+            };
+            if (source) |street| imported.names = street.names;
+            const fore: u16 = @bitCast(row.access.forward);
+            const aft: u16 = @bitCast(row.access.backward);
+            var class: classes.EdgeClass = .{
+                .category = .{ .use = @intCast(@backingInt(row.attr.use)), .road_class = service },
+                .access = .{ .forward = fore, .reverse = aft },
+                .flags = .{ .named = imported.attr.has_names },
+            };
+            imported.by_direction[0] = class;
+            class.access = .{ .forward = aft, .reverse = fore };
+            imported.by_direction[1] = class;
+            try self.ways.putNoClobber(self.gpa, row.id, imported);
+            try self.transit_ways.putNoClobber(self.gpa, row.id, row.source_way_id);
+        }
+        const strings = try saved.map(.transit_strings, self.deadline);
+        defer strings.unmap();
+        var stored: tags.names.StoredNames = .{ .remaining = strings.bytes };
+        try self.transit_names.append(self.gpa, .empty);
+        while (try stored.next(self.deadline)) |name|
+            try self.transit_names.append(self.gpa, try self.strings.intern(name));
+    }
+
+    fn transitName(self: *const Metadata, text: graph.transit.Text) !tags.names.Id {
+        const index = @backingInt(text);
+        if (index == 0 or index >= self.transit_names.items.len) return error.InvalidTransitText;
+        return self.transit_names.items[index];
     }
 
     pub fn node(self: *Metadata, id: i64, attrs: tags.NodeAttrs) !void {
@@ -1273,6 +1383,7 @@ const Shared = struct {
     admin_index: ?graph.admin.View = null,
     countries: []const country_access.Country = &.{},
     apply_country_overrides: bool = true,
+    transit: ?TransitInput = null,
     deadline: io.Deadline,
 
     fn country(self: *const Shared, node: u32) country_access.Country {
@@ -1344,7 +1455,7 @@ fn emitAdmins(index: graph.admin.View, out: *format.SectionWriter(.admins)) !voi
     try index.write(out);
 }
 
-noinline fn writeTimezones(gpa: Allocator, writer: *format.BundleWriter, source: timezones.Source, points: []const format.Coordinate, scratch_dir: []const u8) !void {
+noinline fn writeTimezones(gpa: Allocator, writer: *format.BundleWriter, source: timezones.Source, points: []const format.Coordinate, scratch_dir: []const u8, plan: *const Layout, metadata: *const Metadata) !void {
     const rules = try graph.timezone.Rules.parse(source.rules);
     try rules.verify(writer.deadline);
     var index = try timezones.build(gpa, source.boundaries, rules, points, writer.deadline);
@@ -1352,6 +1463,15 @@ noinline fn writeTimezones(gpa: Allocator, writer: *format.BundleWriter, source:
     var ids = try Scratch(graph.timezone.Id).init(points.len, scratch_dir);
     defer ids.deinit();
     try timezones.assign(index.view, points, ids.data, writer.deadline);
+    var transit_nodes = metadata.transit_timezones.iterator();
+    while (transit_nodes.next()) |entry| {
+        if (writer.deadline.expired()) return error.DeadlineExceeded;
+        const index_in_layout = plan.by_id.get(entry.key_ptr.*) orelse return error.InvalidTransitNode;
+        const node = plan.nodes.items[index_in_layout];
+        const name = metadata.strings.get(try metadata.transitName(entry.value_ptr.*)) orelse return error.InvalidTransitText;
+        const tz = try rules.id(name);
+        if (tz != graph.timezone.unknown) @memset(ids.data[node.first_alias..][0..aliasCount(node.degree)], tz);
+    }
     try writer.write(.node_timezones, ids.data);
     try writer.write(.timezone_rules, source.rules);
 }
@@ -2559,6 +2679,10 @@ noinline fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *Metadata
                 const ref = topo.slot_refs.data[slot];
                 const seg = shared.segments[ref / 2];
                 const way = shared.ways.get(seg.way_id) orelse return error.MissingWayAttributes;
+                const way_id: u64 = if (shared.transit != null)
+                    metadata.transit_ways.get(seg.way_id) orelse @bitCast(seg.way_id)
+                else
+                    @bitCast(seg.way_id);
                 const active = refs[0..way.names.count];
                 const ref_start = way.names.ref_start;
                 const ref_end = @as(usize, ref_start) + way.names.ref_count;
@@ -2593,7 +2717,7 @@ noinline fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *Metadata
                     }
                     const fore = name_writer.sides[0];
                     const aft = name_writer.sides[1];
-                    break :blk try builder.appendFull(@bitCast(seg.way_id), way.speeds.limit, mean, shape, fore.refs.items, .{
+                    break :blk try builder.appendFull(way_id, way.speeds.limit, mean, shape, fore.refs.items, .{
                         .reverse_refs = if (std.mem.eql(u32, fore.refs.items, aft.refs.items)) null else aft.refs.items,
                         .name_details = fore.details(),
                         .reverse_name_details = if (fore.detailsEqual(aft)) null else aft.details(),
@@ -2601,7 +2725,7 @@ noinline fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *Metadata
                         .access_limits = access_limits,
                     });
                 }
-                break :blk try builder.appendFull(@bitCast(seg.way_id), way.speeds.limit, mean, shape, active, .{
+                break :blk try builder.appendFull(way_id, way.speeds.limit, mean, shape, active, .{
                     .indoor = indoor,
                     .access_limits = access_limits,
                 });
@@ -2614,7 +2738,74 @@ noinline fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *Metadata
     try writer.write(.cold_idx, index.data);
     if (coverage.finish()) |bounds| try writer.write(.coverage, &.{bounds});
     try writeSigns(shared, metadata, plan, edge_classes, &builder, writer);
+    if (shared.transit) |input| try writeTransitSections(input, metadata, plan, &builder, writer);
     return builder.write(writer);
+}
+
+fn writeTransitSections(input: TransitInput, metadata: *const Metadata, plan: *const Layout, cold: *ColdBuilder, writer: *format.BundleWriter) !void {
+    inline for (format.transit_sections) |kind| {
+        const artifact = @field(checkpoint.Artifact, @tagName(kind) ++ "_rows");
+        const mapped = try input.saved.map(artifact, writer.deadline);
+        defer mapped.unmap();
+        const records = try checkpoint.array(kind.Record(), mapped);
+        switch (kind) {
+            .transit_stops, .transit_stations, .transit_egresses, .transit_routes, .transit_departures => {
+                const Emitter = TransitEmitter(kind);
+                try writer.stream(kind, Emitter{ .records = records, .metadata = metadata, .plan = plan, .cold = cold, .node_base = input.node_base }, Emitter.write);
+            },
+            else => try writer.write(kind, records),
+        }
+    }
+}
+
+fn TransitEmitter(comptime kind: format.SectionKind) type {
+    const Record = kind.Record();
+    return struct {
+        records: []const Record,
+        metadata: *const Metadata,
+        plan: *const Layout,
+        cold: *ColdBuilder,
+        node_base: i64,
+
+        fn write(self: @This(), out: *format.SectionWriter(kind)) !void {
+            var batch: [256]Record = undefined;
+            var first: usize = 0;
+            while (first < self.records.len) {
+                if (out.deadline().expired()) return error.DeadlineExceeded;
+                const count = @min(batch.len, self.records.len - first);
+                @memcpy(batch[0..count], self.records[first..][0..count]);
+                for (batch[0..count]) |*record| {
+                    switch (kind) {
+                        .transit_stops, .transit_stations, .transit_egresses => {
+                            const place = &record.place;
+                            place.name = try self.name(place.name);
+                            place.one_stop_id = try self.name(place.one_stop_id);
+                            place.timezone = try self.name(place.timezone);
+                            if (place.graph_node != graph.transit.no_id) {
+                                const osm_id = std.math.add(i64, self.node_base, place.graph_node) catch return error.InvalidTransitNode;
+                                const node = self.plan.by_id.get(osm_id);
+                                place.graph_node = if (node) |id| self.plan.nodes.items[id].first_alias else graph.transit.no_id;
+                            }
+                        },
+                        .transit_routes => {
+                            inline for (@typeInfo(Record).@"struct".field_names, @typeInfo(Record).@"struct".field_types) |field, T| {
+                                if (T == graph.transit.Text) @field(record, field) = try self.name(@field(record, field));
+                            }
+                        },
+                        .transit_departures => record.headsign = try self.name(record.headsign),
+                        else => unreachable,
+                    }
+                }
+                try out.append(batch[0..count]);
+                first += count;
+            }
+        }
+
+        fn name(self: @This(), id: graph.transit.Text) !graph.transit.Text {
+            if (id == .none) return .none;
+            return @fromBackingInt(try self.cold.nameRef(try self.metadata.transitName(id), false));
+        }
+    };
 }
 
 noinline fn selectEdgeSigns(shared: *const Shared, node: u32, segment: edges.Edge, ref: u32, raw_class: classes.EdgeClass) !?sign_build.Selection {

@@ -100,6 +100,7 @@ fn createCommands(a: Allocator) !*Command {
     }, &.{});
     _ = try command(root, "build", "Build a graph bundle from OSM data", buildGraph, &.{
         option("output", "Publish the graph bundle at this path", .string),
+        option("gtfs", "GTFS schedule ZIP. Use zig_routing.build.gtfs_inputs for multiple feeds", .string),
         option("work-dir", "Directory for stage checkpoints and build-stats.json", .string),
         option("dem", "Directory of HGT elevation tiles", .string),
         option("timezones", "Timezone boundary GeoJSON file", .string),
@@ -462,6 +463,7 @@ fn buildGraph(ctx: *Context) !u8 {
     for (arguments, 0..) |*value, i| value.* = ctx.getArgument(i).?;
     const options: driver.Options = .{
         .inputs = if (arguments.len == 0) settings.inputs else arguments,
+        .gtfs_inputs = if (ctx.getOption("gtfs")) |path| &.{path} else settings.gtfs_inputs,
         .output = output,
         .work_dir = work_dir,
         .dem_dir = ctx.getOption("dem") orelse settings.dem_dir orelse loaded.config.additional_data.elevation,
@@ -486,10 +488,16 @@ fn buildGraph(ctx: *Context) !u8 {
     const allocator = std.heap.c_allocator;
     const result = driver.run(allocator, options, if (ctx.wantsJson()) null else ctx.out, &diagnostic) catch |err| {
         const stage = if (diagnostic.stage) |stage| @tagName(stage) else "setup";
-        const message = if (diagnostic.input) |path|
-            try std.fmt.allocPrint(ctx.allocator, "build {s} could not read {s} ({s})", .{ stage, path, @errorName(err) })
-        else switch (err) {
+        const message = if (diagnostic.input) |path| blk: {
+            const table = diagnostic.gtfs_table;
+            if (table.file.len != 0)
+                break :blk try std.fmt.allocPrint(ctx.allocator, "build {s} could not read {s} {s} row {d}, column {d} ({s})", .{
+                    stage, path, table.file, table.row, table.column, @errorName(err),
+                });
+            break :blk try std.fmt.allocPrint(ctx.allocator, "build {s} could not read {s} ({s})", .{ stage, path, @errorName(err) });
+        } else switch (err) {
             error.MissingOsmInput => "provide at least one OSM PBF input",
+            error.MissingGtfsInput => "provide a GTFS schedule ZIP for the transit stage",
             error.MissingBundlePath => "provide --output to finalize the bundle",
             error.InvalidStageRange => "--from must precede or equal --to",
             error.PbfDecodeBudgetExceeded => "PBF decode buffer budget cannot fit the largest compressed block",
@@ -504,7 +512,15 @@ fn buildGraph(ctx: *Context) !u8 {
         return err;
     };
     defer result.deinit(allocator);
-    if (ctx.wantsJson()) try ctx.writeJson(result);
+    if (ctx.wantsJson()) {
+        try ctx.writeJson(result);
+    } else if (result.transit) |report| {
+        try ctx.out.?.print("transit connected {d}/{d} platforms\n", .{ report.connected, report.platforms });
+        if (report.connected != report.platforms)
+            try ctx.out.?.print("  {d} missing coordinates, {d} without a walkable street, {d} without a pathway to the street, {d} one-way only\n", .{
+                report.missing_coordinates, report.no_pedestrian_street, report.no_pathway_to_street, report.one_way_only,
+            });
+    }
     return 0;
 }
 

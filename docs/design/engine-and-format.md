@@ -201,6 +201,41 @@ The index costs eight bytes per stored occurrence and orders ties by canonical r
 position. Both paths use a single binary search and return a borrowed record and its
 offered time. Callers can check service dates and access flags on that record.
 
+### Building transit from GTFS
+
+`zr build --gtfs feed.zip --output graph roads.osm.pbf` builds one feed.
+For multiple feeds, set the ordered `zig_routing.build.gtfs_inputs` list in the
+configuration. Feed fingerprints contribute to the bundle UUID. Platform,
+route and trip identifiers belong to their feed's namespace.
+
+The transit stage runs between segment generation and node ordering. It
+resolves the stop hierarchy, uses supplied station pathways, and creates
+entrances and platform connections for stations without pathways. The
+street spatial index finds walkable edges within 500 m of each entrance.
+Approach shapes follow the street from each endpoint to the projection and
+then reach the entrance. Street and pathway directions determine access to
+the resulting edges. At stations with complete pathway times, generated
+transfers use the shortest permitted path's time.
+
+The stage checkpoints the augmented segments, transit records and names.
+Run with `--to transit` to publish this checkpoint and `--from order` to
+resume graph assembly from it. Graph ordering assigns dense node IDs and
+the cold stage interns transit names alongside road names. Service dates use
+the stop's inherited timezone. When the build includes timezone rules,
+transit nodes take their feed timezone alongside the street timezone index.
+
+The `transit` object in `build-stats.json` counts platforms reachable from
+and able to return to a street. It reports missing coordinates, entrances
+without a walkable street, missing station pathways and one-way access.
+It also counts timetable legs, pathways and transfers with missing endpoints.
+
+The Brockton city build produced 1,460 lines and 83,484 departures. All 963
+platform nodes in the installed bundle had a pedestrian connection in both
+directions. All 18 transit checkpoint artifacts were byte-identical across
+one and eight workers.
+[Brockton Area Transit GTFS](https://data.trilliumtransit.com/gtfs/brockton-ma-us/brockton-ma-us.zip) ·
+[2026-11-19 Massachusetts street extract](https://download.geofabrik.de/north-america/us/massachusetts/massachusetts-261119.osm.pbf)
+
 ## Q3. Hot loop in Zig
 
 ```zig

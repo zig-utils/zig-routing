@@ -9,6 +9,7 @@ test {
     _ = @import("pbf.zig");
     _ = @import("edges.zig");
     _ = @import("assemble.zig");
+    _ = @import("transit.zig");
 }
 
 pub fn intersection(arena: Allocator) !gurka.Map {

@@ -1,5 +1,6 @@
 //! Tables and field types for the GTFS Schedule feed.
 const std = @import("std");
+const datetime = @import("../../graph/datetime.zig");
 
 pub const Text = enum(u32) { _ };
 pub const Namespace = enum { agency, stop, route, trip, service, shape, pathway, level };
@@ -12,7 +13,19 @@ pub fn Id(comptime tag: Namespace) type {
 }
 
 pub const Time = struct { seconds: u32 };
-pub const Date = struct { yyyymmdd: u32 };
+pub const Date = struct {
+    yyyymmdd: u32,
+
+    pub fn civil(self: Date) error{InvalidDate}!datetime.Date {
+        const year = self.yyyymmdd / 10_000;
+        const month: u8 = @intCast(self.yyyymmdd / 100 % 100);
+        const day: u8 = @intCast(self.yyyymmdd % 100);
+        if (year == 0 or year > 9999 or month == 0 or month > 12 or day == 0) return error.InvalidDate;
+        const y: u16 = @intCast(year);
+        if (day > datetime.daysInMonth(y, month)) return error.InvalidDate;
+        return .{ .year = y, .month = month, .day = day };
+    }
+};
 
 pub const LocationType = enum(u8) { stop, station, entrance, node, boarding_area };
 pub const Availability = enum(u8) { unknown, available, unavailable };

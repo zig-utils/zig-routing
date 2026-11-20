@@ -579,6 +579,11 @@ test "fuzz costing-reference" {
 fn fuzzBuildCheckpoint(_: void, smith: *Smith) !void {
     var buf: [max_input]u8 = undefined;
     const input = draw(smith, &buf, 0x6275_696c);
+    var names: routing.build.tags.names.StoredNames = .{ .remaining = input };
+    while (true) {
+        const name = (names.next(.none) catch break) orelse break;
+        try expectBorrowed(input, name);
+    }
     _ = routing.build.checkpoint.Manifest.parse(std.testing.allocator, input) catch return;
 }
 
@@ -599,7 +604,7 @@ test "fuzz build-checkpoint" {
     const encoded = try std.json.Stringify.valueAlloc(a, fixture, .{});
     const round_trip = try checkpoint.Manifest.parse(a, encoded);
     try std.testing.expectEqual(fixture.parent, round_trip.parent);
-    try std.testing.fuzz({}, fuzzBuildCheckpoint, .{ .corpus = try seeds(a, &.{ "", "{}", encoded }) });
+    try std.testing.fuzz({}, fuzzBuildCheckpoint, .{ .corpus = try seeds(a, &.{ "", "{}", encoded, "\x04\x00\x00\x00Main" }) });
 }
 
 const pbf_fixtures = [_][]const u8{

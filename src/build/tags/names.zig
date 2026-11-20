@@ -10,6 +10,21 @@ const Language = @import("../../graph/linguistics.zig").Language;
 
 pub const Id = enum(u32) { empty = 0, _ };
 
+pub const StoredNames = struct {
+    remaining: []const u8,
+
+    pub fn next(self: *StoredNames, deadline: io.Deadline) !?[]const u8 {
+        if (self.remaining.len == 0) return null;
+        if (deadline.expired()) return error.DeadlineExceeded;
+        if (self.remaining.len < @sizeOf(u32)) return error.InvalidCheckpoint;
+        const size = std.mem.readInt(u32, self.remaining[0..4], .little);
+        const payload = self.remaining[4..];
+        if (size == 0 or size > payload.len) return error.InvalidCheckpoint;
+        self.remaining = payload[size..];
+        return payload[0..size];
+    }
+};
+
 pub const LocalizedId = struct {
     text: Id = .empty,
     language: Id = .empty,
@@ -184,6 +199,21 @@ pub const StringTable = struct {
         self.ids.putAssumeCapacityNoClobber(owned, id);
         self.strings.appendAssumeCapacity(owned);
         return id;
+    }
+
+    pub fn save(self: *const StringTable, file: io.File, deadline: io.Deadline) !void {
+        var offset: u64 = 0;
+        for (self.strings.items) |text| {
+            if (deadline.expired()) return error.DeadlineExceeded;
+            const size = std.math.cast(u32, text.len) orelse return error.NameTooLarge;
+            var header: [4]u8 = undefined;
+            std.mem.writeInt(u32, &header, size, .little);
+            try file.pwriteAll(&header, offset);
+            offset += header.len;
+            try file.pwriteAll(text, offset);
+            offset += size;
+        }
+        try file.sync();
     }
 
     pub fn indexWay(self: *StringTable, way: attrs.WayAttrs, tags: anytype, options: Options, deadline: io.Deadline) !Indexed {

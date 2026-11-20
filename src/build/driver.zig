@@ -12,6 +12,8 @@ const edges = @import("edges.zig");
 const node_store = @import("node_store.zig");
 const usage = @import("node_store/usage.zig");
 const pbf = @import("pbf/root.zig");
+const gtfs = @import("gtfs/root.zig");
+const transit_stage = @import("transit_stage.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Stage = checkpoint.Stage;
@@ -19,6 +21,7 @@ pub const default_pbf_buffer_bytes = 512 * 1024 * 1024;
 
 pub const Options = struct {
     inputs: []const []const u8 = &.{},
+    gtfs_inputs: []const []const u8 = &.{},
     output: ?[]const u8 = null,
     work_dir: []const u8,
     dem_dir: ?[]const u8 = null,
@@ -44,6 +47,7 @@ pub const Options = struct {
 pub const Diagnostic = struct {
     stage: ?Stage = null,
     input: ?[]const u8 = null,
+    gtfs_table: gtfs.Diagnostic = .{},
 };
 
 pub const Result = struct {
@@ -51,6 +55,7 @@ pub const Result = struct {
     finalized: bool,
     stages: []const checkpoint.Metric,
     turn_restrictions: ?turn_restrictions.Stats = null,
+    transit: ?transit_stage.Report = null,
 
     pub fn deinit(self: Result, allocator: Allocator) void {
         allocator.free(self.stages);
@@ -69,6 +74,7 @@ const TimezoneInputs = struct {
 
 const Inputs = struct {
     sources: []const Source,
+    gtfs_sources: []const Source = &.{},
     dem_dir: ?[]const u8,
     dem_digest: ?[32]u8 = null,
     speed_digest: ?[32]u8 = null,
@@ -121,6 +127,13 @@ const Inputs = struct {
             hash.update(std.mem.asBytes(&source.digest.bytes));
             hash.update(std.mem.asBytes(&source.digest.xxh3));
         }
+        if (self.gtfs_sources.len != 0) {
+            hash.update("gtfs-inputs-v1");
+            for (self.gtfs_sources) |source| {
+                hash.update(std.mem.asBytes(&source.digest.bytes));
+                hash.update(std.mem.asBytes(&source.digest.xxh3));
+            }
+        }
         var digest: [32]u8 = undefined;
         hash.final(&digest);
         var id = digest[0..16].*;
@@ -151,6 +164,7 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
         break :blk decoded.value;
     } else .{
         .sources = try fingerprintInputs(a, options, diagnostic),
+        .gtfs_sources = try fingerprintGtfs(a, options, diagnostic),
         .dem_dir = options.dem_dir,
         .timezones = try timezoneInputs(options, diagnostic),
         .reclassify_links = options.reclassify_links orelse true,
@@ -164,6 +178,8 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
         .order = options.order orelse .hilbert,
     };
     if (previous != null) try checkOptions(a, &inputs, options, diagnostic);
+    if (inputs.gtfs_sources.len == 0 and (options.from == .transit or options.to == .transit))
+        return error.MissingGtfsInput;
     var speed_mapping: ?io.Mapping = null;
     defer if (speed_mapping) |mapping| mapping.unmap();
     var speed_input = if (options.default_speeds_config) |path| try openDefaultSpeeds(a, path, options.deadline) else null;
@@ -213,6 +229,7 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
     defer session.metrics.deinit(gpa);
     for (std.enums.values(Stage)) |stage| {
         if (@backingInt(stage) >= @backingInt(options.from)) break;
+        if (stage == .transit and inputs.gtfs_sources.len == 0) continue;
         try session.readPrior(stage);
     }
     var timezone_mappings: ?TimezoneMappings = null;
@@ -250,7 +267,8 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
         if (@backingInt(options.from) <= @backingInt(Stage.edges)) {
             try buildSegments(&session, &metadata, inputs, graph_options, options.pbf_buffer_bytes, diagnostic);
         }
-        if (@backingInt(options.to) >= @backingInt(Stage.order)) try runAssembly(&session, &metadata, graph_options);
+        if (@backingInt(options.to) >= @backingInt(Stage.transit))
+            try runAssembly(&session, &metadata, graph_options, inputs.gtfs_sources, diagnostic);
     }
     if (session.runs(.validate)) try validate(&session);
     if (session.runs(.finalize)) try finalize(&session, options.output.?);
@@ -262,13 +280,17 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
         .finalized = session.runs(.finalize),
         .stages = stages,
         .turn_restrictions = try readRestrictionStats(&session),
+        .transit = if (inputs.gtfs_sources.len != 0 and @backingInt(options.to) >= @backingInt(Stage.transit))
+            (try readTransitLayout(&session)).report
+        else
+            null,
     };
     const report = try std.json.Stringify.valueAlloc(a, result, .{ .whitespace = .indent_2 });
     try root.writeAtomic("build-stats.json", report);
     return result;
 }
 
-noinline fn runAssembly(session: *checkpoint.Session, metadata: *assemble.Metadata, graph_options: assemble.Options) !void {
+noinline fn runAssembly(session: *checkpoint.Session, metadata: *assemble.Metadata, graph_options: assemble.Options, gtfs_inputs: []const Source, diagnostic: *Diagnostic) !void {
     const gpa = session.gpa;
     const deadline = session.deadline;
     const prior = try session.open(.edges);
@@ -279,15 +301,21 @@ noinline fn runAssembly(session: *checkpoint.Session, metadata: *assemble.Metada
         try metadata.loadWays(&prior);
         const nodes = try session.open(.node_store);
         defer nodes.close();
-        if (session.runs(.order)) {
+        if (session.runs(.order) or (gtfs_inputs.len != 0 and session.runs(.transit))) {
             try metadata.loadNodes(&nodes);
         } else {
             try metadata.loadNodeSigns(&nodes);
         }
     }
-    const edge_file = try prior.read(.segments, deadline);
+    if (gtfs_inputs.len != 0 and session.runs(.transit))
+        try runTransit(session, metadata, &prior, source_stats.value, graph_options.workers, gtfs_inputs, diagnostic);
+    if (session.endsAt(.transit)) return;
+    const transit_checkpoint = if (gtfs_inputs.len != 0) try session.open(.transit) else null;
+    defer if (transit_checkpoint) |saved| saved.close();
+    const segments = if (transit_checkpoint) |saved| saved else prior;
+    const edge_file = try segments.read(.segments, deadline);
     defer edge_file.close();
-    const shape_file = try prior.read(.shape_points, deadline);
+    const shape_file = try segments.read(.shape_points, deadline);
     defer shape_file.close();
     const tagged = try session.open(.tags);
     defer tagged.close();
@@ -325,7 +353,57 @@ noinline fn runAssembly(session: *checkpoint.Session, metadata: *assemble.Metada
         restriction_source.complex = try checkpoint.array(turn_restrictions.Complex, complex_rows.?);
         restriction_source.via_ways = try checkpoint.array(i64, via_ways.?);
     }
-    try assemble.buildStaged(session, metadata, source_stats.value, edge_file, shape_file, assembly_options, restriction_source);
+    const layout = if (transit_checkpoint) |*saved| try readTransitLayoutFrom(session, saved) else null;
+    try assemble.buildStaged(
+        session,
+        metadata,
+        if (layout) |present| present.source else source_stats.value,
+        edge_file,
+        shape_file,
+        assembly_options,
+        restriction_source,
+        if (transit_checkpoint) |*saved| .{ .saved = saved, .node_base = layout.?.node_base } else null,
+    );
+}
+
+noinline fn runTransit(session: *checkpoint.Session, metadata: *const assemble.Metadata, roads: *const checkpoint.Existing, source: edges.Stats, workers: usize, inputs: []const Source, diagnostic: *Diagnostic) !void {
+    const timer = io.Timer.start();
+    const gpa = session.gpa;
+    const edge_file = try roads.read(.segments, session.deadline);
+    defer edge_file.close();
+    const shape_file = try roads.read(.shape_points, session.deadline);
+    defer shape_file.close();
+    var tx = try session.begin(.transit);
+    defer tx.deinit();
+    const feeds = try gpa.alloc(gtfs.Feed, inputs.len);
+    defer gpa.free(feeds);
+    var read: usize = 0;
+    defer for (feeds[0..read]) |*feed| feed.deinit();
+    for (inputs, feeds) |input, *feed| {
+        diagnostic.input = input.path;
+        const actual = try fingerprintFile(input.path, session.deadline, diagnostic);
+        diagnostic.input = input.path;
+        if (!std.meta.eql(input.digest, actual.digest)) return error.CheckpointInputMismatch;
+        feed.* = try gtfs.read(gpa, input.path, .{ .workers = workers, .deadline = session.deadline }, &diagnostic.gtfs_table, null);
+        read += 1;
+    }
+    const road_files: edges.Output = .{ .edges = edge_file, .shapes = shape_file };
+    const layout = try assemble.prepareTransit(gpa, &tx, session.path, feeds, road_files, metadata, source);
+    try tx.writeJson(gpa, layout, .transit_layout);
+    try session.commit(&tx, layout.report.platforms, timer);
+    diagnostic.input = null;
+}
+
+fn readTransitLayout(session: *const checkpoint.Session) !transit_stage.Layout {
+    const saved = try session.open(.transit);
+    defer saved.close();
+    return readTransitLayoutFrom(session, &saved);
+}
+
+fn readTransitLayoutFrom(session: *const checkpoint.Session, saved: *const checkpoint.Existing) !transit_stage.Layout {
+    const value = try saved.readJson(transit_stage.Layout, session.gpa, .transit_layout, session.deadline);
+    defer value.deinit();
+    return value.value;
 }
 
 fn readRestrictionStats(session: *checkpoint.Session) !?turn_restrictions.Stats {
@@ -378,6 +456,13 @@ fn fingerprintInputs(a: Allocator, options: Options, diagnostic: *Diagnostic) ![
         row.* = .{ .path = path, .digest = try checkpoint.Fingerprint.read(file, options.deadline) };
     }
     diagnostic.input = null;
+    return rows;
+}
+
+fn fingerprintGtfs(a: Allocator, options: Options, diagnostic: *Diagnostic) ![]const Source {
+    const rows = try a.alloc(Source, options.gtfs_inputs.len);
+    errdefer a.free(rows);
+    for (options.gtfs_inputs, rows) |path, *row| row.* = try fingerprintFile(path, options.deadline, diagnostic);
     return rows;
 }
 
@@ -463,6 +548,14 @@ fn checkOptions(a: Allocator, inputs: *Inputs, options: Options, diagnostic: *Di
             if (!std.meta.eql(present.digest, expected.digest)) return error.CheckpointInputMismatch;
         }
         inputs.sources = current;
+    }
+    if (options.gtfs_inputs.len != 0) {
+        const current = try fingerprintGtfs(a, options, diagnostic);
+        if (current.len != inputs.gtfs_sources.len) return error.CheckpointInputMismatch;
+        for (current, inputs.gtfs_sources) |present, expected| {
+            if (!std.meta.eql(present.digest, expected.digest)) return error.CheckpointInputMismatch;
+        }
+        inputs.gtfs_sources = current;
     }
 }
 

@@ -165,15 +165,9 @@ pub fn time(bytes: []const u8) error{InvalidTime}!model.Time {
 
 pub fn date(bytes: []const u8) error{InvalidDate}!model.Date {
     if (bytes.len != 8) return error.InvalidDate;
-    const value = unsigned(u32, bytes) catch return error.InvalidDate;
-    const year = value / 10_000;
-    const month = value / 100 % 100;
-    const day = value % 100;
-    if (year == 0 or month == 0 or month > 12 or day == 0) return error.InvalidDate;
-    const lengths = [_]u32{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-    const leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0);
-    if (day > lengths[month - 1] + @intFromBool(month == 2 and leap)) return error.InvalidDate;
-    return .{ .yyyymmdd = value };
+    const value: model.Date = .{ .yyyymmdd = unsigned(u32, bytes) catch return error.InvalidDate };
+    _ = try value.civil();
+    return value;
 }
 
 test "GTFS times extend past midnight and dates follow Gregorian months" {
