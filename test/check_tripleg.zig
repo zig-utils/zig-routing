@@ -16,6 +16,10 @@ pub fn main(init: std.process.Init) !void {
     const bundle_path = args.next() orelse return error.MissingBundle;
     const corpus_path = args.next() orelse return error.MissingCorpus;
     const count = if (args.next()) |value| try std.fmt.parseInt(usize, value, 10) else std.math.maxInt(usize);
+    const with_maneuvers = if (args.next()) |option|
+        if (std.mem.eql(u8, option, "--maneuvers")) true else return error.InvalidOption
+    else
+        false;
     if (args.next() != null) return error.TooManyArguments;
 
     var bundle = try routing.graph.reader.Bundle.open(bundle_path);
@@ -44,11 +48,26 @@ pub fn main(init: std.process.Init) !void {
             try writer.writeByte('\n');
             continue;
         };
-        try std.json.Stringify.value(.{ .index = index, .legs = legs }, .{ .emit_null_optional_fields = false }, writer);
+        if (with_maneuvers) {
+            const a = arena.allocator();
+            const values = try a.alloc(ManeuverResult, legs.len);
+            for (legs, values) |*leg, *result| {
+                const maneuvers = routing.narrative.maneuvers.build(a, leg, io.Deadline.fromNowMs(10_000));
+                result.* = if (maneuvers) |steps| .{ .steps = steps } else |err| .{ .failure = @errorName(err) };
+            }
+            try std.json.Stringify.value(.{ .index = index, .legs = legs, .maneuvers = values }, .{ .emit_null_optional_fields = false }, writer);
+        } else {
+            try std.json.Stringify.value(.{ .index = index, .legs = legs }, .{ .emit_null_optional_fields = false }, writer);
+        }
         try writer.writeByte('\n');
     }
     try writer.flush();
 }
+
+const ManeuverResult = struct {
+    steps: ?[]const routing.narrative.maneuver.Maneuver = null,
+    failure: ?[]const u8 = null,
+};
 
 fn check(engine: *Engine, view: *const routing.graph.reader.View, arena: *routing.infra.arena.Arena, cache: *auto.Cache, request_json: []const u8) ![]const trip.TripLeg {
     const a = arena.allocator();

@@ -4,8 +4,10 @@ const std = @import("std");
 
 pub const enhanced = @import("enhanced.zig");
 pub const maneuver = @import("maneuver.zig");
+pub const maneuvers = @import("maneuvers.zig");
 
 test {
     std.testing.refAllDecls(@This());
     _ = @import("enhanced_test.zig");
+    _ = @import("maneuvers_test.zig");
 }

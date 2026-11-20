@@ -782,6 +782,15 @@ The local tile importer does not retain signs and lanes. Run the comparison
 with `--metadata-only` on a bundle built from the same OSM extract to check
 street names, sign groups and lane masks.
 
+For simple urban maneuver parity, use JSON route requests with
+`directions_type` set to `instructions` and the default distance units. Add
+`--maneuvers` after the case count in `check-tripleg` and pass `--maneuvers`
+to `compare-triplegs.py`. This compares type and name sequences, the encoded
+shape, length and time on matching paths within 0.1% of oracle cost.
+The initial Utrecht sample uses the first 300 `route-auto-10km` corpus rows
+with each destination moved to 6% of the straight-line distance from its
+original start, rounded to six decimal places in each coordinate.
+
 ### HTTP and route checks
 
 `compare-height.ts` sends the same random `/height` requests (shapes, encoded polylines at

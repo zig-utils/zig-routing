@@ -57,6 +57,12 @@ def leg_records(blob):
             yield from nested(route, 1)
 
 
+def direction_legs(blob):
+    for directions in nested(decode(blob), 3):
+        for route in nested(directions, 1):
+            yield from nested(route, 1)
+
+
 EDGE_FIELDS = {
     2: "length_km", 3: "speed", 4: "road_class", 5: "begin_heading", 6: "end_heading",
     7: "begin_shape_index", 8: "end_shape_index", 9: "traversability", 10: "use",
@@ -179,16 +185,75 @@ class Comparison:
                 self.fields(f"node.{name}", node["cost"][name], cost[0], {1: "seconds", 2: "cost"})
 
 
+def maneuver_types(descriptors):
+    schema = (descriptors / "directions.proto").read_text()
+    block = re.search(r"message Maneuver\s*\{.*?enum Type\s*\{(.*?)\}", schema, re.S).group(1)
+    return {int(number): name for name, number in re.findall(r"^\s*(\w+)\s*=\s*(\d+)\s*;", block, re.M)}
+
+
+def compare_maneuvers(comparison, ours, donor, directions, result, types):
+    native_nodes = ours["node"]
+    donor_nodes = nested(donor, 6)
+    native_edges = [node["edge"] for node in native_nodes if "edge" in node]
+    donor_edges = [edge for node in donor_nodes for edge in nested(node, 1)]
+    counts = comparison.counts
+    if [(edge["way_id"], edge["forward"]) for edge in native_edges] != [
+        (get(edge, 27), bool(get(edge, 59))) for edge in donor_edges
+    ]:
+        counts["different_paths"] += 1
+        return
+    records = nested(directions, 6)
+    if len(records) < 2:
+        comparison.check("directions.missing_maneuvers", False)
+        return
+    numbers = [get(record, 1) for record in records]
+    supported = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16}
+    if not set(numbers).issubset(supported):
+        counts["advanced_maneuvers"] += 1
+        return
+    if any(get(edge, 15) or get(edge, 16) or get(edge, 53) or
+           get(edge, 10) in (1, 26, 33, 34, 41, 42) for edge in donor_edges):
+        counts["advanced_edge_uses"] += 1
+        return
+    elapsed = nested(nested(donor_nodes[-1], 12)[0], 1)[0]
+    cost = get(elapsed, 2)
+    actual = native_nodes[-1]["cost"]["elapsed_cost"]["cost"]
+    if abs(actual - cost) > abs(cost) * 0.001:
+        counts["different_route_costs"] += 1
+        return
+    counts["matched_legs"] += 1
+    steps = result.get("steps", [])
+    type_match = [step["type"] for step in steps] == [types.get(number) for number in numbers]
+    name_match = [[name["value"].encode() for name in step["street_names"]] for step in steps] == [
+        [get(name, 1, b"") for name in nested(record, 3)] for record in records
+    ]
+    shape_match = ours["shape"].encode() == get(donor, 8, b"")
+    summary = nested(directions, 5)[0]
+    distance, time = get(summary, 1), get(summary, 2)
+    length_match = abs(ours["summary"]["length"] - distance) <= distance * 0.005
+    time_match = abs(ours["summary"]["time"] - time) <= time * 0.01
+    comparison.check("maneuver.types", type_match)
+    comparison.check("maneuver.names", name_match)
+    comparison.check("shape", shape_match)
+    comparison.check("distance", length_match)
+    comparison.check("time", time_match)
+    counts["gate_d_passes"] += type_match and name_match and shape_match and length_match and time_match
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("native", type=Path)
     parser.add_argument("reference", type=Path, help="directory of numbered Api protobufs")
     parser.add_argument("schema", type=Path, help="Valhalla 3.9.3 proto/descriptors directory")
     parser.add_argument("--minimum-legs", type=int, default=1)
-    parser.add_argument("--metadata-only", action="store_true",
-                        help="compare names, signs and turn lane masks on independently built bundles")
+    options = parser.add_mutually_exclusive_group()
+    options.add_argument("--metadata-only", action="store_true",
+                         help="compare names, signs and turn lane masks on independently built bundles")
+    options.add_argument("--maneuvers", action="store_true",
+                         help="score simple maneuver sequences on matching paths for Gate D")
     args = parser.parse_args()
     comparison = Comparison(args.schema)
+    types = maneuver_types(args.schema) if args.maneuvers else {}
     with args.native.open() as rows:
         for line in rows:
             row = json.loads(line)
@@ -196,11 +261,23 @@ def main():
                 comparison.check("native_route", False)
                 continue
             path = args.reference / f"{row['index']}.bin"
-            reference = list(leg_records(path.read_bytes()))
+            blob = path.read_bytes()
+            reference = list(leg_records(blob))
             comparison.check("leg.count", len(row["legs"]) == len(reference))
-            for ours, donor in zip(row["legs"], reference):
-                comparison.leg(ours, donor, args.metadata_only)
+            if args.maneuvers:
+                directions = list(direction_legs(blob))
+                comparison.check("directions.leg_count", len(row["legs"]) == len(directions))
+                for ours, donor, direction, result in zip(row["legs"], reference, directions, row["maneuvers"]):
+                    compare_maneuvers(comparison, ours, donor, direction, result, types)
+            else:
+                for ours, donor in zip(row["legs"], reference):
+                    comparison.leg(ours, donor, args.metadata_only)
     print(json.dumps({"counts": comparison.counts, "differences": comparison.differences}, indent=2))
+    if args.maneuvers:
+        matched = comparison.counts["matched_legs"]
+        structural = ("native_route", "leg.count", "directions.leg_count", "directions.missing_maneuvers")
+        return int(matched < args.minimum_legs or comparison.counts["gate_d_passes"] * 100 < matched * 95 or
+                   any(comparison.differences[key] for key in structural))
     return int(bool(comparison.differences) or comparison.counts["matched_legs"] < args.minimum_legs)
 
 

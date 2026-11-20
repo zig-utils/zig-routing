@@ -322,7 +322,7 @@ pub const Maneuver = struct {
     }
 };
 
-fn baseName(value: []const u8, style: NameStyle) []const u8 {
+pub fn baseName(value: []const u8, style: NameStyle) []const u8 {
     if (style != .us) return value;
     const compass = [_][]const u8{ "North", "East", "South", "West", "Northeast", "Southeast", "Southwest", "Northwest" };
     var start: usize = 0;
