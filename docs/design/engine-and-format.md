@@ -204,6 +204,45 @@ The lookup form accepts optional occurrence and kind fields after direction.
 The defaults are occurrence zero and kind `osm`. The diff reports added and
 removed keys and retained keys whose dense edge ID changed.
 
+### Live traffic overlay
+
+The graph reader opens an optional `traffic-live.bin` beside its immutable
+sections. The 64-byte little-endian header contains the format version, graph
+dataset UUID, directed edge and record counts, an update sequence, the
+publication time in Unix seconds, and the live-to-bound ratio as IEEE binary64.
+The reader requires the overlay UUID and directed edge count to match the
+bundle. Publishers can initialize the file with unknown records before startup
+and update that same mapping while the router runs.
+
+Each 64-edge group has a 16-byte rank block with a drivable bitmap and the
+number of set bits in previous blocks. Edges with forward motor vehicle
+access get one slot each, except internal node connectors. A bit test and a
+population count locate a record. The record uses the Valhalla TrafficSpeed
+layout with four 7-bit speeds in 2 kph units, two 8-bit breakpoints, three
+6-bit congestion values, an incident flag, and one reserved bit. Speed 127 in
+the encoded field marks an unknown observation. An aligned atomic 64-bit load
+reads the entire record from one cache line.
+
+The writer publishes a new file atomically and holds an exclusive file lock
+while it updates the overlay. Readers share the mapping without locking.
+Before publishing a batch, the writer validates its records and publishes an
+odd sequence. It then stores the records individually and marks the update
+complete with the next even sequence. Each complete update advances the epoch
+by one. Readers use the timestamp from a complete update and accept each
+speed word independently. An interrupted publication makes the overlay stale
+until a writer completes a subsequent batch.
+
+The live-to-bound ratio is a conservative maximum of observed live speeds
+over the per-edge bounds, with a floor of one. It can stay elevated after a
+slower update. The freshness window is evaluated when selecting a speed
+provider, with 300 seconds available as the default. A missing, expired, or
+unpublished overlay falls back to the next configured flow source. An
+incremental publisher can clear obsolete observations with the unknown word.
+
+```sh
+zig build bench-live-traffic -Doptimize=ReleaseFast -- BUNDLE
+```
+
 ### Transit timetable sections
 
 A bundle with transit carries sections 27 through 38 together. They use the v1 section

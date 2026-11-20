@@ -1,6 +1,7 @@
 //! Immutable mmap reader for the four v1 topology sections.
 
 const std = @import("std");
+const live = @import("../traffic/live.zig");
 const io = @import("../infra/io.zig");
 const format = @import("format.zig");
 const class_table = @import("class_table.zig");
@@ -27,6 +28,7 @@ pub const Diagnostic = struct {
 pub const Bundle = struct {
     mappings: Mappings,
     view: View,
+    live_overlay: ?live.Reader = null,
 
     pub fn open(path: []const u8) !Bundle {
         return openDescribed(path, null);
@@ -72,10 +74,15 @@ pub const Bundle = struct {
             files.set(kind, mapping.bytes);
         }
         result.view = try View.parseWithDeadline(files, diagnostic, deadline);
+        if (try live.Reader.open(dir, result.view.dataset_uuid, result.view.edges.len, deadline)) |overlay| {
+            result.live_overlay = overlay;
+            result.view.live_traffic = overlay.view;
+        }
         return result;
     }
 
     pub noinline fn close(self: *Bundle) void {
+        if (self.live_overlay) |overlay| overlay.close();
         for (kinds) |kind| self.mappings.get(kind).unmap();
         self.* = undefined;
     }
@@ -140,6 +147,7 @@ test "placement continues when the IO shim rejects advice and page locks" {
 pub const View = struct {
     headers: Headers,
     dataset_uuid: format.DatasetUuid,
+    live_traffic: ?live.View = null,
     nodes: []const format.NodeHot,
     edges: []const format.EdgeHot,
     first_edge: []const format.FirstEdge,
@@ -455,6 +463,19 @@ pub const View = struct {
 
     pub fn header(self: *const View, kind: Kind) ?Header {
         return self.headers.get(kind);
+    }
+
+    pub fn liveTrafficGraph(self: *const View) !live.Graph {
+        return .{
+            .uuid = self.dataset_uuid,
+            .edges = self.edges,
+            .classes = self.classes orelse return error.MissingClassTable,
+            .bounds = self.lb_speeds,
+        };
+    }
+
+    pub fn speedOverlays(self: *const View, now: u64, max_age_seconds: u64) live.Overlays {
+        return .init(self.live_traffic, now, max_age_seconds);
     }
 
     pub fn node(self: *const View, id: format.NodeId) error{InvalidNodeId}!*const format.NodeHot {

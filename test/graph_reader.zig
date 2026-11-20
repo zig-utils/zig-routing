@@ -258,6 +258,71 @@ test "edge key indexes map both directions and validate optional sections togeth
     try testing.expectEqual(null, legacy.view.edge_key_index);
 }
 
+test "mapped live traffic updates reach existing graph readers and expire" {
+    const live = routing.traffic.live;
+    const speed = routing.graph.speed;
+    const fixture = try Fixture.create();
+    defer fixture.deinit();
+    var buf: [80]u8 = undefined;
+    const path = fixture.path(&buf);
+    const dir = try fixture.root.child("bundle");
+    defer dir.close();
+    var base = try reader.Bundle.open(path);
+    defer base.close();
+    try testing.expectEqual(null, base.view.live_traffic);
+    const graph = try base.view.liveTrafficGraph();
+    var written = try live.Writer.create(dir, graph, .none);
+    defer written.close();
+    defer dir.deleteFile(live.filename) catch {};
+    try testing.expectError(error.LiveTrafficWriterBusy, live.Writer.open(dir, graph, .none));
+    try testing.expectError(error.PathAlreadyExists, live.Writer.create(dir, graph, .none));
+    var bundle = try reader.Bundle.open(path);
+    defer bundle.close();
+    const view = &bundle.view;
+    const id: format.EdgeId = @fromBackingInt(0);
+    const query: speed.Query = .{ .time = .{ .seconds_of_week = 0 } };
+    const original = speed.resolve(edges[0], id, query, base.view.speedOverlays(200, live.default_max_age_seconds));
+    try testing.expectEqual(50, original.kph);
+    try testing.expectEqual(original, speed.resolve(edges[0], id, query, view.speedOverlays(200, live.default_max_age_seconds)));
+    const record: live.Record = .{ .overall = 49, .speed1 = 49, .breakpoint1 = 255 };
+    const metadata = try written.update(&.{.{ .edge = id, .record = record }}, 200, .none);
+    try testing.expectEqual(live.Metadata{ .epoch = 1, .last_update = 200, .live_to_bound = 1 }, metadata);
+    try testing.expectEqual(metadata, view.live_traffic.?.metadata().?);
+    try testing.expectEqual(record, view.live_traffic.?.record(id).?);
+    const resolved = speed.resolve(edges[0], id, query, view.speedOverlays(200, live.default_max_age_seconds));
+    try testing.expectEqual(speed.Result{ .kph = 98, .sources = .{ .current = true } }, resolved);
+    try testing.expectEqual(original, speed.resolve(edges[0], id, query, view.speedOverlays(501, live.default_max_age_seconds)));
+    try testing.expectEqual(original, speed.resolve(edges[0], id, query, view.speedOverlays(199, live.default_max_age_seconds)));
+    try testing.expectError(error.EdgeNotDrivable, written.update(&.{
+        .{ .edge = id, .record = .unknown },
+        .{ .edge = @fromBackingInt(2), .record = record },
+    }, 201, .none));
+    try testing.expectEqual(record, view.live_traffic.?.record(id).?);
+    try testing.expectEqual(metadata, view.live_traffic.?.metadata().?);
+    const closure: live.Record = .{ .overall = 0, .speed1 = 0, .breakpoint1 = 255 };
+    _ = try written.update(&.{.{ .edge = id, .record = closure }}, 201, .none);
+    try testing.expect(speed.resolve(edges[0], id, query, view.speedOverlays(201, live.default_max_age_seconds)).closed);
+    try testing.expectEqual(original, speed.resolve(edges[0], id, query, view.speedOverlays(502, live.default_max_age_seconds)));
+}
+
+test "loading a graph rejects a traffic overlay for another dataset" {
+    const live = routing.traffic.live;
+    const fixture = try Fixture.create();
+    defer fixture.deinit();
+    var buf: [80]u8 = undefined;
+    const path = fixture.path(&buf);
+    const dir = try fixture.root.child("bundle");
+    defer dir.close();
+    var bundle = try reader.Bundle.open(path);
+    defer bundle.close();
+    var graph = try bundle.view.liveTrafficGraph();
+    graph.uuid[0] ^= 1;
+    const writer = try live.Writer.create(dir, graph, .none);
+    writer.close();
+    defer dir.deleteFile(live.filename) catch {};
+    try testing.expectError(error.LiveTrafficDatasetUuidMismatch, reader.Bundle.open(path));
+}
+
 test "timetable references can exceed Valhalla's twelve-bit indices" {
     const fixture = try Fixture.createWithTransit(true);
     defer fixture.deinit();

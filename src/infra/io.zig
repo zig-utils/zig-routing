@@ -199,6 +199,11 @@ pub const File = struct {
         try syncFd(self.fd);
     }
 
+    /// Held until this file descriptor is closed.
+    pub fn lockExclusive(self: File) Error!void {
+        try lockExclusiveFd(self.fd);
+    }
+
     /// File size via lseek (portable: glibc does not export fstat as a
     /// plain symbol). Leaves the file offset at the end; reads use pread.
     pub noinline fn size(self: File) Error!u64 {
@@ -303,24 +308,14 @@ pub const Directory = struct {
 
     /// Held until this directory descriptor is closed.
     pub fn lockExclusive(self: Directory) Error!void {
-        while (true) {
-            const result = c.flock(self.fd, c.LOCK.EX | c.LOCK.NB);
-            if (result != 0 and c.errno(result) == .INTR) continue;
-            _ = try checkInt(result);
-            return;
-        }
+        try lockExclusiveFd(self.fd);
     }
 
     pub noinline fn temporaryChild(self: Directory) Error!struct { dir: Directory, name: TempName } {
-        var name: TempName = undefined;
-        name[0..4].* = ".zr-".*;
-        name[name.len] = 0;
         // A collision cannot replace an existing directory. Retry with
         // fresh randomness if a name is already present.
         for (0..16) |_| {
-            var nonce: [16]u8 = undefined;
-            try fillRandom(&nonce);
-            @memcpy(name[4..name.len], &std.fmt.bytesToHex(nonce, .lower));
+            const name = try randomTempName();
             const rc = c.mkdirat(self.fd, &name, 0o755);
             if (rc < 0 and c.errno(rc) == .EXIST) continue;
             _ = try checkInt(rc);
@@ -328,6 +323,29 @@ pub const Directory = struct {
             return .{ .dir = try self.child(&name), .name = name };
         }
         return error.PathAlreadyExists;
+    }
+
+    /// Create a temporary sibling that the caller can publish with renameExclusive.
+    pub noinline fn temporaryFile(self: Directory) Error!struct { file: File, name: TempName } {
+        for (0..16) |_| {
+            const name = try randomTempName();
+            const file = self.createFile(&name) catch |err| {
+                if (err == error.PathAlreadyExists) continue;
+                return err;
+            };
+            return .{ .file = file, .name = name };
+        }
+        return error.PathAlreadyExists;
+    }
+
+    fn randomTempName() Error!TempName {
+        var nonce: [16]u8 = undefined;
+        try fillRandom(&nonce);
+        var name: TempName = undefined;
+        name[0..4].* = ".zr-".*;
+        @memcpy(name[4..name.len], &std.fmt.bytesToHex(nonce, .lower));
+        name[name.len] = 0;
+        return name;
     }
 
     pub noinline fn createFile(self: Directory, name: [:0]const u8) Error!File {
@@ -345,6 +363,12 @@ pub const Directory = struct {
     pub noinline fn readFile(self: Directory, name: [:0]const u8) Error!File {
         try checkChildName(name);
         const flags: c.O = .{ .CLOEXEC = true, .ACCMODE = .RDONLY, .NOFOLLOW = true, .NONBLOCK = true };
+        return .{ .fd = try checkInt(c.openat(self.fd, name, flags)) };
+    }
+
+    pub noinline fn readWriteFile(self: Directory, name: [:0]const u8) Error!File {
+        try checkChildName(name);
+        const flags: c.O = .{ .CLOEXEC = true, .ACCMODE = .RDWR, .NOFOLLOW = true, .NONBLOCK = true };
         return .{ .fd = try checkInt(c.openat(self.fd, name, flags)) };
     }
 
@@ -420,6 +444,15 @@ pub const Directory = struct {
 noinline fn checkChildName(name: []const u8) Error!void {
     if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..") or
         std.mem.indexOfAny(u8, name, "/\x00") != null) return error.InvalidArgument;
+}
+
+fn lockExclusiveFd(fd: c.fd_t) Error!void {
+    while (true) {
+        const result = c.flock(fd, c.LOCK.EX | c.LOCK.NB);
+        if (result != 0 and c.errno(result) == .INTR) continue;
+        _ = try checkInt(result);
+        return;
+    }
 }
 
 fn fillRandom(bytes: []u8) Error!void {

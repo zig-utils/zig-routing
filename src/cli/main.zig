@@ -278,8 +278,12 @@ const Runtime = struct {
         if (self.tiles) |*tiles| tiles.deinit();
     }
 
-    fn openGraph(self: *Runtime, path: ?[]const u8) !void {
-        self.bundle = try routing.graph.reader.Bundle.open(path orelse return);
+    fn openGraph(self: *Runtime, ctx: *Context, path: ?[]const u8) !void {
+        self.bundle = routing.graph.reader.Bundle.open(path orelse return) catch |err| {
+            if (err == error.LiveTrafficDatasetUuidMismatch)
+                ctx.setDiagnostic("traffic-live.bin dataset UUID does not match the configured graph bundle");
+            return err;
+        };
         self.svc.graph = &self.bundle.?.view;
         self.svc.transit_coverage = try routing.graph.transit_coverage.Index.init(std.heap.c_allocator, self.bundle.?.view.transit_index, .none);
         self.svc.register(.locate, routing.api.locate_action.handle);
@@ -315,7 +319,7 @@ fn serve(ctx: *Context) !u8 {
     defer runtime.close();
     const elevation = ctx.getOption("elevation") orelse loaded.config.additional_data.elevation;
     try runtime.open(elevation);
-    try runtime.openGraph(loaded.config.zig_routing.bundle_path);
+    try runtime.openGraph(ctx, loaded.config.zig_routing.bundle_path);
     io.installTerminationHandler();
     var server = http.Server.init(std.heap.c_allocator, settings, runtime.svc.handler());
     try server.start();
@@ -356,7 +360,7 @@ fn route(ctx: *Context) !u8 {
     var runtime: Runtime = .{ .svc = loaded.config.serviceConfig() };
     defer runtime.close();
     try runtime.open(loaded.config.additional_data.elevation);
-    if (action == .locate or action == .tile or action == .transit_available) try runtime.openGraph(loaded.config.zig_routing.bundle_path);
+    if (action == .locate or action == .tile or action == .transit_available) try runtime.openGraph(ctx, loaded.config.zig_routing.bundle_path);
 
     var arena = routing.infra.arena.Arena.init(std.heap.c_allocator, .{ .cap_bytes = settings.arena_cap_bytes });
     defer arena.deinit();

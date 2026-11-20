@@ -391,6 +391,16 @@ pub fn build(b: *std.Build) void {
     run_bench_edge_keys.addPassthruArgs();
     b.step("bench-edge-keys", "Verify stable edge-key round trips and time warm lookups").dependOn(&run_bench_edge_keys.step);
 
+    const bench_live_traffic = b.addExecutable(.{ .name = "bench-live-traffic", .root_module = b.createModule(.{
+        .root_source_file = b.path("test/bench_live_traffic.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{.{ .name = "routing", .module = lib_mod }},
+    }) });
+    const run_bench_live_traffic = b.addRunArtifact(bench_live_traffic);
+    run_bench_live_traffic.addPassthruArgs();
+    b.step("bench-live-traffic", "Time live speed reads and stress the shared traffic overlay").dependOn(&run_bench_live_traffic.step);
+
     const bench_exclusions = b.addExecutable(.{ .name = "bench-exclusions", .root_module = b.createModule(.{
         .root_source_file = b.path("test/bench_exclusions.zig"),
         .target = target,
@@ -457,7 +467,7 @@ pub fn build(b: *std.Build) void {
 
     // Fuzz targets (test/fuzz.zig). `zig build test` replays their seeds; `zig build fuzz
     // --fuzz` fuzzes, ReleaseSafe by default so bounds and overflow checks stay on.
-    const fuzz_filter = b.option([]const u8, "fuzz-target", "Fuzz one target: request, http, polyline, lz4, dem, protobuf, config, osm-pbf, osm-primitives, osm-dense, node-store, graph-bundle, build-checkpoint, valhalla-tile, costing-reference, motor-costing, range-manifest, http-range, usage-directory, speed-config, motor-tags, admin-index, timezone-geojson, timezone-rules, datetime");
+    const fuzz_filter = b.option([]const u8, "fuzz-target", "Fuzz one target: request, http, polyline, lz4, dem, protobuf, config, osm-pbf, osm-primitives, osm-dense, node-store, graph-bundle, live-traffic, build-checkpoint, valhalla-tile, costing-reference, motor-costing, range-manifest, http-range, usage-directory, speed-config, motor-tags, admin-index, timezone-geojson, timezone-rules, datetime");
     const fuzz_opt: @TypeOf(optimize) = .ReleaseSafe;
     const seed_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("test/fuzz.zig"),

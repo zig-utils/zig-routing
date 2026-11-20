@@ -13,7 +13,8 @@
 //! `osm-pbf` (file framing and block inflation), `osm-primitives` and
 //! `osm-dense` (PrimitiveBlock and DenseNodes decoding), and
 //! `node-store` (the build-time coordinate index format) and `graph-bundle`
-//! (section headers, checksums and typed topology access), and
+//! (section headers, checksums and typed topology access), `live-traffic`
+//! (mutable traffic header, bitmap and records), and
 //! `build-checkpoint` (restart manifests), `valhalla-tile` (offline tile import),
 //! `costing-reference` (gate A samples and paths), `speed-config` (default speed tables),
 //! `motor-tags` (motor vehicle access and unit normalization), `admin-index`
@@ -230,6 +231,46 @@ test "fuzz graph-bundle" {
         candidates[i + 1] = raw;
     }
     try std.testing.fuzz(&baseline, fuzzGraphBundle, .{ .corpus = try seeds(a, &candidates) });
+}
+
+const traffic = routing.traffic.live;
+const traffic_uuid: graph.format.DatasetUuid = @splat(42);
+const traffic_edges = 65;
+
+fn fuzzLiveTraffic(_: void, s: *Smith) !void {
+    var buf: [max_input]u8 align(8) = undefined;
+    const bytes = draw(s, &buf, 0x6c697665);
+    const view = traffic.View.parse(bytes, traffic_uuid, traffic_edges, .none) catch return;
+    _ = view.metadata();
+    for (0..traffic_edges + 1) |id| {
+        const edge: graph.format.EdgeId = @fromBackingInt(@as(u32, @intCast(id)));
+        if (view.record(edge)) |record| {
+            try std.testing.expect(id < traffic_edges);
+            _ = record.closed();
+            _ = record.subsegmentKph(.third);
+            _ = record.subsegmentClosed(.third);
+        }
+        _ = traffic.Overlays.init(view, 1000, 300).live(edge);
+    }
+    try std.testing.expectEqual(null, view.load(@fromBackingInt(std.math.maxInt(u32))));
+}
+
+test "fuzz live-traffic" {
+    const Seed = extern struct {
+        header: traffic.Header,
+        bitmap: [2]traffic.RankBlock,
+        records: [3]u64,
+    };
+    const record: traffic.Record = .{ .overall = 49, .speed1 = 49, .breakpoint1 = 255 };
+    const sample: Seed = .{
+        .header = .{ .dataset_uuid = traffic_uuid, .version = 1, .edge_count = traffic_edges, .record_count = 3, .sequence = 2, .last_update = 900 },
+        .bitmap = .{ .{ .mask = 5, .first = 0 }, .{ .mask = 1, .first = 2 } },
+        .records = .{ @bitCast(record), @bitCast(traffic.Record.unknown), @bitCast(record) },
+    };
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const corpus = try seeds(state.allocator(), &.{ &.{}, std.mem.asBytes(&sample.header), std.mem.asBytes(&sample) });
+    try std.testing.fuzz({}, fuzzLiveTraffic, .{ .corpus = corpus });
 }
 
 fn fuzzLaneTags(_: void, s: *Smith) !void {
