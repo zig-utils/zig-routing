@@ -1010,6 +1010,7 @@ const RestrictionMotor = struct {
     }
 
     pub fn allowedTurn(self: RestrictionMotor, view: *const graph.reader.View, turn: search.Transition, _: search.Label, _: search.Direction) !bool {
+        if (!self.restrictionPermission().allowedNode(try view.node(turn.node))) return false;
         const backtrack = turn.incoming_edge.cls.opp_local == turn.outgoing_edge.cls.local;
         if (backtrack and (try view.outEdgeRange(turn.node)).count() > 1) return false;
         return self.ignore or turn.row & 0x80 == 0;
@@ -1131,7 +1132,7 @@ fn expectWayPath(view: *const graph.reader.View, fixture: *const gurka.Map, resu
     try testing.expectEqual(search.no_index, index);
 }
 
-// Ported from the forward and reverse cases in test_time_dependent_restrictions.cc.
+// Ported from test/gurka/test_time_dependent_restrictions.cc (Valhalla 3.9.3).
 test "Gurka timed turn conditions switch the legal movement only within the window" {
     for ([_]bool{ false, true }) |only| {
         var storage: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -1192,6 +1193,102 @@ test "Gurka timed turn conditions switch the legal movement only within the wind
                         arena.reset();
                     }
                 }
+            }
+        }
+        if (!only) {
+            const memory = storage.allocator();
+            const bytes = try io.readFileAlloc(memory, "src/graph/timezones/iana-2026f.ztz", 4 << 20);
+            const aligned = try memory.alignedAlloc(u8, .@"8", bytes.len);
+            @memcpy(aligned, bytes);
+            const rules = try graph.timezone.Rules.parse(aligned);
+            const zones = try memory.alloc(graph.timezone.Id, view.nodes.len);
+            @memset(zones, graph.timezone.utc);
+            zones[(try view.edge(first)).head] = try rules.id("America/Los_Angeles");
+            var zoned = view.*;
+            zoned.node_timezones = zones;
+            zoned.tz_rules = rules;
+            var zoned_engine = try RestrictionSearch.init(testing.allocator, &zoned);
+            defer zoned_engine.deinit();
+            const zoned_cases = [_]struct { utc: []const u8, path: []const []const u8 }{
+                .{ .utc = "2021-04-02T11:00", .path = &.{ "AB", "BC", "CF" } }, // 04:00 at B
+                .{ .utc = "2021-04-02T17:00", .path = &.{ "AB", "BD", "DE", "EC", "CF" } }, // 10:00 at B
+                .{ .utc = "2021-04-03T03:00", .path = &.{ "AB", "BC", "CF" } }, // 20:00 at B
+            };
+            for (zoned_cases) |case| {
+                for ([_]search.Direction{ .forward, .reverse }) |direction| {
+                    const result = try zoned_engine.run(&arena, .{}, .{
+                        .origin = a,
+                        .destination = finish,
+                        .direction = direction,
+                        .timing = try restrictionTiming(case.utc, false),
+                    }, search.Zero{}, .{});
+                    try expectWayPath(&zoned, &fixture, result, direction, case.path);
+                    arena.reset();
+                }
+            }
+        }
+    }
+}
+
+// Ported from test/gurka/test_time_dependent_tags.cc (Valhalla 3.9.3).
+test "Gurka legacy turn windows support hours, weekdays and wrapping dates" {
+    const cases = [_]struct { tags: gurka.Tags, active: [5]bool = @splat(false) }{
+        .{
+            .tags = &.{ .{ .key = "restriction", .value = "no_left_turn" }, .{ .key = "hour_on", .value = "07:00" }, .{ .key = "hour_off", .value = "19:00" } },
+            .active = .{ false, true, false, true, false },
+        },
+        .{
+            .tags = &.{ .{ .key = "restriction", .value = "no_left_turn" }, .{ .key = "day_on", .value = "Monday" }, .{ .key = "day_off", .value = "Friday" } },
+            .active = .{ true, true, true, false, false },
+        },
+        .{
+            .tags = &.{
+                .{ .key = "restriction", .value = "no_left_turn" }, .{ .key = "day_on", .value = "Monday" },  .{ .key = "day_off", .value = "Friday" },
+                .{ .key = "hour_on", .value = "07:00" },            .{ .key = "hour_off", .value = "19:00" },
+            },
+            .active = .{ false, true, false, false, false },
+        },
+        .{
+            .tags = &.{.{ .key = "restriction:conditional", .value = "no_left_turn @ (Apr 24-Apr 21 7:00-19:00)" }},
+            .active = .{ false, false, false, true, false },
+        },
+        .{ .tags = &.{ .{ .key = "restriction", .value = "no_left_turn" }, .{ .key = "day_on", .value = "Thursday" } } },
+        .{ .tags = &.{ .{ .key = "restriction", .value = "no_left_turn" }, .{ .key = "day_off", .value = "Thursday" } } },
+        .{ .tags = &.{ .{ .key = "restriction", .value = "no_left_turn" }, .{ .key = "hour_on", .value = "07:00" } } },
+        .{ .tags = &.{ .{ .key = "restriction", .value = "no_left_turn" }, .{ .key = "hour_off", .value = "19:00" } } },
+    };
+    const dates = [_][]const u8{ "2021-04-22T06:30", "2021-04-22T14:00", "2021-04-22T23:00", "2021-04-25T14:00", "2021-04-25T23:00" };
+    for (cases) |case| {
+        var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer storage.deinit();
+        const a = storage.allocator();
+        const motorway: gurka.Tags = &.{.{ .key = "highway", .value = "motorway" }};
+        const layout = try gurka.mapToCoordinates("D----B----A\n|    |\n|    |\nE----C----F", 10);
+        const tags = try a.alloc(gurka.Tag, case.tags.len + 1);
+        tags[0] = .{ .key = "type", .value = "restriction" };
+        @memcpy(tags[1..], case.tags);
+        const fixture = try gurka.Map.init(a, layout, &.{
+            .{ .label = "AB", .tags = motorway }, .{ .label = "BC", .tags = motorway }, .{ .label = "BD", .tags = motorway },
+            .{ .label = "CF", .tags = motorway }, .{ .label = "DE", .tags = motorway }, .{ .label = "EC", .tags = motorway },
+        }, &.{}, &.{.{
+            .tags = tags,
+            .members = &.{ .{ .kind = .way, .ref = "AB", .role = "from" }, .{ .kind = .node, .ref = "B", .role = "via" }, .{ .kind = .way, .ref = "BC", .role = "to" } },
+        }});
+        var built = try Built.assemble(fixture.osm, 1);
+        defer built.deinit();
+        const view = &built.bundle.view;
+        const from = try at(view, fixture.findNode("A").?.location.toFixed());
+        const to = try at(view, fixture.findNode("F").?.location.toFixed());
+        var engine = try RestrictionSearch.init(testing.allocator, view);
+        defer engine.deinit();
+        var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+        defer arena.deinit();
+        for (dates, case.active) |date, active| {
+            const clock = try restrictionTiming(date, false);
+            for ([_]search.Direction{ .forward, .reverse }) |direction| {
+                const path = try engine.run(&arena, .{}, .{ .origin = from, .destination = to, .direction = direction, .timing = clock }, search.Zero{}, .{});
+                try expectWayPath(view, &fixture, path, direction, if (active) &.{ "AB", "BD", "DE", "EC", "CF" } else &.{ "AB", "BC", "CF" });
+                arena.reset();
             }
         }
     }
@@ -1336,6 +1433,7 @@ test "Gurka conditional access distinguishes unknown time, modes and destination
         const origin = try at(view, fixture.findNode(case.from).?.location.toFixed());
         const destination = try at(view, fixture.findNode(case.to).?.location.toFixed());
         for ([_]search.Direction{ .forward, .reverse }) |direction| {
+            // These pinned cases supply departure time. The other cases exercise both directions.
             if (case.forward_only and direction == .reverse) continue;
             const request: search.Request = .{ .origin = origin, .destination = destination, .direction = direction, .timing = try restrictionTiming(case.date, false) };
             const kernel: RestrictionMotor = .{ .modes = case.modes, .destination_penalty = if (case.modes == 1) 2000 else 0 };
@@ -1752,6 +1850,19 @@ test "assembled motor vehicle limits follow the original way direction" {
     try testing.expect(booth.attr.cash_only_toll);
 }
 
+const LiveClosures = struct {
+    edges: []const format.EdgeId = &.{},
+
+    pub fn live(self: LiveClosures, id: format.EdgeId) ?graph.speed.Live {
+        if (std.mem.indexOfScalar(format.EdgeId, self.edges, id) == null) return null;
+        return .{ .overall = 0, .segments = @splat(0), .breakpoints = .{ 255, 0 } };
+    }
+
+    pub fn predicted(_: LiveClosures, _: format.EdgeId, _: graph.speed.Bucket) ?f32 {
+        return null;
+    }
+};
+
 fn MotorTestCost(comptime model: type) type {
     const compiled = routing.costing.compiled;
     const truck = model == routing.costing.truck;
@@ -1759,6 +1870,7 @@ fn MotorTestCost(comptime model: type) type {
         const Self = @This();
         profile: *const model.Profile,
         tables: *const compiled.Compiled,
+        closures: LiveClosures = .{},
 
         pub fn restrictionPermission(self: Self) routing.costing.base.Permission {
             return self.profile.permission;
@@ -1768,12 +1880,16 @@ fn MotorTestCost(comptime model: type) type {
             return (try self.edgeTraversal(view, edge_id, edge, direction)).cost;
         }
 
-        pub fn edgeTraversal(self: Self, view: *const graph.reader.View, _: format.EdgeId, edge: *const format.EdgeHot, _: search.Direction) !search.Traversal {
-            return self.traversal(view, edge, self.profile.untimedSpeed(edge.*));
+        pub fn closed(self: Self, edge: routing.snap.candidates.DirectedEdge) bool {
+            return self.closures.live(edge.id) != null;
+        }
+
+        pub fn edgeTraversal(self: Self, view: *const graph.reader.View, edge_id: format.EdgeId, edge: *const format.EdgeHot, _: search.Direction) !search.Traversal {
+            return self.traversal(view, edge, self.profile.resolvedSpeed(edge.*, edge_id, null, self.closures));
         }
 
         pub fn edgeCostAt(self: Self, view: *const graph.reader.View, edge_id: format.EdgeId, edge: *const format.EdgeHot, _: search.Direction, time: graph.time_info.TimeInfo) !search.Traversal {
-            const speed = self.profile.resolvedSpeed(edge.*, edge_id, graph.speed.Time.fromTimeInfo(time), graph.speed.NoOverlays{});
+            const speed = self.profile.resolvedSpeed(edge.*, edge_id, graph.speed.Time.fromTimeInfo(time), self.closures);
             return self.traversal(view, edge, speed);
         }
 
@@ -1788,16 +1904,37 @@ fn MotorTestCost(comptime model: type) type {
             return .{ .cost = cost, .measured_speed = @as(u8, @bitCast(speed.sources)) != 0 };
         }
 
+        pub fn slowAllowed(self: Self, view: *const graph.reader.View, id: format.EdgeId, _: *const format.EdgeHot, previous: ?search.Label, _: search.Direction) !bool {
+            // Full-edge seeds have no turn on which to check dimensional limits.
+            if (previous != null) return true;
+            const vehicle = if (truck) self.profile.vehicle else if (model == routing.costing.auto) self.profile.dimensions else return true;
+            const record = try view.coldRecord(id);
+            const admission = try self.profile.permission.evaluateRestrictions(record.access_limits, !record.reverse, null, .{}, vehicle, .none);
+            return admission.allowed;
+        }
+
         pub fn allowedTurn(self: Self, view: *const graph.reader.View, movement: search.Transition, _: search.Label, direction: search.Direction) !bool {
-            if (!self.profile.permission.allowedNode(try view.node(movement.node))) return false;
+            const backtrack = movement.incoming_edge.cls.opp_local == movement.outgoing_edge.cls.local;
+            const barrier = !self.profile.permission.allowedNode(try view.node(movement.node));
+            // A denied node still permits a return along the edge used to reach it.
+            if (barrier and !backtrack) return false;
             const from = try view.class(movement.incoming_edge.cls.class_id);
             const to = try view.class(movement.outgoing_edge.cls.class_id);
             const previous = if (direction == .forward) from else to;
-            const check: model.PathCheck = .{
-                .backtrack = movement.incoming_edge.cls.opp_local == movement.outgoing_edge.cls.local,
-                .previous_dead_end = previous.flags.dead_end or (try view.outEdgeRange(movement.node)).count() == 1,
+            var check: model.PathCheck = .{
+                .backtrack = backtrack,
+                .previous_dead_end = barrier or previous.flags.dead_end or (try view.outEdgeRange(movement.node)).count() == 1,
                 .previous_access = if (direction == .forward) movement.incoming_access else movement.outgoing_access,
             };
+            if (!truck) {
+                const edge = if (direction == .forward) movement.outgoing_edge else movement.incoming_edge;
+                if (edge.cls.cold_checks != 0) {
+                    const id = if (direction == .forward) movement.outgoing else movement.incoming;
+                    const record = try view.coldRecord(id);
+                    check.limits = record.access_limits;
+                    check.original_forward = !record.reverse;
+                }
+            }
             const turn: routing.costing.base.Turn = .{ .row = movement.row };
             const admission = if (truck) switch (direction) {
                 .forward => try model.Kernel.allowed(self.profile, view, movement.outgoing, from, to, turn, check, .none),
@@ -1920,6 +2057,7 @@ fn checkMotorTrip(comptime model: type, mode: if (model == routing.costing.truck
     var engine = try search.Search(Adapter, routing.search.queue.Heap).init(testing.allocator, view);
     defer engine.deinit();
     for ([_]search.Direction{ .forward, .reverse }) |direction| {
+        errdefer std.debug.print("{s} to {s}, {s}, {s}\n", .{ origin, destination, @tagName(direction), settings });
         const result = engine.run(&arena, cost, .{ .origin = from, .destination = to, .direction = direction }, search.Zero{}, .{});
         if (expected) |ways| {
             try expectWayPath(view, fixture, try result, direction, ways);
@@ -1932,6 +2070,477 @@ fn checkMotorTrip(comptime model: type, mode: if (model == routing.costing.truck
 
 fn checkTruckTrip(a: std.mem.Allocator, view: *const graph.reader.View, fixture: *const gurka.Map, origin: []const u8, destination: []const u8, settings: []const u8, expected: ?[]const []const u8) !void {
     return checkMotorTrip(routing.costing.truck, {}, a, view, fixture, origin, destination, settings, expected);
+}
+
+// Ported from test/gurka/test_barrier_uturns.cc (Valhalla 3.9.3).
+test "barriers permit the forced return without admitting through traffic" {
+    const auto = routing.costing.auto;
+    const Adapter = MotorTestCost(auto);
+    const endpoints = routing.search.endpoints;
+    const multi = routing.search.multi;
+    const api = routing.api.request;
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "primary" }};
+    const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates("A---B---C\n    |   |\n    D   |\n    |   |\n    E---F", 25), &.{
+        .{ .label = "AB", .tags = road }, .{ .label = "BC", .tags = road }, .{ .label = "BD", .tags = road },
+        .{ .label = "DE", .tags = road }, .{ .label = "EF", .tags = road }, .{ .label = "CF", .tags = road },
+    }, &.{.{ .label = "D", .tags = &.{ .{ .key = "barrier", .value = "fence" }, .{ .key = "access", .value = "no" } } }}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const ab = try directedBetween(view, &fixture, "A", "B");
+    const bc = try directedBetween(view, &fixture, "B", "C");
+    const bd = try directedBetween(view, &fixture, "B", "D");
+    const db = try view.oppEdge(bd);
+    const cf = try directedBetween(view, &fixture, "C", "F");
+    var warnings: std.ArrayList(routing.costing.base.Warning) = .empty;
+    const profile = try auto.Model.canonicalize(try auto.parse(a, .auto, .null, &warnings, .none));
+    const classes = view.classes.?;
+    const tables = try routing.costing.compiled.compileInto(auto.Model, profile, classes, try a.alloc(f32, classes.len), .none);
+    const motor: Adapter = .{ .profile = &profile, .tables = &tables };
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    var engine = try search.Search(Adapter, routing.search.queue.Heap).init(testing.allocator, view);
+    defer engine.deinit();
+    const correlations = [_]routing.snap.candidates.PathLocation{
+        snapLocation(&.{snapEdge(ab, 0, 0)}, &.{}),
+        snapLocation(&.{ snapEdge(bd, 0.5, 0), snapEdge(db, 0.5, 0) }, &.{}),
+        snapLocation(&.{snapEdge(cf, 1, 0)}, &.{}),
+    };
+    var locations: [3]api.Location = @splat(.{ .lat = 0, .lng = 0 });
+    for ([_]api.LocationType{ .@"break", .break_through }) |kind| {
+        locations[1].type = kind;
+        const route = try multi.route(&engine, &arena, motor, &locations, &correlations, .{ .search = .{ .costing = .auto } }, .{});
+        try testing.expectEqual(2, route.legs.len);
+        try testing.expectEqual(2, route.legs[0].segments.len);
+        try testing.expectEqual(ab, route.legs[0].segments[0].edge);
+        try testing.expectEqual(bd, route.legs[0].segments[1].edge);
+        const second: []const format.EdgeId = if (kind == .@"break") &.{ db, bc, cf } else &.{ bd, db, bc, cf };
+        try testing.expectEqual(second.len, route.legs[1].segments.len);
+        for (second, route.legs[1].segments) |id, segment| try testing.expectEqual(id, segment.edge);
+        arena.reset();
+    }
+    const forced_heading = snapLocation(&.{snapEdge(bd, 0.5, 0)}, &.{});
+    for ([_]search.Direction{ .forward, .reverse }) |direction| {
+        const route = try endpoints.route(&engine, &arena, motor, forced_heading, correlations[2], .{
+            .costing = .auto,
+            .direction = direction,
+            .timing = try restrictionTiming("2020-10-30T09:00", false),
+        }, search.Zero{}, .{});
+        const expected = [_]format.EdgeId{ bd, db, bc, cf };
+        try testing.expectEqual(expected.len, route.segments.len);
+        for (expected, route.segments) |id, segment| try testing.expectEqual(id, segment.edge);
+        arena.reset();
+    }
+}
+
+// Ported from test_closure_penalty.cc and test_search_filter.cc using a pinned
+// live closure observation on each directed edge (Valhalla 3.9.3).
+// Closed destination stretches and the open bypass between closed ends are #244.
+test "live closure penalties find the earliest exit from a closed stretch" {
+    const auto = routing.costing.auto;
+    const Adapter = MotorTestCost(auto);
+    const endpoints = routing.search.endpoints;
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "residential" }};
+    const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates("A---B---C---D---E\n    |       |\n    F-------G", 100), &.{
+        .{ .label = "AB", .tags = road }, .{ .label = "BC", .tags = road }, .{ .label = "CD", .tags = road },
+        .{ .label = "DE", .tags = road }, .{ .label = "BF", .tags = road }, .{ .label = "FG", .tags = road },
+        .{ .label = "GD", .tags = road },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const ab = try directedBetween(view, &fixture, "A", "B");
+    const bc = try directedBetween(view, &fixture, "B", "C");
+    const cd = try directedBetween(view, &fixture, "C", "D");
+    const de = try directedBetween(view, &fixture, "D", "E");
+    const bf = try directedBetween(view, &fixture, "B", "F");
+    const start = snapLocation(&.{snapEdge(ab, 0.5, 0)}, &.{});
+    const goal = snapLocation(&.{snapEdge(de, 0.5, 0)}, &.{});
+    const closures = [_]format.EdgeId{ ab, bc, cd };
+    const classes = view.classes.?;
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    var engine = try search.Search(Adapter, routing.search.queue.Heap).init(testing.allocator, view);
+    defer engine.deinit();
+    const cases = [_]struct { profile: []const u8, next: format.EdgeId }{
+        .{ .profile = "{\"closure_factor\":1}", .next = bc },
+        .{ .profile = "{\"closure_factor\":9}", .next = bf },
+        .{ .profile = "{\"closure_factor\":9,\"ignore_closures\":true}", .next = bc },
+        .{ .profile = "{\"closure_factor\":9,\"speed_types\":[\"constrained\"]}", .next = bc },
+    };
+    const options: endpoints.Options = .{ .costing = .auto, .timing = try restrictionTiming("2026-11-02T12:00", true) };
+    for (cases) |case| {
+        var warnings: std.ArrayList(routing.costing.base.Warning) = .empty;
+        const input = try routing.api.json.parse(a, case.profile);
+        var profile = try auto.Model.canonicalize(try auto.parse(a, .auto, input, &warnings, .none));
+        profile.permission.filter_closures = false;
+        const tables = try routing.costing.compiled.compileInto(auto.Model, profile, classes, try a.alloc(f32, classes.len), .none);
+        const cost: Adapter = .{ .profile = &profile, .tables = &tables, .closures = .{ .edges = &closures } };
+        const route = try endpoints.route(&engine, &arena, cost, start, goal, options, search.Zero{}, .{});
+        try testing.expectEqual(ab, route.segments[0].edge);
+        try testing.expectEqual(case.next, route.segments[1].edge);
+        try testing.expectEqual(de, route.segments[route.segments.len - 1].edge);
+        arena.reset();
+    }
+}
+
+// Ported from test/gurka/test_exclude_cash_only_tolls.cc (Valhalla 3.9.3).
+test "cash-only toll exclusions route around the booth or reject the gravel alternative" {
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const primary: gurka.Tags = &.{.{ .key = "highway", .value = "primary" }};
+    const layout = try gurka.mapToCoordinates(
+        \\A-----------B-------------C-------------D-------------E
+        \\            |                           |
+        \\            |                           |
+        \\            |                           |
+        \\            F---------------------------G
+    , 10);
+    const fixture = try gurka.Map.init(a, layout, &.{
+        .{ .label = "AB", .tags = primary },                                                                                       .{ .label = "BC", .tags = primary }, .{ .label = "CD", .tags = primary },
+        .{ .label = "DE", .tags = primary },                                                                                       .{ .label = "BF", .tags = primary }, .{ .label = "GD", .tags = primary },
+        .{ .label = "FG", .tags = &.{ .{ .key = "highway", .value = "residential" }, .{ .key = "surface", .value = "gravel" } } },
+    }, &.{.{ .label = "C", .tags = &.{ .{ .key = "barrier", .value = "toll_booth" }, .{ .key = "payment:coins", .value = "true" } } }}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const cases = [_]struct { settings: []const u8, path: ?[]const []const u8 }{
+        .{ .settings = "{}", .path = &.{ "AB", "BC", "CD", "DE" } },
+        .{ .settings = "{\"exclude_cash_only_tolls\":false}", .path = &.{ "AB", "BC", "CD", "DE" } },
+        .{ .settings = "{\"exclude_cash_only_tolls\":true}", .path = &.{ "AB", "BF", "FG", "GD", "DE" } },
+        .{ .settings = "{\"exclude_cash_only_tolls\":true,\"exclude_unpaved\":true}", .path = null },
+    };
+    for (cases) |case| {
+        for ([_]routing.costing.auto.Mode{ .auto, .bus, .taxi }) |mode| {
+            try checkMotorTrip(routing.costing.auto, mode, a, view, &fixture, "A", "E", case.settings, case.path);
+        }
+        try checkTruckTrip(a, view, &fixture, "A", "E", case.settings, case.path);
+    }
+}
+
+// Ported from the routed cases in test_hard_exclusions_highways.cc and
+// test_hard_exclusions_bridge_tunnel_tolls.cc (Valhalla 3.9.3).
+test "hard edge exclusions permit leaving an excluded stretch and forbid entering it" {
+    const ordinary = gurka.Tag{ .key = "highway", .value = "residential" };
+    const cases = [_]struct { tags: gurka.Tags, options: []const u8 }{
+        .{ .tags = &.{.{ .key = "highway", .value = "motorway" }}, .options = "{\"shortest\":true,\"exclude_highways\":true}" },
+        .{ .tags = &.{ ordinary, .{ .key = "bridge", .value = "yes" } }, .options = "{\"shortest\":true,\"exclude_bridges\":true}" },
+        .{ .tags = &.{ ordinary, .{ .key = "tunnel", .value = "yes" } }, .options = "{\"shortest\":true,\"exclude_tunnels\":true}" },
+        .{ .tags = &.{ ordinary, .{ .key = "toll", .value = "yes" } }, .options = "{\"shortest\":true,\"exclude_tolls\":true}" },
+    };
+    for (cases) |case| {
+        var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer storage.deinit();
+        const a = storage.allocator();
+        const road: gurka.Tags = &.{ordinary};
+        const layout = try gurka.mapToCoordinates("E----F----G----H----I----A----J----K----L\n                              |    |\n                              M----N", 100);
+        const fixture = try gurka.Map.init(a, layout, &.{
+            .{ .label = "EF", .tags = case.tags }, .{ .label = "FG", .tags = case.tags }, .{ .label = "GH", .tags = road },
+            .{ .label = "HI", .tags = road },      .{ .label = "IA", .tags = road },      .{ .label = "AJ", .tags = road },
+            .{ .label = "JK", .tags = case.tags }, .{ .label = "KL", .tags = road },      .{ .label = "JM", .tags = road },
+            .{ .label = "MN", .tags = road },      .{ .label = "NK", .tags = road },
+        }, &.{}, &.{});
+        var built = try Built.assemble(fixture.osm, 1);
+        defer built.deinit();
+        const view = &built.bundle.view;
+        for ([_]routing.costing.auto.Mode{ .auto, .bus, .taxi }) |mode| {
+            const model = routing.costing.auto;
+            try checkMotorTrip(model, mode, a, view, &fixture, "I", "L", "{\"shortest\":true}", &.{ "IA", "AJ", "JK", "KL" });
+            try checkMotorTrip(model, mode, a, view, &fixture, "I", "L", case.options, &.{ "IA", "AJ", "JM", "MN", "NK", "KL" });
+            try checkMotorTrip(model, mode, a, view, &fixture, "E", "H", case.options, &.{ "EF", "FG", "GH" });
+            try checkMotorTrip(model, mode, a, view, &fixture, "H", "E", case.options, null);
+        }
+        try checkTruckTrip(a, view, &fixture, "I", "L", case.options, &.{ "IA", "AJ", "JM", "MN", "NK", "KL" });
+        try checkMotorTrip(routing.costing.motorcycle, .motorcycle, a, view, &fixture, "I", "L", case.options, &.{ "IA", "AJ", "JM", "MN", "NK", "KL" });
+    }
+}
+
+// Ported from the interior exclusions and smoothness cases in
+// test/gurka/test_exclude_unpaved_smoothness.cc (Valhalla 3.9.3).
+test "smoothness adds an unpaved exclusion unless a surface or track grade takes precedence" {
+    const road = gurka.Tag{ .key = "highway", .value = "residential" };
+    const layout = try gurka.mapToCoordinates("A---B---C---D\n    |   |\n    E---F", 100);
+    const cases = [_]struct { tags: gurka.Tags, ordinary: bool = true, excluded: bool }{
+        .{ .tags = &.{ road, .{ .key = "smoothness", .value = "bad" } }, .excluded = true },
+        .{ .tags = &.{ road, .{ .key = "smoothness", .value = "bad" }, .{ .key = "surface", .value = "asphalt" } }, .excluded = false },
+        .{ .tags = &.{ road, .{ .key = "smoothness", .value = "bad" }, .{ .key = "tracktype", .value = "grade1" } }, .excluded = false },
+        .{ .tags = &.{ road, .{ .key = "smoothness", .value = "impassable" } }, .ordinary = false, .excluded = true },
+    };
+    const direct: []const []const u8 = &.{ "AB", "BC", "CD" };
+    const detour: []const []const u8 = &.{ "AB", "BE", "EF", "FC", "CD" };
+    for (cases) |case| {
+        var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer storage.deinit();
+        const a = storage.allocator();
+        const fixture = try gurka.Map.init(a, layout, &.{
+            .{ .label = "AB", .tags = &.{road} }, .{ .label = "BC", .tags = case.tags }, .{ .label = "CD", .tags = &.{road} },
+            .{ .label = "BE", .tags = &.{road} }, .{ .label = "EF", .tags = &.{road} },  .{ .label = "FC", .tags = &.{road} },
+        }, &.{}, &.{});
+        var built = try Built.assemble(fixture.osm, 1);
+        defer built.deinit();
+        const view = &built.bundle.view;
+        for ([_]routing.costing.auto.Mode{ .auto, .bus, .taxi }) |mode| {
+            try checkMotorTrip(routing.costing.auto, mode, a, view, &fixture, "A", "D", "{}", if (case.ordinary) direct else detour);
+            try checkMotorTrip(routing.costing.auto, mode, a, view, &fixture, "A", "D", "{\"exclude_unpaved\":true}", if (case.excluded) detour else direct);
+        }
+        try checkTruckTrip(a, view, &fixture, "A", "D", "{\"exclude_unpaved\":true}", if (case.excluded) detour else direct);
+    }
+}
+
+// Ported from test/gurka/test_construction.cc (Valhalla 3.9.3).
+test "construction edges require build inclusion and a routing override" {
+    const auto = routing.costing.auto;
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const construction: gurka.Tag = .{ .key = "highway", .value = "construction" };
+    const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates("A---------B--------C\n                   |\n                   D", 100), &.{
+        .{ .label = "AB", .tags = &.{.{ .key = "highway", .value = "primary" }} },
+        .{ .label = "BC", .tags = &.{ construction, .{ .key = "construction", .value = "primary" } } },
+        .{ .label = "CD", .tags = &.{construction} },
+    }, &.{}, &.{});
+    var excluded = try Built.assemble(fixture.osm, 1);
+    defer excluded.deinit();
+    try testing.expectEqual(2, excluded.bundle.view.edges.len);
+
+    var included = try Built.assembleWithOptions(fixture.osm, .{ .scratch_dir = "", .workers = 1, .include_construction = true });
+    defer included.deinit();
+    const view = &included.bundle.view;
+    try testing.expectEqual(4, view.edges.len);
+    const bc = try directedBetween(view, &fixture, "B", "C");
+    const attributes = try view.class((try view.edge(bc)).cls.class_id);
+    try testing.expectEqual(@backingInt(graph.constants.Use.construction), attributes.category.use);
+    try testing.expectEqual(0, attributes.access.forward);
+    try testing.expectEqual(0, attributes.access.reverse);
+    try checkMotorTrip(auto, .auto, a, view, &fixture, "A", "C", "{}", null);
+    try checkMotorTrip(auto, .auto, a, view, &fixture, "A", "C", "{\"ignore_construction\":true}", &.{ "AB", "BC" });
+}
+
+// Ported from test/gurka/test_sump_buster.cc (Valhalla 3.9.3).
+test "sump buster barriers respect the mode mask and explicit access" {
+    const barrier: gurka.Tags = &.{.{ .key = "barrier", .value = "sump_buster" }};
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "residential" }};
+    const defaults: []const gurka.Node = &.{ .{ .label = "F", .tags = barrier }, .{ .label = "G", .tags = barrier } };
+    const overrides: []const gurka.Node = &.{
+        .{ .label = "F", .tags = &.{
+            barrier[0],                              .{ .key = "bus", .value = "no" },   .{ .key = "hgv", .value = "no" },
+            .{ .key = "motorcycle", .value = "no" }, .{ .key = "moped", .value = "no" }, .{ .key = "foot", .value = "no" },
+            .{ .key = "bicycle", .value = "no" },
+        } },
+        .{ .label = "G", .tags = &.{ barrier[0], .{ .key = "motorcar", .value = "yes" } } },
+    };
+    for ([_]bool{ false, true }) |override| {
+        var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer storage.deinit();
+        const a = storage.allocator();
+        const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates(
+            \\A----B----C----D------------E
+            \\     |         |            |
+            \\     F         G            H
+            \\     |         |            |
+            \\     I----J----K------------L
+        , 100), &.{
+            .{ .label = "AB", .tags = road }, .{ .label = "BC", .tags = road }, .{ .label = "CD", .tags = road }, .{ .label = "DE", .tags = road },
+            .{ .label = "BF", .tags = road }, .{ .label = "DG", .tags = road }, .{ .label = "EH", .tags = road }, .{ .label = "FI", .tags = road },
+            .{ .label = "GK", .tags = road }, .{ .label = "HL", .tags = road }, .{ .label = "IJ", .tags = road }, .{ .label = "JK", .tags = road },
+            .{ .label = "KL", .tags = road },
+        }, if (override) overrides else defaults, &.{});
+        var built = try Built.assemble(fixture.osm, 1);
+        defer built.deinit();
+        const view = &built.bundle.view;
+        const short: []const []const u8 = &.{ "AB", "BF", "FI" };
+        const long: []const []const u8 = &.{ "AB", "BC", "CD", "DE", "EH", "HL", "KL", "JK", "IJ" };
+        const through: []const []const u8 = &.{ "AB", "BC", "CD", "DG", "GK", "JK", "IJ" };
+        const unrestricted = if (override) through else short;
+        for ([_]routing.costing.auto.Mode{ .auto, .bus, .taxi }) |mode| {
+            try checkMotorTrip(routing.costing.auto, mode, a, view, &fixture, "A", "I", "{}", if (override or mode == .bus) unrestricted else long);
+        }
+        try checkTruckTrip(a, view, &fixture, "A", "I", "{}", unrestricted);
+        for ([_]routing.costing.motorcycle.Mode{ .motorcycle, .motor_scooter }) |mode| {
+            try checkMotorTrip(routing.costing.motorcycle, mode, a, view, &fixture, "A", "I", "{}", unrestricted);
+        }
+        const from = try at(view, fixture.findNode("A").?.location.toFixed());
+        const to = try at(view, fixture.findNode("I").?.location.toFixed());
+        var engine = try RestrictionSearch.init(testing.allocator, view);
+        defer engine.deinit();
+        var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+        defer arena.deinit();
+        for ([_]graph.constants.AccessMask{ .{ .pedestrian = true }, .{ .bicycle = true } }) |access| {
+            const path = try engine.run(&arena, .{ .modes = @bitCast(access) }, .{ .origin = from, .destination = to }, search.Zero{}, .{});
+            try expectWayPath(view, &fixture, path, .forward, unrestricted);
+            arena.reset();
+        }
+    }
+}
+
+// Ported from AccessPsvWay, AccessPsvNode and the directional overrides in
+// test/gurka/test_access.cc (Valhalla 3.9.3).
+test "public-service access applies on both ways and barrier nodes" {
+    const auto = routing.costing.auto;
+    const road = gurka.Tag{ .key = "highway", .value = "residential" };
+    const denied = gurka.Tag{ .key = "access", .value = "no" };
+    const psv = gurka.Tag{ .key = "psv", .value = "yes" };
+    const layout = try gurka.mapToCoordinates("A---B---C---D---E\n    |       |\n    F-------G", 100);
+    for ([_]bool{ false, true }) |node_restriction| {
+        var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer storage.deinit();
+        const a = storage.allocator();
+        const fixture = try gurka.Map.init(a, layout, &.{
+            .{ .label = "AB", .tags = &.{road} },
+            .{ .label = "BC", .tags = if (node_restriction) &.{road} else &.{ road, denied, psv } },
+            .{ .label = "CD", .tags = &.{road} },
+            .{ .label = "DE", .tags = &.{road} },
+            .{ .label = "BF", .tags = &.{road} },
+            .{ .label = "FG", .tags = &.{road} },
+            .{ .label = "GD", .tags = &.{road} },
+        }, if (node_restriction) &.{.{ .label = "C", .tags = &.{ .{ .key = "barrier", .value = "gate" }, denied, psv } }} else &.{}, &.{});
+        var built = try Built.assemble(fixture.osm, 1);
+        defer built.deinit();
+        const view = &built.bundle.view;
+        try checkMotorTrip(auto, .auto, a, view, &fixture, "A", "E", "{}", &.{ "AB", "BF", "FG", "GD", "DE" });
+        for ([_]auto.Mode{ .bus, .taxi }) |mode| {
+            try checkMotorTrip(auto, mode, a, view, &fixture, "A", "E", "{}", &.{ "AB", "BC", "CD", "DE" });
+        }
+    }
+}
+
+// Ported from the access and oneway cases in test_access.cc, test_oneways.cc
+// and test_route.cc (Valhalla 3.9.3).
+test "motorcar access overrides for each direction remain distinct from oneways" {
+    const auto = routing.costing.auto;
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const road = gurka.Tag{ .key = "highway", .value = "residential" };
+    const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates("A---B---C---D---E\n            |\n            F", 10), &.{
+        .{ .label = "AB", .tags = &.{road} },
+        .{ .label = "BC", .tags = &.{
+            road,                                           .{ .key = "motor_vehicle:forward", .value = "no" }, .{ .key = "motorcar:forward", .value = "yes" },
+            .{ .key = "motorcar:backward", .value = "no" },
+        } },
+        .{ .label = "CD", .tags = &.{road} },
+        .{ .label = "DE", .tags = &.{ road, .{ .key = "oneway", .value = "yes" } } },
+        .{ .label = "DF", .tags = &.{road} },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    try checkMotorTrip(auto, .auto, a, view, &fixture, "A", "D", "{}", &.{ "AB", "BC", "CD" });
+    try checkMotorTrip(auto, .auto, a, view, &fixture, "D", "A", "{}", null);
+    try checkMotorTrip(auto, .auto, a, view, &fixture, "D", "A", "{\"ignore_access\":true}", &.{ "CD", "BC", "AB" });
+    try checkMotorTrip(auto, .auto, a, view, &fixture, "D", "E", "{}", &.{"DE"});
+    try checkMotorTrip(auto, .auto, a, view, &fixture, "E", "D", "{}", null);
+    try checkMotorTrip(auto, .auto, a, view, &fixture, "E", "D", "{\"ignore_oneways\":true}", &.{"DE"});
+    try checkMotorTrip(auto, .bus, a, view, &fixture, "A", "D", "{}", null);
+    try checkMotorTrip(auto, .bus, a, view, &fixture, "D", "A", "{}", &.{ "CD", "BC", "AB" });
+}
+
+// Ported from test/gurka/test_oneways_foot_bike.cc (Valhalla 3.9.3).
+test "foot and bicycle one-ways keep their own direction on shared roads and paths" {
+    const road = gurka.Tag{ .key = "highway", .value = "unclassified" };
+    const layout = try gurka.mapToCoordinates("A---B---C---D\n    |   |\n    E---F", 100);
+    const cases = [_]struct { highway: []const u8, oneway: []const u8, forward: bool, backward: bool, motor: bool }{
+        .{ .highway = "unclassified", .oneway = "yes", .forward = true, .backward = false, .motor = true },
+        .{ .highway = "footway", .oneway = "yes", .forward = true, .backward = false, .motor = false },
+        .{ .highway = "footway", .oneway = "-1", .forward = false, .backward = true, .motor = false },
+    };
+    for (cases) |case| {
+        var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer storage.deinit();
+        const fixture = try gurka.Map.init(storage.allocator(), layout, &.{
+            .{ .label = "AB", .tags = &.{road} }, .{ .label = "CD", .tags = &.{road} },
+            .{ .label = "BE", .tags = &.{road} }, .{ .label = "EF", .tags = &.{road} },
+            .{ .label = "FC", .tags = &.{road} },
+            .{ .label = "BC", .tags = &.{
+                .{ .key = "highway", .value = case.highway },
+                .{ .key = "oneway", .value = "yes" },
+                .{ .key = "bicycle", .value = "yes" },
+                .{ .key = "oneway:bicycle", .value = case.oneway },
+                .{ .key = "oneway:foot", .value = case.oneway },
+            } },
+        }, &.{}, &.{});
+        var built = try Built.assemble(fixture.osm, 1);
+        defer built.deinit();
+        const view = &built.bundle.view;
+        const left = try at(view, fixture.findNode("A").?.location.toFixed());
+        const right = try at(view, fixture.findNode("D").?.location.toFixed());
+        var engine = try RestrictionSearch.init(testing.allocator, view);
+        defer engine.deinit();
+        var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+        defer arena.deinit();
+        for ([_]graph.constants.AccessMask{ .{ .auto = true }, .{ .bicycle = true }, .{ .pedestrian = true } }) |mask| {
+            const costing: RestrictionMotor = .{ .modes = @bitCast(mask) };
+            const shortcut_forward = if (mask.auto) case.motor else case.forward;
+            const shortcut_backward = !mask.auto and case.backward;
+            for ([_]search.Direction{ .forward, .reverse }) |direction| {
+                const outbound = try engine.run(&arena, costing, .{ .origin = left, .destination = right, .direction = direction }, search.Zero{}, .{});
+                try expectWayPath(view, &fixture, outbound, direction, if (shortcut_forward) &.{ "AB", "BC", "CD" } else &.{ "AB", "BE", "EF", "FC", "CD" });
+                arena.reset();
+                const inbound = try engine.run(&arena, costing, .{ .origin = right, .destination = left, .direction = direction }, search.Zero{}, .{});
+                try expectWayPath(view, &fixture, inbound, direction, if (shortcut_backward) &.{ "CD", "BC", "AB" } else &.{ "CD", "FC", "EF", "BE", "AB" });
+                arena.reset();
+            }
+        }
+    }
+}
+
+// Ported from test/gurka/test_permissible_dimensions.cc and the dimensional
+// cases in test_ignore_restrictions.cc (Valhalla 3.9.3).
+test "motor dimensions select roads at their inclusive limits" {
+    const dimensions = [_]struct { tag: []const u8, option: []const u8, unit: []const u8 }{
+        .{ .tag = "maxwidth", .option = "width", .unit = "m" },
+        .{ .tag = "maxheight", .option = "height", .unit = "m" },
+        .{ .tag = "maxlength", .option = "length", .unit = "m" },
+        .{ .tag = "maxweight", .option = "weight", .unit = "t" },
+    };
+    const road = gurka.Tag{ .key = "highway", .value = "residential" };
+    const layout = try gurka.mapToCoordinates("A----B----C----D----E\n     |         |    |\n     |         |    |\n     I----H----G----F", 100);
+    for (dimensions) |dimension| {
+        var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer storage.deinit();
+        const a = storage.allocator();
+        const upper = try std.fmt.allocPrint(a, "2.0{s}", .{dimension.unit});
+        const lower = try std.fmt.allocPrint(a, "1.9{s}", .{dimension.unit});
+        const fixture = try gurka.Map.init(a, layout, &.{
+            .{ .label = "AB", .tags = &.{road} },
+            .{ .label = "BC", .tags = &.{ road, .{ .key = dimension.tag, .value = "2.0" } } },
+            .{ .label = "CD", .tags = &.{ road, .{ .key = dimension.tag, .value = upper } } },
+            .{ .label = "DE", .tags = &.{road} },
+            .{ .label = "EF", .tags = &.{road} },
+            .{ .label = "FG", .tags = &.{road} },
+            .{ .label = "GH", .tags = &.{road} },
+            .{ .label = "HI", .tags = &.{road} },
+            .{ .label = "DG", .tags = &.{ road, .{ .key = dimension.tag, .value = "1.9" } } },
+            .{ .label = "BI", .tags = &.{ road, .{ .key = dimension.tag, .value = lower } } },
+        }, &.{}, &.{});
+        var built = try Built.assemble(fixture.osm, 1);
+        defer built.deinit();
+        const view = &built.bundle.view;
+        const cases = [_]struct { value: []const u8, path: ?[]const []const u8 }{
+            .{ .value = "1.8", .path = &.{ "AB", "BI" } },
+            .{ .value = "1.9", .path = &.{ "AB", "BI" } },
+            .{ .value = "2.0", .path = &.{ "AB", "BC", "CD", "DE", "EF", "FG", "GH", "HI" } },
+            .{ .value = "2.1", .path = null },
+        };
+        for (cases) |case| {
+            // The non-vehicular override leaves vehicle dimensions active.
+            const settings = try std.fmt.allocPrint(a, "{{\"{s}\":{s},\"ignore_non_vehicular_restrictions\":true}}", .{ dimension.option, case.value });
+            for ([_]routing.costing.auto.Mode{ .auto, .bus, .taxi }) |mode| {
+                try checkMotorTrip(routing.costing.auto, mode, a, view, &fixture, "A", "I", settings, case.path);
+            }
+            try checkTruckTrip(a, view, &fixture, "A", "I", settings, case.path);
+        }
+        for ([_]routing.costing.motorcycle.Mode{ .motorcycle, .motor_scooter }) |mode| {
+            try checkMotorTrip(routing.costing.motorcycle, mode, a, view, &fixture, "A", "I", "{}", &.{ "AB", "BI" });
+        }
+    }
 }
 
 // Ported from test/gurka/test_destination_only.cc.

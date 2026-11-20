@@ -147,8 +147,10 @@ P5.19 | Fixed-path recost and named costing requests | costing | port | M | P5.1
 P5.19a | Resolve and apply linear cost factors along exact edge walks | snap | port | M | P5.19 P8.04
 P5.19b | Serialize named recosts and score same-graph routes in zr diff | api | port | M | P5.19 P3.33 P6.13 P6.14
 P5.20 | Port the gurka suites for access, restrictions, time-dependence and closures | infra | test | L | P5.10 P5.15 P5.16 P5.17
+P5.20a | Build and enforce probability-tagged turn restrictions | search | port | M | P5.09 P5.11
+P5.20b | Route through closures explicitly admitted at trip endpoints | search | port | M | P5.15 P5.16
 P5.21 | Experiment E7: time-dependent long route and synthetic congestion | search | experiment | S | P5.15 P4.07
-P5.22 | Phase 5 gate: auto and truck corpora at cost parity, suites green | costing | gate | M | P5.12 P5.13 P5.18 P5.19 P5.20 P5.21
+P5.22 | Phase 5 gate: auto and truck corpora at cost parity, suites green | costing | gate | M | P5.12 P5.13 P5.18 P5.19 P5.20 P5.20a P5.20b P5.21
 
 ## P6 | P6 Narrative and serializers | Maneuvers, instructions in 36 locales, Valhalla, OSRM, GPX and pbf output.
 P6.01 | Trip leg data model as direct structs mirroring trip.proto | api | port | M | P1.08

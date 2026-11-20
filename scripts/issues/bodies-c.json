@@ -1207,9 +1207,53 @@
       "Upstream has 136 gurka files; this batch is the routing-behaviour subset. See docs/upstream/valhalla-architecture.md, section 7."
     ],
     "accept": [
-      "Checklist of ported files in the PR description, each green or linked to a blocking issue.",
+      "Checklist of ported files in the issue, each green or linked to a blocking issue.",
       "No test is silently skipped.",
       "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P5.20a",
+    "goal": "Apply Valhalla 3.9.3's `restriction:probable` turn rules under the request's `restriction_probability` threshold.",
+    "upstream": [
+      "src/mjolnir/pbfgraphparser.cc",
+      "valhalla/sif/dynamiccost.h",
+      "test/gurka/test_probable_restrictions.cc"
+    ],
+    "scope": [
+      "Preserve probability values and ordinary or conditional tag precedence in the built restriction automaton. Keep existing bundles readable.",
+      "Evaluate the threshold for every affected mode and search direction without making time-independent probabilities depend on a request clock."
+    ],
+    "notes": [
+      "The catalog currently counts probable-only relations as deferred and the auto profile already parses the request option. The search has no probability-conditioned terminal output."
+    ],
+    "accept": [
+      "The pinned probable-restriction Gurka cases pass for default, lower, and clamped thresholds, including ordinary and timed precedence.",
+      "Bundle verification and coverage include malformed probabilities and old bundles.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P5.20b",
+    "goal": "Find the least-cost route when a waypoint explicitly admits a live closure.",
+    "upstream": [
+      "src/thor/bidirectional_astar.cc",
+      "test/gurka/test_closure_penalty.cc",
+      "test/gurka/test_search_filter.cc",
+      "test/gurka/test_traffic.cc"
+    ],
+    "scope": [
+      "Allow closed stretches connected to admitted starts and destinations in either search direction. Apply the existing closure factor while pricing them.",
+      "Preserve the closure state needed to compare labels exactly. Exclude disconnected intermediate closures and honor each waypoint's filter.",
+      "Port the remaining closure endpoint and penalty tests using fixed live observations."
+    ],
+    "notes": [
+      "The current search flips the closure pruning bit upon reaching an open edge. When both endpoints are closed it discards a cheaper open bypass because that path must reenter the closure to reach the destination."
+    ],
+    "accept": [
+      "An open bypass competes against an all-closed route, and changing the closure factor switches the winner in both directions.",
+      "Origin-only and destination-only allowances are independent. Consecutive terminal closures work and intermediate closures remain excluded.",
+      "Tests cover all six motor modes and the search budget remains green."
     ]
   },
   {
