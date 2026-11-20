@@ -24,6 +24,7 @@ pub const Config = struct {
             infer_turn_channels: ?bool = null,
             infer_internal_intersections: ?bool = null,
             apply_country_overrides: ?bool = null,
+            use_admin_db: ?bool = null,
         } = .{},
     };
 

@@ -39,13 +39,14 @@ const max_workers = 16;
 
 pub const Options = struct {
     scratch_dir: []const u8,
-    drive_side: edge_class.DriveSide = .right,
+    drive_side: ?edge_class.DriveSide = null,
     workers: usize = 0,
     include_construction: bool = false,
     include_platforms: bool = false,
     dem_source: ?elevation.Source = null,
     admin_drive_side: ?enhance.AdminDriveSide = null,
     admin_index: ?graph.admin.View = null,
+    use_admin_db: bool = true,
     apply_country_overrides: bool = true,
     timezone_source: ?timezones.Source = null,
     speed_rules: ?*const speeds.Config = null,
@@ -78,9 +79,10 @@ pub const Stats = struct {
 /// Parallel builds require an allocator and admin resolver that support concurrent use.
 pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWriter, supplied: Options) !Stats {
     var options = supplied;
+    if (!options.use_admin_db) options.admin_index = null;
     var restrictions: turn_restrictions.Catalog = .{ .a = gpa, .deadline = options.deadline };
     defer restrictions.deinit();
-    var compiled_admins = try admin_index.build(gpa, source, options.deadline, options.admin_index == null, &restrictions);
+    var compiled_admins = try admin_index.build(gpa, source, options.deadline, options.use_admin_db and options.admin_index == null, &restrictions);
     defer if (compiled_admins) |*index| index.deinit();
     if (compiled_admins) |index| options.admin_index = index.view;
     const edge_file = try io.File.temporary(options.scratch_dir);
@@ -451,7 +453,8 @@ const Way = extern struct {
         motorroad: bool = false,
         access_tags_known: bool = false,
         primary_name: bool = false,
-        reserved: u4 = 0,
+        drive_on_left: bool = false,
+        reserved: u3 = 0,
     },
     level_start: u32,
     level_count: u32,
@@ -489,7 +492,8 @@ comptime {
 const Ways = std.AutoHashMapUnmanaged(i64, Way);
 pub const Metadata = struct {
     gpa: Allocator,
-    drive_side: edge_class.DriveSide,
+    drive_side: ?edge_class.DriveSide,
+    use_admin_db: bool,
     deadline: io.Deadline,
     strings: tags.names.StringTable,
     name_ids: std.ArrayList(tags.names.Id) = .empty,
@@ -507,6 +511,7 @@ pub const Metadata = struct {
         return .{
             .gpa = gpa,
             .drive_side = options.drive_side,
+            .use_admin_db = options.use_admin_db,
             .deadline = options.deadline,
             .strings = .init(gpa),
             .conditional = .init(gpa, options.deadline),
@@ -731,9 +736,10 @@ pub const Metadata = struct {
             use;
 
         var pair = [2]classes.EdgeClass{
-            try edge_class.fromWay(attrs, true, self.drive_side),
-            try edge_class.fromWay(attrs, false, self.drive_side),
+            try edge_class.fromWay(attrs, true, .right),
+            try edge_class.fromWay(attrs, false, .right),
         };
+        const drive_on_left = if (self.use_admin_db) false else try wayDriveOnLeft(raw_tags, (self.drive_side orelse .right) == .left);
         for (&pair) |*class| {
             class.category.use = @intCast(@backingInt(directed_use));
             if (directed_use == .ramp or directed_use == .turn_channel) class.flags.internal = false;
@@ -742,7 +748,7 @@ pub const Metadata = struct {
         if (entry.found_existing) return error.DuplicateWay;
         const access_masks = try self.wayAccess(id, &attrs.motor_limits, raw_tags);
         for (&pair, access_masks) |*class, modes| class.detail.access_restriction = modes;
-        const indexed = try self.strings.indexWay(attrs, raw_tags, .{}, self.deadline);
+        const indexed = try self.strings.indexWay(attrs, raw_tags, .{ .use_admin_db = self.use_admin_db }, self.deadline);
         try self.signs.addWay(self.gpa, id, indexed);
         const name_start = try self.nameOffset();
         const ref_first = attrs.road_class == .motorway or attrs.road_class == .trunk;
@@ -775,6 +781,7 @@ pub const Metadata = struct {
                 .importance = @intCast(@backingInt(attrs.road_class)),
                 .has_names = name_start != name_end,
                 .primary_name = primary_name,
+                .drive_on_left = drive_on_left,
                 .layer = attrs.layer,
             },
             .level_start = level_start,
@@ -784,6 +791,16 @@ pub const Metadata = struct {
             .ref_end = ref_end,
             .name_end = @min(name_end, name_start +| graph.cold.max_names),
         };
+    }
+
+    fn wayDriveOnLeft(raw_tags: pbf.block.TagIterator, fallback: bool) !bool {
+        var left = fallback;
+        var tags_at_way = raw_tags;
+        while (try tags_at_way.next()) |tag| {
+            if (std.mem.eql(u8, tag.key, "driving_side"))
+                left = !std.mem.eql(u8, tag.value, "right");
+        }
+        return left;
     }
 
     noinline fn wayAccess(self: *Metadata, id: i64, unconditional: *const access_restriction.Set, raw_tags: pbf.block.TagIterator) ![2]u16 {
@@ -1183,6 +1200,17 @@ const Shared = struct {
     fn country(self: *const Shared, node: u32) country_access.Country {
         return if (self.admin_ids) |ids| self.countries[ids[node]] else .{};
     }
+
+    fn adminDriveOnLeft(self: *const Shared, node: u32, options: *const Options) !?bool {
+        if (options.admin_drive_side) |hook| {
+            if (hook.resolve(hook.context, self.topology.coordinates[node])) |side| return side == .left;
+        }
+        if (!options.use_admin_db) return null;
+        if (self.admin_index) |index| {
+            if (try index.region(self.admin_ids.?[node])) |area| return !area.attr.drive_on_right;
+        }
+        return (options.drive_side orelse .left) == .left;
+    }
 };
 
 const AdminJob = struct {
@@ -1335,6 +1363,7 @@ const LinkSource = struct {
 
 const Job = struct {
     shared: *const Shared,
+    options: *const Options,
     start: usize,
     end: usize,
     interner: classes.Interner,
@@ -1353,6 +1382,7 @@ const Job = struct {
             const first = topo.first_edge[node];
             const group = topo.groups[node];
             const from_country = shared.country(@intCast(node));
+            const admin_left = try shared.adminDriveOnLeft(@intCast(node), self.options);
             for (0..group.real_degree) |local| {
                 const slot = first + local;
                 const ref = topo.slot_refs.data[slot];
@@ -1361,6 +1391,13 @@ const Job = struct {
                 const way = shared.ways.get(segment.way_id) orelse return error.MissingWayAttributes;
                 const direction = ref & 1;
                 var class = way.by_direction[direction];
+                if (admin_left orelse way.attr.drive_on_left) {
+                    const opposing = way.by_direction[direction ^ 1];
+                    class.flags.shoulder = opposing.flags.shoulder;
+                    // Explicit one-way bicycle access and contraflow lanes keep their direction.
+                    if (!way.attr.oneway and class.forwardAccess().bicycle == class.reverseAccess().bicycle)
+                        class.category.cycle_lane = opposing.category.cycle_lane;
+                }
                 if (self.link_results.len != 0) {
                     const link = self.link_results[ref / 2];
                     if (link.processed) {
@@ -1453,7 +1490,7 @@ fn populate(gpa: Allocator, shared: *const Shared, plan: *const Layout, options:
     for (active, 0..) |*job, i| {
         const start = (nodes * i) / count;
         const end = (nodes * (i + 1)) / count;
-        job.* = .{ .shared = shared, .start = start, .end = end, .interner = .init(gpa), .link_results = classified.data };
+        job.* = .{ .shared = shared, .options = &options, .start = start, .end = end, .interner = .init(gpa), .link_results = classified.data };
     }
     defer for (active) |*job| job.interner.deinit();
 
@@ -1515,7 +1552,7 @@ const NodeEnhanceJob = struct {
     tiles: enhance.TileIndex,
     active: []const u32,
     nodes: []format.NodeHot,
-    admin_ids: ?[]const graph.admin.Id,
+    shared: *const Shared,
     options: Options,
     result: anyerror!void = {},
 
@@ -1533,18 +1570,31 @@ const NodeEnhanceJob = struct {
             for (self.tiles.nodes(tile), 0..) |id, j| {
                 try checkDeadline(deadline, j);
                 const node = &self.nodes[id];
-                const override = if (self.options.admin_drive_side) |admin|
-                    admin.resolve(admin.context, self.network.coordinates[id])
-                else
-                    null;
-                const admin_side: ?edge_class.DriveSide = if (self.options.admin_index) |index| side: {
-                    const area = (try index.region(self.admin_ids.?[id])) orelse break :side null;
-                    break :side if (area.attr.drive_on_right) .right else .left;
-                } else null;
-                node.attr.drive_on_left = (override orelse admin_side orelse self.options.drive_side) == .left;
+                node.attr.drive_on_left = (try self.shared.adminDriveOnLeft(id, &self.options)) orelse
+                    try self.wayDriveOnLeft(id);
                 node.attr.intersection = try enhance.intersection(self.network, id, deadline);
             }
         }
+    }
+
+    fn wayDriveOnLeft(self: *const NodeEnhanceJob, node: u32) !bool {
+        // With admin lookup disabled, Valhalla retains the driving side of
+        // the last physical edge in incident order at the junction.
+        const first = self.network.canonical(node);
+        const end = try self.network.endAlias(first, self.options.deadline);
+        const topo = self.shared.topology;
+        const start = topo.first_edge[first];
+        var i = topo.first_edge[end];
+        while (i > start) {
+            i -= 1;
+            try checkDeadline(self.options.deadline, i);
+            const slot = self.network.walk_order[i];
+            if (self.network.classes[topo.output.data[slot].cls.class_id].flags.node_connector) continue;
+            const segment = self.shared.segments[topo.slot_refs.data[slot] / 2];
+            const way = self.shared.ways.get(segment.way_id) orelse return error.MissingWayAttributes;
+            return way.attr.drive_on_left;
+        }
+        return (self.options.drive_side orelse .right) == .left;
     }
 };
 
@@ -1683,7 +1733,7 @@ noinline fn enhanceGraph(gpa: Allocator, shared: *const Shared, plan: *const Lay
                 .tiles = tiles,
                 .active = active[active.len * i / count .. active.len * (i + 1) / count],
                 .nodes = topo.nodes,
-                .admin_ids = shared.admin_ids,
+                .shared = shared,
                 .options = options,
             };
         }

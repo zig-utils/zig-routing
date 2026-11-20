@@ -461,6 +461,7 @@ fn buildGraph(ctx: *Context) !u8 {
         .infer_turn_channels = loaded.config.mjolnir.data_processing.infer_turn_channels,
         .infer_internal_intersections = loaded.config.mjolnir.data_processing.infer_internal_intersections,
         .apply_country_overrides = loaded.config.mjolnir.data_processing.apply_country_overrides,
+        .use_admin_db = loaded.config.mjolnir.data_processing.use_admin_db,
         .drive_side = side,
         .order = order,
         .workers = (try unsigned(ctx, usize, "threads")) orelse settings.threads orelse configured.threads,

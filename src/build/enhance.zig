@@ -36,11 +36,11 @@ pub const Network = struct {
     /// Empty for graphs without aliases. Otherwise indexed by physical node ID.
     aliases: []const u32 = &.{},
 
-    fn canonical(self: Network, node: u32) u32 {
+    pub fn canonical(self: Network, node: u32) u32 {
         return if (self.aliases.len == 0) node else self.aliases[node];
     }
 
-    fn endAlias(self: Network, first: u32, deadline: io.Deadline) !u32 {
+    pub fn endAlias(self: Network, first: u32, deadline: io.Deadline) !u32 {
         var end = first + 1;
         if (self.aliases.len == 0) return end;
         while (end < self.aliases.len and self.aliases[end] == first) : (end += 1) {

@@ -818,3 +818,20 @@ pub fn turnNames(arena: Allocator, us: bool) !gurka.Map {
         }),
     }});
 }
+
+pub fn drivingSide(arena: Allocator) !gurka.Map {
+    const layout = try gurka.mapToCoordinates("A----B----C", 30);
+    return gurka.Map.init(arena, layout, &.{
+        .{ .label = "AB", .tags = &.{
+            .{ .key = "highway", .value = "primary" },
+            .{ .key = "driving_side", .value = "left" },
+            .{ .key = "shoulder:right", .value = "yes" },
+            .{ .key = "cycleway:left", .value = "track" },
+            .{ .key = "cycleway:right", .value = "lane" },
+        } },
+        .{ .label = "BC", .tags = &.{
+            .{ .key = "highway", .value = "tertiary" },
+            .{ .key = "driving_side", .value = "right" },
+        } },
+    }, &.{}, &.{});
+}

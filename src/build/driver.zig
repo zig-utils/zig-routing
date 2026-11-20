@@ -29,6 +29,7 @@ pub const Options = struct {
     infer_turn_channels: ?bool = null,
     infer_internal_intersections: ?bool = null,
     apply_country_overrides: ?bool = null,
+    use_admin_db: ?bool = null,
     drive_side: ?@import("edge_class.zig").DriveSide = null,
     order: ?graph.format.OrderingKind = null,
     workers: usize = 0,
@@ -74,14 +75,15 @@ const Inputs = struct {
     infer_turn_channels: bool = true,
     infer_internal_intersections: bool = true,
     apply_country_overrides: bool = true,
-    drive_side: @import("edge_class.zig").DriveSide,
+    use_admin_db: bool = true,
+    drive_side: ?@import("edge_class.zig").DriveSide = null,
     order: graph.format.OrderingKind,
 
     fn identity(self: Inputs) graph.format.DatasetUuid {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        // Link classification changes the way attributes and classes saved in checkpoints.
-        hash.update("zr-build-v2");
-        hash.update(&.{ @intFromBool(self.dem_dir != null), @backingInt(self.drive_side) });
+        // Driving side changes both the checkpointed way attributes and the graph.
+        hash.update("zr-build-v3");
+        hash.update(&.{ @intFromBool(self.dem_dir != null), if (self.drive_side) |side| @as(u8, @backingInt(side)) else 2 });
         hash.update(@tagName(self.order));
         if (self.dem_digest) |digest| {
             hash.update("dem-bytes-v1");
@@ -105,6 +107,7 @@ const Inputs = struct {
         if (!self.infer_turn_channels) hash.update("turn-channels-off");
         if (!self.infer_internal_intersections) hash.update("internal-intersections-off");
         if (!self.apply_country_overrides) hash.update("country-overrides-off");
+        if (!self.use_admin_db) hash.update("admin-lookup-off");
         for (self.sources) |source| {
             hash.update(std.mem.asBytes(&source.digest.bytes));
             hash.update(std.mem.asBytes(&source.digest.xxh3));
@@ -145,7 +148,8 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
         .infer_turn_channels = options.infer_turn_channels orelse true,
         .infer_internal_intersections = options.infer_internal_intersections orelse true,
         .apply_country_overrides = options.apply_country_overrides orelse true,
-        .drive_side = options.drive_side orelse .right,
+        .use_admin_db = options.use_admin_db orelse true,
+        .drive_side = options.drive_side,
         .order = options.order orelse .hilbert,
     };
     if (previous != null) try checkOptions(a, &inputs, options, diagnostic);
@@ -217,6 +221,7 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
         .infer_turn_channels = inputs.infer_turn_channels,
         .infer_internal_intersections = inputs.infer_internal_intersections,
         .apply_country_overrides = inputs.apply_country_overrides,
+        .use_admin_db = inputs.use_admin_db,
         .timezone_source = if (timezone_mappings) |mapped| .{ .boundaries = mapped.boundaries.bytes, .rules = mapped.rules.bytes } else null,
     };
     if (session.runs(.read)) {
@@ -417,6 +422,7 @@ fn checkOptions(a: Allocator, inputs: *Inputs, options: Options, diagnostic: *Di
     if (options.infer_turn_channels) |infer| if (infer != inputs.infer_turn_channels) return error.CheckpointInputMismatch;
     if (options.infer_internal_intersections) |infer| if (infer != inputs.infer_internal_intersections) return error.CheckpointInputMismatch;
     if (options.apply_country_overrides) |apply| if (apply != inputs.apply_country_overrides) return error.CheckpointInputMismatch;
+    if (options.use_admin_db) |use_admin_db| if (use_admin_db != inputs.use_admin_db) return error.CheckpointInputMismatch;
     if (options.timezone_geojson) |path| {
         const expected = if (inputs.timezones) |input| input.boundaries else return error.CheckpointInputMismatch;
         const actual = try fingerprintFile(path, options.deadline, diagnostic);
@@ -483,7 +489,7 @@ fn buildSegments(session: *checkpoint.Session, metadata: *assemble.Metadata, inp
         try edges.saveUsage(&tx, &referenced, .usage_directory, .usage_leaves);
         var restrictions: turn_restrictions.Catalog = .{ .a = gpa, .deadline = deadline };
         defer restrictions.deinit();
-        if (try admin_index.build(gpa, source, deadline, true, &restrictions)) |compiled| {
+        if (try admin_index.build(gpa, source, deadline, graph_options.use_admin_db, &restrictions)) |compiled| {
             var index = compiled;
             defer index.deinit();
             try admin_index.save(index.view, &tx);

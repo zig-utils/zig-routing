@@ -265,7 +265,7 @@ test "assembled turn rows use opposing locals, shared names and class-based stop
         .{ .label = "BE", .tags = &.{.{ .key = "highway", .value = "residential" }} },
     }, &.{.{ .label = "B", .tags = &.{.{ .key = "highway", .value = "traffic_signals" }} }}, &.{});
 
-    var result = try Built.assemble(fixture.osm, 4);
+    var result = try Built.assembleWithOptions(fixture.osm, .{ .scratch_dir = "", .workers = 4, .drive_side = .right });
     defer result.deinit();
     const view = &result.bundle.view;
     try checkOpposites(view, 8);
@@ -478,6 +478,7 @@ test "enhancer recognizes a motorway-link fork and resolves node driving side" {
     var result = try Built.assembleWithOptions(fixture.osm, .{
         .scratch_dir = "",
         .workers = 2,
+        .drive_side = .right,
         .admin_drive_side = .{ .context = &junction, .resolve = Hook.driveSide },
     });
     defer result.deinit();
@@ -676,7 +677,7 @@ test "locate correlates junctions, projects mid-edge, and preserves heading and 
         .{ .label = "AD", .tags = road },
         .{ .label = "CD", .tags = road },
     }, &.{}, &.{});
-    var built = try Built.assemble(fixture.osm, 1);
+    var built = try Built.assembleWithOptions(fixture.osm, .{ .scratch_dir = "", .workers = 1, .drive_side = .right });
     defer built.deinit();
     const view = &built.bundle.view;
     const snap = routing.snap.candidates;
@@ -1546,6 +1547,31 @@ test "assembled admin assignments follow stitched boundaries, holes and islands"
     try testing.expectEqualStrings("TST", (try view.adminAt(.init(2, 44.6), .none)).state_iso);
     try testing.expectEqualStrings("GB", (try view.adminAt(.init(4, 44.6), .none)).country_iso);
     try testing.expectEqualStrings("", (try view.adminAt(.init(4, 45.1), .none)).country_iso);
+}
+
+test "driving side follows admin mode, tagged ways and the configured fallback" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const fixture = try @import("examples.zig").drivingSide(arena.allocator());
+    const cases = [_]struct { options: build.assemble.Options, left: [3]bool, forward_left: bool }{
+        .{ .options = .{ .scratch_dir = "" }, .left = .{ true, true, true }, .forward_left = true },
+        .{ .options = .{ .scratch_dir = "", .drive_side = .right }, .left = .{ false, false, false }, .forward_left = false },
+        .{ .options = .{ .scratch_dir = "", .use_admin_db = false }, .left = .{ true, false, false }, .forward_left = true },
+    };
+    for (cases) |case| {
+        var result = try Built.assembleWithOptions(fixture.osm, case.options);
+        defer result.deinit();
+        const view = &result.bundle.view;
+        for ([_][]const u8{ "A", "B", "C" }, case.left) |label, expected| {
+            const node = try at(view, fixture.findNode(label).?.location.toFixed());
+            try testing.expectEqual(expected, (try view.node(node)).attr.drive_on_left);
+        }
+        const arc = try view.edge(try directedBetween(view, &fixture, "A", "B"));
+        const forward = try view.class(arc.cls.class_id);
+        const cycle_lane: graph.constants.CycleLane = if (case.forward_left) .separated else .dedicated;
+        try testing.expectEqual(@backingInt(cycle_lane), forward.category.cycle_lane);
+        try testing.expectEqual(!case.forward_left, forward.flags.shoulder);
+    }
 }
 
 test "assembled motor vehicle limits follow the original way direction" {

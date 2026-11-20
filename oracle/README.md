@@ -211,14 +211,19 @@ masks, country-crossing flag and source node's driving side exactly.
 | Netherlands-Belgium Gurka fixture | 10 | 0 | 0 |
 | Pinned Amsterdam fixture | 178 | 42 | 0 |
 | Liechtenstein | 15,760 | 4,546 | 0 |
+| Utrecht | 85,336 | 12,650 | 0 |
+| Luxembourg 260101 | 475,332 | 114,448 | 0 |
 
-The pinned Utrecht extract has 85,336 paired edges and no assigned admins.
-The native builder uses the configured driving side for unassigned nodes.
-Valhalla 3.9.3 with its admin database enabled uses left for those nodes.
-On this extract, 85,266 pairs agree on both access masks. The other 70 are
-motorroads that Valhalla downgrades below primary during link reclassification
-before it applies country rules. All 85,336 pairs agree on access when both
-builders disable country overrides. Link reclassification is tracked in #118.
+Country overrides were enabled for all comparisons. Utrecht includes the
+70 motorroad arcs whose access depends on the reclassified link class.
+The Luxembourg comparison leaves four directions unpaired because their
+short shapes have multiple possible matches at E6 precision.
+
+With admin lookup enabled, both builders use left for unassigned Utrecht
+nodes. The driving-side fixture verifies eight directed arcs with lookup
+enabled and disabled. It also compares the directed shoulder and cycle
+lane fields. Generate it with
+`zig build gurka-pbf -- input.osm.pbf driving-side`.
 
 The fixtures derive from OpenStreetMap data © OpenStreetMap contributors, under the
 [Open Database License](https://www.openstreetmap.org/copyright).
@@ -533,8 +538,15 @@ the dead-end flag from their destination. Low-class edges use Valhalla's not-thr
 walk with its 256-expansion limit and local order. The walk uses a scratch ordering
 and the CSR edge indices stay in segment encounter order. Co-located aliases contribute
 to their logical junction and synthetic connectors carry no dead-end or not-thru flag.
-The per-node driving side defaults to the build option and can be overridden through
-the admin resolver hook.
+With admin lookup enabled, the admin region supplies the driving side.
+Unassigned nodes use Valhalla's left fallback, with an optional native
+`--drive-side` override. With `mjolnir.data_processing.use_admin_db` set to
+`false`, ways use `driving_side` and untagged ways use the right fallback
+or the explicit build option. A junction takes the side of the last real
+edge in Valhalla's incident order. Directed shoulders and cycle lanes use
+the source side. Build checkpoints retain the lookup mode and fallback.
+The updated build identity requires a fresh work directory for older
+checkpoints.
 
 Against pinned Valhalla 3.9.3 tiles stopped after Enhance, all 6,280 Liechtenstein
 node densities and road-length inputs matched. With the full oracle, 1,600 seeded

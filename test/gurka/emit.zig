@@ -22,6 +22,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, name, "signs")) break :blk try examples.signs(arena);
         if (std.mem.eql(u8, name, "turn-names-us")) break :blk try examples.turnNames(arena, true);
         if (std.mem.eql(u8, name, "turn-names-ca")) break :blk try examples.turnNames(arena, false);
+        if (std.mem.eql(u8, name, "driving-side")) break :blk try examples.drivingSide(arena);
         if (std.meta.stringToEnum(examples.LinkCase, name)) |scenario| break :blk try examples.links(arena, scenario);
         if (std.mem.eql(u8, name, "timed-turns")) break :blk try examples.timedTurns(arena, false);
         return error.UnknownFixture;
