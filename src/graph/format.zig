@@ -115,13 +115,14 @@ pub const SectionKind = enum(u32) {
     turn_restrictions = 19,
     restriction_automaton = 20,
     restriction_conditions = 21,
+    signs = 22,
 
     pub fn placement(kind: SectionKind) Placement {
         return switch (kind) {
             .nodes, .edges, .first_edge, .turns, .classes, .turn_sides => .hot,
             .coordinates, .spatial, .components, .metadata, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules => .warm,
             .turn_restrictions, .restriction_automaton, .restriction_conditions => .warm,
-            .cold_idx, .cold, .slopes => .cold,
+            .cold_idx, .cold, .slopes, .signs => .cold,
         };
     }
 
@@ -148,6 +149,7 @@ pub const SectionKind = enum(u32) {
             .turn_restrictions => "turn_restrictions.bin",
             .restriction_automaton => "restr.bin",
             .restriction_conditions => "restr_domains.bin",
+            .signs => "signs.bin",
         };
     }
 
@@ -171,6 +173,7 @@ pub const SectionKind = enum(u32) {
             .turn_restrictions => turn_restrictions.Entry,
             .restriction_automaton => restriction_automaton.State,
             .restriction_conditions => restriction_automaton.Condition,
+            .signs => @import("signs.zig").Entry,
         };
     }
 
@@ -406,7 +409,7 @@ const PayloadWriter = struct {
             if (self.deadline.expired()) return error.DeadlineExceeded;
             const chunk = remaining[0..@min(1024 * 1024, remaining.len)];
             try self.file.pwriteAll(chunk, self.offset);
-            self.hash.update(chunk);
+            io.updateFileHash(&self.hash, chunk);
             self.offset += chunk.len;
             remaining = remaining[chunk.len..];
         }

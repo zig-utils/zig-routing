@@ -17,6 +17,7 @@ pub const range_manifest = @import("range_manifest.zig");
 pub const reader = @import("reader.zig");
 pub const class_table = @import("class_table.zig");
 pub const cold = @import("cold.zig");
+pub const signs = @import("signs.zig");
 pub const spatial = @import("spatial.zig");
 
 test {

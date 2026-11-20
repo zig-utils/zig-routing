@@ -168,6 +168,12 @@ pub const Cursor = struct {
     used: [decoded_cache]bool = @splat(false),
     replace: usize = 0,
 
+    pub fn reset(self: *Cursor) void {
+        @memset(&self.directory, .{});
+        @memset(&self.used, false);
+        self.replace = 0;
+    }
+
     pub fn lookup(self: *Cursor, store: Store, id: i64, deadline: io.Deadline) !?Location {
         if (deadline.expired()) return error.DeadlineExceeded;
         const key = keyFor(id);

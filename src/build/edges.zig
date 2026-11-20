@@ -172,7 +172,7 @@ pub fn generate(
     const requested = if (options.workers == 0) std.Thread.getCpuCount() catch 1 else options.workers;
     const workers = try gpa.alloc(Worker, @min(requested, max_workers));
     defer gpa.free(workers);
-    for (workers) |*worker| worker.* = .{ .cuts = cuts.cursor() };
+    for (workers) |*worker| worker.init(cuts);
     defer for (workers) |*worker| worker.deinit(gpa);
     const Pass = StreamPass(@TypeOf(context), consumeWay);
     var pass: Pass = .{
@@ -244,12 +244,12 @@ pub fn saveUsage(tx: *checkpoint.Transaction, store: *usage.Usage, directory: ch
     try tx.stash(leaves, frozen.leaves);
 }
 
-pub fn loadUsage(saved: checkpoint.Existing, scratch: []const u8, directory: checkpoint.Artifact, leaves: checkpoint.Artifact, deadline: io.Deadline) !usage.Usage {
+pub fn loadUsage(out: *usage.Usage, saved: checkpoint.Existing, scratch: []const u8, directory: checkpoint.Artifact, leaves: checkpoint.Artifact, deadline: io.Deadline) !void {
     const leaf = try loadUsageFile(saved, scratch, leaves, null, deadline);
     errdefer leaf.close();
     const dir = try loadUsageFile(saved, scratch, directory, try usage.Usage.maxDirectoryBranches(leaf), deadline);
     errdefer dir.close();
-    return usage.Usage.reopen(dir, leaf);
+    try out.reopen(dir, leaf);
 }
 
 fn loadUsageFile(saved: checkpoint.Existing, scratch: []const u8, key: checkpoint.Artifact, max_branches: ?u64, deadline: io.Deadline) !io.File {
@@ -365,9 +365,11 @@ pub const Preparation = struct {
     }
 
     pub fn loadCuts(self: *Preparation, saved: checkpoint.Existing) !void {
-        const cuts = try loadUsage(saved, self.options.scratch_dir, .cuts_directory, .cuts_leaves, self.options.deadline);
-        self.cuts.deinit();
-        self.cuts = cuts;
+        const old_dir = self.cuts.dir;
+        const old_leaves = self.cuts.leaves;
+        try loadUsage(&self.cuts, saved, self.options.scratch_dir, .cuts_directory, .cuts_leaves, self.options.deadline);
+        old_leaves.close();
+        old_dir.close();
     }
 
     pub fn deinit(self: *Preparation) void {
@@ -457,19 +459,36 @@ const Candidate = struct {
 
 const Worker = struct {
     cuts: usage.Usage.Cursor,
-    cursor: node_store.Cursor = .{},
-    scratch: tags.Scratch = .{},
-    refs: Refs = .empty,
-    last: Occurrences = .empty,
-    locations: std.ArrayList(?node_store.Location) = .empty,
-    doubled_back: std.ArrayList(bool) = .empty,
-    ways: std.ArrayList(WayRecord) = .empty,
-    edges: std.ArrayList(Edge) = .empty,
-    shapes: std.ArrayList(Point) = .empty,
-    candidates: std.ArrayList(Candidate) = .empty,
-    road_occurrences: std.ArrayList(culdesac.Occurrence) = .empty,
-    stats: Stats = .{},
-    result: anyerror!void = {},
+    cursor: node_store.Cursor,
+    scratch: tags.Scratch,
+    refs: Refs,
+    last: Occurrences,
+    locations: std.ArrayList(?node_store.Location),
+    doubled_back: std.ArrayList(bool),
+    ways: std.ArrayList(WayRecord),
+    edges: std.ArrayList(Edge),
+    shapes: std.ArrayList(Point),
+    candidates: std.ArrayList(Candidate),
+    road_occurrences: std.ArrayList(culdesac.Occurrence),
+    stats: Stats,
+    result: anyerror!void,
+
+    fn init(self: *Worker, cuts: usage.Usage.View) void {
+        cuts.initCursor(&self.cuts);
+        self.cursor.reset();
+        self.scratch = .{};
+        self.refs = .empty;
+        self.last = .empty;
+        self.locations = .empty;
+        self.doubled_back = .empty;
+        self.ways = .empty;
+        self.edges = .empty;
+        self.shapes = .empty;
+        self.candidates = .empty;
+        self.road_occurrences = .empty;
+        self.stats = .{};
+        self.result = {};
+    }
 
     fn deinit(self: *Worker, gpa: Allocator) void {
         self.refs.deinit(gpa);

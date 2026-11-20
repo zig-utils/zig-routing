@@ -113,6 +113,19 @@ fn fuzzGraphBundle(baseline: *const graph.reader.Files, s: *Smith) !void {
             var limits = record.restrictions();
             while (limits.next()) |limit| try std.testing.expect(limit.valid());
         } else |_| {}
+        if (view.signs) |sign_section| {
+            const lists = [_][]const graph.signs.Entry{
+                graph.signs.signsForEdge(&view, edge) catch &.{},
+                graph.signs.signsForNode(&view, @fromBackingInt(id)) catch &.{},
+            };
+            for (lists) |list| {
+                if (list.len == 0) continue;
+                try expectBorrowed(std.mem.sliceAsBytes(sign_section), std.mem.sliceAsBytes(list));
+                if (view.cold_data) |table| {
+                    for (list) |entry| _ = entry.text(table) catch continue;
+                }
+            }
+        }
         _ = view.edgeSlopes(edge) catch null;
         if (view.shape(edge, gpa)) |shape| gpa.free(shape) else |_| {}
         if (view.names(edge)) |names| {

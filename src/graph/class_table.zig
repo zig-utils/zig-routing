@@ -57,7 +57,8 @@ pub const EdgeClass = extern struct {
         country_crossing: bool = false,
         tagged_speed: bool = false,
         node_connector: bool = false,
-        reserved: u4 = 0,
+        sign: bool = false,
+        reserved: u3 = 0,
     } = .{},
     restrictions: packed struct(u32) {
         start: u16 = 0,

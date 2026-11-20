@@ -34,11 +34,10 @@ comptime {
 }
 
 const Slot = struct {
-    key: u64 = 0,
-    page: u64 = 0,
-    known: bool = false,
-    dirty: bool = false,
-    data: Leaf = .{},
+    key: u64,
+    page: u64,
+    dirty: bool,
+    data: Leaf,
 };
 
 const Bits = struct {
@@ -65,10 +64,13 @@ pub fn keyFor(id: i64) u64 {
 pub const Usage = struct {
     dir: io.File,
     leaves: io.File,
-    branches: u64 = 1,
-    pages: u64 = 0,
-    cache: [cache_size]Slot = @splat(.{}),
-    path: [levels - 1]CachedBranch = @splat(.{}),
+    branches: u64,
+    pages: u64,
+    // Empty slots have no payload to initialize. The bitmap also guards
+    // slots whose reads failed partway through a disk operation.
+    known: std.StaticBitSet(cache_size),
+    cache: [cache_size]Slot,
+    path: [levels - 1]CachedBranch,
 
     pub fn init(scratch_dir: []const u8) !Usage {
         const dir = try io.File.temporary(scratch_dir);
@@ -76,16 +78,27 @@ pub const Usage = struct {
         const leaves = try io.File.temporary(scratch_dir);
         errdefer leaves.close();
         try dir.pwriteAll(std.mem.asBytes(&empty_branch), 0);
-        return .{ .dir = dir, .leaves = leaves };
+        var result: Usage = undefined;
+        result.initialize(dir, leaves, 1, 0);
+        return result;
     }
 
     /// Transfer ownership of writable checkpoint copies.
-    pub fn reopen(dir: io.File, leaves: io.File) !Usage {
+    pub fn reopen(self: *Usage, dir: io.File, leaves: io.File) !void {
         const dir_bytes = try dir.size();
         const leaf_bytes = try leaves.size();
         if (dir_bytes < @sizeOf(Branch) or dir_bytes % @sizeOf(Branch) != 0 or leaf_bytes % @sizeOf(Leaf) != 0)
             return error.InvalidUsageStore;
-        return .{ .dir = dir, .leaves = leaves, .branches = dir_bytes / @sizeOf(Branch), .pages = leaf_bytes / @sizeOf(Leaf) };
+        self.initialize(dir, leaves, dir_bytes / @sizeOf(Branch), leaf_bytes / @sizeOf(Leaf));
+    }
+
+    fn initialize(self: *Usage, dir: io.File, leaves: io.File, branches: u64, pages: u64) void {
+        self.dir = dir;
+        self.leaves = leaves;
+        self.branches = branches;
+        self.pages = pages;
+        self.known = .empty;
+        @memset(&self.path, .{});
     }
 
     pub fn maxDirectoryBranches(leaves: io.File) !u64 {
@@ -139,8 +152,8 @@ pub const Usage = struct {
         dir: io.File,
         leaves: io.File,
 
-        pub fn cursor(self: View) Cursor {
-            return .{ .usage = .{ .dir = self.dir, .leaves = self.leaves } };
+        pub fn initCursor(self: View, cursor: *Cursor) void {
+            cursor.usage.initialize(self.dir, self.leaves, 1, 0);
         }
     };
 
@@ -172,9 +185,9 @@ pub const Usage = struct {
     }
 
     fn flushAll(self: *Usage, deadline: io.Deadline) !void {
-        for (&self.cache) |*slot| {
+        for (&self.cache, 0..) |*slot, i| {
             if (deadline.expired()) return error.DeadlineExceeded;
-            try self.flush(slot);
+            if (self.known.isSet(i)) try self.flush(slot);
         }
     }
 
@@ -219,20 +232,20 @@ pub const Usage = struct {
     fn get(self: *Usage, key: u64, create: bool) !?*Slot {
         const index = (key ^ (key >> 9) ^ (key >> 18)) % cache_size;
         const slot = &self.cache[index];
-        if (slot.known and slot.key == key) {
+        const known = self.known.isSet(index);
+        if (known and slot.key == key) {
             if (slot.page != 0) return slot;
             if (!create) return null;
         }
         const page = try self.find(key, create);
-        try self.flush(slot);
-        if (page == 0) {
-            slot.* = .{ .key = key, .known = true };
-            return null;
-        }
-        var leaf: Leaf = undefined;
-        try self.leaves.preadAll(std.mem.asBytes(&leaf), (page - 1) * @sizeOf(Leaf));
-        slot.* = .{ .key = key, .page = page, .known = true, .data = leaf };
-        return slot;
+        if (known) try self.flush(slot);
+        self.known.unset(index);
+        if (page != 0) try self.leaves.preadAll(std.mem.asBytes(&slot.data), (page - 1) * @sizeOf(Leaf));
+        slot.key = key;
+        slot.page = page;
+        slot.dirty = false;
+        self.known.set(index);
+        return if (page == 0) null else slot;
     }
 
     fn find(self: *Usage, key: u64, create: bool) !u64 {

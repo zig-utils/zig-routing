@@ -2594,3 +2594,80 @@ test "regional registry snaps and routes in one bundle and rejects cross-bundle 
     try testing.expectEqual(regions[0].bounds, derived.bounds);
     try testing.expectError(error.DeadlineExceeded, registry.snap(&arena, &locations[0], defaults, cost, .{ .at_ns = 0 }));
 }
+
+test "signs preserve exits, forks, directions and named nodes from PBF" {
+    const sign = graph.signs;
+    const Expected = struct { kind: sign.Type, text: []const u8, route: bool = false };
+    const cases: []const struct { from: []const u8, to: []const u8, signs: []const Expected } = &.{
+        .{ .from = "B", .to = "J", .signs = &.{
+            .{ .kind = .exit_number, .text = "5" },
+            .{ .kind = .exit_branch, .text = "I 95" },
+            .{ .kind = .exit_toward, .text = "I 695" },
+            .{ .kind = .exit_toward, .text = "Airport" },
+            .{ .kind = .exit_toward, .text = "Downtown" },
+            .{ .kind = .exit_name, .text = "West Exit" },
+        } },
+        .{ .from = "J", .to = "B", .signs = &.{} },
+        .{ .from = "B", .to = "C", .signs = &.{} },
+        .{ .from = "C", .to = "E", .signs = &.{
+            .{ .kind = .exit_number, .text = "9A" },
+            .{ .kind = .exit_number, .text = "9B" },
+            .{ .kind = .exit_branch, .text = "A 1", .route = true },
+            .{ .kind = .exit_branch, .text = "A 2", .route = true },
+            .{ .kind = .exit_branch, .text = "West Road" },
+            .{ .kind = .exit_branch, .text = " West Spur" },
+            .{ .kind = .exit_toward, .text = "B 7", .route = true },
+            .{ .kind = .exit_toward, .text = "East Road" },
+            .{ .kind = .exit_toward, .text = "Harbour" },
+            .{ .kind = .exit_toward, .text = "Parks" },
+            .{ .kind = .exit_toward, .text = "Harbour" },
+            .{ .kind = .exit_name, .text = "East Exit" },
+            .{ .kind = .exit_name, .text = "Clover Junction" },
+        } },
+        .{ .from = "D", .to = "F", .signs = &.{.{ .kind = .guide_toward, .text = "Museum" }} },
+        .{ .from = "F", .to = "D", .signs = &.{.{ .kind = .guide_toward, .text = "Old Town" }} },
+        .{ .from = "G", .to = "H", .signs = &.{
+            .{ .kind = .exit_branch, .text = "M 2", .route = true },
+            .{ .kind = .exit_toward, .text = "Coast" },
+        } },
+        .{ .from = "G", .to = "I", .signs = &.{.{ .kind = .exit_toward, .text = "Hills" }} },
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const fixture = try @import("examples.zig").signs(arena.allocator());
+    var result = try Built.assemble(fixture.osm, 4);
+    defer result.deinit();
+    const view = &result.bundle.view;
+    try view.verify(.none, null);
+    for (cases) |case| {
+        const from = try at(view, fixture.findNode(case.from).?.location.toFixed());
+        const to = try at(view, fixture.findNode(case.to).?.location.toFixed());
+        const range = try view.outEdgeRange(from);
+        const id: format.EdgeId = for (range.first..range.end) |slot| {
+            if (view.edges[slot].head == @backingInt(to)) break @fromBackingInt(@as(u32, @intCast(slot)));
+        } else return error.MissingTestEdge;
+        try testing.expectEqual(case.signs.len != 0, try sign.hasSigns(view, id));
+        const rows = try sign.signsForEdge(view, id);
+        try testing.expectEqual(case.signs.len, rows.len);
+        for (rows, case.signs) |row, expected| {
+            try testing.expectEqual(expected.kind, row.attr.sign_type);
+            try testing.expectEqual(expected.route, row.attr.route_number);
+            try testing.expect(!row.attr.tagged);
+            try testing.expectEqualStrings(expected.text, try row.text(view.cold_data.?));
+        }
+    }
+    const junction = try at(view, fixture.findNode("D").?.location.toFixed());
+    const junction_signs = try sign.signsForNode(view, junction);
+    try testing.expectEqual(2, junction_signs.len);
+    for (junction_signs, [_][]const u8{ "Central Crossing", "North Crossing" }) |row, expected| {
+        try testing.expectEqual(sign.Type.junction_name, row.attr.sign_type);
+        try testing.expectEqualStrings(expected, try row.text(view.cold_data.?));
+    }
+    const toll = try at(view, fixture.findNode("F").?.location.toFixed());
+    const toll_signs = try sign.signsForNode(view, toll);
+    try testing.expectEqual(1, toll_signs.len);
+    try testing.expectEqual(sign.Type.toll_name, toll_signs[0].attr.sign_type);
+    try testing.expectEqualStrings("River Toll", try toll_signs[0].text(view.cold_data.?));
+    const exit = try at(view, fixture.findNode("B").?.location.toFixed());
+    try testing.expectEqual(0, (try sign.signsForNode(view, exit)).len);
+}

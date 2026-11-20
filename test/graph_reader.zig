@@ -69,6 +69,16 @@ test "mapped records have checked typed accessors and offline checksums" {
     try testing.expectEqual(3, (try view.class(edges[0].cls.class_id)).access.forward);
     try testing.expectEqual(7, (try view.class(edges[1].cls.class_id)).access.forward);
     try testing.expectError(error.InvalidClassId, view.class(2));
+    const sign_api = routing.graph.signs;
+    try testing.expect(try sign_api.hasSigns(view, @fromBackingInt(0)));
+    try testing.expect(!try sign_api.hasSigns(view, @fromBackingInt(1)));
+    const edge_signs = try sign_api.signsForEdge(view, @fromBackingInt(0));
+    const node_signs = try sign_api.signsForNode(view, @fromBackingInt(0));
+    try testing.expectEqual(1, edge_signs.len);
+    try testing.expectEqual(1, node_signs.len);
+    try testing.expect(edge_signs[0].attr.route_number and node_signs[0].attr.tagged);
+    try testing.expectEqualStrings("Main", try edge_signs[0].text(view.cold_data.?));
+    try testing.expectEqualStrings("Main", try node_signs[0].text(view.cold_data.?));
     const slopes = try view.edgeSlopes(@fromBackingInt(@as(u32, 1)));
     try testing.expectEqual(15, slopes.maxUp());
     try testing.expectEqual(-24, slopes.maxDown());
@@ -83,6 +93,7 @@ test "mapped records have checked typed accessors and offline checksums" {
 
     const dir = try fixture.root.child("bundle");
     defer dir.close();
+    try dir.deleteFile(format.SectionKind.signs.filename());
     try dir.deleteFile(format.SectionKind.classes.filename());
     var topology = try reader.Bundle.open(fixture.path(&buf));
     defer topology.close();
@@ -133,6 +144,7 @@ test "cold sections are optional as a pair and reject unsafe indexes and offsets
     try dir.deleteFile(format.SectionKind.cold.filename());
     try testing.expectError(error.MissingSection, reader.Bundle.open(path_name));
     try dir.deleteFile(format.SectionKind.cold_idx.filename());
+    try dir.deleteFile(format.SectionKind.signs.filename());
     var bundle = try reader.Bundle.open(path_name);
     defer bundle.close();
     try testing.expectError(error.MissingColdData, bundle.view.wayId(first));

@@ -28,6 +28,9 @@ const mode_turns = @import("../graph/turn_restrictions.zig");
 const automaton = @import("../graph/restriction_automaton.zig");
 const automaton_builder = @import("restriction_automaton.zig");
 const conditional_access = @import("conditional_access.zig");
+const sign_build = @import("signs.zig");
+const grid = @import("../geo/grid.zig");
+const radix = @import("../infra/radix.zig");
 
 const Allocator = std.mem.Allocator;
 const max_degree = turns.max_degree;
@@ -130,7 +133,9 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
         .segments = segments,
         .shape_points = shape_points,
         .ways = &metadata.ways,
+        .metadata = &metadata,
         .admin_ids = if (admin_ids) |ids| ids.data else null,
+        .admin_index = options.admin_index,
         .countries = country_table,
         .apply_country_overrides = options.apply_country_overrides,
         .deadline = options.deadline,
@@ -165,7 +170,7 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     if (options.timezone_source) |source_tz| try writeTimezones(gpa, writer, source_tz, topology.coordinates, options.scratch_dir);
     const topology_ns = timer.read();
     const means: []const i16 = if (terrain) |*present| present.means.data else &.{};
-    const cold_bytes = try buildCold(gpa, &shared, &metadata, writer, options.scratch_dir, means);
+    const cold_bytes = try buildCold(gpa, &shared, &metadata, &plan, table.classes, writer, options.scratch_dir, means);
     const spatial = try buildSpatial(gpa, &shared, writer, options.scratch_dir, options.workers);
     const bundle_metadata = [_]format.Metadata{.{
         .ordering_kind = @backingInt(options.ordering.kind),
@@ -194,7 +199,7 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
 /// section writers are used by build() for ephemeral callers.
 pub fn buildStaged(
     session: *checkpoint.Session,
-    metadata: *const Metadata,
+    metadata: *Metadata,
     source_stats: edges.Stats,
     edge_file: io.File,
     shape_file: io.File,
@@ -250,7 +255,9 @@ pub fn buildStaged(
         .segments = segments,
         .shape_points = points,
         .ways = &metadata.ways,
+        .metadata = metadata,
         .admin_ids = if (admin_ids) |ids| ids.data else null,
+        .admin_index = options.admin_index,
         .countries = country_table,
         .apply_country_overrides = options.apply_country_overrides,
         .deadline = options.deadline,
@@ -332,7 +339,7 @@ pub fn buildStaged(
     }
     if (session.endsAt(.turns)) return;
 
-    if (session.runs(.cold)) try saveColdStage(session, &shared, metadata, edge_classes.?, &options, plan.order_hash);
+    if (session.runs(.cold)) try saveColdStage(session, &shared, metadata, &plan, edge_classes.?, &options);
     if (session.endsAt(.cold)) return;
 
     if (session.runs(.spatial)) {
@@ -349,7 +356,7 @@ pub fn buildStaged(
 }
 
 // Each section is copied into the stage's own transaction before publishing it.
-noinline fn saveColdStage(session: *checkpoint.Session, shared: *const Shared, metadata: *const Metadata, edge_classes: []const classes.EdgeClass, options: *const Options, order_hash: u64) !void {
+noinline fn saveColdStage(session: *checkpoint.Session, shared: *const Shared, metadata: *Metadata, plan: *const Layout, edge_classes: []const classes.EdgeClass, options: *const Options) !void {
     const gpa = session.gpa;
     const start = io.Timer.start();
     var tx = try session.begin(.cold);
@@ -396,11 +403,11 @@ noinline fn saveColdStage(session: *checkpoint.Session, shared: *const Shared, m
         defer rows.unmap();
         try writer.write(.restriction_conditions, try checkpoint.array(automaton.Condition, rows));
     }
-    const cold_bytes = try buildCold(gpa, shared, metadata, &writer, options.scratch_dir, means);
+    const cold_bytes = try buildCold(gpa, shared, metadata, plan, edge_classes, &writer, options.scratch_dir, means);
     try tx.writeJson(gpa, cold_bytes, .source_stats);
     try writer.write(.metadata, &.{.{
         .ordering_kind = @backingInt(options.ordering.kind),
-        .order_hash = order_hash,
+        .order_hash = plan.order_hash,
     }});
     try tx.saveSections(&writer);
     try session.commit(&tx, shared.topology.output.data.len / 2, start);
@@ -503,6 +510,7 @@ pub const Metadata = struct {
     access_limits: std.AutoHashMapUnmanaged(i64, std.ArrayList(access_restriction.Entry)) = .empty,
     access_scratch: std.ArrayList(access_restriction.Entry) = .empty,
     conditional: conditional_access.Parser,
+    signs: sign_build.Catalog,
 
     pub fn init(gpa: Allocator, options: Options) Metadata {
         return .{
@@ -511,10 +519,12 @@ pub const Metadata = struct {
             .deadline = options.deadline,
             .strings = .init(gpa),
             .conditional = .init(gpa, options.deadline),
+            .signs = .{ .arena = .init(gpa) },
         };
     }
 
     pub fn saveNodes(self: *const Metadata, tx: *checkpoint.Transaction) !void {
+        try self.signs.saveNodes(tx);
         const file = try tx.create(.node_attributes);
         defer file.close();
         var rows: [2048]NodeEntry = undefined;
@@ -536,6 +546,7 @@ pub const Metadata = struct {
     }
 
     pub fn loadNodes(self: *Metadata, saved: checkpoint.Existing) !void {
+        try self.loadNodeSigns(saved);
         const mapped = try saved.map(.node_attributes, self.deadline);
         defer mapped.unmap();
         for (try checkpoint.array(NodeEntry, mapped), 0..) |entry, i| {
@@ -553,7 +564,12 @@ pub const Metadata = struct {
         }
     }
 
+    pub fn loadNodeSigns(self: *Metadata, saved: checkpoint.Existing) !void {
+        try self.signs.loadNodes(self.gpa, saved, self.deadline);
+    }
+
     pub fn saveWays(self: *const Metadata, tx: *checkpoint.Transaction) !void {
+        try self.signs.saveWays(tx);
         const file = try tx.create(.way_attributes);
         defer file.close();
         var rows: [512]WayEntry = undefined;
@@ -624,6 +640,7 @@ pub const Metadata = struct {
             _ = try self.strings.intern(remaining[0..len]);
             remaining = remaining[len..];
         }
+        try self.signs.loadWays(self.gpa, saved, &self.strings, self.deadline);
         const refs = try saved.map(.name_refs, self.deadline);
         defer refs.unmap();
         for (try checkpoint.array(tags.names.Id, refs), 0..) |id, i| {
@@ -677,6 +694,7 @@ pub const Metadata = struct {
         self.access_limits.deinit(self.gpa);
         self.access_scratch.deinit(self.gpa);
         self.conditional.deinit();
+        self.signs.deinit(self.gpa);
         self.name_ids.deinit(self.gpa);
         self.levels.deinit(self.gpa);
         self.strings.deinit();
@@ -684,6 +702,7 @@ pub const Metadata = struct {
 
     pub fn node(self: *Metadata, id: i64, attrs: tags.NodeAttrs) !void {
         try self.storeControls(id, attrs.flags);
+        try self.signs.addNode(self.gpa, id, attrs);
         const hot: format.NodeHot = .{
             .turn_off = 0,
             .attr = .{
@@ -730,6 +749,7 @@ pub const Metadata = struct {
         const access_masks = try self.wayAccess(id, &attrs.motor_limits, raw_tags);
         for (&pair, access_masks) |*class, modes| class.detail.access_restriction = modes;
         const indexed = try self.strings.indexWay(attrs, raw_tags, .{}, self.deadline);
+        try self.signs.addWay(self.gpa, id, indexed);
         const name_start = try self.nameOffset();
         const ref_first = attrs.road_class == .motorway or attrs.road_class == .trunk;
         if (!ref_first) try self.appendNames(indexed.name.text);
@@ -1157,7 +1177,9 @@ const Shared = struct {
     segments: []const edges.Edge,
     shape_points: []const geo.FixedLL,
     ways: *const Ways,
+    metadata: *const Metadata,
     admin_ids: ?[]const graph.admin.Id = null,
+    admin_index: ?graph.admin.View = null,
     countries: []const country_access.Country = &.{},
     apply_country_overrides: bool = true,
     deadline: io.Deadline,
@@ -1259,6 +1281,8 @@ const Job = struct {
                 const way = shared.ways.get(segment.way_id) orelse return error.MissingWayAttributes;
                 const direction = ref & 1;
                 var class = way.by_direction[direction];
+                if (shared.metadata.signs.ways.count() != 0 or shared.metadata.signs.nodes.count() != 0)
+                    class.flags.sign = (try selectEdgeSigns(shared, @intCast(node), segment, ref, class)) != null;
                 edge_class.applySegmentControls(&class, segment.flags, direction == 0, way.attr.oneway);
                 const to_country = shared.country(opposite.node);
                 class.flags.country_crossing = from_country.iso != 0 and to_country.iso != 0 and from_country.iso != to_country.iso;
@@ -1468,7 +1492,7 @@ const EdgeEnhanceJob = struct {
                         const names = try index.names(self.shared.admin_ids.?[edge.head]);
                         break :region .{ .country = names.country_iso, .state = names.state_iso };
                     } else .{};
-                    const signed = if (class.flags.link) self.hasExitSign(@intCast(slot)) else false;
+                    const signed = class.flags.link and (class.flags.sign or self.hasExitSign(@intCast(slot)));
                     break :configured rules.speed(region, class, density, signed);
                 } else null;
                 const ferry_duration = if (class.category.use == @backingInt(graph.constants.Use.ferry)) ferry: {
@@ -2208,7 +2232,7 @@ fn appendLevels(out: *std.ArrayList(graph.cold.LevelRange), gpa: Allocator, sour
     }
 }
 
-fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *const Metadata, writer: *format.BundleWriter, scratch_dir: []const u8, means: []const i16) !u64 {
+fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *Metadata, plan: *const Layout, edge_classes: []const classes.EdgeClass, writer: *format.BundleWriter, scratch_dir: []const u8, means: []const i16) !u64 {
     const topo = shared.topology;
     var coverage: graph.coverage.Builder = .{};
     try coverage.add(topo.coordinates, writer.deadline);
@@ -2260,7 +2284,119 @@ fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *const Metadata, w
     if (builder.record_count != topo.output.data.len / 2) return error.InvalidColdRecordCount;
     try writer.write(.cold_idx, index.data);
     if (coverage.finish()) |bounds| try writer.write(.coverage, &.{bounds});
+    try writeSigns(gpa, shared, metadata, plan, edge_classes, &builder, writer);
     return builder.write(writer);
+}
+
+noinline fn selectEdgeSigns(shared: *const Shared, node: u32, segment: edges.Edge, ref: u32, raw_class: classes.EdgeClass) !?sign_build.Selection {
+    if (!raw_class.forwardAccess().auto) return null;
+    const catalog = &shared.metadata.signs;
+    const forward = ref & 1 == 0;
+    const tail = if (forward) segment.from else segment.to;
+    const node_tags = catalog.nodes.get(tail) orelse sign_build.NodeTags{};
+    const way_tags: sign_build.WayTags = catalog.ways.get(segment.way_id) orelse way: {
+        if (node_tags.ref.len == 0 and node_tags.exit_to.len == 0 and (node_tags.named or node_tags.name.len == 0)) return null;
+        break :way .{};
+    };
+    const junction = try signJunction(shared, node);
+    const node_type = shared.topology.nodes[node].attr.type;
+    const fork = junction.isFork(node_type == @backingInt(graph.constants.NodeType.motorway_junction));
+    const use: graph.constants.Use = @fromBackingInt(raw_class.category.use);
+    const selection: sign_build.Selection = .init(way_tags, node_tags, &shared.metadata.strings, forward, use, fork);
+    return if (selection.present(junction, raw_class.flags.link, fork)) selection else null;
+}
+
+fn signJunction(shared: *const Shared, node: u32) !sign_build.Junction {
+    const topo = shared.topology;
+    var owner = node;
+    while (topo.groups[owner].has_left) {
+        if (shared.deadline.expired()) return error.DeadlineExceeded;
+        owner -= 1;
+    }
+    var result: sign_build.Junction = .{ .degree = 0 };
+    while (true) : (owner += 1) {
+        if (shared.deadline.expired()) return error.DeadlineExceeded;
+        const group = topo.groups[owner];
+        result.degree += group.real_degree;
+        const first = topo.first_edge[owner];
+        for (topo.slot_refs.data[first..][0..group.real_degree]) |ref| {
+            const seg = shared.segments[ref / 2];
+            const way = shared.ways.get(seg.way_id) orelse return error.MissingWayAttributes;
+            const class = way.by_direction[ref & 1];
+            result.links += @intFromBool(class.flags.link);
+            result.drivable += @intFromBool(class.forwardAccess().auto);
+        }
+        if (!group.has_right) return result;
+    }
+}
+
+const SignSink = struct {
+    rows: std.ArrayList(graph.signs.Entry) = .empty,
+    builder: *ColdBuilder,
+    strings: *tags.names.StringTable,
+    cell: u32 = 0,
+    owner: u32 = 0,
+
+    pub fn add(self: *SignSink, kind: graph.signs.Type, route: bool, text: []const u8) !void {
+        const text_ref = try self.builder.nameRef(try self.strings.intern(text), false);
+        try self.rows.append(self.builder.gpa, .{
+            .cell = self.cell,
+            .owner = self.owner,
+            .text_ref = text_ref,
+            .attr = .{ .sign_type = kind, .route_number = route },
+        });
+    }
+};
+
+noinline fn writeSigns(gpa: Allocator, shared: *const Shared, metadata: *Metadata, plan: *const Layout, edge_classes: []const classes.EdgeClass, builder: *ColdBuilder, writer: *format.BundleWriter) !void {
+    if (metadata.signs.ways.count() == 0 and metadata.signs.nodes.count() == 0) return;
+    const topo = shared.topology;
+    var sink: SignSink = .{ .builder = builder, .strings = &metadata.strings };
+    defer sink.rows.deinit(gpa);
+    // Edges are appended first so equal keys retain edge records before
+    // node records in the stable geographic sort.
+    for (topo.groups, 0..) |group, node| {
+        try checkDeadline(shared.deadline, node);
+        const first = topo.first_edge[node];
+        for (topo.output.data[first..][0..group.real_degree], first..) |edge, slot| {
+            if (!edge_classes[edge.cls.class_id].flags.sign) continue;
+            const ref = topo.slot_refs.data[slot];
+            const seg = shared.segments[ref / 2];
+            const way = shared.ways.get(seg.way_id) orelse return error.MissingWayAttributes;
+            const selection = (try selectEdgeSigns(shared, @intCast(node), seg, ref, way.by_direction[ref & 1])) orelse return error.MissingSignTags;
+            sink.cell = grid.snapCell(topo.coordinates[node].toPoint());
+            sink.owner = @intCast(slot);
+            try selection.write(&sink, shared.deadline);
+        }
+    }
+    for (plan.nodes.items, 0..) |node, i| {
+        try checkDeadline(shared.deadline, i);
+        const source = metadata.signs.nodes.get(node.osm_id) orelse continue;
+        if (!source.named) continue;
+        const toll = node.hot.attr.type == @backingInt(graph.constants.NodeType.toll_booth) or
+            node.hot.attr.type == @backingInt(graph.constants.NodeType.toll_gantry);
+        if (!toll) {
+            const admins = shared.admin_index orelse continue;
+            const region = (try admins.region(shared.admin_ids.?[node.first_alias])) orelse continue;
+            if (!region.attr.allow_intersection_names) continue;
+        }
+        sink.cell = grid.snapCell(node.point.toPoint());
+        const alias_end = node.first_alias + aliasCount(node.degree);
+        for (node.first_alias..alias_end) |id| {
+            try checkDeadline(shared.deadline, id);
+            sink.owner = @intCast(id);
+            try sign_build.writeTokens(source.name, if (toll) .toll_name else .junction_name, false, &sink, shared.deadline);
+        }
+    }
+    if (sink.rows.items.len == 0) return;
+    const scratch = try gpa.alloc(graph.signs.Entry, sink.rows.items.len);
+    defer gpa.free(scratch);
+    try radix.sortByU64(graph.signs.Entry, gpa, sink.rows.items, scratch, {}, signKey, shared.deadline);
+    try writer.write(.signs, sink.rows.items);
+}
+
+fn signKey(_: void, row: graph.signs.Entry) u64 {
+    return row.key();
 }
 
 noinline fn accessForDirections(gpa: Allocator, scratch: *std.ArrayList(access_restriction.Entry), limits: []const access_restriction.Entry, enabled: [2]bool, deadline: io.Deadline) ![]const access_restriction.Entry {

@@ -55,7 +55,7 @@ pub fn transfer(file: io.File, output: ?io.File, deadline: io.Deadline) !Fingerp
         const chunk = buffer[0..n];
         try file.preadAll(chunk, offset);
         if (output) |target| try target.pwriteAll(chunk, offset);
-        digest.update(chunk);
+        io.updateFileHash(&digest, chunk);
         offset += n;
     }
     if (output) |target| try target.truncate(size);
@@ -129,6 +129,9 @@ pub const Artifact = enum {
     restriction_conditions,
     bundle_restriction_conditions,
     simple_turn_domains,
+    way_signs,
+    node_signs,
+    bundle_signs,
 
     fn filename(self: Artifact) [:0]const u8 {
         return switch (self) {
@@ -190,18 +193,29 @@ pub const Manifest = struct {
     }
 
     fn digest(self: *const Manifest) u64 {
-        var hash = std.hash.XxHash3.init(0);
-        hash.update(&self.identity);
-        hash.update(@tagName(self.metric.stage));
-        if (self.parent) |parent| hash.update(std.mem.asBytes(&parent));
-        for (std.enums.values(Artifact)) |artifact| {
+        // The digest covers the same ordered byte stream as the manifests
+        // already on disk. Its maximum size follows the two closed enums.
+        const artifacts = std.enums.values(Artifact);
+        const max_bytes = comptime size: {
+            var bytes = @sizeOf(format.DatasetUuid) + @sizeOf(u64);
+            var stage_bytes = 0;
+            for (std.enums.values(Stage)) |stage| stage_bytes = @max(stage_bytes, @tagName(stage).len);
+            for (artifacts) |artifact| bytes += artifact.filename().len + 2 * @sizeOf(u64);
+            break :size bytes + stage_bytes;
+        };
+        var buffer: [max_bytes]u8 = undefined;
+        var input: io.Writer = .fixed(&buffer);
+        input.writeAll(&self.identity) catch unreachable;
+        input.writeAll(@tagName(self.metric.stage)) catch unreachable;
+        if (self.parent) |parent| input.writeInt(u64, parent, .little) catch unreachable;
+        for (artifacts) |artifact| {
             if (self.files.get(artifact)) |fingerprint| {
-                hash.update(artifact.filename());
-                hash.update(std.mem.asBytes(&fingerprint.bytes));
-                hash.update(std.mem.asBytes(&fingerprint.xxh3));
+                input.writeAll(artifact.filename()) catch unreachable;
+                input.writeInt(u64, fingerprint.bytes, .little) catch unreachable;
+                input.writeInt(u64, fingerprint.xxh3, .little) catch unreachable;
             }
         }
-        return hash.final();
+        return std.hash.XxHash3.hash(0, input.buffered());
     }
 };
 const manifest_name = "manifest.json";

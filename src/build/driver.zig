@@ -253,10 +253,12 @@ noinline fn runAssembly(session: *checkpoint.Session, metadata: *assemble.Metada
     defer source_stats.deinit();
     if (@backingInt(session.from) > @backingInt(Stage.edges)) {
         try metadata.loadWays(prior);
+        const nodes = try session.open(.node_store);
+        defer nodes.close();
         if (session.runs(.order)) {
-            const nodes = try session.open(.node_store);
-            defer nodes.close();
             try metadata.loadNodes(nodes);
+        } else {
+            try metadata.loadNodeSigns(nodes);
         }
     }
     const edge_file = try prior.read(.segments, deadline);
@@ -460,16 +462,18 @@ fn buildSegments(session: *checkpoint.Session, metadata: *assemble.Metadata, inp
     var prep = try edges.Preparation.init(gpa, options, true);
     defer prep.deinit();
 
-    var referenced: ?usage.Usage = null;
-    defer if (referenced) |*store| store.deinit();
+    var referenced: usage.Usage = undefined;
+    var have_referenced = false;
+    defer if (have_referenced) referenced.deinit();
     if (session.runs(.tags)) {
         const start = indexed_at;
         var tx = try session.begin(.tags);
         defer tx.deinit();
         referenced = try usage.Usage.init(session.path);
-        try prep.selectWays(source, &referenced.?);
+        have_referenced = true;
+        try prep.selectWays(source, &referenced);
         try prep.saveTags(&tx);
-        try edges.saveUsage(&tx, &referenced.?, .usage_directory, .usage_leaves);
+        try edges.saveUsage(&tx, &referenced, .usage_directory, .usage_leaves);
         var restrictions: turn_restrictions.Catalog = .{ .a = gpa, .deadline = deadline };
         defer restrictions.deinit();
         if (try admin_index.build(gpa, source, deadline, true, &restrictions)) |compiled| {
@@ -493,7 +497,8 @@ fn buildSegments(session: *checkpoint.Session, metadata: *assemble.Metadata, inp
         try prep.loadTags(tags);
         if (session.runs(.node_store)) {
             try prep.loadCuts(tags);
-            referenced = try edges.loadUsage(tags, session.path, .usage_directory, .usage_leaves, deadline);
+            try edges.loadUsage(&referenced, tags, session.path, .usage_directory, .usage_leaves, deadline);
+            have_referenced = true;
         }
     }
     if (session.endsAt(.tags)) return;
@@ -504,7 +509,7 @@ fn buildSegments(session: *checkpoint.Session, metadata: *assemble.Metadata, inp
         defer tx.deinit();
         const node_file = try tx.create(.node_index);
         defer node_file.close();
-        const store = try prep.collectNodes(source, &referenced.?, node_file, metadata, assemble.Metadata.node);
+        const store = try prep.collectNodes(source, &referenced, node_file, metadata, assemble.Metadata.node);
         try node_file.sync();
         try prep.saveNodes(&tx);
         try metadata.saveNodes(&tx);

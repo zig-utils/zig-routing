@@ -592,6 +592,11 @@ pub const Mapping = struct {
     }
 };
 
+/// Share the bulk XXH3 update kernel across file writes and verification.
+pub noinline fn updateFileHash(hash: *std.hash.XxHash3, chunk: []const u8) void {
+    hash.update(chunk);
+}
+
 /// Bounds- and alignment-checked typed view over raw bytes.
 pub fn typedSlice(comptime T: type, bytes: []const u8, offset: usize, count: usize) Error![]const T {
     const addr = try checkedSliceAddress(bytes, offset, count, @sizeOf(T), @alignOf(T));

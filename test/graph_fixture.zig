@@ -26,7 +26,7 @@ const edges = [_]format.EdgeHot{
 const first_edge = [_]format.FirstEdge{ 0, 1, 2 };
 const turns = [_]format.TurnEntry{ 0xb9, 0x72 };
 const classes = [_]routing.graph.class_table.EdgeClass{
-    .{ .access = .{ .forward = 3, .reverse = 7 } },
+    .{ .access = .{ .forward = 3, .reverse = 7 }, .flags = .{ .sign = true } },
     .{ .access = .{ .forward = 7, .reverse = 3 } },
 };
 const coordinates = [_]format.Coordinate{ .{ .lng = 0, .lat = 0 }, .{ .lng = 100000, .lat = 0 } };
@@ -79,6 +79,10 @@ pub fn records(comptime kind: format.SectionKind) []const kind.Record() {
             .{ .edge = 1, .first = 5, .end = 6, .failure = 1, .attr = .{ .depth = 1, .reverse = true } },
             .{ .edge = 1, .first = 6, .end = 6, .failure = 0, .attr = .{ .depth = 2, .forbidden = 1, .timed = true } },
             .{ .edge = 0, .first = 6, .end = 6, .failure = 1, .attr = .{ .depth = 2, .reverse = true, .forbidden = 1, .timed = true } },
+        },
+        .signs => &.{
+            .{ .cell = 0x7e90b400, .owner = 0, .text_ref = 0, .attr = .{ .sign_type = .exit_branch, .route_number = true } },
+            .{ .cell = 0x7e90b400, .owner = 0, .text_ref = 0, .attr = .{ .sign_type = .junction_name, .tagged = true } },
         },
         .restriction_conditions => &.{
             .{ .state = 4, .attr = .{ .modes = 4 }, .domain = 23622321788 },

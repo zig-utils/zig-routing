@@ -166,7 +166,7 @@ pub const View = struct {
         return Record.parse(data, index & high_bit != 0, deadline);
     }
 
-    fn name(self: View, reference: u32) !Name {
+    pub fn name(self: View, reference: u32) !Name {
         const id: usize = @as(u31, @truncate(reference));
         if (id >= self.header.name_count) return error.InvalidNameReference;
         const index = self.names_start + id * @sizeOf(u64);

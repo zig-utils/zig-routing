@@ -498,3 +498,93 @@ test "upstream centroid, zero-length route and pencil-point U-turn examples comp
     try std.testing.expectError(error.NotImplemented, zeroLength(arena));
     try std.testing.expectError(error.NotImplemented, pencilPointUturn(arena));
 }
+
+// Sign tags exercise the ramp and fork cases from Valhalla's
+// test/gurka/test_instructions_keep_ramp_signs.cc.
+pub fn signs(arena: Allocator) !gurka.Map {
+    const layout = try gurka.mapToCoordinatesAt(
+        \\P-------------------------------Q
+        \\
+        \\            E              H
+        \\            |             /
+        \\  A---B-----C---D---F----G----I
+        \\      |             |
+        \\      J---K         L
+        \\
+        \\S-------------------------------R
+    , 200, .{ .lng = 139.7, .lat = 35.7 });
+    const motorway = [_]gurka.Tag{
+        .{ .key = "highway", .value = "motorway" },
+        .{ .key = "oneway", .value = "yes" },
+    };
+    const ramp = [_]gurka.Tag{
+        .{ .key = "highway", .value = "motorway_link" },
+        .{ .key = "oneway", .value = "yes" },
+    };
+    const primary = gurka.Tag{ .key = "highway", .value = "primary" };
+    return gurka.Map.init(arena, layout, &.{
+        .{ .label = "AB", .tags = &motorway },
+        .{ .label = "BC", .tags = &motorway },
+        .{ .label = "CD", .tags = &motorway },
+        .{ .label = "BJ", .tags = &ramp },
+        .{ .label = "JK", .tags = &.{primary} },
+        .{ .label = "CE", .tags = &(ramp ++ [_]gurka.Tag{
+            .{ .key = "junction:ref", .value = "9A;9B" },
+            .{ .key = "destination:ref", .value = "A 1;;A 2;" },
+            .{ .key = "destination:street", .value = "West Road; West Spur" },
+            .{ .key = "destination:ref:to", .value = "B 7" },
+            .{ .key = "destination:street:to", .value = "East Road" },
+            .{ .key = "destination", .value = "Harbour;Parks;Harbour" },
+            .{ .key = "destination:forward", .value = "Suppressed" },
+            .{ .key = "junction:name", .value = "Clover Junction" },
+        }) },
+        .{ .label = "DF", .tags = &.{
+            primary,
+            .{ .key = "destination:forward", .value = "Museum" },
+            .{ .key = "destination:backward", .value = "Old Town" },
+        } },
+        .{ .label = "FG", .tags = &motorway },
+        .{ .label = "FL", .tags = &.{primary} },
+        .{ .label = "GH", .tags = &(motorway ++ [_]gurka.Tag{
+            .{ .key = "destination:ref", .value = "M 2" },
+            .{ .key = "destination", .value = "Coast" },
+        }) },
+        .{ .label = "GI", .tags = &(motorway ++ [_]gurka.Tag{.{ .key = "destination", .value = "Hills" }}) },
+        .{ .label = "PQRSP" },
+    }, &.{
+        .{ .label = "B", .tags = &.{
+            .{ .key = "highway", .value = "motorway_junction" },
+            .{ .key = "ref", .value = "5" },
+            .{ .key = "exit_to", .value = "I 95 To I 695;TO Airport;Downtown" },
+            .{ .key = "name", .value = "West Exit" },
+        } },
+        .{ .label = "C", .tags = &.{
+            .{ .key = "highway", .value = "motorway_junction" },
+            .{ .key = "ref", .value = "Should not appear" },
+            .{ .key = "exit_to", .value = "Should not appear" },
+            .{ .key = "name", .value = "East Exit" },
+        } },
+        .{ .label = "D", .tags = &.{
+            .{ .key = "highway", .value = "traffic_signals" },
+            .{ .key = "name", .value = "Central Crossing;North Crossing" },
+        } },
+        .{ .label = "F", .tags = &.{
+            .{ .key = "barrier", .value = "toll_booth" },
+            .{ .key = "name", .value = "River Toll" },
+        } },
+        .{ .label = "G", .tags = &.{
+            .{ .key = "highway", .value = "motorway_junction" },
+            .{ .key = "ref", .value = "Fork Ref" },
+            .{ .key = "name", .value = "Fork Name" },
+        } },
+    }, &.{.{
+        .members = &.{.{ .kind = .way, .ref = "PQRSP", .role = "outer" }},
+        .tags = &.{
+            .{ .key = "type", .value = "boundary" },
+            .{ .key = "boundary", .value = "administrative" },
+            .{ .key = "admin_level", .value = "2" },
+            .{ .key = "name", .value = "Japan" },
+            .{ .key = "ISO3166-1:alpha2", .value = "JP" },
+        },
+    }});
+}

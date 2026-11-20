@@ -165,6 +165,7 @@ pub const View = struct {
     turn_restrictions: ?[]const restrictions.Entry = null,
     restriction_automaton: ?[]const automaton.State = null,
     restriction_conditions: ?[]const automaton.Condition = null,
+    signs: ?[]const format.SectionKind.signs.Record() = null,
 
     pub fn parse(files: Files, diagnostic: ?*Diagnostic) !View {
         return parseWithDeadline(files, diagnostic, .none);
@@ -267,8 +268,16 @@ pub const View = struct {
         inline for (kinds) |kind| {
             if (headers.get(kind)) |present| {
                 note(diagnostic, kind);
-                const count: usize = @intCast(present.count);
-                @field(graph, @tagName(kind)) = try io.typedSlice(kind.Record(), files.get(kind).?, format.payload_offset, count);
+                const T = kind.Record();
+                const payload = files.get(kind).?[format.payload_offset..];
+                // readHeader checked the exact byte count against the record
+                // width. Only nonempty payloads require an aligned pointer.
+                if (present.count == 0) {
+                    @field(graph, @tagName(kind)) = &.{};
+                } else {
+                    if (!std.mem.isAligned(@intFromPtr(payload.ptr), @alignOf(T))) return error.Misaligned;
+                    @field(graph, @tagName(kind)) = std.mem.bytesAsSlice(T, @as([]align(@alignOf(T)) const u8, @alignCast(payload)));
+                }
             }
         }
         if (graph.first_edge[0] != 0 or graph.first_edge[graph.first_edge.len - 1] != edge_count) {
@@ -279,6 +288,11 @@ pub const View = struct {
             note(diagnostic, .cold);
             graph.cold_data = try cold.View.parse(bytes);
             if (graph.cold_data.?.header.record_count != edge_count / 2) return error.InvalidColdRecordCount;
+        }
+        if (graph.signs) |records| {
+            note(diagnostic, .signs);
+            if (records.len != 0 and (graph.cold_data == null or graph.coordinates == null or graph.classes == null))
+                return error.MissingSection;
         }
         if (graph.spatial) |bytes| {
             note(diagnostic, .spatial);
@@ -493,7 +507,7 @@ pub const View = struct {
             note(diagnostic, kind);
             if (deadline.expired()) return error.DeadlineExceeded;
             const bytes: []const u8 = switch (kind) {
-                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata, .components, .turn_sides, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules, .turn_restrictions, .restriction_automaton, .restriction_conditions => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
+                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata, .components, .turn_sides, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules, .turn_restrictions, .restriction_automaton, .restriction_conditions, .signs => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
                 inline else => |section| std.mem.sliceAsBytes(@field(self, @tagName(section))),
             };
             var hash = std.hash.XxHash3.init(0);
@@ -501,11 +515,13 @@ pub const View = struct {
             while (rest.len != 0) {
                 if (deadline.expired()) return error.DeadlineExceeded;
                 const chunk = rest[0..@min(rest.len, 1024 * 1024)];
-                hash.update(chunk);
+                io.updateFileHash(&hash, chunk);
                 rest = rest[chunk.len..];
             }
             if (hash.final() != entry.payload_hash) return error.PayloadHashMismatch;
         }
+        note(diagnostic, .signs);
+        try @import("signs.zig").verify(self, deadline);
         if (self.admin_index) |index| {
             note(diagnostic, .admins);
             try index.verify(deadline);
