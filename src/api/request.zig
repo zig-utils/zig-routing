@@ -112,6 +112,14 @@ pub const Recosting = struct {
     options: json.Value,
 };
 
+pub const Tile = struct {
+    x: u32,
+    y: u32,
+    z: u5,
+    exclude_edges: bool = false,
+    exclude_nodes: bool = false,
+};
+
 pub const Options = struct {
     action: Action = .no_action,
     format: Format = .json,
@@ -131,6 +139,7 @@ pub const Options = struct {
     verbose: bool = false,
     reverse: bool = false,
     generalize: ?f32 = null,
+    tile: ?Tile = null,
     date_time_type: DateTimeType = .no_time,
     date_time: ?[]const u8 = null,
     shape_format: ShapeFormat = .polyline6,
@@ -575,6 +584,24 @@ fn fromJsonWithin(arena: Allocator, doc: json.Value, action: Action, deadline: D
     o.verbose = json.get(bool, doc, "/verbose", action == .sources_to_targets);
     if (json.getOptional(f32, doc, "/generalize")) |g| o.generalize = g;
     if (json.pointer(doc, "/filters")) |filters| o.filters = attributes.Filter.parse(filters);
+    if (action == .tile) {
+        const z = json.getOptional(u5, doc, "/tile/z") orelse return fail(174);
+        const x = json.getOptional(u32, doc, "/tile/x") orelse return fail(174);
+        const y = json.getOptional(u32, doc, "/tile/y") orelse return fail(174);
+        if (z > 30 or @max(x, y) >= (@as(u32, 1) << z)) return fail(174);
+        var tile: Tile = .{ .x = x, .y = y, .z = z };
+        if (json.array(doc, "/tile_options/exclude_layers")) |layers| {
+            for (layers, 0..) |layer, i| {
+                if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+                if (layer != .string) continue;
+                tile.exclude_edges = tile.exclude_edges or std.mem.eql(u8, layer.string, "edges");
+                tile.exclude_nodes = tile.exclude_nodes or std.mem.eql(u8, layer.string, "nodes");
+            }
+        }
+        o.tile = tile;
+        o.format = .mvt;
+        return .{ .ok = o };
+    }
     if (json.getOptional(f32, doc, "/elevation_interval")) |interval|
         o.elevation_interval = std.math.clamp(interval, 0, 1000);
 

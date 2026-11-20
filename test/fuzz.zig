@@ -1209,6 +1209,8 @@ const request_seeds = [_][]const u8{
     "\x01{\"shape\":[{\"lat\":47.242754,\"lon\":9.574113},{\"lat\":47.244662,\"lon\":9.566932},{\"lon\":9.560015,\"lat\":47.246979},{\"lat\":-0,\"lon\":1.5e2},{\"lat\":47.254214, \"lon\" : 9.548967}],\"range\":false}",
     "\x81{\"encoded_polyline\":\"_p~iF~ps|U_ulLnnqC_mqNvxq`@\",\"shape_format\":\"polyline5\",\"range\":false}",
     "\x08{\"verbose\":true}",
+    "\x0b{\"tile\":{\"x\":8424,\"y\":5406,\"z\":14},\"tile_options\":{\"exclude_layers\":[\"nodes\",3]},\"generalize\":4}",
+    "\x0b{\"tile\":{\"x\":4294967295,\"y\":-1,\"z\":31}}",
     "\x07{\"shape\":[{\"lat\":52.09,\"lon\":5.1},{\"lat\":52.1,\"lon\":5.12}],\"costing\":\"auto\",\"filters\":{\"action\":\"include\",\"attributes\":[\"edge.tagged_names\",\"node.elapsed_time\",\"unknown\",7]},\"elevation_interval\":12}",
     "\x00{\"locations\":[]}",
     "\x00{\"costing\":\"auto\",\"recostings\":[{\"costing\":\"auto\"},{\"costing\":\"pedestrian\",\"name\":\"slow\",\"walking_speed\":2}]}",

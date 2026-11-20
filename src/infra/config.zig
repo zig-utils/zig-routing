@@ -13,7 +13,13 @@ pub const Config = struct {
     service_limits: ServiceLimits = .{},
     httpd: struct { service: HttpService = .{} } = .{},
     additional_data: struct { elevation: ?[]const u8 = null } = .{},
-    loki: struct { actions: []const service.Action = &service.action_order } = .{},
+    loki: struct {
+        actions: []const service.Action = &service.action_order,
+        service_defaults: struct {
+            mvt_min_zoom_road_class: [8]u8 = (service.TileLimits{}).min_zoom,
+            mvt_max_age: []const u8 = (service.TileLimits{}).max_age,
+        } = .{},
+    } = .{},
     mjolnir: Mjolnir = .{},
     zig_routing: ZigRouting = .{},
 
@@ -39,6 +45,7 @@ pub const Config = struct {
             max_shape: usize = (service.Limits{}).skadi_max_shape,
             min_resample: f32 = (service.Limits{}).skadi_min_resample,
         } = .{},
+        tile: struct { allow_verbose: bool = false } = .{},
     };
 
     pub const HttpService = struct {
@@ -94,6 +101,11 @@ pub const Config = struct {
                     .max_exclude_polygons_length = self.service_limits.max_exclude_polygons_length,
                     .max_exclude_polygons_vertices = self.service_limits.max_exclude_polygons_vertices,
                 },
+                .tile = .{
+                    .min_zoom = self.loki.service_defaults.mvt_min_zoom_road_class,
+                    .max_age = self.loki.service_defaults.mvt_max_age,
+                    .allow_verbose = self.service_limits.tile.allow_verbose,
+                },
             },
             .actions = self.loki.actions,
         };
@@ -127,6 +139,10 @@ pub fn decode(arena: std.mem.Allocator, bytes: []const u8, path: []const u8, env
         return error.InvalidSkadiMinResample;
     if (!std.math.isFinite(config.service_limits.max_exclude_polygons_length) or config.service_limits.max_exclude_polygons_length < 0)
         return error.InvalidExcludePolygonsLength;
+    const min_zoom = config.loki.service_defaults.mvt_min_zoom_road_class;
+    if (min_zoom[7] > 30 or !std.sort.isSorted(u8, &min_zoom, {}, std.sort.asc(u8))) return error.InvalidTileMinZoom;
+    const cache_age = config.loki.service_defaults.mvt_max_age;
+    if (cache_age.len == 0 or std.mem.findNone(u8, cache_age, "0123456789") != null) return error.InvalidTileMaxAge;
     // Equal keys have the same diagnostic text, so stability has no effect.
     std.sort.heap([]const u8, ignored.items, {}, struct {
         fn lessThan(_: void, a: []const u8, b: []const u8) bool {

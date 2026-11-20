@@ -331,6 +331,19 @@ pub fn segmentDistanceSquared(a: PointLL, b: PointLL, p: PointLL) SegmentClosest
 /// from the end, ties keep the later vertex, an excluded vertex splits
 /// immediately.
 pub fn douglasPeucker(gpa: Allocator, polyline: *std.ArrayList(PointLL), epsilon_m: f64, excluded: ?[]const bool) Allocator.Error!void {
+    return simplify(gpa, polyline, epsilon_m, excluded, false, .none) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.DeadlineExceeded => unreachable,
+    };
+}
+
+/// The same vertex retention rule in planar coordinates, where both axes
+/// and the tolerance use the projection's units.
+pub fn douglasPeuckerPlanar(gpa: Allocator, polyline: *std.ArrayList(PointLL), epsilon: f64, deadline: Deadline) !void {
+    try simplify(gpa, polyline, epsilon, null, true, deadline);
+}
+
+fn simplify(gpa: Allocator, polyline: *std.ArrayList(PointLL), epsilon_m: f64, excluded: ?[]const bool, comptime planar: bool, deadline: Deadline) (Allocator.Error || error{DeadlineExceeded})!void {
     const pts = polyline.items;
     if (epsilon_m <= 0 or pts.len < 3) return;
     const epsilon = epsilon_m * epsilon_m;
@@ -343,16 +356,21 @@ pub fn douglasPeucker(gpa: Allocator, polyline: *std.ArrayList(PointLL), epsilon
     defer stack.deinit(gpa);
     try stack.append(gpa, .{ .s = 0, .e = pts.len - 1 });
     while (stack.pop()) |r| {
+        if (comptime planar) if (deadline.expired()) return error.DeadlineExceeded;
         var dmax = -std.math.floatMax(f64);
         var split: usize = 0;
         var j = r.e - 1;
         while (j > r.s) : (j -= 1) {
+            if (comptime planar) if (j % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
             if (excluded) |mask| if (mask[j]) {
                 dmax = epsilon;
                 split = j;
                 break;
             };
-            const d = segmentDistanceSquared(pts[r.s], pts[r.e], pts[j]).distance_sq;
+            const d = if (planar)
+                planarDistanceSquared(pts[r.s], pts[r.e], pts[j])
+            else
+                segmentDistanceSquared(pts[r.s], pts[r.e], pts[j]).distance_sq;
             if (d > dmax) {
                 dmax = d;
                 split = j;
@@ -366,12 +384,25 @@ pub fn douglasPeucker(gpa: Allocator, polyline: *std.ArrayList(PointLL), epsilon
         }
     }
     var w: usize = 0;
-    for (pts, keep) |p, kept| {
+    for (pts, keep, 0..) |p, kept, i| {
+        if (comptime planar) if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
         if (!kept) continue;
         pts[w] = p;
         w += 1;
     }
     polyline.shrinkRetainingCapacity(w);
+}
+
+fn planarDistanceSquared(a: PointLL, b: PointLL, p: PointLL) f64 {
+    const dx = b.lng - a.lng;
+    const dy = b.lat - a.lat;
+    const x = p.lng - a.lng;
+    const y = p.lat - a.lat;
+    const len = dx * dx + dy * dy;
+    const t = if (len == 0) 0 else std.math.clamp((x * dx + y * dy) / len, 0, 1);
+    const px = x - t * dx;
+    const py = y - t * dy;
+    return px * px + py * py;
 }
 
 /// Topology-aware Douglas-Peucker for contours, from

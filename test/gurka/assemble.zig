@@ -1135,6 +1135,102 @@ test "Gurka locate reports directed shapes, snapped nodes and missing matches" {
     }
 }
 
+// Ported from test/gurka/test_vector_tiles.cc for the edges and nodes layers.
+test "Gurka tile emits graph features and applies zoom and layer filters" {
+    const http = routing.server.http;
+    const wire = @import("protobuf").wire;
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const layout = try gurka.mapToCoordinatesAt("A----B----C", 50, .init(0.0002, -0.0002));
+    const fixture = try gurka.Map.init(a, layout, &.{
+        .{ .label = "AB", .tags = &.{
+            .{ .key = "highway", .value = "primary" },
+            .{ .key = "name:forward", .value = "East Street" },
+            .{ .key = "name:backward", .value = "West Street" },
+        } },
+        .{ .label = "BC", .tags = &.{
+            .{ .key = "highway", .value = "primary" },
+            .{ .key = "maxspeed", .value = "40" },
+        } },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    var svc: routing.api.service.Service = .{ .graph = &built.bundle.view };
+    svc.register(.tile, routing.api.tile_action.handle);
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    var ctx: http.Ctx = .{ .worker_id = 0, .arena = &arena, .deadline = .none };
+    var req: http.Request = .{
+        .method = .POST,
+        .target = "/tile",
+        .path = "/tile",
+        .query = &.{},
+        .headers = &.{},
+        .body =
+        \\{"tile":{"x":8192,"y":8192,"z":14},
+        \\"filters":{"action":"include","attributes":["edge.speed_forward"]}}
+        ,
+        .keep_alive = false,
+    };
+    var res: http.Response = .{ .gpa = arena.allocator() };
+    svc.handle(&ctx, &req, &res);
+    try testing.expectEqual(200, res.status);
+    try testing.expectEqualStrings("application/vnd.mapbox-vector-tile", res.content_type);
+    try testing.expectEqualStrings("Cache-Control: public, max-age=1800", res.extra_headers.items[0]);
+    var tile = wire.Reader.init(res.body.items);
+    var layer = wire.Reader.init((try tile.next(ctx.deadline)).?.value.length_delimited);
+    var edge_features: usize = 0;
+    var have_speed = false;
+    while (try layer.next(ctx.deadline)) |field| switch (field.number) {
+        1 => try testing.expectEqualStrings("edges", field.value.length_delimited),
+        2 => edge_features += 1,
+        3 => if (std.mem.eql(u8, field.value.length_delimited, "speed:fwd")) {
+            have_speed = true;
+        },
+        else => {},
+    };
+    try testing.expectEqual(3, edge_features);
+    try testing.expect(have_speed);
+    layer = .init((try tile.next(ctx.deadline)).?.value.length_delimited);
+    var node_features: usize = 0;
+    while (try layer.next(ctx.deadline)) |field| switch (field.number) {
+        1 => try testing.expectEqualStrings("nodes", field.value.length_delimited),
+        2 => node_features += 1,
+        else => {},
+    };
+    try testing.expectEqual(3, node_features);
+    try testing.expectEqual(null, try tile.next(ctx.deadline));
+
+    arena.reset();
+    svc.limits.tile.allow_verbose = true;
+    req.body = "{\"tile\":{\"x\":8192,\"y\":8192,\"z\":14},\"verbose\":true}";
+    res = .{ .gpa = arena.allocator() };
+    svc.handle(&ctx, &req, &res);
+    try testing.expectEqual(200, res.status);
+    try testing.expect(std.mem.indexOf(u8, res.body.items, "live_speed:bwd:congestion3") != null);
+
+    const cases = [_]struct { body: []const u8, status: u16, code: u16 = 0 }{
+        .{ .body = "{\"tile\":{\"x\":64,\"y\":64,\"z\":7}}", .status = 200 },
+        .{ .body = "{\"tile\":{\"x\":16384,\"y\":16384,\"z\":15}}", .status = 400, .code = 175 },
+        .{ .body = "{\"tile\":{\"x\":16384,\"y\":8192,\"z\":14}}", .status = 400, .code = 174 },
+        .{ .body = "{\"tile\":{\"x\":8192,\"y\":8192,\"z\":14},\"tile_options\":{\"exclude_layers\":[\"edges\",\"nodes\"]}}", .status = 200 },
+    };
+    for (cases) |case| {
+        arena.reset();
+        req.body = case.body;
+        res = .{ .gpa = arena.allocator() };
+        svc.handle(&ctx, &req, &res);
+        try testing.expectEqual(case.status, res.status);
+        if (case.code == 0) {
+            try testing.expectEqual(0, res.body.items.len);
+        } else {
+            const failure = try std.json.parseFromSliceLeaky(std.json.Value, res.gpa, res.body.items, .{});
+            try testing.expectEqual(case.code, failure.object.get("error_code").?.integer);
+        }
+    }
+}
+
 // Ported from the Dijkstra cases in test/gurka/test_expansion.cc.
 test "Gurka Dijkstra expansion settles the one-way branch only forward" {
     const expansion = routing.search.expand;

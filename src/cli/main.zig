@@ -275,6 +275,7 @@ const Runtime = struct {
         self.bundle = try routing.graph.reader.Bundle.open(path orelse return);
         self.svc.graph = &self.bundle.?.view;
         self.svc.register(.locate, routing.api.locate_action.handle);
+        self.svc.register(.tile, routing.api.tile_action.handle);
     }
 
     fn startWarmup(self: *Runtime, lock_hot: bool) void {
@@ -346,7 +347,7 @@ fn route(ctx: *Context) !u8 {
     var runtime: Runtime = .{ .svc = loaded.config.serviceConfig() };
     defer runtime.close();
     try runtime.open(loaded.config.additional_data.elevation);
-    if (action == .locate) try runtime.openGraph(loaded.config.zig_routing.bundle_path);
+    if (action == .locate or action == .tile) try runtime.openGraph(loaded.config.zig_routing.bundle_path);
 
     var arena = routing.infra.arena.Arena.init(std.heap.c_allocator, .{ .cap_bytes = settings.arena_cap_bytes });
     defer arena.deinit();
@@ -370,7 +371,7 @@ fn route(ctx: *Context) !u8 {
     if (response.body.items.len == 0 and response.status >= 400) return error.RequestFailed;
     const writer = if (response.status >= 400) app.stderr else ctx.out.?;
     try writer.writeAll(response.body.items);
-    try writer.writeByte('\n');
+    if (action != .tile or response.status >= 400) try writer.writeByte('\n');
     return if (response.status >= 400) 1 else 0;
 }
 

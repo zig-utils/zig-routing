@@ -23,6 +23,13 @@ pub const Limits = struct {
     skadi_max_shape: usize = 750_000,
     skadi_min_resample: f32 = 10.0,
     exclusions: exclusions.Limits = .{},
+    tile: TileLimits = .{},
+};
+
+pub const TileLimits = struct {
+    min_zoom: [8]u8 = .{ 7, 7, 8, 11, 11, 12, 13, 14 },
+    max_age: []const u8 = "1800",
+    allow_verbose: bool = false,
 };
 
 pub const Reply = struct {
@@ -174,11 +181,13 @@ test "every action path is reachable by GET and POST; errors match upstream" {
     var buf: [8192]u8 = undefined;
 
     for (action_order) |act| {
-        const g = try std.fmt.bufPrint(buf[4096..], "GET /{s}?json=%7B%7D HTTP/1.1\r\nConnection: close\r\n\r\n", .{@tagName(act)});
+        const query_json = if (act == .tile) "%7B%22tile%22%3A%7B%22x%22%3A0%2C%22y%22%3A0%2C%22z%22%3A0%7D%7D" else "%7B%7D";
+        const g = try std.fmt.bufPrint(buf[4096..], "GET /{s}?json={s} HTTP/1.1\r\nConnection: close\r\n\r\n", .{ @tagName(act), query_json });
         const r = try get(server.port, g, buf[0..4096]);
         try testing.expect(std.mem.startsWith(u8, r, "HTTP/1.1 501"));
         try testing.expect(std.mem.indexOf(u8, body(r), "\"error_code\":107") != null);
-        const p = try std.fmt.bufPrint(buf[4096..], "POST /{s} HTTP/1.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}", .{@tagName(act)});
+        const body_json = if (act == .tile) "{\"tile\":{\"x\":0,\"y\":0,\"z\":0}}" else "{}";
+        const p = try std.fmt.bufPrint(buf[4096..], "POST /{s} HTTP/1.1\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ @tagName(act), body_json.len, body_json });
         try testing.expect(std.mem.startsWith(u8, try get(server.port, p, buf[0..4096]), "HTTP/1.1 501"));
     }
 
