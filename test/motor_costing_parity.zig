@@ -4,6 +4,7 @@ const routing = @import("routing");
 const io = routing.infra.io;
 const graph = routing.graph;
 const auto = routing.costing.auto;
+const motorcycle = routing.costing.motorcycle;
 const truck = routing.costing.truck;
 const compiled = routing.costing.compiled;
 const parity = routing.cli.parity_costing;
@@ -29,7 +30,7 @@ fn Probe(comptime model: type) type {
                 if (self.tables) |tables| return truck.Kernel.edgeCost(self.profile, tables, class, edge.*, speed, .{});
                 return truck.Kernel.rawEdgeCost(self.profile, class, edge.*, speed, .{});
             }
-            return auto.Kernel.edgeCost(self.profile, self.tables.?, class, edge.*, speed, .{});
+            return model.Kernel.edgeCost(self.profile, self.tables.?, class, edge.*, speed, .{});
         }
 
         pub fn turnCost(self: Self, view: *const View, movement: search.Transition, _: search.Label, _: search.Direction) !compiled.Cost {
@@ -58,9 +59,16 @@ pub fn main(init: std.process.Init) !void {
     const path = args.next() orelse return error.MissingBundle;
     const samples = args.next() orelse return error.MissingCostingReference;
     const family_or_minimum = args.next();
-    const truck_only = if (family_or_minimum) |value| std.mem.eql(u8, value, "--truck") else false;
-    const motor_flag = if (family_or_minimum) |value| std.mem.eql(u8, value, "--motor") else false;
-    const min_arg = if (truck_only or motor_flag) args.next() else family_or_minimum;
+    const motor_modes: []const parity.Mode = &.{ .auto, .bus, .taxi };
+    var min_arg = family_or_minimum;
+    const tested: []const parity.Mode = if (family_or_minimum) |value| blk: {
+        if (!std.mem.startsWith(u8, value, "--")) break :blk motor_modes;
+        min_arg = args.next();
+        if (std.mem.eql(u8, value, "--truck")) break :blk &.{.truck};
+        if (std.mem.eql(u8, value, "--motorcycle")) break :blk &.{ .motorcycle, .motor_scooter };
+        if (std.mem.eql(u8, value, "--motor")) break :blk motor_modes;
+        return error.InvalidCostingFamily;
+    } else motor_modes;
     const minimum = if (min_arg) |value| try std.fmt.parseInt(u64, value, 10) else parity.minimum_calls;
     if (args.next() != null) return error.TooManyArguments;
     const files = try io.File.open(samples, .read_only);
@@ -82,17 +90,12 @@ pub fn main(init: std.process.Init) !void {
     var profiles: std.ArrayList(parity.ProfileReport) = .empty;
     defer profiles.deinit(init.gpa);
     while (try reference.nextProfile()) |profile| {
-        const result = if (truck_only) blk: {
-            if (profile.mode != .truck) return error.InvalidReferenceCosting;
-            break :blk try checkProfile(truck, init.gpa, view, &reference, profile, {}, &stderr.interface);
-        } else blk: {
-            const mode: auto.Mode = switch (profile.mode) {
-                .auto => .auto,
-                .bus => .bus,
-                .taxi => .taxi,
-                else => return error.InvalidReferenceCosting,
-            };
-            break :blk try checkProfile(auto, init.gpa, view, &reference, profile, mode, &stderr.interface);
+        if (std.mem.indexOfScalar(parity.Mode, tested, profile.mode) == null) return error.InvalidReferenceCosting;
+        const result = switch (profile.mode) {
+            inline .auto, .bus, .taxi => |mode| try checkProfile(auto, init.gpa, view, &reference, profile, @field(auto.Mode, @tagName(mode)), &stderr.interface),
+            .truck => try checkProfile(truck, init.gpa, view, &reference, profile, {}, &stderr.interface),
+            inline .motorcycle, .motor_scooter => |mode| try checkProfile(motorcycle, init.gpa, view, &reference, profile, @field(motorcycle.Mode, @tagName(mode)), &stderr.interface),
+            else => return error.InvalidReferenceCosting,
         };
         totals.getPtr(profile.mode).merge(result.counts);
         raw_only_profiles += @intFromBool(result.raw_only);
@@ -100,7 +103,6 @@ pub fn main(init: std.process.Init) !void {
     }
     try stderr.interface.flush();
     var passed = true;
-    const tested: []const parity.Mode = if (truck_only) &.{.truck} else &.{ .auto, .bus, .taxi };
     for (tested) |mode| {
         const counts = totals.get(mode);
         passed = passed and counts.calls() >= minimum and counts.recost.samples != 0 and counts.failures() == 0;
@@ -117,6 +119,8 @@ pub fn main(init: std.process.Init) !void {
         .bus = totals.get(.bus),
         .taxi = totals.get(.taxi),
         .truck = totals.get(.truck),
+        .motorcycle = totals.get(.motorcycle),
+        .motor_scooter = totals.get(.motor_scooter),
         .raw_only_profiles = raw_only_profiles,
         .profiles = profiles.items,
         .passed = passed,
@@ -131,16 +135,16 @@ const ProfileResult = struct {
     raw_only: bool,
 };
 
-fn checkProfile(comptime model: type, gpa: Arena, view: *const View, reference: *parity.Reference, sample: parity.Reference.Profile, mode: if (model == truck) void else auto.Mode, diagnostics: *io.Writer) !ProfileResult {
+fn checkProfile(comptime model: type, gpa: Arena, view: *const View, reference: *parity.Reference, sample: parity.Reference.Profile, mode: if (model == truck) void else model.Mode, diagnostics: *io.Writer) !ProfileResult {
     var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();
     const arena = scratch.allocator();
     const settings = try std.json.parseFromSliceLeaky(std.json.Value, arena, sample.options, .{});
     if (settings != .object) return error.InvalidReferenceOptions;
     var warnings: std.ArrayList(routing.costing.base.Warning) = .empty;
-    const options = if (model == truck) try truck.parse(arena, settings, &warnings, .none) else try auto.parse(arena, mode, settings, &warnings, .none);
+    const options = if (model == truck) try truck.parse(arena, settings, &warnings, .none) else try model.parse(arena, mode, settings, &warnings, .none);
     if (warnings.items.len != 0) return error.InvalidReferenceOptions;
-    const profile = if (model == truck) try truck.Profile.init(options) else try auto.Model.canonicalize(options);
+    const profile = try model.Model.canonicalize(options);
     const classes = view.classes orelse return error.MissingClassTable;
     const factors = try arena.alloc(f32, classes.len);
     const tables: ?compiled.Compiled = compiled.compileInto(model.Model, profile, classes, factors, .none) catch |err| switch (err) {
@@ -163,7 +167,7 @@ fn checkProfile(comptime model: type, gpa: Arena, view: *const View, reference: 
 
         const traversal = try probe.edgeCost(view, to, outgoing, .forward);
         const forward = model.Kernel.turnCost(&profile, node, from_class, to_class, turn);
-        if (model == truck) {
+        if (model == truck or model == motorcycle) {
             const opposite = try view.edge(try view.oppEdge(to));
             turn.movement.base_turn.next_destination_only = (try view.class(opposite.cls.class_id)).flags.destination_only;
         }
@@ -183,10 +187,13 @@ fn checkProfile(comptime model: type, gpa: Arena, view: *const View, reference: 
         var path_probe = probe;
         path_probe.previous_internal = &internal;
         path_probe.previous_destination_only = &destination_only;
-        for (path.segments) |segment| {
+        for (path.segments, 0..) |segment, index| {
             const id: EdgeId = @fromBackingInt(segment.edge);
             _ = recost.add(view, path_probe, .{ .edge = id, .begin = segment.begin, .end = segment.end }, try view.edge(id), false) catch |err| {
                 if (err != error.InvalidRouteCost) return err;
+                try diagnostics.print("recost {s}: unusable Valhalla directed edge {d} at segment {d} fraction {d}..{d}\n", .{
+                    @tagName(sample.mode), reference.edges[@backingInt(id)], index, segment.begin, segment.end,
+                });
                 recost.elapsed = .forbidden;
                 break;
             };

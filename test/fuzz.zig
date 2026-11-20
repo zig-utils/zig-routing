@@ -925,6 +925,7 @@ pub fn fuzzRequest(_: void, s: *Smith) !void {
                 .bicycle => (try routing.costing.bicycle.parse(arena, input, &warnings, .none)).shared,
                 .auto, .bus, .taxi => |mode| (try routing.costing.auto.parse(arena, std.meta.stringToEnum(routing.costing.auto.Mode, @tagName(mode)).?, input, &warnings, .none)).shared,
                 .truck => (try routing.costing.truck.parse(arena, input, &warnings, .none)).shared,
+                .motorcycle, .motor_scooter => |mode| (try routing.costing.motorcycle.parse(arena, std.meta.stringToEnum(routing.costing.motorcycle.Mode, @tagName(mode)).?, input, &warnings, .none)).shared,
                 else => try base.parse(arena, input, .{}, &warnings, .none),
             };
             try std.testing.expect(settings.fixed_speed <= base.fixed_speed_max);
@@ -945,6 +946,7 @@ fn fraction(byte: u8) f32 {
 
 fn fuzzMotorCosting(_: void, s: *Smith) !void {
     const auto = routing.costing.auto;
+    const motorcycle = routing.costing.motorcycle;
     const truck = routing.costing.truck;
     const base = routing.costing.base;
     const compiled = routing.costing.compiled;
@@ -954,11 +956,15 @@ fn fuzzMotorCosting(_: void, s: *Smith) !void {
     @memcpy(bytes[0..input.len], input);
     var warnings: std.ArrayList(base.Warning) = .empty;
     defer warnings.deinit(std.testing.allocator);
-    const is_truck = bytes[0] % 4 == 3;
+    const model = bytes[0] % 6;
+    const is_truck = model == 3;
+    const is_cycle = model >= 4;
     const mode: auto.Mode = @fromBackingInt(@intCast(bytes[0] % 3));
+    const cycle_mode: motorcycle.Mode = if (model == 5) .motor_scooter else .motorcycle;
     var auto_options = try auto.parse(std.testing.allocator, mode, .null, &warnings, .none);
     var truck_options = try truck.parse(std.testing.allocator, .null, &warnings, .none);
-    const options = if (is_truck) &truck_options.shared else &auto_options.shared;
+    var cycle_options = try motorcycle.parse(std.testing.allocator, cycle_mode, .null, &warnings, .none);
+    const options = if (is_truck) &truck_options.shared else if (is_cycle) &cycle_options.shared else &auto_options.shared;
     options.fixed_speed = if (bytes[6] & 1 == 0) 0 else bytes[7] % 253;
     options.flags.setPresent(.shortest, bytes[6] & 2 != 0);
     options.flags.setPresent(.ignore_closures, bytes[6] & 4 != 0);
@@ -979,12 +985,29 @@ fn fuzzMotorCosting(_: void, s: *Smith) !void {
             .surface = @truncate(bytes[18]),
             .density = @truncate(bytes[19]),
         },
-        .access = .{ .forward = @bitCast(@as(graph.constants.AccessMask, .{ .auto = bytes[20] & 1 == 0 or mode != .taxi, .taxi = true, .bus = true, .truck = true })) },
-        .flags = .{ .toll = bytes[20] & 2 != 0, .named = bytes[20] & 4 != 0, .roundabout = bytes[20] & 8 != 0, .truck_route = bytes[20] & 64 != 0 },
+        .access = .{ .forward = @bitCast(@as(graph.constants.AccessMask, .{
+            .auto = bytes[20] & 1 == 0 or mode != .taxi,
+            .taxi = true,
+            .bus = true,
+            .truck = true,
+            .motorcycle = bytes[40] & 1 == 0,
+            .moped = bytes[40] & 2 == 0,
+        })) },
+        .flags = .{
+            .toll = bytes[20] & 2 != 0,
+            .named = bytes[20] & 4 != 0,
+            .roundabout = bytes[20] & 8 != 0,
+            .truck_route = bytes[20] & 64 != 0,
+            .destination_only = bytes[20] & 128 != 0,
+        },
     };
     const edge: graph.format.EdgeHot = .{
         .head = 0,
-        .geom = .{ .len_m = std.mem.readInt(u24, bytes[21..24], .little), .grade = 6, .curvature = 0 },
+        .geom = .{
+            .len_m = std.mem.readInt(u24, bytes[21..24], .little),
+            .grade = if (is_cycle) @truncate(bytes[36]) else 6,
+            .curvature = if (is_cycle) @truncate(bytes[37]) else 0,
+        },
         .cls = .{ .class_id = 0, .local = 0, .opp_local = 0, .cold_checks = 0, .pred_speed = 0 },
         .speed = .{ 0, 0, 0, bytes[39] % 253 },
     };
@@ -1054,6 +1077,23 @@ fn fuzzMotorCosting(_: void, s: *Smith) !void {
         const transition = truck.Kernel.turnCost(&profile, &node, &previous, &class, movement);
         try std.testing.expect(compiled.costUnits(truck.Kernel.turnLowerBound()) <= transition.cost);
         break :blk transition;
+    } else if (is_cycle) blk: {
+        cycle_options.use_highways = fraction(bytes[1]);
+        cycle_options.use_tolls = fraction(bytes[2]);
+        cycle_options.min_linear_factor = min_linear_factor;
+        cycle_options.top_speed = if (cycle_mode == .motor_scooter) 20 + bytes[4] % 101 else 10 + bytes[4] % 243;
+        cycle_options.use_trails = fraction(bytes[5]);
+        cycle_options.use_hills = fraction(bytes[32]);
+        cycle_options.use_primary = fraction(bytes[33]);
+        cycle_options.shared.floats.set(.use_curvature, fraction(bytes[34]));
+        cycle_options.may_allow_edges = bytes[35] & 1 != 0;
+        const profile = try motorcycle.Model.canonicalize(cycle_options);
+        const tables = try compiled.compileInto(motorcycle.Model, profile, &.{class}, &factors, .none);
+        const cost = motorcycle.Kernel.edgeCost(&profile, &tables, &class, edge, speed, effects);
+        try std.testing.expect(compiled.costUnits(motorcycle.Kernel.edgeLowerBound(&profile, &tables, &class, edge, upper)) <= cost.cost);
+        const transition = motorcycle.Kernel.turnCost(&profile, &node, &previous, &class, movement);
+        try std.testing.expect(compiled.costUnits(motorcycle.Kernel.turnLowerBound()) <= transition.cost);
+        break :blk transition;
     } else blk: {
         auto_options.use_highways = fraction(bytes[1]);
         auto_options.use_tolls = fraction(bytes[2]);
@@ -1079,7 +1119,14 @@ test "fuzz motor-costing" {
     var truck_minimum: [43]u8 = @splat(0);
     truck_minimum[0] = 3;
     truck_minimum[17] = 6;
-    try std.testing.fuzz({}, fuzzMotorCosting, .{ .corpus = try seeds(arena.allocator(), &.{ &zero, &maximum, &truck_minimum }) });
+    var scooter: [43]u8 = @splat(0);
+    scooter[0] = 5;
+    scooter[6] = 1;
+    scooter[7] = 252;
+    scooter[21] = 1;
+    var motorcycle: [43]u8 = @splat(255);
+    motorcycle[0] = 4;
+    try std.testing.fuzz({}, fuzzMotorCosting, .{ .corpus = try seeds(arena.allocator(), &.{ &zero, &maximum, &truck_minimum, &scooter, &motorcycle }) });
 }
 
 const request_seeds = [_][]const u8{

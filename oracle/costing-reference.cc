@@ -5,6 +5,8 @@
 #include <valhalla/sif/bicyclecost.h>
 #include <valhalla/sif/pedestriancost.h>
 #include <valhalla/sif/truckcost.h>
+#include <valhalla/sif/motorcyclecost.h>
+#include <valhalla/sif/motorscootercost.h>
 #include <valhalla/tyr/actor.h>
 
 #include <boost/property_tree/json_parser.hpp>
@@ -193,13 +195,15 @@ void record(std::ostream& output,
     decltype(&ParseAutoCostOptions) parse;
     decltype(&CreateAutoCost) create;
   };
-  static constexpr std::array<Model, 6> models{{
+  static constexpr std::array<Model, 8> models{{
       {"pedestrian", ParsePedestrianCostOptions, CreatePedestrianCost},
       {"bicycle", ParseBicycleCostOptions, CreateBicycleCost},
       {"auto", ParseAutoCostOptions, CreateAutoCost},
       {"bus", ParseBusCostOptions, CreateBusCost},
       {"taxi", ParseTaxiCostOptions, CreateTaxiCost},
       {"truck", ParseTruckCostOptions, CreateTruckCost},
+      {"motorcycle", ParseMotorcycleCostOptions, CreateMotorcycleCost},
+      {"motor_scooter", ParseMotorScooterCostOptions, CreateMotorScooterCost},
   }};
   const auto model = std::find_if(models.begin(), models.end(),
                                   [&](const Model& candidate) { return candidate.name == mode; });

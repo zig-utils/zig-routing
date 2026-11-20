@@ -149,6 +149,22 @@ and pop counts per source. Median elapsed time was 167.70 ns per settled label
 at `3a1e0b2` and 167.48 ns with truck costing present. The median paired change
 was +0.36%.
 
+Run Gate A for motorcycle and motor scooter costing with:
+
+```bash
+oracle/costing-parity.sh --motorcycle utrecht bench/results/costing-motorcycle-utrecht.json
+oracle/costing-parity.sh --motorcycle liechtenstein bench/results/costing-motorcycle-liechtenstein.json
+```
+
+Each extract contributed 68 profiles and 3.4 million samples of each call
+type per mode. All 27.2 million forward and reverse transitions and 26
+fixed-path recosts matched exactly. The largest relative error across
+13.6 million edge costs was `3.57e-7`.
+
+The scooter oracle profiles keep the grade-adjusted speed within the pinned
+Valhalla speed table. Native tests cover the full fixed-speed range and its
+downhill maximum of 315 km/h using the same seconds-per-metre formula.
+
 ### OSM tag parity
 
 CI compares the normal build tag transform against compressed NDJSON goldens for the

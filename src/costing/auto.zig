@@ -30,7 +30,7 @@ pub const Mode = enum {
     }
 };
 
-const assumed_speed = 140;
+const assumed_speed = motor.assumed_speed;
 const highest_speed = base.fixed_speed_max;
 const alley_range: base.Range = .factor(1);
 const auto_config: base.Config = blk: {
@@ -226,19 +226,7 @@ pub const Model = struct {
 
 pub const Cache = compiled.Cache(Model);
 
-pub const PathCheck = struct {
-    allowed_by_linear_feature: bool = false,
-    avoided: bool = false,
-    backtrack: bool = false,
-    previous_dead_end: bool = false,
-    closed: bool = false,
-    closure_pruning: bool = false,
-    allow_destination_only: bool = true,
-    previous_access: base.AccessState = .{},
-    limits: []align(1) const Restriction = &.{},
-    original_forward: bool = true,
-    time: ?graph.datetime.Local = null,
-};
+pub const PathCheck = motor.PathCheck;
 
 pub const Speed = motor.Speed;
 pub const Turn = motor.Turn;
@@ -289,9 +277,7 @@ pub const Kernel = struct {
         const length: f32 = @floatFromInt(edge.geom.len_m);
         const secs = length * (if (kph == 0) motor.speed_factors[0] else tables.seconds_per_metre[kph]);
         if (profile.shared.shortest) return .{ .cost = length, .secs = secs };
-        const expected = if (profile.top_speed != assumed_speed and speed.sources.current) speed.non_current_kph else kph;
-        const excess: f32 = @floatFromInt(expected -| profile.top_speed);
-        const speed_penalty = excess * profile.shared.speed_penalty_factor;
+        const speed_penalty = motor.speedPenalty(profile.top_speed, profile.shared.speed_penalty_factor, kph, speed);
         const weight = if (speed_penalty == 0) static_weight else profile.classWeight(class, speed_penalty);
         const measured = @as(u8, @bitCast(speed.sources)) & @as(u8, @bitCast(base.Flow.all)) != 0;
         var factor = weight * profile.useFactor(class, measured);
@@ -325,13 +311,7 @@ pub const Kernel = struct {
     }
 
     pub fn turnCost(profile: *const Profile, node: *const NodeHot, from: *const EdgeClass, to: *const EdgeClass, turn: Turn) Cost {
-        if (from.flags.node_connector or to.flags.node_connector) return .{};
-        const entry = turn.movement.base_turn;
-        var result = profile.shared.transition(node, from, to, entry);
-        result.secs += motor.carTurnDuration(node, turn.degrees, turn.more_than_two_roads);
-        if (!profile.shared.shortest) result.cost += motor.turnPenalty(node, from, to, turn);
-        result.cost *= profile.shared.time_weight;
-        return result;
+        return motor.turnCost(&profile.shared, node, from, to, turn);
     }
 
     pub fn turnCostReverse(profile: *const Profile, node: *const NodeHot, from: *const EdgeClass, to: *const EdgeClass, turn: Turn) Cost {

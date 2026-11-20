@@ -3,12 +3,12 @@
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 motor=
-if [ "${1:-}" = "--motor" ] || [ "${1:-}" = "--truck" ]; then
+if [ "${1:-}" = "--motor" ] || [ "${1:-}" = "--truck" ] || [ "${1:-}" = "--motorcycle" ]; then
   motor="$1"
   shift
 fi
 [ "$#" -ge 2 ] && [ "$#" -le 3 ] ||
-  die "usage: $0 [--motor|--truck] DATASET REPORT.json [CASES_PER_PROFILE]"
+  die "usage: $0 [--motor|--truck|--motorcycle] DATASET REPORT.json [CASES_PER_PROFILE]"
 dataset="$1"
 report="$2"
 cases="${3:-50000}"

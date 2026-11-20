@@ -1,6 +1,7 @@
 // Ported from src/sif/autocost.cc, src/sif/truckcost.cc and valhalla/sif/osrm_car_duration.h (Valhalla 3.9.3).
 const std = @import("std");
 const base = @import("base.zig");
+const Cost = @import("compiled.zig").Cost;
 const graph = @import("../graph/root.zig");
 const Deadline = @import("../infra/io.zig").Deadline;
 const EdgeClass = graph.class_table.EdgeClass;
@@ -8,9 +9,12 @@ const NodeHot = graph.format.NodeHot;
 const EdgeHot = graph.format.EdgeHot;
 const Use = graph.constants.Use;
 const highest_speed = base.fixed_speed_max;
+pub const assumed_speed = 140;
+// Scooter grade factors can raise a fixed speed by up to 25 percent.
+const highest_effective_speed = highest_speed * 5 / 4;
 
-pub const speed_factors: [highest_speed + 1]f32 = blk: {
-    var factors: [highest_speed + 1]f32 = undefined;
+pub const speed_factors: [highest_effective_speed + 1]f32 = blk: {
+    var factors: [highest_effective_speed + 1]f32 = undefined;
     factors[0] = 3600;
     for (factors[1..], 1..) |*factor, speed| {
         factor.* = (3600.0 * @as(f32, 0.001)) / @as(f32, @floatFromInt(speed));
@@ -66,7 +70,36 @@ pub const Speed = struct {
     closed: bool = false,
 };
 
+pub fn speedPenalty(top_speed: u8, factor: f32, kph: u8, speed: Speed) f32 {
+    const expected = if (top_speed != assumed_speed and speed.sources.current) speed.non_current_kph else kph;
+    const excess: f32 = @floatFromInt(expected -| top_speed);
+    return excess * factor;
+}
+
 pub const InternalTurn = enum { none, left, right };
+
+pub const PathCheck = struct {
+    allowed_by_linear_feature: bool = false,
+    avoided: bool = false,
+    backtrack: bool = false,
+    previous_dead_end: bool = false,
+    closed: bool = false,
+    closure_pruning: bool = false,
+    allow_destination_only: bool = true,
+    previous_access: base.AccessState = .{},
+    limits: []align(1) const graph.cold.access_restriction.Entry = &.{},
+    original_forward: bool = true,
+    time: ?graph.datetime.Local = null,
+};
+
+pub fn roadUseFactor(shared: *const base.Shared, use: u6) f32 {
+    return switch (use) {
+        @backingInt(Use.track) => shared.tracks.factor,
+        @backingInt(Use.living_street) => shared.living_streets.factor,
+        @backingInt(Use.service_road) => shared.service_factor,
+        else => 1,
+    };
+}
 
 pub const Turn = struct {
     movement: base.IntersectionTurn,
@@ -170,4 +203,13 @@ pub fn carTurnDuration(node: *const NodeHot, degrees: u16, more_than_two_roads: 
     if (more_than_two_roads or reverse) duration += car_turn_duration[@intFromBool(node.attr.drive_on_left)][degrees];
     if (reverse) duration += 20;
     return @floatCast(duration);
+}
+
+pub fn turnCost(shared: *const base.Shared, node: *const NodeHot, from: *const EdgeClass, to: *const EdgeClass, turn: Turn) Cost {
+    if (from.flags.node_connector or to.flags.node_connector) return .{};
+    var result = shared.transition(node, from, to, turn.movement.base_turn);
+    result.secs += carTurnDuration(node, turn.degrees, turn.more_than_two_roads);
+    if (!shared.shortest) result.cost += turnPenalty(node, from, to, turn);
+    result.cost *= shared.time_weight;
+    return result;
 }

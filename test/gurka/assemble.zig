@@ -1685,58 +1685,69 @@ test "assembled motor vehicle limits follow the original way direction" {
     try testing.expect(booth.attr.cash_only_toll);
 }
 
-const TruckTestCost = struct {
-    const truck = routing.costing.truck;
+fn MotorTestCost(comptime model: type) type {
     const compiled = routing.costing.compiled;
-    profile: *const truck.Profile,
-    tables: *const compiled.Compiled,
+    const truck = model == routing.costing.truck;
+    return struct {
+        const Self = @This();
+        profile: *const model.Profile,
+        tables: *const compiled.Compiled,
 
-    pub fn edgeCost(self: TruckTestCost, view: *const graph.reader.View, _: format.EdgeId, edge: *const format.EdgeHot, _: search.Direction) !Cost {
-        const class = try view.class(edge.cls.class_id);
-        return truck.Kernel.edgeCost(self.profile, self.tables, class, edge.*, self.profile.untimedSpeed(edge.*), .{});
-    }
+        pub fn edgeCost(self: Self, view: *const graph.reader.View, _: format.EdgeId, edge: *const format.EdgeHot, _: search.Direction) !Cost {
+            const class = try view.class(edge.cls.class_id);
+            return model.Kernel.edgeCost(self.profile, self.tables, class, edge.*, self.profile.untimedSpeed(edge.*), .{});
+        }
 
-    pub fn allowedTurn(self: TruckTestCost, view: *const graph.reader.View, movement: search.Transition, _: search.Label, direction: search.Direction) !bool {
-        const from = try view.class(movement.incoming_edge.cls.class_id);
-        const to = try view.class(movement.outgoing_edge.cls.class_id);
-        const previous = if (direction == .forward) from else to;
-        const check: truck.PathCheck = .{
-            .backtrack = movement.incoming_edge.cls.opp_local == movement.outgoing_edge.cls.local,
-            .previous_dead_end = previous.flags.dead_end or (try view.outEdgeRange(movement.node)).count() == 1,
-            .previous_access = .{ .destination_only = previous.flags.destination_only_hgv },
-        };
-        const turn: routing.costing.base.Turn = .{ .row = movement.row };
-        const admission = switch (direction) {
-            .forward => try truck.Kernel.allowed(self.profile, view, movement.outgoing, from, to, turn, check, .none),
-            .reverse => try truck.Kernel.allowedReverse(self.profile, view, movement.incoming, from, to, turn, check, .none),
-        };
-        return admission.allowed;
-    }
+        pub fn allowedTurn(self: Self, view: *const graph.reader.View, movement: search.Transition, _: search.Label, direction: search.Direction) !bool {
+            const from = try view.class(movement.incoming_edge.cls.class_id);
+            const to = try view.class(movement.outgoing_edge.cls.class_id);
+            const previous = if (direction == .forward) from else to;
+            const check: model.PathCheck = .{
+                .backtrack = movement.incoming_edge.cls.opp_local == movement.outgoing_edge.cls.local,
+                .previous_dead_end = previous.flags.dead_end or (try view.outEdgeRange(movement.node)).count() == 1,
+                .previous_access = .{ .destination_only = if (truck) previous.flags.destination_only_hgv else previous.flags.destination_only },
+            };
+            const turn: routing.costing.base.Turn = .{ .row = movement.row };
+            const admission = if (truck) switch (direction) {
+                .forward => try model.Kernel.allowed(self.profile, view, movement.outgoing, from, to, turn, check, .none),
+                .reverse => try model.Kernel.allowedReverse(self.profile, view, movement.incoming, from, to, turn, check, .none),
+            } else switch (direction) {
+                .forward => try model.Kernel.allowed(self.profile, from, to, turn, check, .none),
+                .reverse => try model.Kernel.allowedReverse(self.profile, from, to, turn, check, .none),
+            };
+            return admission.allowed;
+        }
 
-    pub fn turnCost(self: TruckTestCost, view: *const graph.reader.View, movement: search.Transition, _: search.Label, _: search.Direction) !Cost {
-        const from = try view.class(movement.incoming_edge.cls.class_id);
-        const to = try view.class(movement.outgoing_edge.cls.class_id);
-        var turn = try truck.Turn.read(view, movement.node, movement.incoming, movement.outgoing, testing.allocator, .none);
-        turn.movement.base_turn.previous_destination_only = from.flags.destination_only_hgv;
-        turn.measured_speed = @as(u8, @bitCast(self.profile.untimedSpeed(movement.incoming_edge.*).sources)) != 0;
-        return truck.Kernel.turnCost(self.profile, try view.node(movement.node), from, to, turn);
-    }
-};
+        pub fn turnCost(self: Self, view: *const graph.reader.View, movement: search.Transition, _: search.Label, direction: search.Direction) !Cost {
+            const from = try view.class(movement.incoming_edge.cls.class_id);
+            const to = try view.class(movement.outgoing_edge.cls.class_id);
+            var turn = try model.Turn.read(view, movement.node, movement.incoming, movement.outgoing, testing.allocator, .none);
+            if (truck) turn.movement.base_turn.previous_destination_only = from.flags.destination_only_hgv;
+            turn.measured_speed = @as(u8, @bitCast(self.profile.untimedSpeed(movement.incoming_edge.*).sources)) != 0;
+            const node = try view.node(movement.node);
+            return switch (direction) {
+                .forward => model.Kernel.turnCost(self.profile, node, from, to, turn),
+                .reverse => model.Kernel.turnCostReverse(self.profile, node, from, to, turn),
+            };
+        }
+    };
+}
 
-fn checkTruckTrip(a: std.mem.Allocator, view: *const graph.reader.View, fixture: *const gurka.Map, origin: []const u8, destination: []const u8, settings: []const u8, expected: ?[]const []const u8) !void {
-    const truck = TruckTestCost.truck;
+fn checkMotorTrip(comptime model: type, mode: if (model == routing.costing.truck) void else model.Mode, a: std.mem.Allocator, view: *const graph.reader.View, fixture: *const gurka.Map, origin: []const u8, destination: []const u8, settings: []const u8, expected: ?[]const []const u8) !void {
+    const Adapter = MotorTestCost(model);
     var warnings: std.ArrayList(routing.costing.base.Warning) = .empty;
-    const options = try truck.parse(a, try routing.api.json.parse(a, settings), &warnings, .none);
+    const input = try routing.api.json.parse(a, settings);
+    const options = if (model == routing.costing.truck) try model.parse(a, input, &warnings, .none) else try model.parse(a, mode, input, &warnings, .none);
     try testing.expectEqual(0, warnings.items.len);
-    const profile = try truck.Profile.init(options);
+    const profile = try model.Model.canonicalize(options);
     const classes = view.classes orelse return error.MissingClasses;
-    const tables = try TruckTestCost.compiled.compileInto(truck.Model, profile, classes, try a.alloc(f32, classes.len), .none);
-    const cost: TruckTestCost = .{ .profile = &profile, .tables = &tables };
+    const tables = try routing.costing.compiled.compileInto(model.Model, profile, classes, try a.alloc(f32, classes.len), .none);
+    const cost: Adapter = .{ .profile = &profile, .tables = &tables };
     const from = try at(view, fixture.findNode(origin).?.location.toFixed());
     const to = try at(view, fixture.findNode(destination).?.location.toFixed());
     var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
     defer arena.deinit();
-    var engine = try search.Search(TruckTestCost, routing.search.queue.Heap).init(testing.allocator, view);
+    var engine = try search.Search(Adapter, routing.search.queue.Heap).init(testing.allocator, view);
     defer engine.deinit();
     for ([_]search.Direction{ .forward, .reverse }) |direction| {
         const result = engine.run(&arena, cost, .{ .origin = from, .destination = to, .direction = direction }, search.Zero{}, .{});
@@ -1747,6 +1758,10 @@ fn checkTruckTrip(a: std.mem.Allocator, view: *const graph.reader.View, fixture:
         }
         arena.reset();
     }
+}
+
+fn checkTruckTrip(a: std.mem.Allocator, view: *const graph.reader.View, fixture: *const gurka.Map, origin: []const u8, destination: []const u8, settings: []const u8, expected: ?[]const []const u8) !void {
+    return checkMotorTrip(routing.costing.truck, {}, a, view, fixture, origin, destination, settings, expected);
 }
 
 // Ported from test/gurka/test_truck.cc.
@@ -1842,6 +1857,60 @@ test "Gurka truck low class entry penalty selects the higher class detour" {
     const view = &built.bundle.view;
     try checkTruckTrip(a, view, &fixture, "S", "T", "{\"low_class_factor\":1,\"low_class_penalty\":0}", &.{ "SA", "AB", "BC", "CT" });
     try checkTruckTrip(a, view, &fixture, "S", "T", "{\"low_class_factor\":1,\"low_class_penalty\":120}", &.{ "SA", "AD", "DE", "EC", "CT" });
+}
+
+// Ported from the motorcycle cases in test/gurka/test_use_options.cc.
+test "Gurka motorcycle curvature preference takes the twisty road" {
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const layout = try gurka.mapToCoordinates(
+        \\A---------G
+        \\|        /
+        \\B     E-F
+        \\ \   /
+        \\  C-D
+    , 50);
+    const road = gurka.Tag{ .key = "highway", .value = "primary" };
+    const fixture = try gurka.Map.init(a, layout, &.{
+        .{ .label = "AG", .tags = &.{ road, .{ .key = "name", .value = "Straight Road" } } },
+        .{ .label = "ABCDEFG", .tags = &.{ road, .{ .key = "name", .value = "Twisty Road" } } },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 2);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const model = routing.costing.motorcycle;
+    try checkMotorTrip(model, .motorcycle, a, view, &fixture, "A", "G", "{}", &.{"AG"});
+    try checkMotorTrip(model, .motorcycle, a, view, &fixture, "A", "G", "{\"use_curvature\":1}", &.{"ABCDEFG"});
+    try checkMotorTrip(model, .motorcycle, a, view, &fixture, "A", "G", "{\"use_curvature\":0.75}", &.{"ABCDEFG"});
+}
+
+// Ported from ScooterTopSpeed and MotorcycleTopSpeed in test/gurka/test_speeds.cc.
+test "Gurka motorcycle and scooter top speed switch the selected road" {
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const layout = try gurka.mapToCoordinates(
+        \\B------C
+        \\|      |
+        \\|      |
+        \\A      D
+        \\|      |
+        \\E------F
+    , 10);
+    const road = gurka.Tag{ .key = "highway", .value = "residential" };
+    const fixture = try gurka.Map.init(a, layout, &.{
+        .{ .label = "ABCD", .tags = &.{ road, .{ .key = "maxspeed", .value = "45" } } },
+        .{ .label = "AEFD", .tags = &.{ road, .{ .key = "maxspeed", .value = "20" } } },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 2);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const model = routing.costing.motorcycle;
+    for ([_]model.Mode{ .motorcycle, .motor_scooter }) |mode| {
+        try checkMotorTrip(model, mode, a, view, &fixture, "A", "D", "{}", &.{"ABCD"});
+        try checkMotorTrip(model, mode, a, view, &fixture, "A", "D", "{\"top_speed\":20}", &.{"AEFD"});
+    }
 }
 
 test "assembled gates and tolls retain shared costing attributes" {

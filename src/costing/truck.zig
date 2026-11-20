@@ -19,7 +19,6 @@ const Cost = compiled.Cost;
 
 const residential = @backingInt(graph.constants.RoadClass.residential);
 const truck_route_factor: f32 = 0.85;
-const assumed_speed = 140;
 const top_speed_range: base.Range = .{ .min = 10, .default = 120, .max = 252 };
 const axle_load_range: base.Range = .{ .min = 0, .default = 9.07, .max = 40 };
 const truck_config: base.Config = blk: {
@@ -194,12 +193,7 @@ pub const Profile = struct {
         const low: f32 = if (class.category.road_class >= residential) self.low_class_adjustment else 0;
         weight += self.highway_bias[class.category.road_class] + surface + speed_penalty + toll + low;
         weight *= if (class.flags.truck_route) truck_route_factor else self.non_truck_route_factor;
-        return weight * switch (use) {
-            @backingInt(Use.track) => self.shared.tracks.factor,
-            @backingInt(Use.living_street) => self.shared.living_streets.factor,
-            @backingInt(Use.service_road) => self.shared.service_factor,
-            else => 1,
-        };
+        return weight * motor.roadUseFactor(&self.shared, use);
     }
 };
 
@@ -312,9 +306,7 @@ pub const Kernel = struct {
         const length: f32 = @floatFromInt(edge.geom.len_m);
         const secs = length * motor.speed_factors[profile.capSpeed(edge, kph)];
         if (profile.shared.shortest) return .{ .cost = length, .secs = secs };
-        const average = if (profile.top_speed != assumed_speed and speed.sources.current) speed.non_current_kph else kph;
-        const excess: f32 = @floatFromInt(average -| profile.top_speed);
-        const speed_penalty = excess * profile.shared.speed_penalty_factor;
+        const speed_penalty = motor.speedPenalty(profile.top_speed, profile.shared.speed_penalty_factor, kph, speed);
         var factor = if (speed_penalty == 0) static_weight else profile.classWeight(class, speed_penalty);
         std.debug.assert(std.math.isFinite(effects.factor) and effects.factor >= profile.min_linear_factor);
         factor *= effects.factor;
