@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate deterministic legal-range and production costing profiles for gate A."""
+"""Generate deterministic costing profiles and timed routes for gates A and B."""
 
 import argparse
 import collections
@@ -187,8 +187,21 @@ def main():
     family.add_argument("--motor", action="store_true", help="sample auto, bus, taxi and HOV options")
     family.add_argument("--truck", action="store_true", help="sample truck costing options and dimensions")
     family.add_argument("--motorcycle", action="store_true", help="sample motorcycle and motor scooter options")
+    family.add_argument("--timed", action="store_true", help="generate timed auto route cases")
     args = parser.parse_args()
     rng = random.Random(0x7A52C057)
+    if args.timed:
+        profiles = list(production(args.corpus, rng, args.paths_per_profile, ("auto",)))
+        if not any(profile["paths"] for profile in profiles):
+            parser.error("corpus must provide two-location auto routes")
+        for profile in profiles:
+            profile["paths"] = [
+                {**path, "date_time": {"type": kind, "value": "2026-11-09T" + time}}
+                for path in profile["paths"]
+                for kind, time in ((1, "06:45"), (1, "18:58"), (2, "19:05"), (3, "12:00"))
+            ]
+            print(json.dumps(profile, separators=(",", ":")))
+        return
     modes = ("truck",) if args.truck else MOTORCYCLE_MODES if args.motorcycle else MOTOR_MODES if args.motor else MODES
     profiles = list(production(args.corpus, rng, args.paths_per_profile, modes))
     if {p["mode"] for p in profiles} != set(modes):

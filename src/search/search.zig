@@ -40,6 +40,7 @@ pub const Label = extern struct {
     const exception_shift = 6;
     const prune_closures: u32 = 1 << 13;
     const excluded_start: u32 = 1 << 14;
+    const measured_speed: u32 = 1 << 15;
 
     pub fn edgeId(self: Label) EdgeId {
         return @fromBackingInt(self.edge);
@@ -79,16 +80,21 @@ pub const Timing = struct {
     start: graph.time_info.TimeInfo = .{},
     invariant: bool = false,
 
-    noinline fn local(self: Timing, view: *const View, node: NodeId, elapsed: f32, direction: Direction) !?graph.datetime.Local {
-        if (!self.start.valid) return null;
+    pub noinline fn at(self: Timing, view: *const View, node: NodeId, elapsed: f32, direction: Direction) !graph.time_info.TimeInfo {
+        if (!self.start.valid) return self.start;
         const zone = try view.nodeTimezone(node);
         const used = if (zone == graph.timezone.unknown) self.start.zone else zone;
         const rules = if (view.tz_rules) |*present| present else null;
         const seconds = if (self.invariant) 0 else elapsed;
-        const here = switch (direction) {
+        return switch (direction) {
             .forward => try self.start.forward(rules, seconds, used),
             .reverse => try self.start.reverse(rules, seconds, used),
         };
+    }
+
+    noinline fn local(self: Timing, view: *const View, node: NodeId, elapsed: f32, direction: Direction) !?graph.datetime.Local {
+        const here = try self.at(view, node, elapsed, direction);
+        const rules = if (view.tz_rules) |*present| present else null;
         return here.local(rules);
     }
 };
@@ -146,6 +152,16 @@ pub const Transition = struct {
     row: TurnEntry,
     incoming_access: base.AccessState = .{},
     outgoing_access: base.AccessState = .{},
+    measured_speed: bool = false,
+};
+
+pub const Traversal = struct {
+    cost: costing.Cost,
+    measured_speed: bool = false,
+
+    fn flags(self: Traversal) u32 {
+        return if (self.measured_speed) Label.measured_speed else 0;
+    }
 };
 
 pub const Result = struct {
@@ -231,7 +247,13 @@ const TurnContext = struct {
 };
 
 const Restrictions = struct {
-    const AliasKey = struct { edge: u32, value: u32, previous_edge: bool };
+    const AliasKey = struct {
+        edge: u32,
+        value: u32,
+        previous_edge: bool,
+        elapsed: u32 = 0,
+        access_flags: u32 = 0,
+    };
     const AliasStatus = std.AutoHashMapUnmanaged(AliasKey, Status);
     const Position = enum { start, middle, end };
 
@@ -244,6 +266,7 @@ const Restrictions = struct {
     control: Control,
     check_access: bool,
     has_exclusions: bool,
+    keep_time: bool,
     aliases: AliasStatus = .empty,
 
     noinline fn advance(self: *const Restrictions, context: TurnContext, previous: Label, node: NodeId, id: EdgeId) !TurnContext {
@@ -312,6 +335,20 @@ const Restrictions = struct {
     fn aliasKey(edge: u32, context: TurnContext) AliasKey {
         return .{ .edge = edge, .value = context.value, .previous_edge = context.alias };
     }
+
+    fn timedKey(label: Label, context: TurnContext) AliasKey {
+        var key = aliasKey(label.edge, context);
+        key.elapsed = @bitCast(label.secs);
+        const access = Label.destination_only | (0x7f << Label.exception_shift) | Label.prune_closures |
+            Label.excluded_start | Label.forbid_uturn | Label.measured_speed;
+        key.access_flags = label.flags & access;
+        return key;
+    }
+};
+
+const TemporalInputs = struct {
+    speeds: base.Flow = .{},
+    access_modes: u16 = 0,
 };
 
 /// K supplies edgeCost(view, edge_id, hot, direction), turnCost(view,
@@ -320,18 +357,26 @@ const Restrictions = struct {
 /// restrictionModes() or restrictionPermission() for selecting conditional
 /// and complex restrictions (defaults to auto). A concrete closed(edge)
 /// policy supplies current-traffic closures when Permission enables them.
+/// Timed kernels can supply edgeCostAt and endpointCostAt returning a
+/// Traversal, and turnCostAt with TimeInfo after the usual parameters.
+/// edgeTraversal supplies source information in the untimed search too.
+/// A graph-only timed kernel can use timeDependentCosts(Flow) to detect
+/// whether the graph's populated speed layers can change its prices.
 /// All weighted costs must be nonnegative. A state is the last directed edge
-/// and the matched restriction prefix.
+/// and the matched restriction prefix, with elapsed time when costs or
+/// restrictions can change along the route.
 /// The cost and admissibility of future steps must be independent of the
 /// path to that state. Queue entries use nonnegative f32 ordering.
 pub fn Search(comptime K: type, comptime Q: type) type {
     return struct {
         const Self = @This();
         const Pool = memory.PagePool(16 * 1024);
+        const timed_costs = @hasDecl(K, "edgeCostAt") or @hasDecl(K, "turnCostAt") or @hasDecl(K, "endpointCostAt");
 
         view: *const View,
         allocator: std.mem.Allocator,
         status: paged.EdgeStatus(Status),
+        temporal_inputs: ?TemporalInputs = null,
 
         pub fn init(allocator: std.mem.Allocator, view: *const View) !Self {
             const virtual = if (view.restriction_automaton) |states| states.len - automaton.first_context else 0;
@@ -393,12 +438,48 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             const simple = if (self.view.turn_restrictions) |rows| rows.len != 0 else false;
             const check_access = !permission.flags.contains(.ignore_restrictions) and
                 (query.timing.start.valid or @hasDecl(K, "restrictionPermission"));
-            if (check_access or (modes != 0 and (simple or self.view.restriction_automaton != null)))
-                return self.runLoop(direction, true, arena, kernel, query, potential, control, permission, check_access);
-            return self.runLoop(direction, false, arena, kernel, query, potential, control, permission, false);
+            const keep_time = query.timing.start.valid and !query.timing.invariant and
+                try self.keepTime(kernel, permission, check_access, control);
+            if (check_access or (timed_costs and query.timing.start.valid) or (modes != 0 and (simple or self.view.restriction_automaton != null)))
+                return self.runLoop(direction, true, arena, kernel, query, potential, control, permission, check_access, keep_time);
+            return self.runLoop(direction, false, arena, kernel, query, potential, control, permission, false, false);
         }
 
-        fn runLoop(self: *Self, comptime direction: Direction, comptime with_restrictions: bool, arena: *memory.Arena, kernel: K, query: anytype, potential: anytype, control: Control, permission: base.Permission, check_access: bool) !Result {
+        fn keepTime(self: *Self, kernel: K, permission: base.Permission, check_access: bool, control: Control) !bool {
+            const graph_costs = timed_costs and @hasDecl(K, "timeDependentCosts");
+            if (timed_costs and !graph_costs) return true;
+            if (permission.restrictionModes() != 0) {
+                if (self.view.restriction_conditions) |conditions| if (conditions.len != 0) return true;
+            }
+            const timed_access = check_access and !permission.flags.contains(.ignore_non_vehicular_restrictions) and self.view.cold_data != null;
+            if (!graph_costs and !timed_access) return false;
+            const inputs = self.temporal_inputs orelse try self.scanTemporalInputs(control);
+            if (timed_access and inputs.access_modes & @as(u16, @bitCast(permission.access_mask)) != 0) return true;
+            if (graph_costs) return kernel.timeDependentCosts(inputs.speeds);
+            return false;
+        }
+
+        noinline fn scanTemporalInputs(self: *Self, control: Control) !TemporalInputs {
+            var inputs: TemporalInputs = .{};
+            for (self.view.edges, 0..) |*edge, i| {
+                if (i % 1024 == 0) try control.check();
+                inputs.speeds.freeflow = inputs.speeds.freeflow or edge.speed[1] != 0;
+                inputs.speeds.constrained = inputs.speeds.constrained or edge.speed[2] != 0;
+                if (edge.cls.cold_checks == 0 or self.view.cold_data == null or self.view.classes == null) continue;
+                const class = try self.view.class(edge.cls.class_id);
+                if (class.detail.access_restriction & ~inputs.access_modes == 0) continue;
+                const record = try self.view.coldRecordWithDeadline(@fromBackingInt(@as(u32, @intCast(i))), control.deadline);
+                var limits = record.restrictions();
+                while (limits.next()) |limit| {
+                    try control.check();
+                    if (limit.attr.kind.timed()) inputs.access_modes |= limit.modes();
+                }
+            }
+            self.temporal_inputs = inputs;
+            return inputs;
+        }
+
+        fn runLoop(self: *Self, comptime direction: Direction, comptime with_restrictions: bool, arena: *memory.Arena, kernel: K, query: anytype, potential: anytype, control: Control, permission: base.Permission, check_access: bool, keep_time: bool) !Result {
             const partial = @TypeOf(query) == PartialRequest;
             const target = if (partial) null else query.target;
             const limit = if (partial) std.math.maxInt(usize) else query.limit;
@@ -421,6 +502,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 .control = control,
                 .check_access = check_access,
                 .has_exclusions = query.excluded.len != 0,
+                .keep_time = keep_time,
             } else {};
             const tracker = if (with_restrictions) &restrictions else null;
             var fractions: ?*ExclusionFractions = null;
@@ -435,7 +517,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             if (partial) {
                 try self.seedPartials(direction, &pool, kernel, query, &labels, &cuts, &pending, potential, tracker, fractions, permission, control);
             } else {
-                try self.seedNode(direction, &pool, kernel, query.start, target, &labels, &pending, potential, tracker, permission, query.excluded.len != 0);
+                try self.seedNode(direction, &pool, kernel, query.start, target, query.timing, &labels, &pending, potential, tracker, permission, query.excluded.len != 0);
             }
 
             var popped: usize = 0;
@@ -452,7 +534,9 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 else
                     .{};
                 if (last.flags & Label.partial_target == 0) {
-                    const active = if (partial and last.flags & Label.excluded_start != 0)
+                    const active: Status = if (with_restrictions and tracker.keep_time)
+                        tracker.aliases.get(Restrictions.timedKey(last, context)) orelse Status{}
+                    else if (partial and last.flags & Label.excluded_start != 0)
                         fractions.?.get(last.edge).?.seed
                     else
                         self.findStatus(tracker, last.edge, context);
@@ -469,6 +553,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 const geometry = if (direction == .forward) previous_edge else try self.view.edge(try self.view.oppEdge(previous_id));
                 const at: NodeId = @fromBackingInt(geometry.head);
                 const exits = try self.view.outEdgeRange(at);
+                const time: graph.time_info.TimeInfo = if (timed_costs) try query.timing.at(self.view, at, last.secs, direction) else .{};
                 const forward_row = if (direction == .forward) try self.view.turnRow(at, geometry.cls.opp_local) else &.{};
                 for (self.view.edges[exits.first..exits.end], exits.first.., 0..) |*outward, index, local| {
                     if (partial and last.flags & Label.forbid_uturn != 0 and local == geometry.cls.opp_local) continue;
@@ -498,7 +583,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                         if (geometry.cls.opp_local >= reverse_row.len) return error.InvalidLocalEdge;
                         break :blk reverse_row[geometry.cls.opp_local];
                     };
-                    const movement: Transition = .{
+                    var movement: Transition = .{
                         .node = at,
                         .incoming = if (direction == .forward) previous_id else next_id,
                         .incoming_edge = if (direction == .forward) previous_edge else next,
@@ -514,9 +599,14 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     if (comptime @hasDecl(K, "slowAllowed")) {
                         if (next.cls.cold_checks != 0 and !try Self.slowAllowed(kernel, self.view, next_id, next, last, direction)) continue;
                     }
-                    const edge_cost = try kernel.edgeCost(self.view, next_id, next, direction);
+                    const traversal = try self.priceEdge(kernel, next_id, next, direction, time, false);
+                    const edge_cost = traversal.cost;
                     if (edge_cost.cost == std.math.inf(f32)) continue;
-                    const delay = try kernel.turnCost(self.view, movement, last, direction);
+                    movement.measured_speed = if (direction == .forward) last.flags & Label.measured_speed != 0 else traversal.measured_speed;
+                    const delay = if (comptime @hasDecl(K, "turnCostAt")) delay: {
+                        if (time.valid) break :delay try kernel.turnCostAt(self.view, movement, last, direction, time);
+                        break :delay try kernel.turnCost(self.view, movement, last, direction);
+                    } else try kernel.turnCost(self.view, movement, last, direction);
                     if (delay.cost == std.math.inf(f32)) continue;
                     const previous: costing.Cost = .{ .cost = last.cost, .secs = last.secs };
                     if (partial) {
@@ -550,7 +640,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                         .dist_m = last.dist_m +| next.geom.len_m,
                         .tcost = delay.cost,
                         .ctx = next_context.value,
-                        .flags = Label.contextFlags(next_context, access.state) | closureFlag(!closed),
+                        .flags = Label.contextFlags(next_context, access.state) | closureFlag(!closed) | traversal.flags(),
                     }, null);
                 }
             }
@@ -581,8 +671,9 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             }
         }
 
-        fn seedNode(self: *Self, comptime direction: Direction, pool: *Pool, kernel: K, start: NodeId, target: ?NodeId, labels: *std.ArrayList(Label), pending: *Q, potential: anytype, tracker: anytype, permission: base.Permission, has_exclusions: bool) !void {
+        fn seedNode(self: *Self, comptime direction: Direction, pool: *Pool, kernel: K, start: NodeId, target: ?NodeId, timing: Timing, labels: *std.ArrayList(Label), pending: *Q, potential: anytype, tracker: anytype, permission: base.Permission, has_exclusions: bool) !void {
             const seeds = try self.view.outEdgeRange(start);
+            const time: graph.time_info.TimeInfo = if (timed_costs) try timing.at(self.view, start, 0, direction) else .{};
             for (self.view.edges[seeds.first..seeds.end], seeds.first..) |*outward, index| {
                 const geometry_id: EdgeId = @fromBackingInt(@as(u32, @intCast(index)));
                 const id = if (direction == .forward) geometry_id else try self.view.oppEdge(geometry_id);
@@ -593,7 +684,8 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 if (comptime @hasDecl(K, "slowAllowed")) {
                     if (edge.cls.cold_checks != 0 and !try Self.slowAllowed(kernel, self.view, id, edge, null, direction)) continue;
                 }
-                const edge_cost = try kernel.edgeCost(self.view, id, edge, direction);
+                const traversal = try self.priceEdge(kernel, id, edge, direction, time, false);
+                const edge_cost = traversal.cost;
                 if (edge_cost.cost == std.math.inf(f32)) continue;
                 const here: NodeId = @fromBackingInt(outward.head);
                 const access = if (@TypeOf(tracker) != @TypeOf(null) and edge.cls.cold_checks != 0)
@@ -608,7 +700,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     .secs = edge_cost.secs,
                     .dist_m = edge.geom.len_m,
                     .ctx = context.value,
-                    .flags = Label.contextFlags(context, access.state) | closureFlag(!closed),
+                    .flags = Label.contextFlags(context, access.state) | closureFlag(!closed) | traversal.flags(),
                 }, null);
             }
         }
@@ -627,18 +719,22 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 if (excluded) |entry| if (cutsExcluded(entry.fraction, candidate.fraction, direction == .forward)) continue;
                 const closed = try self.edgeClosed(kernel, permission, id);
                 if (closed and permission.filter_closures) continue;
-                const full = if (comptime @hasDecl(K, "endpointCost"))
-                    try kernel.endpointCost(self.view, id, edge, direction)
+                const price_at_time = timed_costs and query.timing.start.valid;
+                const check_access = @TypeOf(tracker) != @TypeOf(null) and edge.cls.cold_checks != 0;
+                const tail: NodeId = if (price_at_time or check_access)
+                    @fromBackingInt(if (direction == .forward) (try self.view.edge(try self.view.oppEdge(id))).head else edge.head)
                 else
-                    try kernel.edgeCost(self.view, id, edge, direction);
+                    undefined;
+                const time: graph.time_info.TimeInfo = if (price_at_time) try query.timing.at(self.view, tail, 0, direction) else .{};
+                const traversal = try self.priceEdge(kernel, id, edge, direction, time, true);
+                const full = traversal.cost;
                 if (full.cost == std.math.inf(f32)) continue;
                 const geometry = if (direction == .forward) edge else try self.view.edge(try self.view.oppEdge(id));
                 const node: NodeId = @fromBackingInt(geometry.head);
                 const portion: Cut = if (direction == .forward) .{ .begin = candidate.fraction } else .{ .end = candidate.fraction };
                 const at_node = if (direction == .forward) candidate.end_node else candidate.begin_node;
                 const cost = scale(full, @max(portion.end - portion.begin, std.math.floatEps(f32)), candidate.score);
-                const access = if (@TypeOf(tracker) != @TypeOf(null) and edge.cls.cold_checks != 0) access: {
-                    const tail: NodeId = @fromBackingInt(if (direction == .forward) (try self.view.edge(try self.view.oppEdge(id))).head else edge.head);
+                const access = if (check_access) access: {
                     break :access try tracker.evaluateAccess(id, edge, tail, .{}, .start);
                 } else base.AccessEvaluation{};
                 if (!access.allowed) continue;
@@ -649,7 +745,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     .cost = cost.cost,
                     .secs = cost.secs,
                     .dist_m = fractionalLength(edge.geom.len_m, portion),
-                    .flags = Label.contextFlags(context, access.state) | Label.partial_start | closureFlag(!closed) |
+                    .flags = Label.contextFlags(context, access.state) | Label.partial_start | closureFlag(!closed) | traversal.flags() |
                         (if (query.forbid_initial_uturn and at_node and portion.begin == portion.end) Label.forbid_uturn else 0),
                     .ctx = std.math.cast(u32, cuts.items.len) orelse return error.TooManySearchLabels,
                 };
@@ -692,6 +788,18 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             try pending.push(a, queue.Entry.init(label.cost, index));
         }
 
+        inline fn priceEdge(self: *Self, kernel: K, id: EdgeId, edge: *const EdgeHot, comptime direction: Direction, time: graph.time_info.TimeInfo, comptime endpoint: bool) !Traversal {
+            if (endpoint and @hasDecl(K, "endpointCostAt")) {
+                if (time.valid) return kernel.endpointCostAt(self.view, id, edge, direction, time);
+            }
+            if (endpoint and @hasDecl(K, "endpointCost")) return .{ .cost = try kernel.endpointCost(self.view, id, edge, direction) };
+            if (comptime @hasDecl(K, "edgeCostAt")) {
+                if (time.valid) return kernel.edgeCostAt(self.view, id, edge, direction, time);
+            }
+            if (comptime @hasDecl(K, "edgeTraversal")) return kernel.edgeTraversal(self.view, id, edge, direction);
+            return .{ .cost = try kernel.edgeCost(self.view, id, edge, direction) };
+        }
+
         noinline fn slowAllowed(kernel: K, view: *const View, id: EdgeId, edge: *const EdgeHot, predecessor: ?Label, comptime direction: Direction) !bool {
             return try kernel.slowAllowed(view, id, edge, predecessor, direction);
         }
@@ -712,14 +820,20 @@ pub fn Search(comptime K: type, comptime Q: type) type {
         }
 
         inline fn findStatus(self: *Self, tracker: anytype, edge: u32, context: TurnContext) Status {
-            if (@TypeOf(tracker) == @TypeOf(null) or !context.present()) return self.status.get(edge);
+            if (@TypeOf(tracker) == @TypeOf(null) or tracker.keep_time or !context.present()) return self.status.get(edge);
             if (tracker.statusId(edge, context)) |id| return self.status.get(id);
             if (tracker.has_exclusions and self.status.get(edge).label_plus_one == Status.exclusion) return .{ .label_plus_one = Status.exclusion };
             return tracker.aliases.get(Restrictions.aliasKey(edge, context)) orelse .{};
         }
 
         fn offer(self: *Self, pool: *Pool, labels: *std.ArrayList(Label), pending: *Q, potential: anytype, target: ?NodeId, head: NodeId, status: Status, tracker: anytype, context: TurnContext, label: Label, seed_slot: anytype) !void {
-            if (status.label_plus_one != 0 and labels.items[status.label_plus_one - 1].cost <= label.cost) return;
+            const use_time = @TypeOf(tracker) != @TypeOf(null) and tracker.keep_time;
+            const key = if (use_time) Restrictions.timedKey(label, context) else undefined;
+            const previous = if (use_time and status.label_plus_one != Status.exclusion)
+                tracker.aliases.get(key) orelse Status{}
+            else
+                status;
+            if (previous.label_plus_one != 0 and labels.items[previous.label_plus_one - 1].cost <= label.cost) return;
             if (@backingInt(head) >= self.view.nodes.len) return error.InvalidEdgeHead;
             // A better label may reopen a state for an inconsistent, but
             // admissible, potential. Stale heap entries are skipped on pop.
@@ -734,7 +848,10 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             var record = label;
             if (done) record.flags |= Label.target;
             const a = pool.arena.allocator();
-            const slot = if (@TypeOf(seed_slot) != @TypeOf(null)) seed_slot else if (@TypeOf(tracker) == @TypeOf(null) or !context.present()) try self.status.at(pool, label.edge) else blk: {
+            const slot = if (use_time) timed: {
+                const entry = try tracker.aliases.getOrPutValue(a, key, .{});
+                break :timed entry.value_ptr;
+            } else if (@TypeOf(seed_slot) != @TypeOf(null)) seed_slot else if (@TypeOf(tracker) == @TypeOf(null) or !context.present()) try self.status.at(pool, label.edge) else blk: {
                 if (tracker.statusId(label.edge, context)) |id| break :blk try self.status.at(pool, id);
                 const entry = try tracker.aliases.getOrPutValue(a, Restrictions.aliasKey(label.edge, context), .{});
                 break :blk entry.value_ptr;

@@ -1197,6 +1197,73 @@ test "Gurka timed turn conditions switch the legal movement only within the wind
     }
 }
 
+test "time-dependent search keeps the better continuation of a later arrival" {
+    const TimedCost = struct {
+        shortcut: format.EdgeId,
+        departure: u32,
+        target: u32,
+
+        pub fn edgeCost(self: @This(), view: *const graph.reader.View, id: format.EdgeId, edge: *const format.EdgeHot, _: search.Direction) !Cost {
+            if (!(try view.class(edge.cls.class_id)).forwardAccess().auto) return .forbidden;
+            return if (id == self.shortcut) .{ .cost = 1, .secs = 10 } else .{ .cost = 2, .secs = 40 };
+        }
+
+        pub fn edgeCostAt(self: @This(), view: *const graph.reader.View, id: format.EdgeId, edge: *const format.EdgeHot, direction: search.Direction, time: graph.time_info.TimeInfo) !search.Traversal {
+            var cost = try self.edgeCost(view, id, edge, direction);
+            if (cost.cost != std.math.inf(f32) and time.second_of_week < self.departure + 60 and edge.head == self.target)
+                cost.cost += 50;
+            return .{ .cost = cost };
+        }
+
+        pub fn turnCost(_: @This(), _: *const graph.reader.View, _: search.Transition, _: search.Label, _: search.Direction) !Cost {
+            return .{};
+        }
+    };
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const road: gurka.Tags = &.{ .{ .key = "highway", .value = "residential" }, .{ .key = "oneway", .value = "yes" } };
+    const layout = try gurka.mapToCoordinates(
+        \\A-----X--Y--Z
+        \\|    /
+        \\B----
+    , 10);
+    const fixture = try gurka.Map.init(a, layout, &.{
+        .{ .label = "AX", .tags = road },
+        .{ .label = "AB", .tags = road },
+        .{ .label = "BX", .tags = road },
+        .{ .label = "XY", .tags = road },
+        .{ .label = "YZ", .tags = road },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const from = try at(view, fixture.findNode("A").?.location.toFixed());
+    const to = try at(view, fixture.findNode("Z").?.location.toFixed());
+    const timing = try restrictionTiming("2026-11-02T12:00", false);
+    const kernel: TimedCost = .{
+        .shortcut = try directedBetween(view, &fixture, "A", "X"),
+        .departure = timing.start.second_of_week,
+        .target = @backingInt(to),
+    };
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    var engine = try search.Search(TimedCost, routing.search.queue.Heap).init(testing.allocator, view);
+    defer engine.deinit();
+    var request: search.Request = .{ .origin = from, .destination = to };
+    const untimed = try engine.run(&arena, kernel, request, search.Zero{}, .{});
+    try expectWayPath(view, &fixture, untimed, .forward, &.{ "AX", "XY", "YZ" });
+    arena.reset();
+    request.timing = timing;
+    const timed = try engine.run(&arena, kernel, request, search.Zero{}, .{});
+    try expectWayPath(view, &fixture, timed, .forward, &.{ "AB", "BX", "XY", "YZ" });
+    try testing.expectEqual(@as(f32, 8), timed.best().cost);
+    arena.reset();
+    request.timing.invariant = true;
+    const invariant = try engine.run(&arena, kernel, request, search.Zero{}, .{});
+    try expectWayPath(view, &fixture, invariant, .forward, &.{ "AX", "XY", "YZ" });
+}
+
 test "via-way relation annotations follow the pinned untimed representation" {
     var storage: std.heap.ArenaAllocator = .init(testing.allocator);
     defer storage.deinit();
@@ -1693,9 +1760,28 @@ fn MotorTestCost(comptime model: type) type {
         profile: *const model.Profile,
         tables: *const compiled.Compiled,
 
-        pub fn edgeCost(self: Self, view: *const graph.reader.View, _: format.EdgeId, edge: *const format.EdgeHot, _: search.Direction) !Cost {
+        pub fn edgeCost(self: Self, view: *const graph.reader.View, edge_id: format.EdgeId, edge: *const format.EdgeHot, direction: search.Direction) !Cost {
+            return (try self.edgeTraversal(view, edge_id, edge, direction)).cost;
+        }
+
+        pub fn edgeTraversal(self: Self, view: *const graph.reader.View, _: format.EdgeId, edge: *const format.EdgeHot, _: search.Direction) !search.Traversal {
+            return self.traversal(view, edge, self.profile.untimedSpeed(edge.*));
+        }
+
+        pub fn edgeCostAt(self: Self, view: *const graph.reader.View, edge_id: format.EdgeId, edge: *const format.EdgeHot, _: search.Direction, time: graph.time_info.TimeInfo) !search.Traversal {
+            const speed = self.profile.resolvedSpeed(edge.*, edge_id, graph.speed.Time.fromTimeInfo(time), graph.speed.NoOverlays{});
+            return self.traversal(view, edge, speed);
+        }
+
+        pub fn timeDependentCosts(self: Self, available: graph.speed.Flow) bool {
+            const selected = self.profile.permission.flow;
+            return self.profile.fixed_speed == 0 and ((available.freeflow and selected.freeflow) or (available.constrained and selected.constrained));
+        }
+
+        fn traversal(self: Self, view: *const graph.reader.View, edge: *const format.EdgeHot, speed: model.Speed) !search.Traversal {
             const class = try view.class(edge.cls.class_id);
-            return model.Kernel.edgeCost(self.profile, self.tables, class, edge.*, self.profile.untimedSpeed(edge.*), .{});
+            const cost = model.Kernel.edgeCost(self.profile, self.tables, class, edge.*, speed, .{});
+            return .{ .cost = cost, .measured_speed = @as(u8, @bitCast(speed.sources)) != 0 };
         }
 
         pub fn allowedTurn(self: Self, view: *const graph.reader.View, movement: search.Transition, _: search.Label, direction: search.Direction) !bool {
@@ -1723,7 +1809,7 @@ fn MotorTestCost(comptime model: type) type {
             const to = try view.class(movement.outgoing_edge.cls.class_id);
             var turn = try model.Turn.read(view, movement.node, movement.incoming, movement.outgoing, testing.allocator, .none);
             if (truck) turn.movement.base_turn.previous_destination_only = from.flags.destination_only_hgv;
-            turn.measured_speed = @as(u8, @bitCast(self.profile.untimedSpeed(movement.incoming_edge.*).sources)) != 0;
+            turn.measured_speed = movement.measured_speed;
             const node = try view.node(movement.node);
             return switch (direction) {
                 .forward => model.Kernel.turnCost(self.profile, node, from, to, turn),
@@ -1731,6 +1817,67 @@ fn MotorTestCost(comptime model: type) type {
             };
         }
     };
+}
+
+test "Gurka timed motor routes use free flow at night and constrained flow by day" {
+    const auto = routing.costing.auto;
+    const Adapter = MotorTestCost(auto);
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const tags: gurka.Tags = &.{ .{ .key = "highway", .value = "residential" }, .{ .key = "oneway", .value = "yes" } };
+    const layout = try gurka.mapToCoordinates(
+        \\A---B
+        \\|   |
+        \\D---C
+    , 10);
+    const fixture = try gurka.Map.init(a, layout, &.{
+        .{ .label = "AB", .tags = tags },
+        .{ .label = "BC", .tags = tags },
+        .{ .label = "AD", .tags = tags },
+        .{ .label = "DC", .tags = tags },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    var view = built.bundle.view;
+    const edges = try a.dupe(format.EdgeHot, view.edges);
+    view.edges = edges;
+    for (edges, 0..) |*edge, i| {
+        const id: format.EdgeId = @fromBackingInt(@as(u32, @intCast(i)));
+        const way = try view.wayId(id);
+        const upper = way == fixture.findWay("AB").?.id or way == fixture.findWay("BC").?.id;
+        edge.speed = if (upper) .{ 50, 100, 10, 0 } else .{ 20, 10, 100, 0 };
+    }
+
+    var warnings: std.ArrayList(routing.costing.base.Warning) = .empty;
+    const profile = try auto.Model.canonicalize(try auto.parse(a, .auto, .null, &warnings, .none));
+    const classes = view.classes.?;
+    const tables = try routing.costing.compiled.compileInto(auto.Model, profile, classes, try a.alloc(f32, classes.len), .none);
+    const cost: Adapter = .{ .profile = &profile, .tables = &tables };
+    const from = try at(&view, fixture.findNode("A").?.location.toFixed());
+    const to = try at(&view, fixture.findNode("C").?.location.toFixed());
+    var counting = routing.infra.arena.CountingAllocator.init(testing.allocator);
+    var arena = routing.infra.arena.Arena.init(counting.allocator(), .{});
+    defer arena.deinit();
+    var engine = try search.Search(Adapter, routing.search.queue.Heap).init(counting.allocator(), &view);
+    defer engine.deinit();
+    const cases = [_]struct { time: search.Timing, path: []const []const u8 }{
+        .{ .time = .{}, .path = &.{ "AD", "DC" } },
+        .{ .time = try restrictionTiming("2026-11-02T06:00", false), .path = &.{ "AB", "BC" } },
+        .{ .time = try restrictionTiming("2026-11-02T12:00", false), .path = &.{ "AD", "DC" } },
+        .{ .time = try restrictionTiming("2026-11-02T20:00", true), .path = &.{ "AB", "BC" } },
+    };
+    for (0..2) |round| {
+        if (round == 1) counting.resetCounts();
+        for ([_]search.Direction{ .forward, .reverse }) |direction| {
+            for (cases) |case| {
+                const result = try engine.run(&arena, cost, .{ .origin = from, .destination = to, .direction = direction, .timing = case.time }, search.Zero{}, .{});
+                try expectWayPath(&view, &fixture, result, direction, case.path);
+                arena.reset();
+            }
+        }
+    }
+    try testing.expectEqual(0, counting.calls());
 }
 
 fn checkMotorTrip(comptime model: type, mode: if (model == routing.costing.truck) void else model.Mode, a: std.mem.Allocator, view: *const graph.reader.View, fixture: *const gurka.Map, origin: []const u8, destination: []const u8, settings: []const u8, expected: ?[]const []const u8) !void {
@@ -2662,6 +2809,144 @@ test "ranked endpoint candidates choose between connected alternatives and filte
     const promoted = try endpoints.route(&searcher, &arena, kernel, snapLocation(&.{}, starts[2..3]), end, .{ .costing = .bicycle }, search.Zero{}, .{});
     try testing.expectEqualDeep([2]bool{ true, false }, promoted.ignored_filter);
     try testing.expectApproxEqAbs(full.cost * 0.25, promoted.cost, 1e-5);
+}
+
+// Ported from the route clock and waiting cases in test/gurka/test_time_tracking.cc.
+test "timed routes price each leg at its clock, apply break waiting and report local zones" {
+    const multi = routing.search.multi;
+    const api = routing.api.request;
+    const FixedCost = struct {
+        expected_times: [2]i64,
+        seen: *[2]bool,
+
+        pub fn edgeCost(_: @This(), _: *const graph.reader.View, _: format.EdgeId, _: *const format.EdgeHot, _: search.Direction) !Cost {
+            return .{ .cost = 240, .secs = 240 };
+        }
+
+        pub fn edgeCostAt(self: @This(), view: *const graph.reader.View, id: format.EdgeId, edge: *const format.EdgeHot, direction: search.Direction, time: graph.time_info.TimeInfo) !search.Traversal {
+            for (self.expected_times, self.seen) |instant, *seen| seen.* = seen.* or instant == time.unix_time;
+            return .{ .cost = try self.edgeCost(view, id, edge, direction) };
+        }
+
+        pub fn turnCost(_: @This(), _: *const graph.reader.View, _: search.Transition, _: search.Label, _: search.Direction) !Cost {
+            return .{};
+        }
+    };
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "residential" }};
+    const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates("A---B---C", 20), &.{
+        .{ .label = "AB", .tags = road },
+        .{ .label = "BC", .tags = road },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const ab = try directedBetween(view, &fixture, "A", "B");
+    const correlations = [_]routing.snap.candidates.PathLocation{
+        snapLocation(&.{snapEdge(ab, 0, 0)}, &.{}),
+        snapLocation(&.{snapEdge(ab, 0.5, 0)}, &.{}),
+        snapLocation(&.{snapEdge(ab, 1, 0)}, &.{}),
+    };
+    const origin = "2026-11-02T12:00";
+    const departure = (try restrictionTiming(origin, false)).start.unix_time;
+    var locations = [_]api.Location{
+        .{ .lat = 0, .lng = 0, .date_time = origin, .waiting_secs = 90 },
+        .{ .lat = 0, .lng = 0, .waiting_secs = 60 },
+        .{ .lat = 0, .lng = 0, .date_time = "2026-11-02T12:05", .waiting_secs = 120 },
+    };
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    var engine = try search.Search(FixedCost, routing.search.queue.Heap).init(testing.allocator, view);
+    defer engine.deinit();
+    for ([_]api.DateTimeType{ .depart_at, .arrive_by, .current, .invariant }) |mode| {
+        var seen = [2]bool{ false, false };
+        const expected: [2]i64 = switch (mode) {
+            .arrive_by => .{ departure + 300, departure + 120 },
+            .invariant => .{ departure, departure },
+            else => .{ departure, departure + 180 },
+        };
+        locations[0].date_time = if (mode == .current) "current" else origin;
+        const route = try multi.route(&engine, &arena, FixedCost{ .expected_times = expected, .seen = &seen }, &locations, &correlations, .{
+            .search = .{ .costing = .auto },
+            .date_time_type = mode,
+            .now = departure + 12,
+        }, .{});
+        try testing.expectEqual([2]bool{ true, true }, seen);
+        try testing.expectEqual(@as(f32, 240), route.total.secs);
+        try testing.expectEqualStrings(origin, route.waypoints[0].date_time.?);
+        try testing.expectEqualStrings(if (mode == .invariant) origin else "2026-11-02T12:03", route.waypoints[1].date_time.?);
+        try testing.expectEqualStrings(if (mode == .invariant) origin else "2026-11-02T12:05", route.waypoints[2].date_time.?);
+        try testing.expectEqualStrings("+00:00", route.waypoints[1].time_zone_offset);
+        try testing.expectEqual([3]f32{ 0, 60, 0 }, .{ route.waypoints[0].waiting_secs, route.waypoints[1].waiting_secs, route.waypoints[2].waiting_secs });
+        try testing.expectEqual(@as(usize, 2), route.legs.len);
+        for (route.legs) |leg| {
+            try testing.expectEqual(@as(usize, 1), leg.segments.len);
+            try testing.expectEqual(ab, leg.segments[0].edge);
+        }
+        arena.reset();
+    }
+
+    locations[0].date_time = origin;
+    locations[1].type = .through;
+    var seen = [2]bool{ false, false };
+    const through = try multi.route(&engine, &arena, FixedCost{ .expected_times = .{ departure, departure + 120 }, .seen = &seen }, &locations, &correlations, .{
+        .search = .{ .costing = .auto },
+        .date_time_type = .depart_at,
+        .now = departure,
+    }, .{});
+    try testing.expectEqual([2]bool{ true, true }, seen);
+    try testing.expectEqual(1, through.legs.len);
+    try testing.expectEqual(0, through.waypoints[1].waiting_secs);
+    try testing.expectEqualStrings("2026-11-02T12:02", through.waypoints[1].date_time.?);
+    try testing.expectEqualStrings("2026-11-02T12:04", through.waypoints[2].date_time.?);
+    arena.reset();
+
+    const bytes = try io.readFileAlloc(a, "src/graph/timezones/iana-2026f.ztz", 4 << 20);
+    const aligned = try a.alignedAlloc(u8, .@"8", bytes.len);
+    @memcpy(aligned, bytes);
+    const rules = try graph.timezone.Rules.parse(aligned);
+    const ny = try rules.id("America/New_York");
+    const la = try rules.id("America/Los_Angeles");
+    const bc = try directedBetween(view, &fixture, "B", "C");
+    var zoned = view.*;
+    const zones = try a.alloc(graph.timezone.Id, view.nodes.len);
+    @memset(zones, ny);
+    zones[(try view.edge(bc)).head] = la;
+    zoned.node_timezones = zones;
+    zoned.tz_rules = rules;
+    var zoned_engine = try search.Search(FixedCost, routing.search.queue.Heap).init(testing.allocator, &zoned);
+    defer zoned_engine.deinit();
+    const cross_zone = [_]routing.snap.candidates.PathLocation{
+        snapLocation(&.{snapEdge(ab, 0.25, 0)}, &.{}),
+        snapLocation(&.{snapEdge(bc, 0.75, 0)}, &.{}),
+    };
+    const local_start = "2016-03-13T01:57";
+    const local_end = "2016-03-12T23:03";
+    const start = try graph.time_info.TimeInfo.fromLocal(&rules, local_start, ny, graph.timezone.utc, 0, .none);
+    const stops: [2]api.Location = .{
+        .{ .lat = 0, .lng = 0, .date_time = local_start },
+        .{ .lat = 0, .lng = 0, .date_time = local_end },
+    };
+    for ([_]api.DateTimeType{ .depart_at, .arrive_by }) |mode| {
+        seen = .{ false, false };
+        const anchor_time = if (mode == .depart_at) start.unix_time else start.unix_time + 360;
+        const route = try multi.route(&zoned_engine, &arena, FixedCost{ .expected_times = .{ anchor_time, start.unix_time + 180 }, .seen = &seen }, &stops, &cross_zone, .{
+            .search = .{ .costing = .auto },
+            .date_time_type = mode,
+            .now = start.unix_time,
+        }, .{});
+        try testing.expectEqual([2]bool{ true, true }, seen);
+        try testing.expectEqual(@as(f32, 360), route.total.secs);
+        try testing.expectEqualStrings(local_start, route.waypoints[0].date_time.?);
+        try testing.expectEqualStrings("-05:00", route.waypoints[0].time_zone_offset);
+        try testing.expectEqualStrings("America/New_York", route.waypoints[0].time_zone_name);
+        try testing.expectEqualStrings(local_end, route.waypoints[1].date_time.?);
+        try testing.expectEqualStrings("-08:00", route.waypoints[1].time_zone_offset);
+        try testing.expectEqualStrings("America/Los_Angeles", route.waypoints[1].time_zone_name);
+        arena.reset();
+    }
 }
 
 test "multi-location route types split legs and preserve through direction" {

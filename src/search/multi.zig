@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const graph = @import("../graph/root.zig");
+const io = @import("../infra/io.zig");
 const scratch = @import("../infra/arena.zig");
 const api = @import("../api/request.zig");
 const snap = @import("../snap/search.zig");
@@ -10,13 +11,14 @@ const Cost = @import("../costing/compiled.zig").Cost;
 const endpoints = @import("endpoints.zig");
 const search = @import("search.zig");
 const EdgeId = graph.format.EdgeId;
+const TimeInfo = graph.time_info.TimeInfo;
 
 pub const Waypoint = struct {
     elapsed_secs: f32,
-    /// TODO(P5.15): Apply waiting when computing the next departure time.
     waiting_secs: f32,
-    /// TODO(P5.15): Propagate arrival/departure timestamps and time zones.
     date_time: ?[]const u8,
+    time_zone_offset: []const u8 = "",
+    time_zone_name: []const u8 = "",
     ignored_filter: bool,
 };
 
@@ -44,17 +46,31 @@ pub const Route = struct {
 pub const Options = struct {
     search: endpoints.Options,
     defaults: snap.Defaults = .{},
+    date_time_type: api.DateTimeType = .no_time,
+    now: ?i64 = null,
+};
+
+const PairPaths = struct {
+    paths: []const endpoints.Path,
+    times: []const TimeInfo,
 };
 
 /// Find consecutive paths, keeping the arriving edge when the stop
 /// forbids reversing. Return legs and waypoints in physical travel order.
-pub fn route(engine: anytype, arena: *scratch.Arena, kernel: anytype, locations: []const api.Location, correlations: []const snap.PathLocation, options: Options, control: search.Control) !Route {
+pub fn route(engine: anytype, arena: *scratch.Arena, kernel: anytype, locations: []const api.Location, correlations: []const snap.PathLocation, settings: Options, control: search.Control) !Route {
     try control.check();
     if (locations.len < 2 or locations.len != correlations.len) return error.InvalidLocations;
     const a = arena.allocator();
     const ranked = try a.alloc(endpoints.Ranked, locations.len);
     for (correlations, ranked) |location, *out| {
-        out.* = try endpoints.rank(a, location, options.search.costing, control);
+        out.* = try endpoints.rank(a, location, settings.search.costing, control);
+    }
+    var options = settings;
+    if (options.date_time_type != .no_time) {
+        options.search.direction = if (options.date_time_type == .arrive_by) .reverse else .forward;
+        options.search.timing.invariant = options.date_time_type == .invariant;
+        // Freeze the request clock for the whole search and a reachability retry.
+        if (options.now == null) options.now = io.wallSeconds();
     }
     const point = arena.mark();
     var retried = false;
@@ -108,10 +124,18 @@ fn filter(a: std.mem.Allocator, input: endpoints.Ranked, condition: Filter, cont
     };
 }
 
-fn findPairs(engine: anytype, arena: *scratch.Arena, kernel: anytype, locations: []const api.Location, candidates: []const endpoints.Ranked, options: Options, allow_reach_retry: bool, control: search.Control) ![]const endpoints.Path {
+fn findPairs(engine: anytype, arena: *scratch.Arena, kernel: anytype, locations: []const api.Location, candidates: []const endpoints.Ranked, options: Options, allow_reach_retry: bool, control: search.Control) !PairPaths {
     const a = arena.allocator();
     const paths = try a.alloc(endpoints.Path, candidates.len - 1);
     const reverse = options.search.direction == .reverse;
+    const anchor = if (reverse) locations.len - 1 else 0;
+    var clock = options.search.timing;
+    if (!clock.start.valid and options.date_time_type != .no_time and candidates[anchor].all.len != 0) {
+        const text = locations[anchor].date_time orelse if (options.date_time_type == .current) "current" else "";
+        const node = try edgeHead(engine.view, candidates[anchor].all[0].edge);
+        clock.start = try TimeInfo.fromNode(engine.view, node, text, options.now.?, control.deadline);
+    }
+    const times: []TimeInfo = if (clock.start.valid) try a.alloc(TimeInfo, locations.len) else &.{};
     var carried: ?EdgeId = null;
     for (0..paths.len) |step| {
         try control.check();
@@ -120,6 +144,7 @@ fn findPairs(engine: anytype, arena: *scratch.Arena, kernel: anytype, locations:
         var to = candidates[pair + 1];
         const waypoint = if (reverse) pair + 1 else pair;
         var pair_options = options.search;
+        pair_options.timing = clock;
         pair_options.forbid_initial_uturn = false;
         var restricted: ?endpoints.Ranked = null;
         if (carried) |edge| {
@@ -141,11 +166,36 @@ fn findPairs(engine: anytype, arena: *scratch.Arena, kernel: anytype, locations:
         };
         paths[pair] = path;
         carried = if (reverse) path.segments[0].edge else path.segments[path.segments.len - 1].edge;
+        if (clock.start.valid) {
+            const start_edge = if (reverse) path.segments[path.segments.len - 1].edge else path.segments[0].edge;
+            if (step == 0)
+                times[anchor] = try clock.at(engine.view, try edgeHead(engine.view, start_edge), 0, options.search.direction);
+            const next_waypoint = if (reverse) pair else pair + 1;
+            const waiting = waypointWait(locations, next_waypoint);
+            const offset = if (reverse) @ceil(path.secs - 0.5) else @floor(path.secs + waiting + 0.5);
+            const node = try edgeHead(engine.view, carried.?);
+            const next = try clock.at(engine.view, node, offset, options.search.direction);
+            times[next_waypoint] = next;
+            clock.start = next;
+            if (reverse and waiting != 0)
+                clock.start = try clock.at(engine.view, node, @ceil(waiting - 0.5), .reverse);
+        }
     }
-    return paths;
+    return .{ .paths = paths, .times = times };
 }
 
-fn assemble(a: std.mem.Allocator, view: *const graph.reader.View, locations: []const api.Location, ranked: []const endpoints.Ranked, paths: []const endpoints.Path, reach_retry: bool, control: search.Control) !Route {
+fn edgeHead(view: *const graph.reader.View, edge: EdgeId) !graph.format.NodeId {
+    return @fromBackingInt((try view.edge(edge)).head);
+}
+
+fn waypointWait(locations: []const api.Location, index: usize) f32 {
+    const place = locations[index];
+    if (index == 0 or index + 1 == locations.len or !isBreak(place.type)) return 0;
+    return if (std.math.isFinite(place.waiting_secs)) @max(0, place.waiting_secs) else 0;
+}
+
+fn assemble(a: std.mem.Allocator, view: *const graph.reader.View, locations: []const api.Location, ranked: []const endpoints.Ranked, pairs: PairPaths, reach_retry: bool, control: search.Control) !Route {
+    const paths = pairs.paths;
     var leg_count: usize = 1;
     var segment_count: usize = 0;
     for (paths, 0..) |path, i| {
@@ -166,14 +216,14 @@ fn assemble(a: std.mem.Allocator, view: *const graph.reader.View, locations: []c
     var leg_start: usize = 0;
     var end: usize = 0;
     var retried = reach_retry;
-    waypoints[0] = timing(locations[0], ranked[0], 0);
+    waypoints[0] = try timing(a, view, locations, ranked, pairs.times, 0, 0);
     for (paths, 0..) |path, i| {
         try control.check();
         const step: Cost = .{ .cost = path.cost, .secs = path.secs };
         total = total.add(step);
         leg_cost = leg_cost.add(step);
         retried = retried or path.retried;
-        waypoints[i + 1] = timing(locations[i + 1], ranked[i + 1], total.secs);
+        waypoints[i + 1] = try timing(a, view, locations, ranked, pairs.times, i + 1, total.secs);
 
         // Preserve both cuts at waypoints inside an edge. At a node, the
         // search may represent continuity with a repeated zero-length cut.
@@ -220,11 +270,22 @@ fn atNode(segment: endpoints.Segment) bool {
     return segment.begin == segment.end and (segment.begin == 0 or segment.begin == 1);
 }
 
-fn timing(location: api.Location, ranked: endpoints.Ranked, elapsed: f32) Waypoint {
-    return .{
+fn timing(a: std.mem.Allocator, view: *const graph.reader.View, locations: []const api.Location, ranked: []const endpoints.Ranked, times: []const TimeInfo, index: usize, elapsed: f32) !Waypoint {
+    const location = locations[index];
+    var result: Waypoint = .{
         .elapsed_secs = elapsed,
         .waiting_secs = location.waiting_secs,
         .date_time = location.date_time,
-        .ignored_filter = ranked.ignored_filter,
+        .ignored_filter = ranked[index].ignored_filter,
     };
+    if (times.len == 0) return result;
+    result.waiting_secs = waypointWait(locations, index);
+    const buffer = try a.alloc(u8, 22);
+    const rules = if (view.tz_rules) |*present| present else null;
+    if (try times[index].display(rules, buffer)) |formatted| {
+        result.date_time = formatted.date_time;
+        result.time_zone_offset = formatted.time_zone_offset;
+        result.time_zone_name = formatted.time_zone_name;
+    }
+    return result;
 }

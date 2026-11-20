@@ -29,6 +29,7 @@ pub const Config = struct {
     };
 
     pub const ServiceLimits = struct {
+        max_timedep_distance: f32 = 500_000,
         max_exclude_locations: usize = 50,
         max_exclude_polygons_length: f32 = 10_000,
         max_exclude_polygons_vertices: usize = 100,
@@ -181,11 +182,12 @@ test "environment overrides file, which overrides typed defaults" {
     try env.put("ZR_ZIG_ROUTING_THREADS", "4");
     try env.put("ZR_LOKI_ACTIONS", "status,height");
     const loaded = try decode(state.allocator(),
-        \\{"service_limits":{"skadi":{"max_shape":100,"min_resample":15},"auto":{}},"httpd":{"service":{
+        \\{"service_limits":{"max_timedep_distance":1,"skadi":{"max_shape":100,"min_resample":15},"auto":{}},"httpd":{"service":{
         \\"listen":"tcp://127.0.0.1:0","timeout_seconds":3,"drain_seconds":5,"loopback":"ipc://x"}}}
     , "valhalla.json", &env, null);
     const svc = loaded.config.serviceConfig();
     const server = try loaded.config.httpConfig();
+    try testing.expectEqual(@as(f32, 1), loaded.config.service_limits.max_timedep_distance);
     try testing.expectEqual(200, svc.limits.skadi_max_shape);
     try testing.expectEqual(15.0, svc.limits.skadi_min_resample);
     try testing.expectEqualSlices(service.Action, &.{ .status, .height }, svc.actions);

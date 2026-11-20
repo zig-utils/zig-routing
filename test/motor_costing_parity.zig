@@ -1,4 +1,4 @@
-//! Gate A for the motor costing models on imported Valhalla tiles.
+//! Gates A and B for motor costing and timed routing on imported Valhalla tiles.
 const std = @import("std");
 const routing = @import("routing");
 const io = routing.infra.io;
@@ -12,6 +12,11 @@ const search = routing.search.search;
 const View = graph.reader.View;
 const EdgeId = graph.format.EdgeId;
 const Arena = std.mem.Allocator;
+const Movements = std.AutoHashMapUnmanaged(u64, void);
+
+fn movementKey(incoming: EdgeId, outgoing: EdgeId) u64 {
+    return (@as(u64, @backingInt(incoming)) << 32) | @backingInt(outgoing);
+}
 
 fn Probe(comptime model: type) type {
     return struct {
@@ -22,20 +27,67 @@ fn Probe(comptime model: type) type {
         arena: Arena,
         previous_internal: ?*auto.InternalTurn = null,
         previous_destination_only: ?*bool = null,
+        routed: bool = false,
+        fixed_movements: ?*const Movements = null,
 
         pub fn edgeCost(self: Self, view: *const View, _: EdgeId, edge: *const graph.format.EdgeHot, _: search.Direction) !compiled.Cost {
-            const class = try view.class(edge.cls.class_id);
-            const speed = self.profile.untimedSpeed(edge.*);
-            if (model == truck) {
-                if (self.tables) |tables| return truck.Kernel.edgeCost(self.profile, tables, class, edge.*, speed, .{});
-                return truck.Kernel.rawEdgeCost(self.profile, class, edge.*, speed, .{});
-            }
-            return model.Kernel.edgeCost(self.profile, self.tables.?, class, edge.*, speed, .{});
+            return (try self.traversal(view, edge, self.profile.untimedSpeed(edge.*))).cost;
         }
 
-        pub fn turnCost(self: Self, view: *const View, movement: search.Transition, _: search.Label, _: search.Direction) !compiled.Cost {
+        pub fn edgeTraversal(self: Self, view: *const View, _: EdgeId, edge: *const graph.format.EdgeHot, _: search.Direction) !search.Traversal {
+            return self.traversal(view, edge, self.profile.untimedSpeed(edge.*));
+        }
+
+        pub fn edgeCostAt(self: Self, view: *const View, id: EdgeId, edge: *const graph.format.EdgeHot, _: search.Direction, time: graph.time_info.TimeInfo) !search.Traversal {
+            const speed = self.profile.resolvedSpeed(edge.*, id, graph.speed.Time.fromTimeInfo(time), graph.speed.NoOverlays{});
+            return self.traversal(view, edge, speed);
+        }
+
+        fn traversal(self: Self, view: *const View, edge: *const graph.format.EdgeHot, speed: model.Speed) !search.Traversal {
+            const class = try view.class(edge.cls.class_id);
+            const cost = if (model == truck and self.tables == null)
+                truck.Kernel.rawEdgeCost(self.profile, class, edge.*, speed, .{})
+            else
+                model.Kernel.edgeCost(self.profile, self.tables.?, class, edge.*, speed, .{});
+            return .{ .cost = cost, .measured_speed = @as(u8, @bitCast(speed.sources)) != 0 };
+        }
+
+        pub fn restrictionPermission(self: Self) routing.costing.base.Permission {
+            return self.profile.permission;
+        }
+
+        pub fn timeDependentCosts(self: Self, available: graph.speed.Flow) bool {
+            const selected = self.profile.permission.flow;
+            return self.profile.fixed_speed == 0 and ((available.freeflow and selected.freeflow) or (available.constrained and selected.constrained));
+        }
+
+        pub fn allowedTurn(self: Self, view: *const View, movement: search.Transition, _: search.Label, direction: search.Direction) !bool {
+            if (self.fixed_movements) |fixed| {
+                if (!fixed.contains(movementKey(movement.incoming, movement.outgoing))) return false;
+            }
+            if (!self.profile.allowedNode(try view.node(movement.node))) return false;
+            const from = try view.class(movement.incoming_edge.cls.class_id);
+            const to = try view.class(movement.outgoing_edge.cls.class_id);
+            const prior = if (direction == .forward) from else to;
+            const previous = if (direction == .forward) movement.incoming_access else movement.outgoing_access;
+            const check: auto.PathCheck = .{
+                .previous_dead_end = prior.flags.dead_end or (try view.outEdgeRange(movement.node)).count() == 1,
+                .backtrack = movement.incoming_edge.cls.opp_local == movement.outgoing_edge.cls.local,
+                .previous_access = previous,
+            };
+            const turn: routing.costing.base.Turn = .{ .row = movement.row };
+            const access = if (direction == .forward)
+                try auto.Kernel.allowed(self.profile, from, to, turn, check, .none)
+            else
+                try auto.Kernel.allowedReverse(self.profile, from, to, turn, check, .none);
+            return access.allowed;
+        }
+
+        pub fn turnCost(self: Self, view: *const View, movement: search.Transition, _: search.Label, direction: search.Direction) !compiled.Cost {
             var turn = try model.Turn.read(view, movement.node, movement.incoming, movement.outgoing, self.arena, .none);
-            turn.measured_speed = @as(u8, @bitCast(self.profile.untimedSpeed(movement.incoming_edge.*).sources)) != 0;
+            turn.measured_speed = if (self.routed) movement.measured_speed else @as(u8, @bitCast(self.profile.untimedSpeed(movement.incoming_edge.*).sources)) != 0;
+            turn.movement.base_turn.previous_destination_only = movement.incoming_access.destination_only;
+            turn.movement.base_turn.next_destination_only = movement.outgoing_access.destination_only;
             const from = try view.class(movement.incoming_edge.cls.class_id);
             const to = try view.class(movement.outgoing_edge.cls.class_id);
             const node = try view.node(movement.node);
@@ -48,7 +100,7 @@ fn Probe(comptime model: type) type {
                 turn.movement.base_turn.previous_destination_only = previous.*;
                 previous.* = to.flags.destination_only_hgv;
             }
-            return model.Kernel.turnCost(self.profile, node, from, to, turn);
+            return if (direction == .forward) model.Kernel.turnCost(self.profile, node, from, to, turn) else model.Kernel.turnCostReverse(self.profile, node, from, to, turn);
         }
     };
 }
@@ -59,6 +111,7 @@ pub fn main(init: std.process.Init) !void {
     const path = args.next() orelse return error.MissingBundle;
     const samples = args.next() orelse return error.MissingCostingReference;
     const family_or_minimum = args.next();
+    const timing_routes = if (family_or_minimum) |value| std.mem.eql(u8, value, "--timed") else false;
     const motor_modes: []const parity.Mode = &.{ .auto, .bus, .taxi };
     var min_arg = family_or_minimum;
     const tested: []const parity.Mode = if (family_or_minimum) |value| blk: {
@@ -66,10 +119,11 @@ pub fn main(init: std.process.Init) !void {
         min_arg = args.next();
         if (std.mem.eql(u8, value, "--truck")) break :blk &.{.truck};
         if (std.mem.eql(u8, value, "--motorcycle")) break :blk &.{ .motorcycle, .motor_scooter };
+        if (timing_routes) break :blk &.{.auto};
         if (std.mem.eql(u8, value, "--motor")) break :blk motor_modes;
         return error.InvalidCostingFamily;
     } else motor_modes;
-    const minimum = if (min_arg) |value| try std.fmt.parseInt(u64, value, 10) else parity.minimum_calls;
+    const minimum: u64 = if (min_arg) |value| try std.fmt.parseInt(u64, value, 10) else if (timing_routes) 1 else parity.minimum_calls;
     if (args.next() != null) return error.TooManyArguments;
     const files = try io.File.open(samples, .read_only);
     defer files.close();
@@ -82,6 +136,7 @@ pub fn main(init: std.process.Init) !void {
     const uuid = std.fmt.bytesToHex(view.dataset_uuid, .lower);
     if (!std.mem.eql(u8, reference.uuid, &uuid) or reference.nodes != view.nodes.len or reference.edges.len != view.edges.len)
         return error.CostingReferenceGraphMismatch;
+    if (timing_routes) return compareTimedRoutes(init, view, &reference, &uuid, minimum);
 
     var err_buffer: [4096]u8 = undefined;
     var stderr = io.stderrWriter(init.io, &err_buffer);
@@ -134,6 +189,126 @@ const ProfileResult = struct {
     counts: parity.Counts,
     raw_only: bool,
 };
+
+fn compareTimedRoutes(init: std.process.Init, view: *const View, reference: *parity.Reference, uuid: []const u8, minimum: u64) !void {
+    const api = routing.api.request;
+    const multi = routing.search.multi;
+    var arena = routing.infra.arena.Arena.init(init.gpa, .{});
+    defer arena.deinit();
+    var engine = try search.Search(Probe(auto), routing.search.queue.Heap).init(init.gpa, view);
+    defer engine.deinit();
+    var cases: u64 = 0;
+    var passed: u64 = 0;
+    var same_as_static: u64 = 0;
+    var max_excess: f32 = 0;
+    var error_buffer: [4096]u8 = undefined;
+    var stderr = io.stderrWriter(init.io, &error_buffer);
+
+    while (try reference.nextProfile()) |sample| {
+        if (sample.mode != .auto) return error.InvalidReferenceCosting;
+        const a = arena.allocator();
+        var warnings: std.ArrayList(routing.costing.base.Warning) = .empty;
+        const settings = try std.json.parseFromSliceLeaky(std.json.Value, a, sample.options, .{});
+        const profile = try auto.Model.canonicalize(try auto.parse(a, .auto, settings, &warnings, .none));
+        if (warnings.items.len != 0) return error.InvalidReferenceOptions;
+        const classes = view.classes orelse return error.MissingClassTable;
+        const tables = try compiled.compileInto(auto.Model, profile, classes, try a.alloc(f32, classes.len), .none);
+        const probe: Probe(auto) = .{ .profile = &profile, .tables = &tables, .arena = a, .routed = true };
+        for (0..sample.paths) |_| {
+            const path = try reference.nextPath();
+            const mark = arena.mark();
+            defer arena.rewind(mark);
+            const parsed = try api.parseHttp(a, "/route", &.{}, path.request);
+            if (parsed != .ok or parsed.ok.locations.len != 2 or parsed.ok.date_time_type == .no_time or parsed.ok.date_time_type == .current)
+                return error.InvalidTimedReferenceRequest;
+            const input = parsed.ok;
+            const first = path.segments[0];
+            const last = path.segments[path.segments.len - 1];
+            const origin = referenceCandidate(@fromBackingInt(first.edge), first.begin);
+            const destination = referenceCandidate(@fromBackingInt(last.edge), last.end);
+            const snapped = [_]routing.snap.candidates.PathLocation{
+                .{ .edges = &.{origin}, .filtered_edges = &.{}, .rank_candidates = true },
+                .{ .edges = &.{destination}, .filtered_edges = &.{}, .rank_candidates = true },
+            };
+            const options: multi.Options = .{ .search = .{ .costing = .auto }, .date_time_type = input.date_time_type, .now = 0 };
+            const control: search.Control = .{ .deadline = io.Deadline.fromNowMs(20_000) };
+            const actual = multi.route(&engine, &arena, probe, input.locations, &snapped, options, control) catch |err| {
+                try stderr.interface.print("timed {s} native search: {s}\n", .{ path.request, @errorName(err) });
+                try stderr.interface.flush();
+                return err;
+            };
+
+            var allowed: Movements = .empty;
+            for (path.segments[0 .. path.segments.len - 1], path.segments[1..], 0..) |from, to, i| {
+                if (i % 256 == 0) try control.check();
+                try allowed.put(a, movementKey(@fromBackingInt(from.edge), @fromBackingInt(to.edge)), {});
+            }
+            var replay = probe;
+            replay.fixed_movements = &allowed;
+            const oracle_path = multi.route(&engine, &arena, replay, input.locations, &snapped, options, control) catch |err| {
+                try stderr.interface.print("timed {s} replay: {s}\n", .{ path.request, @errorName(err) });
+                try stderr.interface.flush();
+                return err;
+            };
+            const replayed = oracle_path.legs[0].segments;
+            if (replayed.len != path.segments.len) return error.TimedReferencePathChanged;
+            for (replayed, path.segments) |native, pinned| {
+                if (@backingInt(native.edge) != pinned.edge or native.begin != pinned.begin or native.end != pinned.end)
+                    return error.TimedReferencePathChanged;
+            }
+            cases += 1;
+            if (actual.total.cost <= oracle_path.total.cost) {
+                passed += 1;
+            } else {
+                max_excess = @max(max_excess, actual.total.cost - oracle_path.total.cost);
+                try stderr.interface.print("timed {s}: weighted cost {d} exceeds oracle path {d}\n", .{
+                    path.request, actual.total.cost, oracle_path.total.cost,
+                });
+            }
+            const untimed = try multi.route(&engine, &arena, probe, input.locations, &snapped, .{
+                .search = .{ .costing = .auto, .direction = if (input.date_time_type == .arrive_by) .reverse else .forward },
+            }, control);
+            const timed_path = actual.legs[0].segments;
+            const static_path = untimed.legs[0].segments;
+            if (timed_path.len == static_path.len) {
+                same_as_static += @intFromBool(blk: {
+                    for (timed_path, static_path) |timed_segment, static_segment| {
+                        if (!std.meta.eql(timed_segment, static_segment)) break :blk false;
+                    }
+                    break :blk true;
+                });
+            }
+        }
+        arena.reset();
+    }
+    try stderr.interface.flush();
+    var buffer: [8192]u8 = undefined;
+    var stdout = io.stdoutWriter(init.io, &buffer);
+    const success = cases != 0 and cases >= minimum and passed == cases;
+    try std.json.Stringify.value(.{
+        .dataset_uuid = uuid,
+        .oracle_version = "3.9.3",
+        .cases = cases,
+        .optimal = passed,
+        .same_as_static = same_as_static,
+        .max_excess = max_excess,
+        .passed = success,
+    }, .{}, &stdout.interface);
+    try stdout.interface.writeByte('\n');
+    try stdout.interface.flush();
+    if (!success) return error.TimedRouteParityFailed;
+}
+
+fn referenceCandidate(id: EdgeId, fraction: f32) routing.snap.candidates.PathEdge {
+    return .{
+        .id = id,
+        .percent_along = fraction,
+        .projected = .init(0, 0),
+        .distance = 0,
+        .heading = 0,
+        .node = if (fraction == 0) .begin else if (fraction == 1) .end else .none,
+    };
+}
 
 fn checkProfile(comptime model: type, gpa: Arena, view: *const View, reference: *parity.Reference, sample: parity.Reference.Profile, mode: if (model == truck) void else model.Mode, diagnostics: *io.Writer) !ProfileResult {
     var scratch: std.heap.ArenaAllocator = .init(gpa);

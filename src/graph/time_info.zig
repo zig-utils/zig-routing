@@ -8,6 +8,12 @@ const NodeId = @import("format.zig").NodeId;
 
 pub const invalid_second_of_week: u32 = (1 << 20) - 1;
 
+pub const Display = struct {
+    date_time: []const u8,
+    time_zone_offset: []const u8,
+    time_zone_name: []const u8,
+};
+
 pub const TimeInfo = struct {
     valid: bool = false,
     zone: timezone.Id = timezone.unknown,
@@ -19,6 +25,14 @@ pub const TimeInfo = struct {
         if (!self.valid or self.unix_time == 0) return null;
         const shift = (try offsetAt(rules, self.zone, self.unix_time)) orelse return null;
         return datetime.Local.fromSeconds(try std.math.add(i64, self.unix_time, shift));
+    }
+
+    pub fn display(self: TimeInfo, rules: ?*const timezone.Rules, buffer: []u8) !?Display {
+        if (!self.valid or self.unix_time == 0) return null;
+        const offset = (try offsetAt(rules, self.zone, self.unix_time)) orelse return null;
+        const text = try datetime.formatIso(buffer, self.unix_time, offset, true);
+        const name = if (rules) |table| (try table.name(self.zone)) orelse "" else "";
+        return .{ .date_time = text[0..16], .time_zone_offset = text[16..], .time_zone_name = name };
     }
 
     pub fn fromNode(view: *const reader.View, node: NodeId, value: []const u8, now: i64, deadline: io.Deadline) !TimeInfo {
@@ -76,21 +90,17 @@ pub const TimeInfo = struct {
         const elapsed: i64 = @intFromFloat(seconds);
         const delta = if (backwards) -elapsed else elapsed;
         const instant = try std.math.add(i64, self.unix_time, delta);
-        var week: i64 = if (backwards)
-            @as(i64, self.second_of_week) - elapsed
+        // Recalculate the local week at the new instant. Staying in the
+        // same zone can still cross a daylight-saving transition.
+        const week = if (try offsetAt(rules, next, instant)) |offset|
+            datetime.secondOfWeek(instant, offset)
         else
-            @intFromFloat(@as(f32, @floatFromInt(self.second_of_week)) + seconds);
-        if (next != self.zone) week += try timezoneDifference(rules, self.zone, next, instant);
-        if (week < 0) {
-            week = @mod(week, datetime.seconds_per_week);
-        } else if (week > datetime.seconds_per_week) {
-            week = @mod(week - 1, datetime.seconds_per_week) + 1;
-        }
+            @as(u32, @intCast(@mod(@as(i64, self.second_of_week) + delta, datetime.seconds_per_week)));
         return .{
             .valid = true,
             .zone = next,
             .unix_time = instant,
-            .second_of_week = @intCast(week),
+            .second_of_week = week,
             .seconds_from_now = try std.math.add(i64, self.seconds_from_now, delta),
         };
     }
@@ -155,6 +165,22 @@ test "TimeInfo advances in both directions across timezone changes" {
     try testing.expect(!(try TimeInfo.fromLocal(&rules, "2026-02-30T10:00", ny, 0, 0, .none)).valid);
     const current = try TimeInfo.fromLocal(null, "current", 0, 0, 1573344059, .none);
     try testing.expectEqual(sunday, current);
+}
+
+test "TimeInfo follows the local clock across DST within one zone" {
+    const testing = std.testing;
+    const rules = try timezone.Rules.parse(&Fixture.bytes);
+    const ny = try rules.id("America/New_York");
+    const start = try TimeInfo.fromLocal(&rules, "2016-03-13T01:55", ny, timezone.utc, 1457852100, .none);
+    const after = try start.forward(&rules, 600, ny);
+    try testing.expectEqual(1457852700, after.unix_time);
+    try testing.expectEqual(3 * 3600 + 5 * 60, after.second_of_week);
+    var buffer: [22]u8 = undefined;
+    const rendered = (try after.display(&rules, &buffer)).?;
+    try testing.expectEqualStrings("2016-03-13T03:05", rendered.date_time);
+    try testing.expectEqualStrings("-04:00", rendered.time_zone_offset);
+    try testing.expectEqualStrings("America/New_York", rendered.time_zone_name);
+    try testing.expectEqual(start, try after.reverse(&rules, 600, ny));
 }
 
 // Ported from the start and end instants in test/datetime.cc.

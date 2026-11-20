@@ -165,6 +165,26 @@ The scooter oracle profiles keep the grade-adjusted speed within the pinned
 Valhalla speed table. Native tests cover the full fixed-speed range and its
 downhill maximum of 315 km/h using the same seconds-per-metre formula.
 
+### Timed route optimality (gate B)
+
+```bash
+oracle/costing-parity.sh --timed liechtenstein bench/results/timed-liechtenstein.json
+oracle/costing-parity.sh --timed utrecht bench/results/timed-utrecht.json
+```
+
+The runner builds a complete local graph for each pinned extract with
+Valhalla's hierarchy and shortcuts disabled. It selects eight auto requests
+and adds morning and evening departures, an arrival time, and an invariant
+time. Both searches use the same directed endpoint edges and fractional cuts.
+Native search also replays the pinned oracle's path with only its movements
+available and checks each edge and cut before comparing weighted costs. Gate B
+requires the native route to cost at most as much as that replay.
+
+All 64 routes met Gate B with zero excess cost. In the two pinned extracts
+the timed paths also matched all 64 static paths. Gurka fixtures cover changes
+from populated speed layers and timed restrictions, waiting at break stops,
+and local waypoint times across a timezone boundary and a DST transition.
+
 ### Speed resolution
 
 Synthetic overlays exercise live coverage and the one-hour fade, predicted
