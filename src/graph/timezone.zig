@@ -6,6 +6,7 @@ const Span = @import("polygon_grid.zig").Span;
 
 pub const Id = u16;
 pub const unknown: Id = 0;
+pub const utc: Id = 291;
 pub const base_bits = 9;
 pub const max_id: Id = (1 << (base_bits + 1)) - 1;
 pub const attribution = "Timezone boundaries from timezone-boundary-builder (ODbL)";
@@ -72,10 +73,8 @@ const Zone = extern struct {
         if (!self.start.valid() or !self.end.valid()) return error.InvalidTimezoneRules;
 
         // Gregorian weekdays and leap years repeat every 400 years.
-        const normalized = @mod(@mod(instant, cycle_seconds) - epoch_2000, cycle_seconds);
-        const days: i32 = @intCast(@divFloor(normalized, seconds_per_day));
-        var year = 2000 + @divFloor(days, 365);
-        if (days < january1(year)) year -= 1;
+        const normalized = inCycle(instant);
+        const year = cycleYear(normalized);
         var latest: i64 = std.math.minInt(i64);
         var present = self.standard;
         // Rule times can move a January or December change into the adjacent year.
@@ -98,6 +97,16 @@ const Zone = extern struct {
 const seconds_per_day: i64 = 86400;
 const epoch_2000: i64 = 946684800;
 const cycle_seconds: i64 = 146097 * seconds_per_day;
+
+fn inCycle(instant: i64) i64 {
+    return @mod(@mod(instant, cycle_seconds) - epoch_2000, cycle_seconds);
+}
+
+fn cycleYear(normalized: i64) i32 {
+    const days: i32 = @intCast(@divFloor(normalized, seconds_per_day));
+    const year = 2000 + @divFloor(days, 365);
+    return if (days < january1(year)) year - 1 else year;
+}
 
 fn january1(year: i32) i32 {
     const last = year - 1;
@@ -164,19 +173,43 @@ pub const Rules = struct {
 
     pub fn offsetAt(self: Rules, tz: Id, epoch_seconds: i64) Error!?Offset {
         const zone = self.find(tz) orelse return null;
+        return try self.zoneOffset(zone, epoch_seconds);
+    }
+
+    fn zoneOffset(self: Rules, zone: *const Zone, epoch_seconds: i64) Error!Offset {
         const starts = zone.transitions.get(self.starts) catch return error.InvalidTimezoneRules;
         if (starts.len == 0 or epoch_seconds > starts[starts.len - 1])
             return try zone.recurring(epoch_seconds);
         if (epoch_seconds < starts[0]) return zone.initial;
 
         const shifts = zone.transitions.get(self.shifts) catch return error.InvalidTimezoneRules;
-        var lo: usize = 0;
-        var hi = starts.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (starts[mid] <= epoch_seconds) lo = mid + 1 else hi = mid;
+        return shifts[after(starts, epoch_seconds) - 1];
+    }
+
+    /// Choose the later UTC instant for an overlap. A local time skipped
+    /// by a forward jump resolves to the transition's UTC instant.
+    pub fn toUtc(self: Rules, tz: Id, local_seconds: i64, deadline: io.Deadline) !?i64 {
+        if (deadline.expired()) return error.DeadlineExceeded;
+        const zone = self.find(tz) orelse return null;
+        const starts = zone.transitions.get(self.starts) catch return error.InvalidTimezoneRules;
+        const shifts = zone.transitions.get(self.shifts) catch return error.InvalidTimezoneRules;
+        const reach = 1 << 23;
+        const lower = local_seconds -| reach;
+        const upper = local_seconds +| reach;
+        var resolve: Resolve = .{ .rules = self, .zone = zone, .local = local_seconds };
+        var previous = try self.zoneOffset(zone, lower);
+        try resolve.candidate(previous);
+        const start = after(starts, lower);
+        for (starts[start..], shifts[start..], 0..) |at, next, i| {
+            if (at > upper) break;
+            if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+            try resolve.candidate(next);
+            resolve.jump(at, previous, next);
+            previous = next;
         }
-        return shifts[lo - 1];
+        const latest = if (starts.len == 0) std.math.minInt(i64) else starts[starts.len - 1];
+        if (upper > latest) try resolve.recurring(latest);
+        return resolve.match orelse resolve.gap;
     }
 
     pub fn verify(self: Rules, deadline: io.Deadline) !void {
@@ -225,6 +258,54 @@ pub const Rules = struct {
             if (tz < zone.tag.id) hi = mid else lo = mid + 1;
         }
         return null;
+    }
+};
+
+fn after(starts: []const i64, epoch_seconds: i64) usize {
+    var lo: usize = 0;
+    var hi = starts.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (starts[mid] <= epoch_seconds) lo = mid + 1 else hi = mid;
+    }
+    return lo;
+}
+
+const Resolve = struct {
+    rules: Rules,
+    zone: *const Zone,
+    local: i64,
+    match: ?i64 = null,
+    gap: ?i64 = null,
+
+    fn candidate(self: *Resolve, offset: Offset) Error!void {
+        const instant = std.math.sub(i64, self.local, offset.seconds) catch return;
+        if (self.match) |found| if (instant <= found) return;
+        if ((try self.rules.zoneOffset(self.zone, instant)).seconds == offset.seconds) self.match = instant;
+    }
+
+    fn jump(self: *Resolve, instant: i64, prior: Offset, next: Offset) void {
+        const relative = @as(i128, self.local) - instant;
+        if (relative >= prior.seconds and relative < next.seconds) self.gap = instant;
+    }
+
+    fn recurring(self: *Resolve, latest: i64) Error!void {
+        const zone = self.zone;
+        try self.candidate(zone.standard);
+        if (@as(u32, @bitCast(zone.start)) == 0 and @as(u32, @bitCast(zone.end)) == 0) return;
+        if (!zone.start.valid() or !zone.end.valid()) return error.InvalidTimezoneRules;
+        try self.candidate(zone.daylight);
+        const normalized = inCycle(self.local);
+        const base = @as(i128, self.local) - normalized;
+        const year = cycleYear(normalized);
+        for ([_]i32{ year - 1, year, year + 1 }) |y| {
+            if (std.math.cast(i64, base + zone.start.instant(y, zone.standard))) |at| {
+                if (at > latest) self.jump(at, zone.standard, zone.daylight);
+            }
+            if (std.math.cast(i64, base + zone.end.instant(y, zone.daylight))) |at| {
+                if (at > latest) self.jump(at, zone.daylight, zone.standard);
+            }
+        }
     }
 };
 

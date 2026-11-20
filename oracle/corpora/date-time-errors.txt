@@ -1,0 +1,24 @@
+/route	{"costing":"bicycle","date_time":{"type":1}}
+/route	{"costing":"bicycle","date_time":{"type":1,"value":""}}
+/route	{"costing":"bicycle","date_time":{"type":1,"value":17}}
+/route	{"costing":"bicycle","date_time":{"type":1,"value":false}}
+/route	{"costing":"bicycle","date_time":{"type":"1"}}
+/route	{"costing":"bicycle","date_time":{"type":2}}
+/route	{"costing":"bicycle","date_time":{"type":2,"value":""}}
+/route	{"costing":"bicycle","date_time":{"type":3}}
+/route	{"costing":"bicycle","date_time":{"type":3,"value":""}}
+/route	{"costing":"bicycle","date_time":{"type":1,"value":"1900-02-01T10:00"}}
+/route	{"costing":"bicycle","date_time":{"type":1,"value":"2015-05-06T24:00"}}
+/route	{"costing":"bicycle","date_time":{"type":1,"value":"2015-05-06T 1:00"}}
+/route	{"costing":"transit","date_time":{"type":2,"value":"2026-05-12T08:00"}}
+/route	{"costing":"multimodal","date_time":{"type":3,"value":"2026-05-12T08:00"}}
+/isochrone	{"costing":"bicycle","date_time":{"type":2,"value":"2026-05-12T08:00"}}
+/isochrone	{"costing":"bicycle","date_time":{"type":3,"value":"2026-05-12T08:00"}}
+/isochrone	{"costing":"transit","date_time":{"type":2,"value":"invalid"}}
+/height	{"date_time":{"type":1,"value":"2026-02-30T10:00"}}
+/height	{"date_time":{"type":1,"value":"2015-05-06T01:0A"}}
+/height	{"date_time":{"type":1,"value":"1901-02-01T10:00"}}
+/height	{"date_time":{"type":1,"value":"current"}}
+/height	{"date_time":{"type":0,"value":"ignored"}}
+/height	{"date_time":{"type":4}}
+/height	{"date_time":{"type":4294967295}}

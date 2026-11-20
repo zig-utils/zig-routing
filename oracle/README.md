@@ -244,6 +244,19 @@ Node coordinates pair within two E7 units per axis.
 | Liechtenstein | 6,280 | 6,280 |
 | Utrecht | 30,638 | 30,638 |
 
+### Date and time request validation
+
+Run both services with elevation data for the date and time error corpus.
+It covers missing values for the three explicit time modes, range and syntax
+errors, and unsupported modes for transit and isochrones. The height requests
+also check that accepted dates reach Valhalla's missing-shape error.
+
+```bash
+zig-out/bin/zr diff "$native_url" "$valhalla_url" --corpus oracle/corpora/date-time-errors.txt
+```
+
+All 24 requests match the stock service's status, JSON schema and error code.
+
 ### Way splitting and edge counts
 
 ```bash

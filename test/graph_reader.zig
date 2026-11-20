@@ -76,6 +76,10 @@ test "mapped records have checked typed accessors and offline checksums" {
     try testing.expectEqual(@as(routing.graph.timezone.Id, 292), zone);
     try testing.expectEqualStrings("Europe/Amsterdam", (try view.tz_rules.?.name(zone)).?);
     try testing.expectEqual(@as(routing.graph.timezone.Id, 0), try view.nodeTimezone(@fromBackingInt(1)));
+    const stamp = try routing.graph.time_info.TimeInfo.fromNode(view, @fromBackingInt(0), "2019-11-06T17:15", 1573056900, .none);
+    try testing.expect(stamp.valid);
+    try testing.expectEqual(zone, stamp.zone);
+    try testing.expectEqual(1573056900, stamp.unix_time);
 
     const dir = try fixture.root.child("bundle");
     defer dir.close();

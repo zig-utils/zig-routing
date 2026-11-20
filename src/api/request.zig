@@ -12,6 +12,7 @@
 const std = @import("std");
 const json = @import("json.zig");
 const errors = @import("errors.zig");
+const datetime = @import("../graph/datetime.zig");
 const polyline = @import("../geo/polyline.zig");
 const PointLL = @import("../geo/point.zig").PointLL;
 const Allocator = std.mem.Allocator;
@@ -581,23 +582,7 @@ pub fn fromJson(arena: Allocator, doc: json.Value, action: Action) Allocator.Err
         return failExtra(125, try std.fmt.allocPrint(arena, "'{s}'", .{costing_str}));
     o.costing_options = json.pointer(root, "/costing_options");
 
-    // date_time (type and value validation; full time handling arrives with P5).
-    if (json.getOptional(u32, root, "/date_time/type")) |t| if (t + 1 <= 4) {
-        o.date_time_type = @fromBackingInt(@intCast(t + 1));
-        const value = json.getOptional([]const u8, root, "/date_time/value");
-        if (o.date_time_type == .current) {
-            o.date_time = "current";
-        } else if (value) |v| {
-            if (!isIsoDateTime(v)) return fail(162);
-            o.date_time = v;
-        } else {
-            return fail(switch (o.date_time_type) {
-                .depart_at => 160,
-                .arrive_by => 161,
-                else => 165,
-            });
-        }
-    };
+    if (parseDateTime(root, &o)) |code| return fail(code);
 
     // shape_format (also selects the precision of /height encoded_polyline).
     if (json.getOptional([]const u8, root, "/shape_format")) |sf| {
@@ -651,6 +636,34 @@ pub fn fromJson(arena: Allocator, doc: json.Value, action: Action) Allocator.Err
 
 const LocationsResult = union(enum) { ok: []Location, failure: errors.Failure };
 
+fn parseDateTime(root: json.Value, o: *Options) ?u16 {
+    if (json.getOptional(u32, root, "/date_time/type")) |value| {
+        if (value <= 3) o.date_time_type = @fromBackingInt(@intCast(value + 1));
+    }
+    const transit = o.costing == .multimodal or o.costing == .transit;
+    if (o.date_time_type == .no_time and transit) o.date_time_type = .current;
+    switch (o.date_time_type) {
+        .no_time => return null,
+        .current => o.date_time = "current",
+        .depart_at, .arrive_by, .invariant => |mode| {
+            const value = json.get([]const u8, root, "/date_time/value", "");
+            if (value.len == 0) return switch (mode) {
+                .depart_at => 160,
+                .arrive_by => 161,
+                .invariant => 165,
+                else => unreachable,
+            };
+            if (!std.mem.eql(u8, value, "current") and !isIsoDateTime(value)) return 162;
+            o.date_time = value;
+        },
+    }
+    if (o.date_time_type == .arrive_by or o.date_time_type == .invariant) {
+        if (transit) return 141;
+        if (o.action == .isochrone) return 142;
+    }
+    return null;
+}
+
 /// `parse_locations`: any failure parsing one location becomes the
 /// caller's node-specific code (130 locations, 134 shape, ...); a
 /// failure code of 0 means "use the node's code".
@@ -660,6 +673,17 @@ fn parseLocations(arena: Allocator, doc: json.Value, path: []const u8, o: *const
     for (items, 0..) |item, i| {
         locs[i] = parseLocation(item, o) orelse return .{ .failure = .{ .code = 0 } };
         locs[i].original_index = @intCast(i);
+        if (o.action == .sources_to_targets) continue;
+        switch (o.date_time_type) {
+            .no_time => {},
+            .current, .depart_at => if (i == 0) {
+                locs[i].date_time = o.date_time;
+            },
+            .arrive_by => if (i + 1 == items.len) {
+                locs[i].date_time = o.date_time;
+            },
+            .invariant => locs[i].date_time = o.date_time,
+        }
     }
     if (locs.len > 0) {
         locs[0].type = .@"break";
@@ -754,18 +778,9 @@ fn parseLocation(r: json.Value, o: *const Options) ?Location {
     return loc;
 }
 
-/// baldr::DateTime::is_iso_valid: "YYYY-MM-DDTHH:MM" with valid ranges.
+/// Valhalla's date and time syntax check for request options.
 pub fn isIsoDateTime(s: []const u8) bool {
-    if (s.len != 16 or s[4] != '-' or s[7] != '-' or s[10] != 'T' or s[13] != ':') return false;
-    const year = std.fmt.parseInt(u32, s[0..4], 10) catch return false;
-    const month = std.fmt.parseInt(u32, s[5..7], 10) catch return false;
-    const day = std.fmt.parseInt(u32, s[8..10], 10) catch return false;
-    const hour = std.fmt.parseInt(u32, s[11..13], 10) catch return false;
-    const minute = std.fmt.parseInt(u32, s[14..16], 10) catch return false;
-    if (year < 1900 or month < 1 or month > 12 or day < 1 or hour > 23 or minute > 59) return false;
-    const leap = (year % 4 == 0 and year % 100 != 0) or year % 400 == 0;
-    const days = [_]u32{ 31, if (leap) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-    return day <= days[month - 1];
+    return datetime.validRequest(s);
 }
 
 // ---------------------------------------------------------------------------
@@ -777,6 +792,34 @@ const testing = std.testing;
 fn parseText(arena: Allocator, action: Action, text: []const u8) !Result {
     const doc = try json.parse(arena, text);
     return fromJson(arena, doc, action);
+}
+
+test "request time modes attach dates to the selected locations" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const arrive = (try parseText(a, .route,
+        \\{"costing":"auto","date_time":{"type":2,"value":"2026-01-03T06:17"},
+        \\"locations":[{"lat":1,"lon":1,"date_time":"2026-01-02T18:00"},{"lat":2,"lon":2}]}
+    )).ok;
+    try testing.expectEqual(.arrive_by, arrive.date_time_type);
+    try testing.expectEqualStrings("2026-01-02T18:00", arrive.locations[0].date_time.?);
+    try testing.expectEqualStrings("2026-01-03T06:17", arrive.locations[1].date_time.?);
+    const invariant = (try parseText(a, .route,
+        \\{"date_time":{"type":3,"value":"current"},"locations":[{"lat":1,"lon":1},{"lat":2,"lon":2}]}
+    )).ok;
+    try testing.expectEqual(.invariant, invariant.date_time_type);
+    for (invariant.locations) |location| try testing.expectEqualStrings("current", location.date_time.?);
+    const transit = (try parseText(a, .route,
+        \\{"costing":"multimodal","locations":[{"lat":1,"lon":1},{"lat":2,"lon":2}]}
+    )).ok;
+    try testing.expectEqual(.current, transit.date_time_type);
+    try testing.expectEqualStrings("current", transit.locations[0].date_time.?);
+    try testing.expectEqual(@as(?[]const u8, null), transit.locations[1].date_time);
+    const ignored = (try parseText(a, .route,
+        \\{"date_time":{"type":4294967295}}
+    )).ok;
+    try testing.expectEqual(.no_time, ignored.date_time_type);
 }
 
 test "route request: wildloop-style pedestrian with costing options" {
@@ -824,7 +867,7 @@ test "error codes in upstream order" {
     try testing.expectEqual(@as(u16, 130), (try parseText(a, .route, "{\"locations\":[{\"lat\":91,\"lon\":0}]}")).failure.code);
     try testing.expectEqual(@as(u16, 130), (try parseText(a, .route, "{\"locations\":[{\"lon\":0}]}")).failure.code);
     try testing.expectEqual(@as(u16, 134), (try parseText(a, .height, "{\"shape\":[{\"lat\":\"x\",\"lon\":0}]}")).failure.code);
-    try testing.expectEqual(@as(u16, 162), (try parseText(a, .route, "{\"date_time\":{\"type\":1,\"value\":\"2026-02-30T10:00\"}}")).failure.code);
+    try testing.expectEqual(@as(u16, 162), (try parseText(a, .route, "{\"date_time\":{\"type\":1,\"value\":\"1900-02-01T10:00\"}}")).failure.code);
     try testing.expectEqual(@as(u16, 160), (try parseText(a, .route, "{\"date_time\":{\"type\":1}}")).failure.code);
     const unknown = (try parseText(a, .route, "{\"costing\":\"rocket\"}")).failure;
     try testing.expectEqualStrings("'rocket'", unknown.extra);

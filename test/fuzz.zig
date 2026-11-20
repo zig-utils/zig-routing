@@ -16,7 +16,8 @@
 //! `build-checkpoint` (restart manifests), `valhalla-tile` (offline tile import),
 //! `costing-reference` (gate A samples and paths), `speed-config` (default speed tables),
 //! `motor-tags` (motor vehicle access and unit normalization), `admin-index`
-//! (stored administrative boundaries), `timezone-geojson`, and `timezone-rules`.
+//! (stored administrative boundaries), `timezone-geojson`, `timezone-rules`,
+//! and `datetime`.
 //!
 //! The contract for every parser: malformed input returns an error, never
 //! panics, overflows or reads out of bounds. The fuzz step builds ReleaseSafe
@@ -232,6 +233,7 @@ fn fuzzTimezoneRules(_: void, s: *Smith) !void {
     _ = rules.name(zone) catch null;
     for ([_]i64{ std.math.minInt(i64), -2717650800, 0, 1772953200, std.math.maxInt(i64) }) |stamp| {
         _ = rules.offsetAt(zone, stamp) catch null;
+        _ = rules.toUtc(zone, stamp, .none) catch null;
     }
 }
 
@@ -278,6 +280,28 @@ test "timezone assignment reads shapes and properties in either order" {
     var ids: [points.len]graph.timezone.Id = undefined;
     try routing.build.timezones.assign(pending.view, &points, &ids, .none);
     try std.testing.expectEqualSlices(graph.timezone.Id, &.{ try rules.id("Europe/London"), try rules.id("Europe/Amsterdam"), 0 }, &ids);
+}
+
+fn fuzzDateTime(_: void, s: *Smith) !void {
+    var buf: [64]u8 = undefined;
+    const text = draw(s, &buf, 0x6461_7465);
+    const datetime = graph.datetime;
+    _ = datetime.secondsFromMidnight(text);
+    _ = datetime.validRequest(text);
+    const parsed = datetime.Local.parse(text) orelse return;
+    const seconds = parsed.seconds();
+    if (seconds == 0) return;
+    var result: [16]u8 = undefined;
+    const rendered = try datetime.formatIso(&result, seconds, 0, false);
+    try std.testing.expectEqual(parsed, datetime.Local.parse(rendered).?);
+}
+
+test "fuzz datetime" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    try std.testing.fuzz({}, fuzzDateTime, .{ .corpus = try seeds(state.allocator(), &.{
+        "", "2016-11-06T01:30", "2026-02-30T10:00", "2015-05-06T01:0A", "2015-05-06T26:16:01", "1901-01-01", "9999-12-31T23:59",
+    }) });
 }
 
 fn fuzzValhallaTile(_: void, s: *Smith) !void {
