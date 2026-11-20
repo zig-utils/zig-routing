@@ -260,3 +260,95 @@ test "Valhalla configured speeds use the selected region and density band" {
     defer allocator.free(duplicate);
     try testing.expectError(error.DuplicateSpeedRegion, Config.parse(allocator, duplicate, .none));
 }
+
+// Ported from test/gurka/test_config_speed.cc (DefaultSpeedConfig,
+// SuburbanSpeedConfig and HandleNulls).
+test "configured speed tables address every road and link class and special use" {
+    const all: Table = .{
+        .way = .{ 65, 66, 67, 68, 69, 70, 71, 72 },
+        .link_exiting = .{ 9, 10, 11, 12, 13 },
+        .link_turning = .{ 15, 16, 17, 18, 19 },
+        .roundabout = .{ 21, 22, 23, 24, 25, 26, 27, 28 },
+        .driveway = 29,
+        .alley = 30,
+        .parking_aisle = 31,
+        .@"drive-through" = 32,
+    };
+    const none: Table = .{
+        .way = @splat(null),
+        .link_exiting = @splat(null),
+        .link_turning = @splat(null),
+        .roundabout = @splat(null),
+        .driveway = null,
+        .alley = null,
+        .parking_aisle = null,
+        .@"drive-through" = null,
+    };
+    const rules: [1]Rule = .{.{ .rural = none, .suburban = all, .urban = all }};
+    const allocator = std.testing.allocator;
+    const bytes = try std.json.Stringify.valueAlloc(allocator, rules, .{});
+    defer allocator.free(bytes);
+    var config = try Config.parse(allocator, bytes, .none);
+    defer config.deinit(allocator);
+    var class: EdgeClass = .{ .access = .{ .forward = @bitCast(graph.AccessMask{ .auto = true }) } };
+    try std.testing.expectEqual(null, config.speed(.{}, class, 1, false));
+    // The selected table covers all road classes for both roads and roundabouts.
+    for (all.way, all.roundabout, 0..) |road, roundabout, i| {
+        class.category.road_class = @intCast(i);
+        class.flags.roundabout = false;
+        try std.testing.expectEqual(road.?, config.speed(.{}, class, 6, false).?);
+        class.flags.roundabout = true;
+        try std.testing.expectEqual(roundabout.?, config.speed(.{}, class, 11, false).?);
+    }
+    class.flags.roundabout = false;
+    class.flags.link = true;
+    for (all.link_exiting, all.link_turning, 0..) |exiting, turning, i| {
+        class.category.road_class = @intCast(i);
+        try std.testing.expectEqual(exiting.?, config.speed(.{}, class, 6, true).?);
+        try std.testing.expectEqual(turning.?, config.speed(.{}, class, 11, false).?);
+    }
+    class.category.road_class = @backingInt(graph.RoadClass.unclassified);
+    try std.testing.expectEqual(null, config.speed(.{}, class, 11, true));
+    class.flags.link = false;
+    const uses: []const struct { use: graph.Use, speed: ?u8 } = &.{
+        .{ .use = .driveway, .speed = 29 },
+        .{ .use = .alley, .speed = 30 },
+        .{ .use = .parking_aisle, .speed = 31 },
+        .{ .use = .drive_through, .speed = 32 },
+        .{ .use = .ferry, .speed = null },
+        .{ .use = .rail_ferry, .speed = null },
+    };
+    for (uses) |entry| {
+        class.category.use = @intCast(@backingInt(entry.use));
+        try std.testing.expectEqual(entry.speed, config.speed(.{}, class, 6, false));
+    }
+    class.category.use = @backingInt(graph.Use.road);
+    class.access = .{ .forward = @bitCast(graph.AccessMask{ .pedestrian = true, .bicycle = true }) };
+    try std.testing.expectEqual(null, config.speed(.{}, class, 6, false));
+}
+
+// Ported from test/gurka/test_config_speed.cc (Malformed).
+test "malformed default speed configuration cannot load part of a table" {
+    const allocator = std.testing.allocator;
+    const complete =
+        \\{"way":[11,11,11,11,11,11,11,11],"link_exiting":[11,11,11,11,11],"link_turning":[11,11,11,11,11],
+        \\"roundabout":[11,11,11,11,11,11,11,11],"driveway":11,"alley":11,"parking_aisle":11,"drive-through":11}
+    ;
+    const valid = "{\"rural\":" ++ complete ++ ",\"suburban\":" ++ complete ++ ",\"urban\":" ++ complete ++ "}";
+    const invalid = [_][]const u8{
+        "foo",
+        "{}",
+        "[{\"rural\":" ++ complete ++ "}]",
+        "[{\"rural\":" ++ complete ++ ",\"suburban\":" ++ complete ++ "}]",
+        "[" ++ valid ++ ",{\"iso3166-1\":\"\",\"rural\":" ++ complete ++ ",\"suburban\":" ++ complete ++ ",\"urban\":" ++ complete ++ "}]",
+        "[{\"iso3166-1\":\"US\",\"iso3166-2\":\"\",\"rural\":" ++ complete ++ ",\"suburban\":" ++ complete ++ ",\"urban\":" ++ complete ++ "}]",
+        "[{\"urban\":{\"way\":[11]},\"rural\":" ++ complete ++ ",\"suburban\":" ++ complete ++ "}]",
+    };
+    for (invalid) |bytes| {
+        if (Config.parse(allocator, bytes, .none)) |result| {
+            var config = result;
+            config.deinit(allocator);
+            return error.MalformedSpeedConfigAccepted;
+        } else |_| {}
+    }
+}

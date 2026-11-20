@@ -28,8 +28,24 @@ workers. A configured speed run used a global 135 km/h base setting on
 after relocating the configuration file reproduced the fresh bundle.
 Supplying changed configuration bytes was rejected before enhancement.
 
-The remaining CLI inputs are the destination country and state from the
-admin index and the directed exit-sign flags from the sign build. Assembly
-accepts both inputs and has a fixture that exercises their combined speed
-rule. [Admin index](https://github.com/zig-utils/zig-routing/issues/120),
-[Signs and exits](https://github.com/zig-utils/zig-routing/issues/141)
+## Native admin and sign inputs
+
+The builder selects the configured speed table with the destination node's
+country and state. The stored directed sign flag selects the exiting speed
+for a link. The signed ramp fixture takes 77 km/h in the signed direction
+and 51 km/h in the opposing direction. The regional fixture selects
+48 km/h into Belgium and 63 km/h into the configured Dutch state.
+
+Together these fixtures matched Valhalla 3.9.3 on all four speed fields,
+speed type, and node and edge density for 32 directed edges. The turn
+type, side and stop impact agreed for all 64 movements across 20 local
+turn matrices. Pairing used OSM way IDs and full directed geometry, with
+a tolerance of one microdegree for coordinate encoding. Speed, node
+density and turns were compared using imported base tiles. Final edge
+density was read from hierarchical tiles, where Valhalla writes the
+endpoint average. The oracle builds disabled link reclassification and
+turn-channel inference to exercise speed selection on the original
+road classes.
+
+A malformed speed configuration produced the same verified bundle as
+a build with no configuration.

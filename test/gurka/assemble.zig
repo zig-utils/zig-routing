@@ -176,50 +176,76 @@ test "duration sets a ferry's speed across all segments of its OSM way" {
     try testing.expectEqual(4, ferry_edges);
 }
 
-test "configured speeds resolve the destination region and directional exit sign" {
-    const Lookup = struct {
-        fn region(context: *const anyopaque, point: format.Coordinate) build.speeds.Region {
-            const destination: *const format.Coordinate = @ptrCast(@alignCast(context));
-            return if (std.meta.eql(destination.*, point)) .{ .country = "US", .state = "PA" } else .{};
-        }
-
-        fn signed(_: *const anyopaque, _: i64, _: i64, forward: bool) bool {
-            return forward;
-        }
-    };
+// Ported from test/gurka/test_config_speed.cc (DefaultSpeedConfig and AdminFallback).
+test "configured link speeds use directed signs and the destination admin" {
     const table =
-        \\{"way":[26,26,26,26,26,26,26,26],"link_exiting":[77,77,77,77,77],"link_turning":[51,51,51,51,51],
-        \\"roundabout":[20,20,20,20,20,20,20,20],"driveway":10,"alley":10,"parking_aisle":10,"drive-through":10}
+        \\{"way":[26,26,26,26,26,26,26,26],"link_exiting":[77,76,75,74,73],"link_turning":[51,50,49,48,47],
+        \\"roundabout":[20,20,20,20,20,20,20,20],"driveway":10,"alley":11,"parking_aisle":12,"drive-through":13}
     ;
-    const config = "[{\"iso3166-1\":\"US\",\"iso3166-2\":\"PA\",\"rural\":" ++ table ++
+    const config = "[{\"iso3166-1\":\"JP\",\"rural\":" ++ table ++
         ",\"suburban\":" ++ table ++ ",\"urban\":" ++ table ++ "}]";
     var rules = try build.speeds.Config.parse(testing.allocator, config, .none);
     defer rules.deinit(testing.allocator);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const fixture = try gurka.Map.init(arena.allocator(), try gurka.mapToCoordinates("A---B---C", 25), &.{
-        .{ .label = "AB", .tags = &.{ .{ .key = "highway", .value = "motorway_link" }, .{ .key = "maxspeed", .value = "95" } } },
-        .{ .label = "BC", .tags = &.{.{ .key = "highway", .value = "motorway" }} },
-    }, &.{}, &.{});
-    const origin = fixture.findNode("A").?.location.toFixed();
-    const destination = fixture.findNode("B").?.location.toFixed();
+    const fixture = try @import("examples.zig").signs(arena.allocator());
     var result = try Built.assembleWithOptions(fixture.osm, .{
         .scratch_dir = "",
         .workers = 4,
         .speed_rules = &rules,
-        .admin_speed_region = .{ .context = &destination, .resolve = Lookup.region },
-        .exit_signs = .{ .context = &destination, .has = Lookup.signed },
     });
     defer result.deinit();
     const view = &result.bundle.view;
-    const range = try view.outEdgeRange(try at(view, origin));
-    const id: format.EdgeId = @fromBackingInt(range.first);
-    const edge = try view.edge(id);
-    const reverse = try view.edge(try view.oppEdge(id));
-    try testing.expectEqual(77, edge.speed[0]);
-    try testing.expect(!(try view.class(edge.cls.class_id)).flags.tagged_speed);
-    try testing.expectEqual(95, reverse.speed[0]);
-    try testing.expect((try view.class(reverse.cls.class_id)).flags.tagged_speed);
+    const ramp = try directedBetween(view, &fixture, "B", "J");
+    try testing.expectEqual(95, (try view.coldRecord(ramp)).speedLimit());
+    const cases = [_]struct { from: []const u8, to: []const u8, speed: u8, signed: bool }{
+        .{ .from = "B", .to = "J", .speed = 77, .signed = true },
+        .{ .from = "J", .to = "B", .speed = 51, .signed = false },
+        .{ .from = "C", .to = "E", .speed = 77, .signed = true },
+        .{ .from = "G", .to = "H", .speed = 26, .signed = true },
+        .{ .from = "A", .to = "B", .speed = 26, .signed = false },
+    };
+    for (cases) |case| {
+        const id = try directedBetween(view, &fixture, case.from, case.to);
+        const edge = try view.edge(id);
+        try testing.expectEqual(case.signed, try graph.signs.hasSigns(view, id));
+        try testing.expectEqual(case.speed, edge.speed[0]);
+        try testing.expect(!(try view.class(edge.cls.class_id)).flags.tagged_speed);
+        try testing.expectEqualStrings("JP", (try view.nodeAdmin(@fromBackingInt(edge.head))).country_iso);
+    }
+}
+
+test "country and state speed rules follow the destination across the same way" {
+    const table =
+        \\{"way":[39,39,39,39,39,39,39,39],"link_exiting":[null,null,null,null,null],"link_turning":[null,null,null,null,null],
+        \\"roundabout":[null,null,null,null,null,null,null,null],"driveway":null,"alley":null,"parking_aisle":null,"drive-through":null}
+    ;
+    const state =
+        \\{"way":[63,63,63,63,63,63,63,63],"link_exiting":[null,null,null,null,null],"link_turning":[null,null,null,null,null],
+        \\"roundabout":[null,null,null,null,null,null,null,null],"driveway":null,"alley":null,"parking_aisle":null,"drive-through":null}
+    ;
+    const country =
+        \\{"way":[48,48,48,48,48,48,48,48],"link_exiting":[null,null,null,null,null],"link_turning":[null,null,null,null,null],
+        \\"roundabout":[null,null,null,null,null,null,null,null],"driveway":null,"alley":null,"parking_aisle":null,"drive-through":null}
+    ;
+    const config = "[{\"rural\":" ++ table ++ ",\"suburban\":" ++ table ++ ",\"urban\":" ++ table ++
+        "},{\"iso3166-1\":\"NL\",\"iso3166-2\":\"TST\",\"rural\":" ++ state ++
+        ",\"suburban\":" ++ state ++ ",\"urban\":" ++ state ++
+        "},{\"iso3166-1\":\"BE\",\"rural\":" ++ country ++ ",\"suburban\":" ++ country ++ ",\"urban\":" ++ country ++ "}]";
+    var rules = try build.speeds.Config.parse(testing.allocator, config, .none);
+    defer rules.deinit(testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const fixture = try @import("examples.zig").countryAccess(arena.allocator());
+    var built = try Built.assembleWithOptions(fixture.osm, .{ .scratch_dir = "", .speed_rules = &rules, .workers = 4 });
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const toward_country = try directedBetween(view, &fixture, "R", "S");
+    const toward_state = try view.oppEdge(toward_country);
+    try testing.expectEqual(48, (try view.edge(toward_country)).speed[0]);
+    try testing.expectEqual(63, (try view.edge(toward_state)).speed[0]);
+    const fallback = try directedBetween(view, &fixture, "W", "X");
+    try testing.expectEqual(39, (try view.edge(fallback)).speed[0]);
 }
 
 test "assembled turn rows use opposing locals, shared names and class-based stops" {
@@ -2670,4 +2696,70 @@ test "signs preserve exits, forks, directions and named nodes from PBF" {
     try testing.expectEqualStrings("River Toll", try toll_signs[0].text(view.cold_data.?));
     const exit = try at(view, fixture.findNode("B").?.location.toFixed());
     try testing.expectEqual(0, (try sign.signsForNode(view, exit)).len);
+}
+
+// Ported from test/gurka/test_stopimpact.cc (Valhalla 3.9.3).
+test "stop impact follows crossings and way changes" {
+    const motorway: gurka.Tags = &.{ .{ .key = "highway", .value = "motorway" }, .{ .key = "oneway", .value = "yes" } };
+    const primary: gurka.Tags = &.{.{ .key = "highway", .value = "primary" }};
+    const residence: gurka.Tag = .{ .key = "highway", .value = "residential" };
+    const cycleway: gurka.Tags = &.{.{ .key = "highway", .value = "cycleway" }};
+    const crossing = "         D\n         |\nA--------B--------C\n         |\n         E";
+    const Movement = struct { from: []const u8, via: []const u8, to: []const u8, stopped: bool };
+    const straight: Movement = .{ .from = "A", .via = "B", .to = "C", .stopped = false };
+    const straight_with_stop: Movement = .{ .from = "A", .via = "B", .to = "C", .stopped = true };
+    const cross: Movement = .{ .from = "D", .via = "B", .to = "E", .stopped = true };
+    const cases: []const struct { map: []const u8, ways: []const gurka.Way, turns: []const Movement } = &.{
+        .{
+            .map = "A-----------B-----------C",
+            .ways = &.{ .{ .label = "AB", .tags = motorway }, .{ .label = "BC", .tags = motorway } },
+            .turns = &.{straight},
+        },
+        .{
+            .map = "A-----------B-----------C",
+            .ways = &.{ .{ .label = "AB", .tags = &.{residence} }, .{ .label = "BC", .tags = &.{residence} } },
+            .turns = &.{straight},
+        },
+        .{
+            .map = "         D        F\n         |        |\nA--------B--------C\n         |        |\n         E        G",
+            .ways = &.{
+                .{ .label = "AB", .tags = primary },       .{ .label = "BC", .tags = primary },
+                .{ .label = "BD", .tags = cycleway },      .{ .label = "BE", .tags = cycleway },
+                .{ .label = "CF", .tags = &.{residence} }, .{ .label = "CG", .tags = &.{residence} },
+            },
+            .turns = &.{ straight, cross, .{ .from = "F", .via = "C", .to = "G", .stopped = true } },
+        },
+        .{
+            .map = crossing,
+            .ways = &.{
+                .{ .label = "AB", .tags = &.{residence} }, .{ .label = "BC", .tags = &.{residence} },
+                .{ .label = "BD", .tags = &.{residence} }, .{ .label = "BE", .tags = &.{residence} },
+            },
+            .turns = &.{ straight_with_stop, cross },
+        },
+        .{
+            .map = "A-----------B-----------C\n            |\n            D",
+            .ways = &.{
+                .{ .label = "AB", .tags = &.{residence} },
+                .{ .label = "BC", .tags = &.{residence} },
+                .{ .label = "BD", .tags = &.{ residence, .{ .key = "oneway", .value = "yes" } } },
+            },
+            .turns = &.{straight_with_stop},
+        },
+    };
+    for (cases) |case| {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        const fixture = try gurka.Map.init(arena.allocator(), try gurka.mapToCoordinates(case.map, 100), case.ways, &.{}, &.{});
+        var built = try Built.assemble(fixture.osm, 4);
+        defer built.deinit();
+        const view = &built.bundle.view;
+        for (case.turns) |movement| {
+            const incoming = try view.edge(try directedBetween(view, &fixture, movement.from, movement.via));
+            const outgoing = try view.edge(try directedBetween(view, &fixture, movement.via, movement.to));
+            const row = try view.turnRow(@fromBackingInt(incoming.head), incoming.cls.opp_local);
+            const stop: u3 = @truncate(row[outgoing.cls.local] >> 3);
+            try testing.expectEqual(movement.stopped, stop != 0);
+        }
+    }
 }

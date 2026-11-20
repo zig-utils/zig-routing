@@ -520,6 +520,7 @@ pub fn signs(arena: Allocator) !gurka.Map {
     const ramp = [_]gurka.Tag{
         .{ .key = "highway", .value = "motorway_link" },
         .{ .key = "oneway", .value = "yes" },
+        .{ .key = "maxspeed", .value = "95" },
     };
     const primary = gurka.Tag{ .key = "highway", .value = "primary" };
     return gurka.Map.init(arena, layout, &.{

@@ -36,17 +36,6 @@ const Allocator = std.mem.Allocator;
 const max_degree = turns.max_degree;
 const max_workers = 16;
 
-pub const AdminSpeedRegion = struct {
-    context: *const anyopaque,
-    resolve: *const fn (*const anyopaque, geo.FixedLL) speeds.Region,
-};
-
-pub const ExitSigns = struct {
-    context: *const anyopaque,
-    /// Parameters after the context are OSM way ID, source node ID and way direction.
-    has: *const fn (*const anyopaque, i64, i64, bool) bool,
-};
-
 pub const Options = struct {
     scratch_dir: []const u8,
     drive_side: edge_class.DriveSide = .right,
@@ -55,11 +44,9 @@ pub const Options = struct {
     include_platforms: bool = false,
     dem_source: ?elevation.Source = null,
     admin_drive_side: ?enhance.AdminDriveSide = null,
-    admin_speed_region: ?AdminSpeedRegion = null,
     admin_index: ?graph.admin.View = null,
     apply_country_overrides: bool = true,
     timezone_source: ?timezones.Source = null,
-    exit_signs: ?ExitSigns = null,
     speed_rules: ?*const speeds.Config = null,
     infer_turn_channels: bool = true,
     infer_internal_intersections: bool = true,
@@ -1486,14 +1473,11 @@ const EdgeEnhanceJob = struct {
                     continue;
                 }
                 const configured = if (self.options.speed_rules) |rules| configured: {
-                    const region: speeds.Region = if (self.options.admin_speed_region) |admin|
-                        admin.resolve(admin.context, self.network.coordinates[edge.head])
-                    else if (self.options.admin_index) |index| region: {
+                    const region: speeds.Region = if (self.options.admin_index) |index| region: {
                         const names = try index.names(self.shared.admin_ids.?[edge.head]);
                         break :region .{ .country = names.country_iso, .state = names.state_iso };
                     } else .{};
-                    const signed = class.flags.link and (class.flags.sign or self.hasExitSign(@intCast(slot)));
-                    break :configured rules.speed(region, class, density, signed);
+                    break :configured rules.speed(region, class, density, class.flags.sign);
                 } else null;
                 const ferry_duration = if (class.category.use == @backingInt(graph.constants.Use.ferry)) ferry: {
                     const segment = self.shared.segments[self.shared.topology.slot_refs.data[slot] / 2];
@@ -1532,14 +1516,6 @@ const EdgeEnhanceJob = struct {
         const shape = try segmentShape(self.shared.shape_points, segment);
         const class = &self.network.classes[self.network.edges[slot].cls.class_id];
         return turns.rawHeading(shape, ref & 1 == 0, class, self.options.deadline);
-    }
-
-    fn hasExitSign(self: *const EdgeEnhanceJob, slot: u32) bool {
-        const signs = self.options.exit_signs orelse return false;
-        const ref = self.shared.topology.slot_refs.data[slot];
-        const segment = self.shared.segments[ref / 2];
-        const forward = ref & 1 == 0;
-        return signs.has(signs.context, segment.way_id, if (forward) segment.from else segment.to, forward);
     }
 };
 
