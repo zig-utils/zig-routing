@@ -185,6 +185,12 @@ pub const View = struct {
     transit_exceptions: ?[]const transit.Exception = null,
     transit_transfers: ?[]const transit.Transfer = null,
     transit_index: ?transit.View = null,
+    edge_keys: ?[]const @import("edge_keys.zig").Record = null,
+    edge_key_inverse: ?[]const u32 = null,
+    edge_key_hash_header: ?[]const @import("edge_keys.zig").HashHeader = null,
+    edge_key_hash_buckets: ?[]const u64 = null,
+    edge_key_hash_slots: ?[]const u32 = null,
+    edge_key_index: ?@import("edge_keys.zig").View = null,
 
     pub fn parse(files: Files, diagnostic: ?*Diagnostic) !View {
         return parseWithDeadline(files, diagnostic, .none);
@@ -376,8 +382,34 @@ pub const View = struct {
             return error.MissingSection;
         }
         try graph.openTransit(diagnostic);
+        try graph.openEdgeKeys(diagnostic);
         note(diagnostic, null);
         return graph;
+    }
+
+    fn openEdgeKeys(self: *View, diagnostic: ?*Diagnostic) !void {
+        const hash_present = self.edge_key_hash_header != null or self.edge_key_hash_buckets != null or self.edge_key_hash_slots != null;
+        if (self.edge_keys == null and self.edge_key_inverse == null and !hash_present) return;
+        note(diagnostic, .edge_keys);
+        const records = self.edge_keys orelse return error.MissingSection;
+        if (records.len != self.edges.len) return error.InvalidEdgeKeyIndex;
+        note(diagnostic, .edge_key_inverse);
+        const inverse = self.edge_key_inverse orelse return error.MissingSection;
+        if (inverse.len != self.edges.len) return error.InvalidEdgeKeyIndex;
+        var index: @import("edge_keys.zig").View = .{ .records = records, .inverse = inverse };
+        if (hash_present) {
+            note(diagnostic, .edge_key_hash_header);
+            const hash_header = self.edge_key_hash_header orelse return error.MissingSection;
+            if (hash_header.len != 1 or hash_header[0].version != 1 or hash_header[0].reserved != 0) return error.InvalidEdgeKeyHash;
+            note(diagnostic, .edge_key_hash_buckets);
+            const buckets = self.edge_key_hash_buckets orelse return error.MissingSection;
+            if (buckets.len == 0 or buckets.len > records.len) return error.InvalidEdgeKeyHash;
+            note(diagnostic, .edge_key_hash_slots);
+            const slots = self.edge_key_hash_slots orelse return error.MissingSection;
+            if (slots.len != records.len) return error.InvalidEdgeKeyHash;
+            index.hash = .{ .seed = hash_header[0].seed, .buckets = buckets, .slots = slots };
+        }
+        self.edge_key_index = index;
     }
 
     fn openTransit(self: *View, diagnostic: ?*Diagnostic) !void {
@@ -654,6 +686,10 @@ pub const View = struct {
         if (self.transit_index) |index| {
             note(diagnostic, .transit_metadata);
             try index.verify(self.nodes.len, deadline);
+        }
+        if (self.edge_key_index) |index| {
+            note(diagnostic, .edge_keys);
+            try index.verify(self.edges.len, deadline);
         }
         note(diagnostic, null);
     }

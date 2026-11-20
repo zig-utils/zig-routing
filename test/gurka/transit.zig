@@ -115,7 +115,13 @@ test "GTFS transit prepares a restartable graph with the same bytes across worke
             street_links += 1;
             connector = edge;
             try testing.expect(class.forwardAccess().pedestrian and !class.forwardAccess().auto);
-            try testing.expectEqual(9001, try first.view.wayId(@fromBackingInt(@as(u32, @intCast(slot)))));
+            const id: graph.format.EdgeId = @fromBackingInt(@as(u32, @intCast(slot)));
+            try testing.expectEqual(9001, try first.view.wayId(id));
+            const keys = first.view.edge_key_index.?;
+            const key = try keys.key(id);
+            try testing.expectEqual(.transit, key.flags.kind);
+            try testing.expectEqual(9001, key.way_id);
+            try testing.expectEqual(@as(?graph.format.EdgeId, id), try keys.find(key));
         }
     }
     try testing.expectEqual(2, street_links);

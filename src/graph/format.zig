@@ -6,6 +6,7 @@ const constants = @import("constants.zig");
 const turn_restrictions = @import("turn_restrictions.zig");
 const restriction_automaton = @import("restriction_automaton.zig");
 const transit = @import("transit.zig");
+const edge_keys = @import("edge_keys.zig");
 
 pub const magic = "ZRGRAPH\x00".*;
 pub const version: u32 = 1;
@@ -133,6 +134,11 @@ pub const SectionKind = enum(u32) {
     transit_days = 36,
     transit_exceptions = 37,
     transit_transfers = 38,
+    edge_keys = 39,
+    edge_key_inverse = 40,
+    edge_key_hash_header = 41,
+    edge_key_hash_buckets = 42,
+    edge_key_hash_slots = 43,
 
     pub fn placement(kind: SectionKind) Placement {
         return switch (kind) {
@@ -141,6 +147,7 @@ pub const SectionKind = enum(u32) {
             .turn_restrictions, .restriction_automaton, .restriction_conditions => .warm,
             .transit_metadata, .transit_stops, .transit_stations, .transit_egresses, .transit_routes, .transit_lines, .transit_departures, .transit_occurrences, .transit_schedules, .transit_days, .transit_exceptions, .transit_transfers => .warm,
             .cold_idx, .cold, .slopes, .signs, .turnlanes, .lane_connectivity => .cold,
+            .edge_keys, .edge_key_inverse, .edge_key_hash_header, .edge_key_hash_buckets, .edge_key_hash_slots => .cold,
         };
     }
 
@@ -184,6 +191,11 @@ pub const SectionKind = enum(u32) {
             .transit_days => "transit_days.bin",
             .transit_exceptions => "transit_exceptions.bin",
             .transit_transfers => "transit_transfers.bin",
+            .edge_keys => "edge_keys.bin",
+            .edge_key_inverse => "edge_key_inverse.bin",
+            .edge_key_hash_header => "edge_key_hash_header.bin",
+            .edge_key_hash_buckets => "edge_key_hash_buckets.bin",
+            .edge_key_hash_slots => "edge_key_hash_slots.bin",
         };
     }
 
@@ -203,7 +215,7 @@ pub const SectionKind = enum(u32) {
             .coverage => Bounds,
             .admins, .timezone_rules => u8,
             .node_admins, .node_timezones => u16,
-            .components, .turn_sides => u32,
+            .components, .turn_sides, .edge_key_inverse, .edge_key_hash_slots => u32,
             .turn_restrictions => turn_restrictions.Entry,
             .restriction_automaton => restriction_automaton.State,
             .restriction_conditions => restriction_automaton.Condition,
@@ -222,6 +234,9 @@ pub const SectionKind = enum(u32) {
             .transit_days => transit.DayWord,
             .transit_exceptions => transit.Exception,
             .transit_transfers => transit.Transfer,
+            .edge_keys => edge_keys.Record,
+            .edge_key_hash_header => edge_keys.HashHeader,
+            .edge_key_hash_buckets => u64,
         };
     }
 

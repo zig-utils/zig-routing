@@ -169,6 +169,11 @@ pub const Artifact = enum {
     transit_days_rows,
     transit_exceptions_rows,
     transit_transfers_rows,
+    bundle_edge_keys,
+    bundle_edge_key_inverse,
+    bundle_edge_key_hash_header,
+    bundle_edge_key_hash_buckets,
+    bundle_edge_key_hash_slots,
 
     noinline fn filename(self: Artifact) [:0]const u8 {
         return switch (self) {

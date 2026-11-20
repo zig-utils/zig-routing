@@ -3,6 +3,7 @@ const std = @import("std");
 const routing = @import("routing");
 const format = routing.graph.format;
 const transit = routing.graph.transit;
+const edge_keys = routing.graph.edge_keys;
 
 const uuid: format.DatasetUuid = .{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x46, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
 
@@ -25,6 +26,20 @@ const edges = [_]format.EdgeHot{
     },
 };
 const first_edge = [_]format.FirstEdge{ 0, 1, 2 };
+const keys = [_]edge_keys.Record{
+    .{ .key = .{ .way_id = 12, .begin_node = 42, .end_node = 43 }, .edge = 0 },
+    .{ .key = .{ .way_id = 12, .begin_node = 43, .end_node = 42, .flags = .{ .reversed = true } }, .edge = 1 },
+};
+const hash_seed = blk: {
+    var seed: u64 = 0;
+    while (keys[0].key.hash(seed) % 2 == keys[1].key.hash(seed) % 2) : (seed += 1) {}
+    break :blk seed;
+};
+const hash_buckets = blk: {
+    var buckets: [2]u64 = undefined;
+    for (keys, 0..) |row, i| buckets[row.key.hash(hash_seed) % 2] = edge_keys.singleton_bucket | i;
+    break :blk buckets;
+};
 const turns = [_]format.TurnEntry{ 0xb9, 0x72 };
 const classes = [_]routing.graph.class_table.EdgeClass{
     .{ .access = .{ .forward = 3, .reverse = 7 }, .flags = .{ .sign = true, .turnlanes = true, .lane_conn = true } },
@@ -158,6 +173,10 @@ pub fn records(comptime kind: format.SectionKind) []const kind.Record() {
             .{ .origin = 1, .destination = 0, .origin_route = 0, .destination_route = 0, .minimum_time = 180, .flags = .{ .kind = .minimum_time } },
             .{ .origin_trip = 42, .destination_trip = 44, .flags = .{ .kind = .in_seat } },
         },
+        .edge_keys => &keys,
+        .edge_key_inverse, .edge_key_hash_slots => &.{ 0, 1 },
+        .edge_key_hash_header => &.{.{ .seed = hash_seed }},
+        .edge_key_hash_buckets => &hash_buckets,
     };
 }
 

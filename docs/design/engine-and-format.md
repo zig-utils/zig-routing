@@ -163,6 +163,47 @@ On the pinned Liechtenstein PBF, `zig build check-edges -- INPUT.osm.pbf SCRATCH
 reported 279 base classes across 15,760 directed edges. Utrecht reported 1,379 across 85,336.
 The class table checksum was identical with 1, 4 and 8 workers on each extract.
 
+### Stable directed edge keys
+
+A road key records the signed OSM way ID, the OSM node IDs at the beginning and end
+of the directed segment, and its direction relative to the order of nodes in the
+source way. Reverse travel swaps the endpoint IDs and sets the reverse bit.
+Way splits are distinguished by their endpoint pairs. When a looping or repeated way
+produces the same directed pair more than once, its zero-based occurrence follows
+segment order within the source way. Inserting or removing an earlier copy of the
+same pair can change the occurrence assigned to later copies.
+
+Generated edges use separate kinds. A node connector uses way ID zero, the
+original OSM node ID at both ends, and the left-to-right alias sequence for its
+occurrence. A generated transit connection uses the source street way ID when
+available, or zero, and the signed endpoint IDs assigned by the transit build.
+Generated keys remain stable across node permutations and worker counts for the
+same ordered source inputs.
+
+The cold `edge_keys.bin` section (39) contains 40-byte sorted records with a
+32-byte key, the directed edge ID, and four reserved bytes. The key is three
+signed 64-bit IDs followed by a 64-bit word containing a 32-bit occurrence, one
+direction bit, two kind bits, and 29 reserved zero bits. The sort compares the
+signed IDs in order, then the unsigned flags word. `edge_key_inverse.bin` (40)
+maps each directed edge ID to a 32-bit row in that array. Both sections are
+memory mapped for inspection and ingest.
+
+The default forward lookup binary-searches the sorted array. Building with
+`--edge-key-hash` adds a versioned hash seed, displacement buckets, and one slot
+per key (sections 41-43). Each slot holds a sorted row index. The lookup checks
+the full key at that row, including for keys absent from the bundle.
+
+```sh
+zr inspect BUNDLE --key-for-edge 123
+zr inspect BUNDLE --edge-key 100,10,20,forward
+zr diff OLD_BUNDLE NEW_BUNDLE --edge-keys --json
+zig build bench-edge-keys -Doptimize=ReleaseFast -- BUNDLE
+```
+
+The lookup form accepts optional occurrence and kind fields after direction.
+The defaults are occurrence zero and kind `osm`. The diff reports added and
+removed keys and retained keys whose dense edge ID changed.
+
 ### Transit timetable sections
 
 A bundle with transit carries sections 27 through 38 together. They use the v1 section

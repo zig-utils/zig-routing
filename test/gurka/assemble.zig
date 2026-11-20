@@ -121,6 +121,40 @@ test "valhalla loop fixtures retain edge counts and opposing involution" {
     }
 }
 
+test "stable road keys distinguish repeated endpoints by source segment order" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates("    C   D   E\nA---------------B---F", 20), &.{
+        .{ .label = "ACBDAEBF", .tags = &.{.{ .key = "highway", .value = "residential" }} },
+    }, &.{}, &.{});
+    var result = try Built.assemble(fixture.osm, 2);
+    defer result.deinit();
+    const view = &result.bundle.view;
+    const keys = view.edge_key_index.?;
+    const refs = fixture.osm.ways[0].refs;
+    const way_id = fixture.osm.ways[0].id;
+    for (0..2) |occurrence| {
+        const key: graph.edge_keys.Key = .{
+            .way_id = way_id,
+            .begin_node = refs[0],
+            .end_node = refs[2],
+            .flags = .{ .occurrence = @intCast(occurrence) },
+        };
+        const edge = (try keys.find(key)) orelse return error.MissingRepeatedEdge;
+        const path = try view.shape(edge, a);
+        const intermediate = fixture.findNode(if (occurrence == 0) "C" else "E").?.location.toFixed();
+        try testing.expectEqualDeep(intermediate, path[1]);
+        const reverse = try keys.key(try view.oppEdge(edge));
+        try testing.expectEqualDeep(graph.edge_keys.Key{
+            .way_id = way_id,
+            .begin_node = key.end_node,
+            .end_node = key.begin_node,
+            .flags = .{ .reversed = true, .occurrence = @intCast(occurrence) },
+        }, reverse);
+    }
+}
+
 test "assemble directs speed and access and preserves node attributes and coordinates" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -397,6 +431,7 @@ test "high-degree node aliases reserve both directions and preserve connectivity
     defer result.deinit();
     const view = &result.bundle.view;
     try checkOpposites(view, 2 * leaves + 4);
+    const keys = view.edge_key_index.?;
     try testing.expectEqual(1, result.stats.split_nodes);
     try testing.expectEqual(2, result.stats.connectors);
     try testing.expectEqual(leaves + 3, view.nodes.len);
@@ -415,6 +450,14 @@ test "high-degree node aliases reserve both directions and preserve connectivity
             try testing.expectEqual(alias, edge.geom.len_m == 0);
             if (alias) {
                 connectors += 1;
+                const directed: format.EdgeId = @fromBackingInt((try view.outEdgeRange(id)).first + edge.cls.local);
+                const key = try keys.key(directed);
+                const opposite = try keys.key(try view.oppEdge(directed));
+                try testing.expectEqual(.node_connector, key.flags.kind);
+                try testing.expectEqual(1, key.begin_node);
+                try testing.expectEqual(1, key.end_node);
+                try testing.expectEqual(key.flags.occurrence, opposite.flags.occurrence);
+                try testing.expect(key.flags.reversed != opposite.flags.reversed);
                 for (try view.turnRow(id, edge.cls.local)) |entry| {
                     try testing.expectEqual(build.turns.encode(.straight, 0, true), entry);
                 }

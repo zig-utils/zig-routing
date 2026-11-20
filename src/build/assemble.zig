@@ -4,6 +4,7 @@ const std = @import("std");
 const geo = @import("../geo/point.zig");
 const math = @import("../geo/build_math.zig");
 const io = @import("../infra/io.zig");
+const radix = @import("../infra/radix.zig");
 const graph = @import("../graph/root.zig");
 const format = graph.format;
 const classes = graph.class_table;
@@ -37,6 +38,7 @@ const grid = @import("../geo/grid.zig");
 const transit_stage = @import("transit_stage.zig");
 const transit_connections = @import("transit_connections.zig");
 const gtfs = @import("gtfs/root.zig");
+const edge_key_hash = @import("edge_key_hash.zig");
 
 const Allocator = std.mem.Allocator;
 const max_degree = turns.max_degree;
@@ -61,6 +63,8 @@ pub const Options = struct {
     infer_turn_channels: bool = true,
     infer_internal_intersections: bool = true,
     ordering: node_order.Ordering = .{},
+    emit_edge_keys: bool = true,
+    edge_key_hash: bool = false,
     deadline: io.Deadline = .none,
 };
 
@@ -229,6 +233,7 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     const topology_ns = timer.read();
     const means: []const i16 = if (terrain) |*present| present.means.data else &.{};
     const cold_bytes = try buildCold(gpa, &shared, &metadata, &plan, table.classes, writer, options.scratch_dir, means);
+    try writeEdgeKeys(gpa, &shared, &plan, writer, options);
     const spatial = try buildSpatial(gpa, &shared, writer, options.scratch_dir, options.workers);
     const bundle_metadata = [_]format.Metadata{.{
         .ordering_kind = @backingInt(options.ordering.kind),
@@ -482,6 +487,7 @@ noinline fn saveColdStage(session: *checkpoint.Session, shared: *const Shared, m
         try writer.write(.restriction_conditions, try checkpoint.array(automaton.Condition, rows));
     }
     const cold_bytes = try buildCold(gpa, shared, metadata, plan, edge_classes, &writer, options.scratch_dir, means);
+    try writeEdgeKeys(gpa, shared, plan, &writer, options.*);
     try tx.writeJson(gpa, cold_bytes, .source_stats);
     try writer.write(.metadata, &.{.{
         .ordering_kind = @backingInt(options.ordering.kind),
@@ -495,6 +501,95 @@ noinline fn saveAttributes(topology: *const Topology, edge_classes: []const clas
     try tx.writeArray(topology.nodes, .nodes);
     try tx.writeArray(topology.output.data, .directed_edges);
     try tx.writeArray(edge_classes, .classes);
+}
+
+const EdgeKeyField = enum { flags, end_node, begin_node, way_id };
+
+fn edgeKeyWord(field: EdgeKeyField, row: graph.edge_keys.Record) u64 {
+    const sign = @as(u64, 1) << 63;
+    return switch (field) {
+        .flags => @bitCast(row.key.flags),
+        .end_node => @as(u64, @bitCast(row.key.end_node)) ^ sign,
+        .begin_node => @as(u64, @bitCast(row.key.begin_node)) ^ sign,
+        .way_id => @as(u64, @bitCast(row.key.way_id)) ^ sign,
+    };
+}
+
+noinline fn writeEdgeKeys(gpa: Allocator, shared: *const Shared, plan: *const Layout, writer: *format.BundleWriter, options: Options) !void {
+    if (!options.emit_edge_keys) return;
+    const keys = graph.edge_keys;
+    const deadline = options.deadline;
+    const topology = shared.topology;
+    const count = topology.output.data.len;
+    const records = try Scratch(keys.Record).init(count, options.scratch_dir);
+    defer records.deinit();
+    const work = try Scratch(keys.Record).init(count, options.scratch_dir);
+    defer work.deinit();
+    const inverse = try Scratch(u32).init(count, options.scratch_dir);
+    defer inverse.deinit();
+
+    for (shared.segments, 0..) |segment, i| {
+        try checkDeadline(deadline, i);
+        const road_way = shared.metadata.transit_ways.get(segment.way_id);
+        const kind: keys.Kind = if (road_way != null) .transit else .osm;
+        const way_id: i64 = if (road_way) |orig| @bitCast(orig) else segment.way_id;
+        records.data[2 * i] = .{
+            .key = .{ .way_id = way_id, .begin_node = segment.from, .end_node = segment.to, .flags = .{ .kind = kind } },
+            .edge = topology.placements.data[2 * i].slot,
+        };
+        records.data[2 * i + 1] = .{
+            .key = .{ .way_id = way_id, .begin_node = segment.to, .end_node = segment.from, .flags = .{ .kind = kind, .reversed = true } },
+            .edge = topology.placements.data[2 * i + 1].slot,
+        };
+    }
+
+    var next = 2 * shared.segments.len;
+    for (plan.nodes.items, 0..) |node, i| {
+        try checkDeadline(deadline, i);
+        for (0..aliasCount(node.degree) - 1) |alias| {
+            try checkDeadline(deadline, alias);
+            const left = node.first_alias + alias;
+            const right = left + 1;
+            const forward = topology.first_edge[right] - 1;
+            const reverse = topology.first_edge[right] + topology.groups[right].real_degree;
+            records.data[next] = .{
+                .key = .{ .way_id = 0, .begin_node = node.osm_id, .end_node = node.osm_id, .flags = .{ .kind = .node_connector } },
+                .edge = forward,
+            };
+            records.data[next + 1] = .{
+                .key = .{ .way_id = 0, .begin_node = node.osm_id, .end_node = node.osm_id, .flags = .{ .kind = .node_connector, .reversed = true } },
+                .edge = reverse,
+            };
+            next += 2;
+        }
+    }
+    if (next != count) return error.InvalidEdgeKeyIndex;
+
+    // Preserve source way order within each repeated endpoint pair. Node
+    // ordering only changes the dense edge IDs carried by the rows.
+    for (std.enums.values(EdgeKeyField)) |field|
+        try radix.sortByU64(keys.Record, gpa, records.data, work.data, field, edgeKeyWord, deadline);
+    @memset(inverse.data, std.math.maxInt(u32));
+    var previous: ?keys.Key = null;
+    var occurrence: u32 = 0;
+    for (records.data, 0..) |*row, i| {
+        try checkDeadline(deadline, i);
+        occurrence = if (previous != null and previous.?.order(row.key) == .eq) occurrence + 1 else 0;
+        previous = row.key;
+        row.key.flags.occurrence = occurrence;
+        if (row.edge >= count or inverse.data[row.edge] != std.math.maxInt(u32)) return error.InvalidEdgeKeyIndex;
+        inverse.data[row.edge] = @intCast(i);
+    }
+    try writer.write(.edge_keys, records.data);
+    try writer.write(.edge_key_inverse, inverse.data);
+    if (options.edge_key_hash) {
+        if (try edge_key_hash.build(gpa, records.data, deadline)) |table| {
+            defer table.deinit(gpa);
+            try writer.write(.edge_key_hash_header, &.{table.header});
+            try writer.write(.edge_key_hash_buckets, table.buckets);
+            try writer.write(.edge_key_hash_slots, table.slots);
+        }
+    }
 }
 
 fn writeTopology(writer: *format.BundleWriter, scratch_dir: []const u8, topology: *const Topology, edge_classes: []const classes.EdgeClass, turn_data: []const u8, slopes: ?[]const u16) !void {

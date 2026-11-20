@@ -208,6 +208,56 @@ test "transit groups require all sections, a supported version and valid checksu
     try testing.expectEqual(.transit_occurrences, diagnostic.section.?);
 }
 
+test "edge key indexes map both directions and validate optional sections together" {
+    const fixture = try Fixture.create();
+    defer fixture.deinit();
+    var buf: [80]u8 = undefined;
+    const path = fixture.path(&buf);
+    var diagnostic: reader.Diagnostic = .{};
+    {
+        var bundle = try reader.Bundle.openVerified(path, .none, &diagnostic);
+        defer bundle.close();
+        const index = bundle.view.edge_key_index.?;
+        try testing.expect(index.hash != null);
+        for (sample.records(.edge_keys)) |row| {
+            const id: format.EdgeId = @fromBackingInt(row.edge);
+            try testing.expectEqualDeep(row.key, try index.key(id));
+            try testing.expectEqual(@as(?format.EdgeId, id), try index.find(row.key));
+        }
+    }
+    {
+        const slots = try fixture.section(.edge_key_hash_slots);
+        defer slots.close();
+        var header = sample.header(.edge_key_hash_slots);
+        const corrupt = std.mem.sliceAsBytes(&[_]u32{ std.math.maxInt(u32), 1 });
+        header.payload_hash = std.hash.XxHash3.hash(0, corrupt);
+        try slots.pwriteAll(std.mem.asBytes(&header), 0);
+        try slots.pwriteAll(corrupt, format.payload_offset);
+        try testing.expectError(error.InvalidEdgeKeyHash, reader.Bundle.openVerified(path, .none, &diagnostic));
+    }
+    const directory = try fixture.root.child("bundle");
+    defer directory.close();
+    try directory.deleteFile(format.SectionKind.edge_key_hash_slots.filename());
+    try testing.expectError(error.MissingSection, reader.Bundle.openDescribed(path, &diagnostic));
+    try testing.expectEqual(.edge_key_hash_slots, diagnostic.section.?);
+    try directory.deleteFile(format.SectionKind.edge_key_hash_header.filename());
+    try directory.deleteFile(format.SectionKind.edge_key_hash_buckets.filename());
+    {
+        var bundle = try reader.Bundle.openVerified(path, .none, null);
+        defer bundle.close();
+        const index = bundle.view.edge_key_index.?;
+        try testing.expectEqual(null, index.hash);
+        try testing.expectEqual(@as(?format.EdgeId, @fromBackingInt(1)), try index.find(sample.records(.edge_keys)[1].key));
+    }
+    try directory.deleteFile(format.SectionKind.edge_key_inverse.filename());
+    try testing.expectError(error.MissingSection, reader.Bundle.openDescribed(path, &diagnostic));
+    try testing.expectEqual(.edge_key_inverse, diagnostic.section.?);
+    try directory.deleteFile(format.SectionKind.edge_keys.filename());
+    var legacy = try reader.Bundle.openVerified(path, .none, null);
+    defer legacy.close();
+    try testing.expectEqual(null, legacy.view.edge_key_index);
+}
+
 test "timetable references can exceed Valhalla's twelve-bit indices" {
     const fixture = try Fixture.createWithTransit(true);
     defer fixture.deinit();

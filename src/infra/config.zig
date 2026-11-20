@@ -57,6 +57,7 @@ pub const Config = struct {
     pub const Build = struct {
         inputs: []const []const u8 = &.{},
         gtfs_inputs: []const []const u8 = &.{},
+        edge_key_hash: ?bool = null,
         dem_dir: ?[]const u8 = null,
         timezone_geojson: ?[]const u8 = null,
         timezone_rules: ?[]const u8 = null,

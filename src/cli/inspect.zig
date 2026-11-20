@@ -3,7 +3,144 @@ const std = @import("std");
 const io = @import("../infra/io.zig");
 const format = @import("../graph/format.zig");
 const reader = @import("../graph/reader.zig");
+const edge_keys = @import("../graph/edge_keys.zig");
 const kinds = std.enums.values(format.SectionKind);
+
+pub fn parseEdgeKey(text: []const u8) !edge_keys.Key {
+    var parts = std.mem.splitScalar(u8, text, ',');
+    var key: edge_keys.Key = .{
+        .way_id = try parseKeyPart(i64, parts.next()),
+        .begin_node = try parseKeyPart(i64, parts.next()),
+        .end_node = try parseKeyPart(i64, parts.next()),
+    };
+    const direction = parts.next() orelse return error.InvalidEdgeKey;
+    key.flags.reversed = if (std.mem.eql(u8, direction, "reverse"))
+        true
+    else if (std.mem.eql(u8, direction, "forward"))
+        false
+    else
+        return error.InvalidEdgeKey;
+    if (parts.next()) |occurrence| key.flags.occurrence = try parseKeyPart(u32, occurrence);
+    if (parts.next()) |kind| key.flags.kind = std.meta.stringToEnum(edge_keys.Kind, kind) orelse return error.InvalidEdgeKey;
+    if (!key.valid() or parts.next() != null) return error.InvalidEdgeKey;
+    return key;
+}
+
+fn parseKeyPart(comptime T: type, part: ?[]const u8) !T {
+    return std.fmt.parseInt(T, part orelse return error.InvalidEdgeKey, 10) catch error.InvalidEdgeKey;
+}
+
+const Key = struct {
+    way_id: i64,
+    begin_node: i64,
+    end_node: i64,
+    direction: enum { forward, reverse },
+    occurrence: u32,
+    kind: edge_keys.Kind,
+
+    fn read(key: edge_keys.Key) Key {
+        return .{
+            .way_id = key.way_id,
+            .begin_node = key.begin_node,
+            .end_node = key.end_node,
+            .direction = if (key.flags.reversed) .reverse else .forward,
+            .occurrence = key.flags.occurrence,
+            .kind = key.flags.kind,
+        };
+    }
+
+    fn write(self: Key, out: *io.Writer) !void {
+        try out.print("{d},{d},{d},{s},{d},{s}", .{
+            self.way_id, self.begin_node, self.end_node, @tagName(self.direction), self.occurrence, @tagName(self.kind),
+        });
+    }
+};
+
+pub fn writeEdgeKey(index: edge_keys.View, out: *io.Writer, json: bool, lookup: union(enum) { key: edge_keys.Key, edge: u32 }) !void {
+    const result = switch (lookup) {
+        .key => |key| .{ @backingInt((try index.find(key)) orelse return error.EdgeKeyNotFound), Key.read(key) },
+        .edge => |id| .{ id, Key.read(try index.key(@fromBackingInt(id))) },
+    };
+    if (json) {
+        try std.json.Stringify.value(.{ .edge = result[0], .key = result[1] }, .{}, out);
+    } else {
+        try result[1].write(out);
+        try out.print(" edge {d}", .{result[0]});
+    }
+    try out.writeByte('\n');
+}
+
+pub fn diffEdgeKeys(old: edge_keys.View, new: edge_keys.View, out: *io.Writer, json: bool, deadline: io.Deadline) !void {
+    const Status = enum { added, removed, changed };
+    const Change = struct { status: Status, key: Key, old_edge: ?u32, new_edge: ?u32 };
+    var counts = std.EnumArray(Status, usize).initFill(0);
+    var left: usize = 0;
+    var right: usize = 0;
+    var separator: []const u8 = "";
+    if (json) try out.writeAll("{\"changes\":[");
+    while (left < old.records.len or right < new.records.len) {
+        if ((left +% right) % 1024 < 2 and deadline.expired()) return error.DeadlineExceeded;
+        const order: std.math.Order = if (left == old.records.len)
+            .gt
+        else if (right == new.records.len)
+            .lt
+        else
+            old.records[left].key.order(new.records[right].key);
+        const before = if (order != .gt) old.records[left] else null;
+        const after = if (order != .lt) new.records[right] else null;
+        left += @intFromBool(before != null);
+        right += @intFromBool(after != null);
+        if (before != null and after != null and before.?.edge == after.?.edge) continue;
+        const key = if (before) |row| row.key else after.?.key;
+        if (!key.valid()) return error.InvalidEdgeKey;
+        const change: Change = .{
+            .status = switch (order) {
+                .lt => .removed,
+                .gt => .added,
+                .eq => .changed,
+            },
+            .key = Key.read(key),
+            .old_edge = if (before) |row| row.edge else null,
+            .new_edge = if (after) |row| row.edge else null,
+        };
+        counts.getPtr(change.status).* += 1;
+        if (json) {
+            try out.writeAll(separator);
+            try std.json.Stringify.value(change, .{}, out);
+            separator = ",";
+        } else {
+            try out.print("{s} ", .{@tagName(change.status)});
+            try change.key.write(out);
+            if (change.old_edge) |id| try out.print(" old edge {d}", .{id});
+            if (change.new_edge) |id| try out.print(" new edge {d}", .{id});
+            try out.writeByte('\n');
+        }
+    }
+    if (json)
+        try out.print("],\"added\":{d},\"removed\":{d},\"changed\":{d}}}\n", .{ counts.get(.added), counts.get(.removed), counts.get(.changed) })
+    else
+        try out.print("{d} added, {d} removed, {d} changed\n", .{ counts.get(.added), counts.get(.removed), counts.get(.changed) });
+}
+
+test "edge key diff reports membership changes and dense edge moves" {
+    const first = try parseEdgeKey("1,10,20,forward");
+    const retained = try parseEdgeKey("2,10,20,reverse,1");
+    const added = try parseEdgeKey("3,10,20,forward,0,transit");
+    const old: edge_keys.View = .{ .records = &.{ .{ .key = first, .edge = 0 }, .{ .key = retained, .edge = 1 } }, .inverse = &.{ 0, 1 } };
+    const new: edge_keys.View = .{ .records = &.{ .{ .key = retained, .edge = 0 }, .{ .key = added, .edge = 1 } }, .inverse = &.{ 0, 1 } };
+    var buffer: [1024]u8 = undefined;
+    var writer: io.Writer = .fixed(&buffer);
+    try diffEdgeKeys(old, new, &writer, false, .none);
+    try std.testing.expectEqualStrings(
+        "removed 1,10,20,forward,0,osm old edge 0\n" ++
+            "changed 2,10,20,reverse,1,osm old edge 1 new edge 0\n" ++
+            "added 3,10,20,forward,0,transit new edge 1\n" ++
+            "1 added, 1 removed, 1 changed\n",
+        writer.buffered(),
+    );
+    try std.testing.expectError(error.InvalidEdgeKey, parseEdgeKey("1,10,20,left"));
+    try std.testing.expectError(error.InvalidEdgeKey, parseEdgeKey("1,10,20,reverse,0,transit,1"));
+}
 
 const Section = struct {
     kind: format.SectionKind,

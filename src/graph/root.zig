@@ -18,6 +18,7 @@ pub const range_http = @import("range_http.zig");
 pub const range_manifest = @import("range_manifest.zig");
 pub const reader = @import("reader.zig");
 pub const class_table = @import("class_table.zig");
+pub const edge_keys = @import("edge_keys.zig");
 pub const cold = @import("cold.zig");
 pub const openlr = @import("openlr.zig");
 pub const transit = @import("transit.zig");

@@ -11,6 +11,7 @@ const http = routing.server.http;
 const service = routing.api.service;
 const bench = routing.cli.bench;
 const diff = routing.cli.diff;
+const inspect = routing.cli.inspect;
 const dem = routing.cli.dem;
 const Command = cli.BaseCommand;
 const Context = Command.ParseContext;
@@ -101,6 +102,7 @@ fn createCommands(a: Allocator) !*Command {
     _ = try command(root, "build", "Build a graph bundle from OSM data", buildGraph, &.{
         option("output", "Publish the graph bundle at this path", .string),
         option("gtfs", "GTFS schedule ZIP. Use zig_routing.build.gtfs_inputs for multiple feeds", .string),
+        option("edge-key-hash", "Build a minimal perfect hash for edge-key lookup", .bool),
         option("work-dir", "Directory for stage checkpoints and build-stats.json", .string),
         option("dem", "Directory of HGT elevation tiles", .string),
         option("timezones", "Timezone boundary GeoJSON file", .string),
@@ -131,19 +133,22 @@ fn createCommands(a: Allocator) !*Command {
         option("commit", "Server commit recorded in the result", .string),
         option("label", "Label recorded in the result", .string),
     }, &.{ arg("URL|A.json", "HTTP server or first result file"), arg("B.json", "Second result file").withRequired(false) });
-    _ = try command(root, "diff", "Check API parity between two servers", compareServers, &.{
-        option("corpus", "Request corpus file", .string).withRequired(true),
+    _ = try command(root, "diff", "Compare API servers or graph edge keys", compareServers, &.{
+        option("edge-keys", "Compare the stable edge keys of two graph bundles", .bool),
+        option("corpus", "Request corpus file for HTTP comparison", .string),
         option("endpoint", "Default path for requests (default /route)", .string),
         option("timeout", "Per-response timeout (default 60s)", .string),
-        option("out", "Write the JSON parity report to a file", .string),
+        option("out", "Write the JSON report to a file", .string),
         option("worst", "Write worst cases to an existing directory", .string),
         option("keep", "Worst cases per scorer (default 10)", .int),
         option("label", "Label recorded in the report", .string),
-    }, &.{ arg("A_URL", "First server"), arg("B_URL", "Second server") });
+    }, &.{ arg("A", "First server URL or graph bundle"), arg("B", "Second server URL or graph bundle") });
     _ = try command(root, "inspect", "Inspect a graph bundle", inspectGraph, &.{
         option("verify", "Verify every section payload checksum", .bool),
         option("edge", "Print a directed edge by ID", .int),
         option("node", "Print a node by ID", .int),
+        option("edge-key", "Find WAY,BEGIN,END,forward|reverse[,OCCURRENCE[,KIND]]", .string),
+        option("key-for-edge", "Print the stable key for a directed edge ID", .int),
     }, &.{arg("BUNDLE", "Graph bundle directory")});
     _ = try command(root, "bundle-manifest", "Write range hashes for a graph bundle", bundleManifest, &.{
         option("output", "Range manifest output file", .string).withRequired(true),
@@ -421,6 +426,8 @@ fn benchmark(ctx: *Context) !u8 {
 }
 
 fn compareServers(ctx: *Context) !u8 {
+    if (std.mem.eql(u8, ctx.getOption("edge-keys") orelse "false", "true")) return compareEdgeKeys(ctx);
+    const corpus = ctx.getOption("corpus") orelse return badOption(ctx, "provide --corpus for HTTP comparison");
     const a = ctx.getArgument(0).?;
     const b = ctx.getArgument(1).?;
     var opts: diff.Options = .{
@@ -435,11 +442,38 @@ fn compareServers(ctx: *Context) !u8 {
     const ok = try diff.runCommand(std.heap.c_allocator, opts, .{
         .a = a,
         .b = b,
-        .corpus_path = ctx.getOption("corpus").?,
+        .corpus_path = corpus,
         .corpus_hash = 0,
         .label = ctx.getOption("label") orelse "",
     }, ctx.getOption("endpoint") orelse "/route", ctx.getOption("out"), ctx.getOption("worst"), ctx.wantsJson());
     return if (ok) 0 else 1;
+}
+
+fn compareEdgeKeys(ctx: *Context) !u8 {
+    if (ctx.getOption("corpus") != null or ctx.getOption("endpoint") != null or ctx.getOption("worst") != null or
+        ctx.getOption("keep") != null or ctx.getOption("label") != null)
+        return badOption(ctx, "--edge-keys expects two bundle directories and accepts --timeout, --out and --json");
+    const deadline: io.Deadline = if (try duration(ctx, "timeout")) |span| io.Deadline.fromNow(span) else .none;
+    var diagnostic: routing.graph.reader.Diagnostic = .{};
+    const Bundle = routing.graph.reader.Bundle;
+    var old = Bundle.openVerified(ctx.getArgument(0).?, deadline, &diagnostic) catch |err|
+        return graphDiagnostic(ctx, "verify first", diagnostic, err);
+    defer old.close();
+    var new = Bundle.openVerified(ctx.getArgument(1).?, deadline, &diagnostic) catch |err|
+        return graphDiagnostic(ctx, "verify second", diagnostic, err);
+    defer new.close();
+    const before = old.view.edge_key_index orelse return missingEdgeKeys(ctx);
+    const after = new.view.edge_key_index orelse return missingEdgeKeys(ctx);
+    if (ctx.getOption("out")) |path| {
+        var report: io.Writer.Allocating = .init(std.heap.c_allocator);
+        defer report.deinit();
+        try inspect.diffEdgeKeys(before, after, &report.writer, true, deadline);
+        try io.writeFile(path, report.written());
+        if (ctx.wantsJson()) try ctx.out.?.writeAll(report.written());
+    }
+    if (!ctx.wantsJson() or ctx.getOption("out") == null)
+        try inspect.diffEdgeKeys(before, after, ctx.out.?, ctx.wantsJson(), deadline);
+    return 0;
 }
 
 fn buildGraph(ctx: *Context) !u8 {
@@ -467,6 +501,7 @@ fn buildGraph(ctx: *Context) !u8 {
     const options: driver.Options = .{
         .inputs = if (arguments.len == 0) settings.inputs else arguments,
         .gtfs_inputs = if (ctx.getOption("gtfs")) |path| &.{path} else settings.gtfs_inputs,
+        .edge_key_hash = if (ctx.getOption("edge-key-hash")) |enabled| std.mem.eql(u8, enabled, "true") else settings.edge_key_hash,
         .output = output,
         .work_dir = work_dir,
         .dem_dir = ctx.getOption("dem") orelse settings.dem_dir orelse loaded.config.additional_data.elevation,
@@ -530,6 +565,13 @@ fn buildGraph(ctx: *Context) !u8 {
 fn inspectGraph(ctx: *Context) !u8 {
     const edge_id = try unsigned(ctx, u32, "edge");
     const node_id = try unsigned(ctx, u32, "node");
+    const key_edge = try unsigned(ctx, u32, "key-for-edge");
+    const edge_key = if (ctx.getOption("edge-key")) |text|
+        inspect.parseEdgeKey(text) catch return badOption(ctx, "--edge-key expects WAY,BEGIN,END,forward|reverse[,OCCURRENCE[,KIND]]")
+    else
+        null;
+    if ((edge_key != null and key_edge != null) or ((edge_key != null or key_edge != null) and (edge_id != null or node_id != null)))
+        return badOption(ctx, "choose one edge-key lookup per inspection");
     const verify = std.mem.eql(u8, ctx.getOption("verify") orelse "false", "true");
     const path = ctx.getArgument(0).?;
     var diagnostic: routing.graph.reader.Diagnostic = .{};
@@ -539,8 +581,18 @@ fn inspectGraph(ctx: *Context) !u8 {
     else
         Bundle.openDescribed(path, &diagnostic) catch |err| return graphDiagnostic(ctx, "open", diagnostic, err);
     defer bundle.close();
-    try routing.cli.inspect.write(&bundle, ctx.out.?, ctx.wantsJson(), verify, edge_id, node_id);
+    if (edge_key != null or key_edge != null) {
+        const index = bundle.view.edge_key_index orelse return missingEdgeKeys(ctx);
+        try inspect.writeEdgeKey(index, ctx.out.?, ctx.wantsJson(), if (edge_key) |key| .{ .key = key } else .{ .edge = key_edge.? });
+    } else {
+        try inspect.write(&bundle, ctx.out.?, ctx.wantsJson(), verify, edge_id, node_id);
+    }
     return 0;
+}
+
+fn missingEdgeKeys(ctx: *Context) error{MissingEdgeKeys} {
+    ctx.setDiagnostic("bundle needs stable edge-key sections");
+    return error.MissingEdgeKeys;
 }
 
 fn bundleManifest(ctx: *Context) !u8 {

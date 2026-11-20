@@ -155,6 +155,12 @@ fn fuzzGraphBundle(baseline: *const graph.reader.Files, s: *Smith) !void {
         _ = view.turnSides(@fromBackingInt(id), @truncate(input[input.len - 1]), @truncate(id)) catch null;
         _ = view.class(@truncate(id)) catch null;
         const edge: graph.format.EdgeId = @fromBackingInt(id);
+        if (view.edge_key_index) |keys| {
+            if (keys.key(edge) catch null) |key| {
+                if (keys.find(key) catch null) |found| try std.testing.expect(@backingInt(found) < view.edges.len);
+            }
+            _ = keys.find(.{ .way_id = @as(i32, @bitCast(id)), .begin_node = 42, .end_node = 43 }) catch null;
+        }
         _ = view.wayId(edge) catch null;
         if (view.coldRecord(edge)) |record| {
             _ = try record.indoor.includes(0.5, .none);

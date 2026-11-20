@@ -381,6 +381,16 @@ pub fn build(b: *std.Build) void {
     run_bench_gtfs.addPassthruArgs();
     b.step("bench-gtfs", "Count feed rows and measure parallel GTFS stop-time parsing").dependOn(&run_bench_gtfs.step);
 
+    const bench_edge_keys = b.addExecutable(.{ .name = "bench-edge-keys", .root_module = b.createModule(.{
+        .root_source_file = b.path("test/bench_edge_keys.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{.{ .name = "routing", .module = lib_mod }},
+    }) });
+    const run_bench_edge_keys = b.addRunArtifact(bench_edge_keys);
+    run_bench_edge_keys.addPassthruArgs();
+    b.step("bench-edge-keys", "Verify stable edge-key round trips and time warm lookups").dependOn(&run_bench_edge_keys.step);
+
     const bench_exclusions = b.addExecutable(.{ .name = "bench-exclusions", .root_module = b.createModule(.{
         .root_source_file = b.path("test/bench_exclusions.zig"),
         .target = target,

@@ -35,6 +35,7 @@ pub const Options = struct {
     use_admin_db: ?bool = null,
     allow_alt_name: ?bool = null,
     use_direction_on_ways: ?bool = null,
+    edge_key_hash: ?bool = null,
     drive_side: ?@import("edge_class.zig").DriveSide = null,
     order: ?graph.format.OrderingKind = null,
     workers: usize = 0,
@@ -86,13 +87,15 @@ const Inputs = struct {
     use_admin_db: bool = true,
     allow_alt_name: bool = false,
     use_direction_on_ways: bool = false,
+    emit_edge_keys: bool = false,
+    edge_key_hash: bool = false,
     drive_side: ?@import("edge_class.zig").DriveSide = null,
     order: graph.format.OrderingKind,
 
     noinline fn identity(self: *const Inputs) graph.format.DatasetUuid {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        // The build retains edge linguistics and tagged values across checkpoints.
-        hash.update("zr-build-v7");
+        hash.update(if (self.emit_edge_keys) "zr-build-v8" else "zr-build-v7");
+        if (self.edge_key_hash) hash.update("edge-key-hash-v1");
         hash.update(&.{
             @intFromBool(self.dem_dir != null),
             if (self.drive_side) |side| @as(u8, @backingInt(side)) else 2,
@@ -174,6 +177,8 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
         .use_admin_db = options.use_admin_db orelse true,
         .allow_alt_name = options.allow_alt_name orelse false,
         .use_direction_on_ways = options.use_direction_on_ways orelse false,
+        .emit_edge_keys = true,
+        .edge_key_hash = options.edge_key_hash orelse false,
         .drive_side = options.drive_side,
         .order = options.order orelse .hilbert,
     };
@@ -252,6 +257,8 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
         .use_admin_db = inputs.use_admin_db,
         .allow_alt_name = inputs.allow_alt_name,
         .use_direction_on_ways = inputs.use_direction_on_ways,
+        .emit_edge_keys = inputs.emit_edge_keys,
+        .edge_key_hash = inputs.edge_key_hash,
         .timezone_source = if (timezone_mappings) |mapped| .{ .boundaries = mapped.boundaries.bytes, .rules = mapped.rules.bytes } else null,
     };
     if (session.runs(.read)) {
@@ -524,6 +531,7 @@ fn checkOptions(a: Allocator, inputs: *Inputs, options: Options, diagnostic: *Di
     if (options.use_admin_db) |use_admin_db| if (use_admin_db != inputs.use_admin_db) return error.CheckpointInputMismatch;
     if (options.allow_alt_name) |allow| if (allow != inputs.allow_alt_name) return error.CheckpointInputMismatch;
     if (options.use_direction_on_ways) |use| if (use != inputs.use_direction_on_ways) return error.CheckpointInputMismatch;
+    if (options.edge_key_hash) |enabled| if (enabled != inputs.edge_key_hash) return error.CheckpointInputMismatch;
     if (options.timezone_geojson) |path| {
         const expected = if (inputs.timezones) |input| input.boundaries else return error.CheckpointInputMismatch;
         const actual = try fingerprintFile(path, options.deadline, diagnostic);
