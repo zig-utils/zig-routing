@@ -260,7 +260,9 @@ const Query = struct {
         if (comptime @import("edge.zig").hasPolicy(@TypeOf(costing), "closed")) {
             if (filter.exclude_closures and costing.closed(edge)) return false;
         }
-        if (comptime @import("edge.zig").hasPolicy(@TypeOf(costing), "meetsAccessRestrictions")) {
+        if (comptime @import("edge.zig").hasPolicy(@TypeOf(costing), "meetsAccessRestrictionsWithin")) {
+            if (filter.exclude_restricted and !try costing.meetsAccessRestrictionsWithin(edge, self.deadline)) return false;
+        } else if (comptime @import("edge.zig").hasPolicy(@TypeOf(costing), "meetsAccessRestrictions")) {
             if (filter.exclude_restricted and !costing.meetsAccessRestrictions(edge)) return false;
         }
         if (filter.level != request.max_level) {
@@ -484,12 +486,17 @@ const Work = struct {
 
     fn append(self: *Work, input: PathEdge, opposite: DirectedEdge, costing: anytype) !void {
         const q = self.query;
-        const status = try self.seen.at(q.arena, @backingInt(input.id));
-        if (status.* & correlated_flag != 0) return;
-        status.* |= correlated_flag;
+        const filtered = try q.softFilter(input, opposite);
+        // A filtered interior projection does not consume the edge ID.
+        // Valhalla can subsequently correlate that edge at a snapped node.
+        if (!filtered or input.node != .none) {
+            const status = try self.seen.at(q.arena, @backingInt(input.id));
+            if (status.* & correlated_flag != 0) return;
+            status.* |= correlated_flag;
+        }
         var edge = input;
         edge.reach = try self.finder.counts(edge.id, costing);
-        const output = if (try q.softFilter(edge, opposite)) &self.filtered else if (edge.node == .end and
+        const output = if (filtered) &self.filtered else if (edge.node == .end and
             q.location.heading != null and (q.location.type == .through or q.location.type == .break_through))
             &self.through_ends
         else

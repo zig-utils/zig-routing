@@ -44,6 +44,7 @@ pub const Service = struct {
     handlers: [14]?ActionFn = @splat(null),
     /// Opaque per-service state handlers can reach (elevation tiles, graph, ...).
     state: ?*anyopaque = null,
+    graph: ?*const @import("../graph/reader.zig").View = null,
 
     pub fn register(self: *Service, action: Action, f: ActionFn) void {
         self.handlers[@backingInt(action)] = f;

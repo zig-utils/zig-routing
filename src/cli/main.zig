@@ -271,6 +271,12 @@ const Runtime = struct {
         if (self.tiles) |*tiles| tiles.deinit();
     }
 
+    fn openGraph(self: *Runtime, path: ?[]const u8) !void {
+        self.bundle = try routing.graph.reader.Bundle.open(path orelse return);
+        self.svc.graph = &self.bundle.?.view;
+        self.svc.register(.locate, routing.api.locate_action.handle);
+    }
+
     fn startWarmup(self: *Runtime, lock_hot: bool) void {
         if (self.bundle == null) return;
         self.warmup = std.Thread.spawn(.{}, warmBundle, .{ self, lock_hot }) catch |err| {
@@ -299,9 +305,7 @@ fn serve(ctx: *Context) !u8 {
     defer runtime.close();
     const elevation = ctx.getOption("elevation") orelse loaded.config.additional_data.elevation;
     try runtime.open(elevation);
-    if (loaded.config.zig_routing.bundle_path) |path| {
-        runtime.bundle = try routing.graph.reader.Bundle.open(path);
-    }
+    try runtime.openGraph(loaded.config.zig_routing.bundle_path);
     io.installTerminationHandler();
     var server = http.Server.init(std.heap.c_allocator, settings, runtime.svc.handler());
     try server.start();
@@ -342,6 +346,7 @@ fn route(ctx: *Context) !u8 {
     var runtime: Runtime = .{ .svc = loaded.config.serviceConfig() };
     defer runtime.close();
     try runtime.open(loaded.config.additional_data.elevation);
+    if (action == .locate) try runtime.openGraph(loaded.config.zig_routing.bundle_path);
 
     var arena = routing.infra.arena.Arena.init(std.heap.c_allocator, .{ .cap_bytes = settings.arena_cap_bytes });
     defer arena.deinit();

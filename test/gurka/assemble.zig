@@ -1041,6 +1041,100 @@ const RestrictionMotor = struct {
 
 const RestrictionSearch = search.Search(RestrictionMotor, routing.search.queue.Heap);
 
+// Ported from test/gurka/test_locate.cc for the public locate action.
+test "Gurka locate reports directed shapes, snapped nodes and missing matches" {
+    const http = routing.server.http;
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates("A----B", 50), &.{
+        .{ .label = "AB", .tags = &.{
+            .{ .key = "highway", .value = "primary" },
+            .{ .key = "name", .value = "Market St" },
+            .{ .key = "oneway", .value = "yes" },
+            .{ .key = "maxheight", .value = "3.8" },
+        } },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    var svc: routing.api.service.Service = .{ .graph = &built.bundle.view };
+    svc.register(.locate, routing.api.locate_action.handle);
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    var ctx: http.Ctx = .{ .worker_id = 0, .arena = &arena, .deadline = .none };
+    const end = fixture.findNode("B").?.location;
+    const start = fixture.findNode("A").?.location;
+    const middle = start.midpoint(end);
+    const encoded = try std.fmt.allocPrint(a,
+        \\{{"locations":[{{"lat":{d},"lon":{d}}},{{"lat":{d},"lon":{d}}},{{"lat":86,"lon":2}}],
+        \\"verbose":true,"costing":"auto"}}
+    , .{ middle.lat, middle.lng, end.lat, end.lng });
+    var req: http.Request = .{
+        .method = .POST,
+        .target = "/locate",
+        .path = "/locate",
+        .query = &.{},
+        .headers = &.{},
+        .body = encoded,
+        .keep_alive = false,
+    };
+    var res: http.Response = .{ .gpa = arena.allocator() };
+    svc.handle(&ctx, &req, &res);
+    try testing.expectEqual(200, res.status);
+    const verbose = try std.json.parseFromSliceLeaky(std.json.Value, res.gpa, res.body.items, .{});
+    const first = verbose.array.items[0].object;
+    const edges = first.get("edges").?.array.items;
+    try testing.expectEqual(1, edges.len);
+    const edge = edges[0].object;
+    try testing.expectApproxEqAbs(@as(f64, 0.5), edge.get("percent_along").?.float, 1e-5);
+    try testing.expect(edge.get("linear_reference").?.string.len >= 20);
+    const info = edge.get("edge_info").?.object;
+    try testing.expectEqualStrings("Market St", info.get("names").?.array.items[0].string);
+    const restriction = edge.get("access_restrictions").?.array.items[0].object;
+    try testing.expectEqualStrings("max_height", restriction.get("type").?.string);
+    try testing.expectApproxEqAbs(@as(f64, 3.8), restriction.get("value").?.float, 0.01);
+    const nodes = verbose.array.items[1].object.get("nodes").?.array.items;
+    try testing.expectEqual(1, nodes.len);
+    try testing.expect(nodes[0].object.get("node_id") != null);
+    try testing.expectEqual(0, verbose.array.items[2].object.get("edges").?.array.items.len);
+    try testing.expectEqual(0, verbose.array.items[2].object.get("nodes").?.array.items.len);
+
+    arena.reset();
+    req.body = try std.fmt.allocPrint(a,
+        \\{{"locations":[{{"lat":{d},"lon":{d}}}],"format":"osrm","costing":"auto"}}
+    , .{ middle.lat, middle.lng });
+    res = .{ .gpa = arena.allocator() };
+    svc.handle(&ctx, &req, &res);
+    try testing.expectEqual(200, res.status);
+    const nearest = try std.json.parseFromSliceLeaky(std.json.Value, res.gpa, res.body.items, .{});
+    try testing.expectEqualStrings("Ok", nearest.object.get("code").?.string);
+    const waypoint = nearest.object.get("waypoints").?.array.items[0].object;
+    try testing.expectEqualStrings("Market St", waypoint.get("name").?.string);
+    try testing.expectEqual(2, waypoint.get("location").?.array.items.len);
+    try testing.expectEqual(2, waypoint.get("nodes").?.array.items.len);
+
+    arena.reset();
+    req.body = try std.fmt.allocPrint(a,
+        \\{{"locations":[{{"lat":{d},"lon":{d},"search_filter":{{"exclude_restricted":true}}}}],
+        \\"format":"osrm","costing":"auto","costing_options":{{"auto":{{"height":4.0}}}}}}
+    , .{ middle.lat, middle.lng });
+    res = .{ .gpa = arena.allocator() };
+    svc.handle(&ctx, &req, &res);
+    try testing.expectEqual(400, res.status);
+    const missing = try std.json.parseFromSliceLeaky(std.json.Value, res.gpa, res.body.items, .{});
+    try testing.expectEqualStrings("NoSegment", missing.object.get("code").?.string);
+
+    for ([_][]const u8{ "{}", "{\"locations\":[]}" }) |body| {
+        arena.reset();
+        req.body = body;
+        res = .{ .gpa = arena.allocator() };
+        svc.handle(&ctx, &req, &res);
+        try testing.expectEqual(400, res.status);
+        const failure = try std.json.parseFromSliceLeaky(std.json.Value, res.gpa, res.body.items, .{});
+        try testing.expectEqual(110, failure.object.get("error_code").?.integer);
+    }
+}
+
 // Ported from the Dijkstra cases in test/gurka/test_expansion.cc.
 test "Gurka Dijkstra expansion settles the one-way branch only forward" {
     const expansion = routing.search.expand;

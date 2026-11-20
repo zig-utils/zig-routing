@@ -74,6 +74,9 @@ pub fn build(b: *std.Build) void {
             .{ .name = "build_options", .module = version_options.createModule() },
         },
     }));
+    // Keep the symbol table and DWARF in Linux release binaries. Compress
+    // the debug sections so additional actions fit the executable budget.
+    if (target.result.os.tag == .linux and optimize != .debug) exe.compress_debug_sections = .zlib;
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
