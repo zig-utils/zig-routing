@@ -182,8 +182,8 @@ P7.05 | Matrix v2: turn-aware multilevel overlay on the separator tree, customis
 P7.06 | Matrix v2 queries: one-to-many sweeps, many-to-many, memory budget | search | new | L | P7.05
 P7.07 | Isochrone expansion into the grid with multiple time and distance contours | search | port | M | P7.01 P1.06 P3.34a
 P7.08 | /isochrone API: polygons, lines, denoise, generalize, reverse, GeoJSON | api | port | M | P7.07
-P7.09 | /expansion endpoint | api | port | S | P7.01
-P7.10 | /centroid | search | port | M | P7.01
+P7.09 | /expansion endpoint | api | port | S | P7.01 P3.33 P7.03 P7.08
+P7.10 | /centroid | search | port | M | P7.01 P6.13
 P7.11 | /optimized_route: port of the optimizer on top of the matrix | search | port | M | P7.03 P6.13
 P7.12 | /locate with verbose edge and node info | api | port | M | P3.23 P3.17
 P7.13 | /status with verbose output | api | port | S | P1.13 P3.13 P5.06 P6.09a

@@ -600,7 +600,8 @@
     "out_of_scope": ["Any change to search order to imitate upstream: our expansion is smaller by design."],
     "notes": [
       "Edge sets will differ from Valhalla's because our search is guided; parity here is shape and schema, not edge set.",
-      "Useful for experiments E2 and E6 visualisation."
+      "Useful for experiments E2 and E6 visualisation.",
+      "The recorder wraps the route, matrix and isochrone request paths from P3.33, P7.03 and P7.08."
     ],
     "accept": [
       "Gate H for keys, types and property names against the oracle.",
@@ -622,7 +623,8 @@
     "out_of_scope": ["Narrative details beyond what /route already provides (P6)."],
     "notes": [
       "Bounded by deadline and by the route distance limits.",
-      "Label storage per origin must come from the arena and be released at request end."
+      "Label storage per origin must come from the arena and be released at request end.",
+      "The centroid paths use the route response pipeline from P6.13, including directions and both wire formats."
     ],
     "accept": [
       "Upstream centroid tests ported and green.",
