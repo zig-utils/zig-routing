@@ -3899,9 +3899,13 @@ test "route leg recost preserves the intersection turn at a stitched node" {
     }
 
     const ba = try view.oppEdge(ab);
+    var from_node = snapEdge(ba, 0, 0);
+    from_node.projected = joint;
+    var to_node = snapEdge(ba, 1, 0);
+    to_node.projected = first;
     const opposing = [_]routing.snap.candidates.PathLocation{
-        snapLocation(&.{snapEdge(ba, 0, 0)}, &.{}),
-        snapLocation(&.{snapEdge(ba, 1, 0)}, &.{}),
+        snapLocation(&.{from_node}, &.{}),
+        snapLocation(&.{to_node}, &.{}),
     };
     const from_b: routing.api.request.Location = .{ .lng = joint.lng, .lat = joint.lat };
     const to_a: routing.api.request.Location = .{ .lng = first.lng, .lat = first.lat };
@@ -4449,4 +4453,173 @@ test "turn name consistency uses the admin country at the shared node" {
         try testing.expectEqual(us, row[to.cls.local] & 0x40 != 0);
         try testing.expect(row[crossing.cls.local] & 0x40 == 0);
     }
+}
+
+// Ported from test/gurka/test_trimming.cc (Valhalla 3.9.3).
+test "Gurka trip leg retains a near-end trim, an interior via and the physical intersection" {
+    const api = routing.api.request;
+    const multi = routing.search.multi;
+    const tripleg = routing.search.tripleg;
+    const mem = routing.infra.arena;
+    var fixture_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer fixture_arena.deinit();
+    const a = fixture_arena.allocator();
+    const motorway: gurka.Tag = .{ .key = "highway", .value = "motorway" };
+    const fixture = try gurka.Map.init(a, try gurka.mapToCoordinatesAt(
+        \\AB----C
+        \\ |
+        \\ D
+    , 90.857, .{ .lat = 52.0981145, .lng = 5.1309431 }), &.{
+        .{ .label = "AB", .tags = &.{
+            motorway,
+            .{ .key = "ref", .value = "A 1" },
+            .{ .key = "maxspeed", .value = "100" },
+            .{ .key = "lanes", .value = "2" },
+            .{ .key = "turn:lanes:forward", .value = "through|through;right" },
+        } },
+        .{ .label = "BC", .tags = &.{
+            motorway,
+            .{ .key = "name", .value = "Rue Orient" },
+            .{ .key = "name:pronunciation", .value = "ʁy ɔʁjɑ̃" },
+            .{ .key = "tunnel", .value = "yes" },
+            .{ .key = "tunnel:name", .value = "East Tunnel" },
+            .{ .key = "level", .value = "1.2" },
+        } },
+        .{ .label = "BD", .tags = &.{
+            .{ .key = "highway", .value = "motorway_link" },
+            .{ .key = "oneway", .value = "yes" },
+            .{ .key = "junction:ref", .value = "9A" },
+            .{ .key = "destination", .value = "Harbour" },
+        } },
+    }, &.{}, &.{.{
+        .members = &.{
+            .{ .kind = .way, .ref = "AB", .role = "from" },
+            .{ .kind = .node, .ref = "B", .role = "via" },
+            .{ .kind = .way, .ref = "BC", .role = "to" },
+        },
+        .tags = &.{ .{ .key = "type", .value = "connectivity" }, .{ .key = "from", .value = "2|1" }, .{ .key = "to", .value = "1|2" } },
+    }});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const ab = try directedBetween(view, &fixture, "A", "B");
+    const bc = try directedBetween(view, &fixture, "B", "C");
+    const p = fixture.findNode("A").?.location.toFixed().toTilePoint();
+    const b = fixture.findNode("B").?.location.toFixed().toTilePoint();
+    const c = fixture.findNode("C").?.location.toFixed().toPoint();
+    const from = routing.geo.PointLL.init(b.lng - 0.0000005, b.lat);
+    const via = routing.geo.PointLL.init((b.lng + c.lng) / 2, (b.lat + c.lat) / 2);
+    const fraction: f32 = @floatCast(p.distance(from) / p.distance(b));
+    var start = snapEdge(ab, fraction, 0);
+    start.projected = from;
+    var middle = snapEdge(bc, 0.5, 0);
+    middle.projected = via;
+    var last = snapEdge(bc, 1, 0);
+    last.projected = c;
+    const correlations = [_]routing.snap.candidates.PathLocation{
+        snapLocation(&.{start}, &.{}),
+        snapLocation(&.{middle}, &.{}),
+        snapLocation(&.{last}, &.{}),
+    };
+    const locations = [_]api.Location{
+        .{ .lat = from.lat, .lng = from.lng },
+        .{ .lat = via.lat, .lng = via.lng, .type = .via, .original_index = 1 },
+        .{ .lat = c.lat, .lng = c.lng, .original_index = 2 },
+    };
+    const path: multi.Leg = .{
+        .origin = 0,
+        .destination = 2,
+        .segments = &.{
+            .{ .edge = ab, .begin = fraction, .end = 1 },
+            .{ .edge = bc, .begin = 0, .end = 0.5 },
+            .{ .edge = bc, .begin = 0.5, .end = 1 },
+        },
+        .segment_contexts = &.{ .{ .pair = 0, .starts_pair = true }, .{ .pair = 0, .starts_pair = false }, .{ .pair = 1, .starts_pair = true } },
+        .length_km = @floatCast(from.distance(b) * 0.001 + b.distance(c) * 0.001),
+        .cost = .{},
+    };
+    const waypoints: [3]multi.Waypoint = @splat(.{
+        .elapsed_secs = 0,
+        .waiting_secs = 0,
+        .date_time = null,
+        .ignored_filter = false,
+    });
+    const route: multi.Route = .{ .legs = &.{path}, .waypoints = &waypoints, .total = .{}, .retried = false };
+
+    var counting = mem.CountingAllocator.init(testing.allocator);
+    var arena = mem.Arena.init(counting.allocator(), .{});
+    defer arena.deinit();
+    const geometry = try routing.search.legs.build(arena.allocator(), view, SearchTestCost{ .seed = 5 }, route, &correlations, .{});
+    const saved = arena.mark();
+    const input: tripleg.Input = .{
+        .segments = path.segments,
+        .geometry = &geometry.legs[0],
+        .locations = .{
+            .requested = &locations,
+            .correlations = &correlations,
+            .waypoints = &waypoints,
+            .segment_contexts = path.segment_contexts,
+        },
+    };
+    const leg = try tripleg.build(arena.allocator(), view, input, .{});
+    try testing.expectEqual(4, leg.node.len);
+    try testing.expectEqual(3, leg.location.len);
+    try testing.expectEqual(routing.api.trip.LocationType.kVia, leg.location[1].type);
+    const via_index = leg.location[1].correlation.?.leg_shape_index;
+    try testing.expect(geometry.legs[0].shape[via_index].eql(via));
+    try testing.expect(geometry.legs[0].shape[0].eql(from));
+    try testing.expect(geometry.legs[0].shape[geometry.legs[0].shape.len - 1].eql(c));
+    try testing.expect(!c.eql(c.toFixed().toTilePoint()));
+    try testing.expectApproxEqAbs(b.distance(c), routing.geo.line.length(geometry.legs[0].shape), 1);
+    const clipped = leg.node[0].edge.?;
+    try testing.expectEqualStrings("A 1", clipped.name[0].value);
+    try testing.expect(clipped.name[0].is_route_number);
+    try testing.expectEqual(100, clipped.speed_limit);
+    try testing.expect(clipped.length_km > 0 and clipped.length_km < 0.001);
+    try testing.expectEqual(1, leg.node[1].intersecting_edge.len);
+    try testing.expectEqualStrings("BD", leg.node[1].intersecting_edge[0].name[0].value);
+    const signs = leg.node[1].intersecting_edge[0].sign.?;
+    try testing.expectEqualStrings("9A", signs.exit_numbers[0].text);
+    try testing.expectEqualStrings("Harbour", signs.exit_toward_locations[0].text);
+    try testing.expectEqual(2, clipped.turn_lanes.len);
+    const tunnel = leg.node[1].edge.?;
+    try testing.expectEqualStrings("Rue Orient", tunnel.name[0].value);
+    try testing.expectEqual(routing.api.trip.Alphabet.kIpa, tunnel.name[0].pronunciation.?.alphabet);
+    try testing.expectEqualStrings("ʁy ɔʁjɑ̃", tunnel.name[0].pronunciation.?.value);
+    try testing.expectEqualStrings("East Tunnel", tunnel.tunnel_name[0].value);
+    try testing.expectEqual(10, tunnel.level_precision);
+    try testing.expectEqual(@as(f32, 1.2), tunnel.levels[0].start);
+    try testing.expectEqual(@as(f32, 1.2), leg.level_changes[0].level);
+    try testing.expectEqual(1, tunnel.lane_connectivity.len);
+    try testing.expectEqualStrings("2|1", tunnel.lane_connectivity[0].from_lanes);
+    try testing.expectEqualStrings("1|2", tunnel.lane_connectivity[0].to_lanes);
+    try testing.expectEqual(@as(f64, geometry.legs[0].edges[2].elapsed.secs), leg.node[3].cost.?.elapsed_cost.?.seconds);
+
+    const parsed = try api.parseHttp(a, "/route", &.{},
+        \\{"locations":[{"lat":52.1,"lon":5.1},{"lat":52.2,"lon":5.2}],"costing":"auto",
+        \\ "filters":{"action":"include","attributes":["shape","edge.length","shape_attributes.length"]}}
+    );
+    try testing.expect(parsed == .ok);
+    var narrowed = input;
+    narrowed.attributes = try parsed.ok.tripAttributes(true, .none);
+    var without_cold = view.*;
+    without_cold.cold_data = null;
+    const projected = try tripleg.build(arena.allocator(), &without_cold, narrowed, .{});
+    try testing.expectEqual(0, projected.node[0].edge.?.name.len);
+    try testing.expectEqual(0, projected.node[0].edge.?.speed_limit);
+    try testing.expectEqual(0, projected.node[1].intersecting_edge.len);
+    try testing.expectEqual(null, projected.node[0].cost);
+    try testing.expectEqualStrings(leg.shape, projected.shape);
+    try testing.expectEqual(geometry.legs[0].shape.len - 1, projected.shape_attributes.?.length.len);
+    try testing.expectEqual(0, projected.shape_attributes.?.time.len);
+
+    arena.rewind(saved);
+    counting.resetCounts();
+    for (0..4) |_| {
+        const replay = try tripleg.build(arena.allocator(), view, input, .{});
+        try testing.expectEqual(via_index, replay.location[1].correlation.?.leg_shape_index);
+        arena.rewind(saved);
+    }
+    try testing.expectEqual(0, counting.calls());
+    try testing.expectError(error.Cancelled, tripleg.build(arena.allocator(), view, input, .{ .deadline = .{ .at_ns = 0 } }));
 }

@@ -964,6 +964,7 @@ pub fn fuzzRequest(_: void, s: *Smith) !void {
     const body = if (via_query) "" else doc;
     const fast = try request.parseHttp(arena, path, query, body);
     if (fast == .ok) {
+        _ = try fast.ok.tripAttributes(fast.ok.action == .trace_attributes, .none);
         _ = try routing.api.exclusions.validate(arena, .{}, fast.ok.exclude_polygons, fast.ok.exclude_locations.len, .none);
         if (fast.ok.costing_options) |options| {
             const base = routing.costing.base;
@@ -1186,6 +1187,7 @@ const request_seeds = [_][]const u8{
     "\x01{\"shape\":[{\"lat\":47.242754,\"lon\":9.574113},{\"lat\":47.244662,\"lon\":9.566932},{\"lon\":9.560015,\"lat\":47.246979},{\"lat\":-0,\"lon\":1.5e2},{\"lat\":47.254214, \"lon\" : 9.548967}],\"range\":false}",
     "\x81{\"encoded_polyline\":\"_p~iF~ps|U_ulLnnqC_mqNvxq`@\",\"shape_format\":\"polyline5\",\"range\":false}",
     "\x08{\"verbose\":true}",
+    "\x07{\"shape\":[{\"lat\":52.09,\"lon\":5.1},{\"lat\":52.1,\"lon\":5.12}],\"costing\":\"auto\",\"filters\":{\"action\":\"include\",\"attributes\":[\"edge.tagged_names\",\"node.elapsed_time\",\"unknown\",7]},\"elevation_interval\":12}",
     "\x00{\"locations\":[]}",
     "\x00{\"costing\":\"auto\",\"recostings\":[{\"costing\":\"auto\"},{\"costing\":\"pedestrian\",\"name\":\"slow\",\"walking_speed\":2}]}",
     "\x00{\"costing\":\"auto\",\"recostings\":[{\"costing\":\"auto\"},{\"costing\":\"auto\"}]}",

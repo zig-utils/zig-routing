@@ -6,6 +6,7 @@ pub const legs = @import("legs.zig");
 pub const multi = @import("multi.zig");
 pub const queue = @import("queue.zig");
 pub const search = @import("search.zig");
+pub const tripleg = @import("tripleg.zig");
 
 const std = @import("std");
 

@@ -7,6 +7,7 @@
 //! the longitude scale, so results match to the last bit where upstream's do.
 
 const std = @import("std");
+const Deadline = @import("../infra/io.zig").Deadline;
 const libm = @import("libm.zig");
 const k = @import("constants.zig");
 
@@ -310,6 +311,22 @@ pub const FixedLL = extern struct {
         return .{ .lng = @round(p.lng * 1e6) * 1e-6, .lat = @round(p.lat * 1e6) * 1e-6 };
     }
 
+    /// NodeInfo::latlng reconstructs a node from its tile corner, six-digit
+    /// offset and seventh digit. Preserve its rounding at polyline E6 ties.
+    pub fn toTileNodePoint(fixed: FixedLL, corner: PointLL) PointLL {
+        const base = corner.toFixed();
+        return .{
+            .lng = corner.lng + nodeOffset(@as(i64, fixed.lng) - base.lng),
+            .lat = corner.lat + nodeOffset(@as(i64, fixed.lat) - base.lat),
+        };
+    }
+
+    fn nodeOffset(offset: i64) f64 {
+        const microdegrees: f64 = @floatFromInt(@divFloor(offset, 10));
+        const remainder: f64 = @floatFromInt(@mod(offset, 10));
+        return microdegrees * 1e-6 + remainder * 1e-7;
+    }
+
     pub fn toPoint(self: FixedLL) PointLL {
         return .{ .lng = @as(f64, @floatFromInt(self.lng)) * 1e-7, .lat = @as(f64, @floatFromInt(self.lat)) * 1e-7 };
     }
@@ -317,12 +334,17 @@ pub const FixedLL = extern struct {
 
 /// Heading from `pts[idx0]` to the point `dist` metres along the line.
 pub fn headingAlongPolyline(pts: []const PointLL, dist: f64, idx0: u32, idx1: u32) f64 {
+    return headingAlongPolylineWithDeadline(pts, dist, idx0, idx1, .none) catch unreachable;
+}
+
+pub fn headingAlongPolylineWithDeadline(pts: []const PointLL, dist: f64, idx0: u32, idx1: u32, deadline: Deadline) error{DeadlineExceeded}!f64 {
     const n = @as(i64, idx1) - @as(i64, idx0);
     if (n < 1) return 0.0;
     if (n > 1) {
         var d: f64 = 0.0;
         var i: usize = idx0;
         while (d < dist and i + 1 <= idx1) {
+            if ((i - idx0) % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
             const pt0 = pts[i];
             const pt1 = pts[i + 1];
             const seglength = pt0.distance(pt1);
@@ -345,12 +367,17 @@ pub fn headingAlongPolylineAll(pts: []const PointLL, dist: f64) f64 {
 
 /// Heading from the point `dist` metres before the end to `pts[idx1]`.
 pub fn headingAtEndOfPolyline(pts: []const PointLL, dist: f64, idx0: u32, idx1: u32) f64 {
+    return headingAtEndOfPolylineWithDeadline(pts, dist, idx0, idx1, .none) catch unreachable;
+}
+
+pub fn headingAtEndOfPolylineWithDeadline(pts: []const PointLL, dist: f64, idx0: u32, idx1: u32, deadline: Deadline) error{DeadlineExceeded}!f64 {
     const n = @as(i64, idx1) - @as(i64, idx0);
     if (n < 1) return 0.0;
     if (n > 1) {
         var d: f64 = 0.0;
         var end_i: usize = idx1;
         while (d < dist and end_i >= idx0 + 1) {
+            if ((idx1 - end_i) % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
             const pt1 = pts[end_i];
             const pt0 = pts[end_i - 1];
             const seglength = pt0.distance(pt1);

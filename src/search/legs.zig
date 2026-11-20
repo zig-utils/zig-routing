@@ -17,6 +17,7 @@ pub const Edge = struct {
     length_m: f32,
     elapsed: Cost,
     transition: Cost,
+    full_travel_secs: f32 = 0,
     shape_begin: usize,
     shape_end: usize,
 };
@@ -57,6 +58,7 @@ pub const Recost = struct {
         length_m: f32,
         transition: Cost,
         elapsed: Cost,
+        full_travel_secs: f32 = 0,
     };
 
     pub const Options = struct {
@@ -160,7 +162,7 @@ pub const Recost = struct {
             .tcost = transition.cost,
         };
         self.previous.setTraversal(access, traversal);
-        return .{ .length_m = length, .transition = transition, .elapsed = self.elapsed };
+        return .{ .length_m = length, .transition = transition, .elapsed = self.elapsed, .full_travel_secs = full.secs };
     }
 };
 
@@ -223,8 +225,16 @@ fn buildLeg(a: std.mem.Allocator, view: *const View, kernel: anytype, leg: multi
             point.* = vertex.toTilePoint();
         }
         if (i == 0 or i + 1 == edges.len or segment.begin != 0 or segment.end != 1) {
-            const start = if (segment.begin == 0) vertices.items[0] else try projected(correlations[context.pair], segment.edge, segment.begin, control);
-            const end = if (segment.end == 1) vertices.items[vertices.items.len - 1] else try projected(correlations[context.pair + 1], segment.edge, segment.end, control);
+            // A node snap supplies its node coordinate even at fraction 0 or
+            // 1. EdgeInfo vertices have a different coordinate precision.
+            const start = if (i == 0 or segment.begin != 0)
+                try projected(correlations[context.pair], segment.edge, segment.begin, control)
+            else
+                vertices.items[0];
+            const end = if (i + 1 == edges.len or segment.end != 1)
+                try projected(correlations[context.pair + 1], segment.edge, segment.end, control)
+            else
+                vertices.items[vertices.items.len - 1];
             try geo.line.trimShapeWithDeadline(segment.begin * metres, start, segment.end * metres, end, vertices, control.deadline);
         }
         const joined = shape.items.len != 0 and shape.items[shape.items.len - 1].eql(vertices.items[0]);
@@ -243,6 +253,7 @@ fn buildLeg(a: std.mem.Allocator, view: *const View, kernel: anytype, leg: multi
             .length_m = step.length_m,
             .elapsed = step.elapsed,
             .transition = step.transition,
+            .full_travel_secs = step.full_travel_secs,
             .shape_begin = shape_begin,
             .shape_end = shape.items.len - 1,
         };

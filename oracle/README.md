@@ -764,6 +764,24 @@ accepted and heading or side fallback candidates into account. It reports
 Valhalla error 171 when a location has no candidate and 170 when the locations
 share no weak component. A shared component still requires a directed path.
 
+### Trip leg fields
+
+`zig build check-tripleg -Doptimize=ReleaseFast -- BUNDLE CORPUS CASES` routes
+untimed auto requests and writes the typed leg for each corpus row as JSONL.
+The Valhalla actor retains its protobuf trip when using the normal JSON route
+request. Compile `tripleg-reference.cc` inside the pinned image using the same
+compiler and libraries as `costing-parity.sh`. Run it as
+`tripleg-reference CONFIG CORPUS REFERENCE_DIR CASES` to capture those messages.
+
+Use a flat oracle build and the corresponding `zr import-valhalla` bundle to
+compare partial lengths, shapes, headings, node costs and intersections on the
+same graph. Use `compare-triplegs.py NATIVE.jsonl REFERENCE_DIR DESCRIPTORS`
+with the 3.9.3 `proto/descriptors` directory and `--minimum-legs` to require
+coverage. The report counts paths with different directed OSM ways separately.
+The local tile importer does not retain signs and lanes. Run the comparison
+with `--metadata-only` on a bundle built from the same OSM extract to check
+street names, sign groups and lane masks.
+
 ### HTTP and route checks
 
 `compare-height.ts` sends the same random `/height` requests (shapes, encoded polylines at

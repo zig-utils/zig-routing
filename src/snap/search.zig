@@ -561,7 +561,10 @@ const Work = struct {
 
     fn correlateNode(self: *Work, costing: anytype, view: *const graph.reader.View, node_id: u32, projected: geo.PointLL, level: usize) !void {
         const q = self.query;
-        const point = (try view.coordinate(@fromBackingInt(node_id))).toPoint();
+        const coordinate = try view.coordinate(@fromBackingInt(node_id));
+        const tiles = upstream_tiles[level];
+        const corner = tiles.base(tiles.tileIdOf(coordinate.toPoint()));
+        const point = coordinate.toTileNodePoint(corner);
         const distance = q.point.distance(point);
         var node = node_id;
         while (try view.aliasNeighbor(node, false)) |prev| {

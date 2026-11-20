@@ -80,6 +80,43 @@ pub const LevelRange = extern struct {
     }
 };
 
+/// Decoder for the length-prefixed kLevels value in EdgeInfo. The native
+/// string table stores the bytes without the tile text's trailing NUL.
+pub const EncodedLevels = struct {
+    const Decoder = polyline.IntDecoder(i32);
+
+    values: Decoder,
+    precision: u32,
+
+    pub fn parse(bytes: []const u8) !EncodedLevels {
+        var prefix = Decoder.init(bytes);
+        const tagged_size = (try prefix.nextDelta()) orelse return error.InvalidLevels;
+        const size = std.math.cast(usize, tagged_size) orelse return error.InvalidLevels;
+        const rest = bytes[prefix.pos..];
+        if (size != rest.len) return error.InvalidLevels;
+        var values = Decoder.init(rest);
+        const precision = (try values.nextDelta()) orelse return error.InvalidLevels;
+        // Valhalla 3.9.3 uses a factor of ten for any positive precision.
+        return .{ .values = values, .precision = if (precision > 0) 10 else 1 };
+    }
+
+    pub noinline fn next(self: *EncodedLevels, deadline: io.Deadline) !?LevelRange {
+        const factor: f32 = @floatFromInt(self.precision);
+        var range: ?LevelRange = null;
+        var i: usize = 0;
+        while (try self.values.nextDelta()) |value| : (i += 1) {
+            if (i % 64 == 0 and deadline.expired()) return error.DeadlineExceeded;
+            if (value == 1_048_575) {
+                if (range != null) break;
+                continue;
+            }
+            const level = @as(f32, @floatFromInt(value)) / factor;
+            if (range) |*parsed| parsed.bounds.last = level else range = .init(level, level);
+        }
+        return range;
+    }
+};
+
 pub const Indoor = struct {
     layer: i8 = 0,
     levels: []align(1) const LevelRange = &.{},
@@ -242,13 +279,24 @@ pub const Names = struct {
     };
 
     pub fn count(self: Names) usize {
-        return self.references.len / @sizeOf(u32) + (if (self.options.include_tagged) self.details.tagged.len else 0);
+        return self.ordinaryCount() + (if (self.options.include_tagged) self.details.tagged.len else 0);
     }
 
-    pub fn at(self: Names, i: usize) !Name {
+    pub fn ordinaryCount(self: Names) usize {
+        return self.references.len / @sizeOf(u32);
+    }
+
+    pub fn tagKind(self: Names, i: usize) !?linguistics.Tag {
         if (i >= self.count()) return error.InvalidNameIndex;
-        const ordinary = self.references.len / @sizeOf(u32);
-        var result: Name = if (i < ordinary)
+        const ordinary = self.ordinaryCount();
+        return if (i < ordinary) null else self.details.tagged[i - ordinary].attr.kind;
+    }
+
+    /// Read the spelling and its flags without looking up linguistic records.
+    pub fn valueAt(self: Names, i: usize) !Name {
+        if (i >= self.count()) return error.InvalidNameIndex;
+        const ordinary = self.ordinaryCount();
+        return if (i < ordinary)
             try self.table.name(readInt(u32, self.references, i * @sizeOf(u32)))
         else tagged: {
             const tag = self.details.tagged[i - ordinary];
@@ -256,6 +304,10 @@ pub const Names = struct {
             name.tagged = tag.attr.kind;
             break :tagged name;
         };
+    }
+
+    pub fn at(self: Names, i: usize) !Name {
+        var result = try self.valueAt(i);
         if (try self.preferred(i)) |entry| {
             result.language = entry.attr.language;
             if (entry.attr.alphabet != .none) result.pronunciation = .{

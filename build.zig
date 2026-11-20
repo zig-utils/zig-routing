@@ -334,6 +334,16 @@ pub fn build(b: *std.Build) void {
     run_motor_costing.addPassthruArgs();
     b.step("motor-costing-parity", "Compare motor costing calls with the Valhalla oracle").dependOn(&run_motor_costing.step);
 
+    const check_tripleg = b.addExecutable(.{ .name = "check-tripleg", .root_module = b.createModule(.{
+        .root_source_file = b.path("test/check_tripleg.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{.{ .name = "routing", .module = lib_mod }},
+    }) });
+    const run_check_tripleg = b.addRunArtifact(check_tripleg);
+    run_check_tripleg.addPassthruArgs();
+    b.step("check-tripleg", "Dump native trip legs for a route corpus").dependOn(&run_check_tripleg.step);
+
     // Fuzz targets (test/fuzz.zig). `zig build test` replays their seeds; `zig build fuzz
     // --fuzz` fuzzes, ReleaseSafe by default so bounds and overflow checks stay on.
     const fuzz_filter = b.option([]const u8, "fuzz-target", "Fuzz one target: request, http, polyline, lz4, dem, protobuf, config, osm-pbf, osm-primitives, osm-dense, node-store, graph-bundle, build-checkpoint, valhalla-tile, costing-reference, motor-costing, range-manifest, http-range, usage-directory, speed-config, motor-tags, admin-index, timezone-geojson, timezone-rules, datetime");

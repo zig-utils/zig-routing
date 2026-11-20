@@ -13,6 +13,7 @@ const std = @import("std");
 const json = @import("json.zig");
 const errors = @import("errors.zig");
 const exclusions = @import("exclusions.zig");
+const attributes = @import("attributes.zig");
 const datetime = @import("../graph/datetime.zig");
 const Deadline = @import("../infra/io.zig").Deadline;
 const polyline = @import("../geo/polyline.zig");
@@ -122,6 +123,8 @@ pub const Options = struct {
     /// The whole `costing_options` object, parsed later by the costing model.
     costing_options: ?json.Value = null,
     recostings: []const Recosting = &.{},
+    filters: attributes.Filter = .{},
+    elevation_interval: f32 = 0,
     ignore_closures: ?bool = null,
     filter_closures: bool = true,
     verbose: bool = false,
@@ -145,6 +148,10 @@ pub const Options = struct {
     height_precision: u32 = 0,
     resample_distance: ?f64 = null,
     warnings: std.ArrayList(u16) = .empty,
+
+    pub fn tripAttributes(self: *const Options, strict: bool, deadline: Deadline) error{DeadlineExceeded}!attributes.Controller {
+        return attributes.Controller.init(self.filters, strict, self.elevation_interval, deadline);
+    }
 
     pub fn heightPoints(self: *const Options, arena: Allocator) Allocator.Error![]const PointLL {
         if (self.height_points) |points| return points;
@@ -566,6 +573,9 @@ fn fromJsonWithin(arena: Allocator, doc: json.Value, action: Action, deadline: D
 
     o.verbose = json.get(bool, doc, "/verbose", action == .sources_to_targets);
     if (json.getOptional(f32, doc, "/generalize")) |g| o.generalize = g;
+    if (json.pointer(doc, "/filters")) |filters| o.filters = attributes.Filter.parse(filters);
+    if (json.getOptional(f32, doc, "/elevation_interval")) |interval|
+        o.elevation_interval = std.math.clamp(interval, 0, 1000);
 
     // Deprecated directions_options: hoist its units, narrative, format, language.
     var root = doc;
