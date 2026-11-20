@@ -2,8 +2,100 @@
 const std = @import("std");
 const io = @import("../infra/io.zig");
 const model = @import("model.zig");
+const house = @import("house_number.zig");
+const interpolation = @import("interpolation.zig");
+const postal = @import("postcode.zig");
 
 const sections = std.enums.values(model.Section);
+const base_section_count = @backingInt(model.Section.street_ways);
+
+pub const AddressData = struct {
+    country_codes: []const model.Span = &.{},
+    street_shapes: []const model.Span = &.{},
+    address_coordinates: []const model.Coordinate = &.{},
+    street_houses: []const model.Span = &.{},
+    house_links: []const model.HouseLink = &.{},
+    interpolations: []const model.Interpolation = &.{},
+    postcodes: []const model.Postcode = &.{},
+
+    fn validate(self: AddressData, core: Data, deadline: io.Deadline) !void {
+        if (self.country_codes.len != core.admins.len or self.street_shapes.len != core.street_ways.len or
+            self.street_houses.len != core.streets.len)
+            return error.InvalidGeocodeAddressIndex;
+        for (self.country_codes, core.admins, 0..) |span, region, i| {
+            try checkAt(deadline, i);
+            const code = try span.get(core.text);
+            if (code.len != 0 and (region.attr.division != .country or code.len != 2 or
+                !std.ascii.isUpper(code[0]) or !std.ascii.isUpper(code[1])))
+                return error.InvalidGeocodeAddressIndex;
+        }
+        for (self.address_coordinates, 0..) |coordinate, i| {
+            try checkAt(deadline, i);
+            if (!coordinate.inRange()) return error.InvalidGeocodeRecord;
+        }
+        for (self.street_shapes, 0..) |span, i| {
+            try checkAt(deadline, i);
+            try nonEmpty(span, self.address_coordinates);
+        }
+        for (self.interpolations, 0..) |range, i| {
+            try checkAt(deadline, i);
+            const shape = try range.shape.get(self.address_coordinates);
+            if (shape.len < 2 or range.attr.reserved != 0 or range.reserved != 0 or range.first == range.last)
+                return error.InvalidGeocodeAddressIndex;
+            if (range.attr.mode == .alphabetic) {
+                if (@max(range.first, range.last) > 26) return error.InvalidGeocodeAddressIndex;
+            } else if (range.alphabetic_base != 0) {
+                return error.InvalidGeocodeAddressIndex;
+            }
+            try core.checkHierarchy(range.hierarchy);
+        }
+        var next_link: usize = 0;
+        for (self.street_houses, core.streets, 0..) |span, street, i| {
+            try checkAt(deadline, i);
+            if (span.first != next_link) return error.InvalidGeocodeAddressIndex;
+            const links = try span.get(self.house_links);
+            var previous: ?house.Key = null;
+            for (links, 0..) |link, j| {
+                try checkAt(deadline, j);
+                if (link.attr.reserved != 0 or link.street_way < street.ways.first or link.street_way - street.ways.first >= street.ways.len)
+                    return error.InvalidGeocodeAddressIndex;
+                const count = if (link.attr.kind == .exact) core.addresses.len else self.interpolations.len;
+                if (link.object_id >= count) return error.InvalidGeocodeAddressIndex;
+                const first = try link.first.key(core.text);
+                if (previous) |key| if (key.order(first) == .gt) return error.InvalidGeocodeAddressIndex;
+                if (link.attr.has_last and first.order(try link.last.key(core.text)) == .gt)
+                    return error.InvalidGeocodeAddressIndex;
+                _ = try link.unit.get(core.text);
+                previous = first;
+            }
+            next_link += links.len;
+        }
+        if (next_link != self.house_links.len) return error.InvalidGeocodeAddressIndex;
+        try self.validatePostcodes(core, deadline);
+    }
+
+    fn validatePostcodes(self: AddressData, core: Data, deadline: io.Deadline) !void {
+        var previous: ?model.Postcode = null;
+        for (self.postcodes, 0..) |postcode, i| {
+            try checkAt(deadline, i);
+            const code = try postcode.code.get(core.text);
+            const canonical = postal.Code.normalize(code, "") orelse return error.InvalidGeocodePostcode;
+            if (!std.mem.eql(u8, code, canonical.bytes()) or postcode.attr.reserved != 0 or
+                (!postcode.attr.from_boundary and postcode.address_count == 0) or
+                !postcode.center.inRange() or !postcode.min.inRange() or !postcode.max.inRange() or
+                postcode.min.lat > postcode.center.lat or postcode.center.lat > postcode.max.lat)
+                return error.InvalidGeocodePostcode;
+            if (try core.admin(postcode.country)) |region| {
+                if (region.attr.division != .country) return error.InvalidGeocodePostcode;
+            }
+            if (previous) |prior| {
+                if (try comparePostcode(prior, postcode.country, code, core.text) != .lt)
+                    return error.InvalidGeocodePostcode;
+            }
+            previous = postcode;
+        }
+    }
+};
 
 pub const Coverage = struct {
     country: usize = 0,
@@ -32,6 +124,7 @@ pub const Data = struct {
     names: []const model.Name = &.{},
     text: []const u8 = &.{},
     street_ways: []const i64 = &.{},
+    address_data: ?AddressData = null,
 
     pub fn coverage(self: Data, deadline: io.Deadline) !Coverage {
         var result: Coverage = .{};
@@ -90,6 +183,7 @@ pub const Data = struct {
             try nonEmpty(poi.category, self.text);
             try nonEmpty(poi.kind, self.text);
         }
+        if (self.address_data) |addresses| try addresses.validate(self, deadline);
     }
 
     pub fn admin(self: Data, id: model.AdminId) !?model.Admin {
@@ -99,14 +193,53 @@ pub const Data = struct {
         return self.admins[raw - 1];
     }
 
+    pub fn countryIso(self: Data, id: model.AdminId) ![]const u8 {
+        const addresses = self.address_data orelse return "";
+        if (try self.admin(id)) |region| {
+            if (region.attr.division != .country) return error.InvalidGeocodeAdmin;
+            const row = @backingInt(id) - 1;
+            if (row >= addresses.country_codes.len) return error.InvalidGeocodeAddressIndex;
+            return addresses.country_codes[row].get(self.text);
+        }
+        return "";
+    }
+
+    pub fn lookupPostcode(self: Data, country: model.AdminId, raw: []const u8) !?model.Postcode {
+        const addresses = self.address_data orelse return null;
+        const code = postal.Code.normalize(raw, try self.countryIso(country)) orelse return null;
+        var low: usize = 0;
+        var high = addresses.postcodes.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            const candidate = addresses.postcodes[middle];
+            switch (try comparePostcode(candidate, country, code.bytes(), self.text)) {
+                .lt => low = middle + 1,
+                .gt => high = middle,
+                .eq => return candidate,
+            }
+        }
+        return null;
+    }
+
+    pub fn estimateInterpolation(self: Data, index: u32, label: house.Label, deadline: io.Deadline) !?interpolation.Estimate {
+        const addresses = self.address_data orelse return null;
+        if (index >= addresses.interpolations.len) return null;
+        const row = addresses.interpolations[index];
+        return row.range().locate(label, try row.shape.get(addresses.address_coordinates), deadline);
+    }
+
     fn checkRecord(self: Data, record: model.Record) !void {
         if (!record.coordinate.inRange() or record.attr.reserved != 0 or
             @backingInt(record.attr.source) > @backingInt(model.Source.relation))
             return error.InvalidGeocodeRecord;
         _ = try record.names.get(self.names);
-        _ = try record.hierarchy.postcode.get(self.text);
+        try self.checkHierarchy(record.hierarchy);
+    }
+
+    fn checkHierarchy(self: Data, hierarchy: model.Hierarchy) !void {
+        _ = try hierarchy.postcode.get(self.text);
         inline for (std.enums.values(model.Division)) |division| {
-            const id = @field(record.hierarchy, @tagName(division));
+            const id = @field(hierarchy, @tagName(division));
             if (try self.admin(id)) |region| {
                 if (region.attr.division != division) return error.InvalidGeocodeAdmin;
             }
@@ -114,31 +247,49 @@ pub const Data = struct {
     }
 };
 
+fn comparePostcode(row: model.Postcode, country: model.AdminId, code: []const u8, text: []const u8) !std.math.Order {
+    const countries = std.math.order(@backingInt(row.country), @backingInt(country));
+    return if (countries == .eq) std.mem.order(u8, try row.code.get(text), code) else countries;
+}
+
 pub const Bundle = struct {
     uuid: model.DatasetUuid,
     data: Data,
-    mappings: [sections.len]io.Mapping,
+    mappings: [sections.len]?io.Mapping,
 
     pub fn open(path: []const u8, deadline: io.Deadline) !Bundle {
         const dir = try io.Directory.open(path);
         defer dir.close();
-        var result: Bundle = .{ .uuid = undefined, .data = .{}, .mappings = undefined };
-        var mapped: usize = 0;
-        errdefer for (result.mappings[0..mapped]) |mapping| mapping.unmap();
+        var result: Bundle = .{ .uuid = undefined, .data = .{}, .mappings = @splat(null) };
+        errdefer result.close();
+        var addresses: AddressData = .{};
+        var extra: usize = 0;
         inline for (sections, 0..) |section, i| {
-            const mapping = try map(dir, section);
-            result.mappings[i] = mapping;
-            mapped += 1;
-            const decoded = try model.readSection(section, mapping.bytes, if (i == 0) null else result.uuid, deadline);
-            result.uuid = decoded.uuid;
-            @field(result.data, @tagName(section)) = decoded.records;
+            const mapping: ?io.Mapping = map(dir, section) catch |err| blk: {
+                if (section.addressSection() and err == error.FileNotFound) break :blk null;
+                return err;
+            };
+            if (mapping) |present| {
+                result.mappings[i] = present;
+                const decoded = try model.readSection(section, present.bytes, if (i == 0) null else result.uuid, deadline);
+                result.uuid = decoded.uuid;
+                if (comptime section.addressSection()) {
+                    @field(addresses, @tagName(section)) = decoded.records;
+                    extra += 1;
+                } else {
+                    @field(result.data, @tagName(section)) = decoded.records;
+                }
+            }
         }
+        if (extra == sections.len - base_section_count) {
+            result.data.address_data = addresses;
+        } else if (extra != 0) return error.IncompleteGeocodeAddressIndex;
         try result.data.validate(deadline);
         return result;
     }
 
     pub fn close(self: *Bundle) void {
-        for (self.mappings) |mapping| mapping.unmap();
+        for (self.mappings) |mapping| if (mapping) |present| present.unmap();
         self.* = undefined;
     }
 };
@@ -167,14 +318,23 @@ pub fn write(path: []const u8, uuid: model.DatasetUuid, data: Data, deadline: io
         parent.deleteDir(&staged.name) catch {};
     };
     inline for (sections) |section| {
-        const records = @field(data, @tagName(section));
-        try writeSection(staged.dir, section, uuid, @sizeOf(section.Item()), records.len, std.mem.sliceAsBytes(records), deadline);
+        if (comptime section.addressSection()) {
+            if (data.address_data) |addresses| {
+                try writeRecords(staged.dir, section, uuid, @field(addresses, @tagName(section)), deadline);
+            }
+        } else {
+            try writeRecords(staged.dir, section, uuid, @field(data, @tagName(section)), deadline);
+        }
     }
     try staged.dir.sync();
     if (deadline.expired()) return error.DeadlineExceeded;
     try parent.renameExclusive(&staged.name, target[0..name.len :0]);
     published = true;
     try parent.sync();
+}
+
+fn writeRecords(dir: io.Directory, comptime section: model.Section, uuid: model.DatasetUuid, records: []const section.Item(), deadline: io.Deadline) !void {
+    try writeSection(dir, section, uuid, @sizeOf(section.Item()), records.len, std.mem.sliceAsBytes(records), deadline);
 }
 
 noinline fn writeSection(dir: io.Directory, section: model.Section, uuid: model.DatasetUuid, size: u32, count: usize, bytes: []const u8, deadline: io.Deadline) !void {

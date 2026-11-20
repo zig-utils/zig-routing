@@ -130,3 +130,118 @@ test "geocode bundle keeps multilingual labels and merges streets by municipalit
     try testing.expectEqualStrings("The Schoolhouse", try data.addresses[1].house_name.get(data.text));
     try testing.expectEqualStrings("school", try data.pois[0].kind.get(data.text));
 }
+
+fn addressTags(allocator: std.mem.Allocator, number: []const u8) !gurka.Tags {
+    return allocator.dupe(gurka.Tag, &.{
+        .{ .key = "addr:housenumber", .value = number },
+        .{ .key = "addr:street", .value = "Curve Road" },
+        .{ .key = "addr:postcode", .value = "L-1234" },
+    });
+}
+
+test "extract postcode areas and linked interpolation ranges from a PBF" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    var owned = std.heap.ArenaAllocator.init(a);
+    defer owned.deinit();
+    const arena = owned.allocator();
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const source = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/address.osm.pbf", .{temporary.sub_path});
+    const output = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/geocode", .{temporary.sub_path});
+    var nodes: std.ArrayList(gurka.OsmNode) = .empty;
+    try nodes.appendSlice(arena, &.{
+        node(1, 0, 0, &.{}),       node(2, 4, 0, &.{}),       node(3, 4, 4, &.{}),       node(4, 0, 4, &.{}),
+        node(5, 1.01, 1.01, &.{}), node(6, 1.02, 1.01, &.{}), node(7, 1.02, 1.02, &.{}), node(8, 1.01, 1.02, &.{}),
+    });
+    var ways: std.ArrayList(gurka.OsmWay) = .empty;
+    try ways.appendSlice(arena, &.{
+        way(101, &.{ 1, 2, 3, 4, 1 }, &.{}),
+        way(102, &.{ 5, 6, 7, 8, 5 }, &.{}),
+    });
+    const samples = [_]struct { scheme: []const u8, low: []const u8, high: []const u8, requested: []const u8 }{
+        .{ .scheme = "all", .low = "1", .high = "5", .requested = "4" },
+        .{ .scheme = "even", .low = "2", .high = "10", .requested = "8" },
+        .{ .scheme = "odd", .low = "17", .high = "9", .requested = "11" },
+        .{ .scheme = "alphabetic", .low = "25", .high = "25D", .requested = "25C" },
+    };
+    for (samples, 0..) |sample, i| {
+        const start: i64 = @intCast(20 + i * 3);
+        const refs = try arena.dupe(i64, &.{ start, start + 1, start + 2 });
+        const tags = try arena.dupe(gurka.Tag, &.{.{ .key = "addr:interpolation", .value = sample.scheme }});
+        try nodes.appendSlice(arena, &.{
+            node(start, 1, 1, try addressTags(arena, sample.low)),
+            node(start + 1, 1.001, 1, if (i == 0) try addressTags(arena, "3") else &.{}),
+            node(start + 2, 1.001, 1.001, try addressTags(arena, sample.high)),
+        });
+        try ways.append(arena, way(@intCast(110 + i), refs, tags));
+    }
+    try ways.append(arena, way(120, &.{ 20, 21, 22 }, &.{
+        .{ .key = "highway", .value = "residential" },
+        .{ .key = "name", .value = "Curve Road" },
+    }));
+    const dataset: gurka.Dataset = .{
+        .nodes = nodes.items,
+        .ways = ways.items,
+        .relations = &.{
+            .{
+                .id = 201,
+                .members = &.{.{ .kind = .way, .id = 101, .role = "outer" }},
+                .tags = &.{
+                    .{ .key = "boundary", .value = "administrative" },
+                    .{ .key = "admin_level", .value = "2" },
+                    .{ .key = "ISO3166-1:alpha2", .value = "lu" },
+                    .{ .key = "name", .value = "Land" },
+                },
+            },
+            .{
+                .id = 202,
+                .members = &.{.{ .kind = .way, .id = 102, .role = "outer" }},
+                .tags = &.{
+                    .{ .key = "boundary", .value = "postal_code" },
+                    .{ .key = "postal_code", .value = "2345" },
+                },
+            },
+        },
+    };
+    try dataset.writePbf(a, source);
+    const report = try geocode.extract.build(a, source, output, .{ .workers = 2 }, .none);
+    try testing.expectEqual(5, report.interpolations);
+    try testing.expectEqual(14, report.house_links);
+    try testing.expectEqual(2, report.postcodes);
+    var opened = try geocode.bundle.Bundle.open(output, .none);
+    defer opened.close();
+    const data = opened.data;
+    const country: geocode.model.AdminId = @fromBackingInt(@intCast(1));
+    try testing.expectEqualStrings("LU", try data.countryIso(country));
+    const from_addresses = (try data.lookupPostcode(country, "L-1234")).?;
+    try testing.expectEqual(9, from_addresses.address_count);
+    try testing.expectEqual(routing.geo.PointLL.init(1.0005556, 1.0004444).toFixed(), from_addresses.center);
+    try testing.expect(!from_addresses.attr.from_boundary);
+    const from_area = (try data.lookupPostcode(country, "2345")).?;
+    try testing.expectEqual(0, from_area.address_count);
+    try testing.expectEqual(routing.geo.PointLL.init(1.015, 1.015).toFixed(), from_area.center);
+    try testing.expectEqual(routing.geo.PointLL.init(1.01, 1.01).toFixed(), from_area.min);
+    try testing.expectEqual(routing.geo.PointLL.init(1.02, 1.02).toFixed(), from_area.max);
+    try testing.expect(from_area.attr.from_boundary);
+    const extensions = data.address_data.?;
+    try testing.expectEqual(14, extensions.street_houses[0].len);
+    const expected = routing.geo.PointLL.init(1.001, 1.0005);
+    for (samples) |sample| {
+        const scheme = geocode.interpolation.Mode.fromTag(sample.scheme).?;
+        var matches: usize = 0;
+        for (extensions.interpolations, 0..) |row, i| {
+            if (row.attr.mode != scheme) continue;
+            const number = try geocode.house_number.parse(sample.requested, "");
+            const estimate = try data.estimateInterpolation(@intCast(i), number, .none) orelse continue;
+            try testing.expect(estimate.approximate);
+            try testing.expect(estimate.coordinate.toPoint().distance(expected) < 10);
+            matches += 1;
+        }
+        try testing.expectEqual(1, matches);
+    }
+    const folder = try io.Directory.open(output);
+    defer folder.close();
+    try folder.deleteFile(geocode.model.Section.postcodes.filename());
+    try testing.expectError(error.IncompleteGeocodeAddressIndex, geocode.bundle.Bundle.open(output, .none));
+}

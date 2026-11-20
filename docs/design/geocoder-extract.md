@@ -39,12 +39,14 @@ source way IDs and the combined names of the component ways. Streets with
 unknown municipalities keep their individual way records. An explicit
 `addr:postcode` value stays attached to the feature.
 
-The bundle consists of eight little-endian mmap sections. Each section has a
+The base bundle consists of eight little-endian mmap sections. Each section has a
 64-byte header, a shared 128-bit dataset ID, a record count, and an XXH3 checksum
 over the payload. Arrays begin at a 64 KiB boundary. Records refer to names,
 strings, administrative rows, and street ways through checked spans and IDs.
 The reader verifies section identity, checksums, lengths, and references when
 opening the bundle. Publication uses a staged directory and an exclusive rename.
+The address index adds its own sections to the base bundle.
+[Address interpolation and postcodes](geocoder-addresses.md)
 
 Published geocoding results derived from these bundles carry
 **© OpenStreetMap contributors** and identify the Open Database License.

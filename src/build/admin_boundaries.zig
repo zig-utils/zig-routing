@@ -64,6 +64,12 @@ pub fn collectBoundaries(comptime Policy: type, gpa: Allocator, source: anytype,
     return collectWith(Policy, gpa, source, deadline, true, null, null);
 }
 
+pub fn polygonRole(value: []const u8) ?polygon.Role {
+    if (std.mem.eql(u8, value, "inner")) return .inner;
+    if (value.len == 0 or std.mem.eql(u8, value, "outer")) return .outer;
+    return null;
+}
+
 fn collectWith(comptime Policy: type, gpa: Allocator, source: anytype, deadline: io.Deadline, boundaries: bool, restrictions: ?*turns.Catalog, connections: ?*lanes.Catalog) !CatalogFor(Policy) {
     var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();

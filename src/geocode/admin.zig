@@ -18,12 +18,15 @@ const Policy = struct {
         level: u8,
         division: model.Division,
         names: []const Label,
+        iso: [2]u8,
     };
 
     pub fn read(owned: Allocator, relation: pbf.Relation, _: io.Deadline) !?Attributes {
         var boundary: []const u8 = "";
         var place: []const u8 = "";
         var level: u8 = 0;
+        var iso: [2]u8 = @splat(0);
+        var alpha2: [2]u8 = @splat(0);
         var tags_iter = relation.tags;
         while (try tags_iter.next()) |tag| {
             if (eql(u8, tag.key, "boundary")) {
@@ -32,6 +35,10 @@ const Policy = struct {
                 level = std.fmt.parseInt(u8, tag.value, 10) catch 0;
             } else if (eql(u8, tag.key, "place")) {
                 place = tag.value;
+            } else if (eql(u8, tag.key, "ISO3166-1:alpha2")) {
+                alpha2 = countryCode(tag.value) orelse alpha2;
+            } else if (eql(u8, tag.key, "ISO3166-1")) {
+                iso = countryCode(tag.value) orelse iso;
             }
         }
         if (!eql(u8, boundary, "administrative")) return null;
@@ -43,15 +50,16 @@ const Policy = struct {
             if (tag.value.len == 0) continue;
             try names.append(owned, .{ .language = try owned.dupe(u8, lang), .value = try owned.dupe(u8, tag.value) });
         }
-        return .{ .level = level, .division = division, .names = names.items };
+        return .{ .level = level, .division = division, .names = names.items, .iso = if (alpha2[0] == 0) iso else alpha2 };
     }
 
-    pub fn wayRole(value: []const u8) ?polygon.Role {
-        if (eql(u8, value, "inner")) return .inner;
-        if (value.len == 0 or eql(u8, value, "outer")) return .outer;
-        return null;
-    }
+    pub const wayRole = boundaries.polygonRole;
 };
+
+fn countryCode(raw: []const u8) ?[2]u8 {
+    if (raw.len != 2 or !std.ascii.isAlphabetic(raw[0]) or !std.ascii.isAlphabetic(raw[1])) return null;
+    return .{ std.ascii.toUpper(raw[0]), std.ascii.toUpper(raw[1]) };
+}
 
 fn role(level: u8, place: []const u8) ?model.Division {
     if (level == 2) return .country;
@@ -75,6 +83,7 @@ pub const Index = struct {
     catalog: boundaries.CatalogFor(Policy),
     tree: polygon_index.Index,
     records: []model.Admin,
+    country_codes: []model.Span,
     owners: []const usize,
     areas: []const f64,
     hits: std.ArrayList(u32) = .empty,
@@ -87,6 +96,7 @@ pub const Index = struct {
         var catalog = try boundaries.collectBoundaries(Policy, a, source, deadline);
         errdefer catalog.deinit();
         const records = try scratch.alloc(model.Admin, catalog.regions.len);
+        const country_codes = try scratch.alloc(model.Span, catalog.regions.len);
         const areas = try scratch.alloc(f64, catalog.regions.len);
         const samples = try scratch.alloc(PointLL, catalog.regions.len);
         var polys: std.ArrayList(polygon.Polygon) = .empty;
@@ -103,6 +113,10 @@ pub const Index = struct {
                 .names = try model.Span.init(first, region.attrs.names.len),
                 .attr = .{ .division = region.attrs.division, .level = region.attrs.level },
             };
+            country_codes[i] = if (region.attrs.division == .country and region.attrs.iso[0] != 0)
+                try pool.text(&region.attrs.iso)
+            else
+                .{};
             var largest: f64 = -1;
             area.* = 0;
             for (region.geometry.polygons) |poly| {
@@ -120,6 +134,7 @@ pub const Index = struct {
             .catalog = catalog,
             .tree = try polygon_index.Index.init(a, polys.items, deadline),
             .records = records,
+            .country_codes = country_codes,
             .owners = owners.items,
             .areas = areas,
             .a = a,

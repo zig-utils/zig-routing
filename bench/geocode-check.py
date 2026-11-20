@@ -181,7 +181,8 @@ def main():
     parser.add_argument("bundle", type=Path)
     parser.add_argument("--admin-pbf", action="append", default=[], type=Path)
     args = parser.parse_args()
-    identity = hashlib.sha256(b"zr-geocode-admin-v1" if args.admin_pbf else b"zr-geocode-v1")
+    generation = b"2" if (args.bundle / "postcodes.bin").is_file() else b"1"
+    identity = hashlib.sha256((b"zr-geocode-admin-v" if args.admin_pbf else b"zr-geocode-v") + generation)
     for path in [args.pbf, *args.admin_pbf]:
         if args.admin_pbf:
             identity.update(struct.pack("<Q", path.stat().st_size))

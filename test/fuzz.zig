@@ -20,7 +20,8 @@
 //! `costing-reference` (gate A samples and paths), `speed-config` (default speed tables),
 //! `motor-tags` (motor vehicle access and unit normalization), `admin-index`
 //! (stored administrative boundaries), `timezone-geojson`, `timezone-rules`,
-//! `datetime`, `time-domain`, `lane-tags`, `name-tags` and `geocode-bundle`.
+//! `datetime`, `time-domain`, `lane-tags`, `name-tags`, `geocode-bundle` and
+//! `geocode-address`.
 //!
 //! The contract for every parser: malformed input returns an error, never
 //! panics, overflows or reads out of bounds. The fuzz step builds ReleaseSafe
@@ -450,7 +451,13 @@ fn fuzzGeocodeBundle(_: void, s: *Smith) !void {
             if (bytes[1] != 0) storage[bytes[1] % @sizeOf(model.Header)] ^= bytes[2];
             const read = model.readSection(kind, storage[0 .. model.payload_offset + payload.len], @splat(0), .none) catch return;
             var data: geocode.bundle.Data = .{};
-            @field(data, @tagName(kind)) = read.records;
+            if (comptime kind.addressSection()) {
+                var addresses: geocode.bundle.AddressData = .{};
+                @field(addresses, @tagName(kind)) = read.records;
+                data.address_data = addresses;
+            } else {
+                @field(data, @tagName(kind)) = read.records;
+            }
             data.validate(.none) catch return;
             try std.testing.expectEqual(payload.len, read.records.len * @sizeOf(kind.Item()));
         }
@@ -464,6 +471,31 @@ test "fuzz geocode-bundle" {
     admin_row[0] = 4;
     const inputs = &.{ "", "\x06\x00\x00town", "\x00\x00\x00", "\x05\x08\x04", &admin_row };
     try std.testing.fuzz({}, fuzzGeocodeBundle, .{ .corpus = try seeds(arena.allocator(), inputs) });
+}
+
+fn fuzzGeocodeAddress(_: void, s: *Smith) !void {
+    var input: [256]u8 = undefined;
+    const bytes = draw(s, &input, 0x686f7573);
+    const split = std.mem.indexOfScalar(u8, bytes, 0) orelse bytes.len;
+    const unit = if (split == bytes.len) "" else bytes[split + 1 ..];
+    const Postcode = routing.geocode.postcode.Code;
+    if (Postcode.normalize(bytes[0..split], unit)) |code| {
+        try std.testing.expect(code.len > 0 and code.len <= code.storage.len);
+        try std.testing.expectEqualStrings(code.bytes(), Postcode.normalize(code.bytes(), "").?.bytes());
+    }
+    const parsed = routing.geocode.house_number.parse(bytes[0..split], unit) catch return;
+    try std.testing.expect(parsed.first.fraction.numerator < parsed.first.fraction.denominator);
+    if (parsed.last) |last| {
+        try std.testing.expect(last.fraction.numerator < last.fraction.denominator);
+        try std.testing.expect(parsed.first.order(last) != .gt);
+    }
+}
+
+test "fuzz geocode-address" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const inputs = &.{ "", "12a–16", "7 2/4", "25½", "17 #B", "012b\x00Flat 3", "4294967296", "3 1/0", "L-1240\x00LU", "sw1a 1aa", "12345-1234" };
+    try std.testing.fuzz({}, fuzzGeocodeAddress, .{ .corpus = try seeds(arena.allocator(), inputs) });
 }
 
 fn fuzzLaneTags(_: void, s: *Smith) !void {

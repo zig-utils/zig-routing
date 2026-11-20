@@ -2,6 +2,8 @@
 const std = @import("std");
 const graph = @import("../graph/format.zig");
 const io = @import("../infra/io.zig");
+const house = @import("house_number.zig");
+const interpolation = @import("interpolation.zig");
 
 pub const attribution = "© OpenStreetMap contributors";
 pub const attribution_url = "https://www.openstreetmap.org/copyright";
@@ -100,6 +102,73 @@ pub const Admin = extern struct {
     },
 };
 
+pub const HouseKey = extern struct {
+    number: u32,
+    fraction: packed struct(u32) {
+        numerator: u16 = 0,
+        denominator: u16 = 1,
+    } = .{},
+    letters: Span = .{},
+
+    pub fn key(self: HouseKey, text: []const u8) !house.Key {
+        if (self.fraction.numerator >= self.fraction.denominator) return error.InvalidGeocodeHouseKey;
+        return .{
+            .number = self.number,
+            .fraction = .{ .numerator = self.fraction.numerator, .denominator = self.fraction.denominator },
+            .letters = try self.letters.get(text),
+        };
+    }
+};
+
+pub const HouseLink = extern struct {
+    /// Zero-based address or interpolation row, selected by kind.
+    object_id: u32,
+    /// Zero-based row in the member-way sections.
+    street_way: u32,
+    /// Fraction along this member way on the full u32 range.
+    position: u32,
+    attr: packed struct(u32) {
+        kind: enum(u1) { exact, interpolation },
+        has_last: bool = false,
+        reserved: u30 = 0,
+    },
+    first: HouseKey,
+    last: HouseKey = .{ .number = 0 },
+    unit: Span = .{},
+};
+
+pub const Interpolation = extern struct {
+    osm_id: i64,
+    first: u32,
+    last: u32,
+    alphabetic_base: u32,
+    attr: packed struct(u32) {
+        mode: interpolation.Mode,
+        reserved: u30 = 0,
+    },
+    shape: Span,
+    hierarchy: Hierarchy,
+    reserved: u32 = 0,
+
+    pub fn range(self: Interpolation) interpolation.Range {
+        return .{ .mode = self.attr.mode, .first = self.first, .last = self.last, .alphabetic_base = self.alphabetic_base };
+    }
+};
+
+pub const Postcode = extern struct {
+    code: Span,
+    country: AdminId,
+    address_count: u32,
+    center: Coordinate,
+    /// Longitude min greater than max denotes an extent across the antimeridian.
+    min: Coordinate,
+    max: Coordinate,
+    attr: packed struct(u32) {
+        from_boundary: bool,
+        reserved: u31 = 0,
+    },
+};
+
 pub const Section = enum(u32) {
     places = 1,
     streets = 2,
@@ -109,6 +178,17 @@ pub const Section = enum(u32) {
     names = 6,
     text = 7,
     street_ways = 8,
+    country_codes = 9,
+    street_shapes = 10,
+    address_coordinates = 11,
+    street_houses = 12,
+    house_links = 13,
+    interpolations = 14,
+    postcodes = 15,
+
+    pub fn addressSection(self: Section) bool {
+        return @backingInt(self) >= @backingInt(Section.country_codes);
+    }
 
     pub fn filename(self: Section) [:0]const u8 {
         return switch (self) {
@@ -120,6 +200,13 @@ pub const Section = enum(u32) {
             .names => "names.bin",
             .text => "text.bin",
             .street_ways => "street-ways.bin",
+            .country_codes => "country-codes.bin",
+            .street_shapes => "street-shapes.bin",
+            .address_coordinates => "address-coordinates.bin",
+            .street_houses => "street-houses.bin",
+            .house_links => "house-links.bin",
+            .interpolations => "interpolations.bin",
+            .postcodes => "postcodes.bin",
         };
     }
 
@@ -133,6 +220,11 @@ pub const Section = enum(u32) {
             .names => Name,
             .text => u8,
             .street_ways => i64,
+            .country_codes, .street_shapes, .street_houses => Span,
+            .address_coordinates => Coordinate,
+            .house_links => HouseLink,
+            .interpolations => Interpolation,
+            .postcodes => Postcode,
         };
     }
 };
@@ -186,6 +278,17 @@ comptime {
     std.debug.assert(@sizeOf(Poi) == 72 and @offsetOf(Poi, "record") == 0 and @offsetOf(Poi, "category") == 56 and @offsetOf(Poi, "kind") == 64);
     std.debug.assert(@sizeOf(Admin) == 24 and @offsetOf(Admin, "osm_id") == 0 and @offsetOf(Admin, "names") == 8 and
         @offsetOf(Admin, "parent") == 16 and @offsetOf(Admin, "attr") == 20);
+    std.debug.assert(@sizeOf(HouseKey) == 16 and @offsetOf(HouseKey, "number") == 0 and @offsetOf(HouseKey, "fraction") == 4 and
+        @offsetOf(HouseKey, "letters") == 8);
+    std.debug.assert(@sizeOf(HouseLink) == 56 and @offsetOf(HouseLink, "object_id") == 0 and @offsetOf(HouseLink, "street_way") == 4 and
+        @offsetOf(HouseLink, "position") == 8 and @offsetOf(HouseLink, "attr") == 12 and @offsetOf(HouseLink, "first") == 16 and
+        @offsetOf(HouseLink, "last") == 32 and @offsetOf(HouseLink, "unit") == 48);
+    std.debug.assert(@sizeOf(Interpolation) == 64 and @offsetOf(Interpolation, "osm_id") == 0 and @offsetOf(Interpolation, "first") == 8 and
+        @offsetOf(Interpolation, "last") == 12 and @offsetOf(Interpolation, "alphabetic_base") == 16 and @offsetOf(Interpolation, "attr") == 20 and
+        @offsetOf(Interpolation, "shape") == 24 and @offsetOf(Interpolation, "hierarchy") == 32 and @offsetOf(Interpolation, "reserved") == 60);
+    std.debug.assert(@sizeOf(Postcode) == 44 and @offsetOf(Postcode, "code") == 0 and @offsetOf(Postcode, "country") == 8 and
+        @offsetOf(Postcode, "address_count") == 12 and @offsetOf(Postcode, "center") == 16 and @offsetOf(Postcode, "min") == 24 and
+        @offsetOf(Postcode, "max") == 32 and @offsetOf(Postcode, "attr") == 40);
     std.debug.assert(payload_offset % @alignOf(Record) == 0);
 }
 

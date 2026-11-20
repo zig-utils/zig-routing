@@ -33,6 +33,10 @@ pub const Polygon = struct {
 
     pub fn locate(self: Polygon, point: PointLL, deadline: Deadline) error{DeadlineExceeded}!Location {
         const shell = try locateInRing(self.outer, point, deadline);
+        return self.locateWithShell(point, shell, deadline);
+    }
+
+    pub fn locateWithShell(self: Polygon, point: PointLL, shell: Location, deadline: Deadline) error{DeadlineExceeded}!Location {
         if (shell != .inside) return shell;
         for (self.holes, 0..) |hole, i| {
             try checkAt(deadline, i);
@@ -304,16 +308,41 @@ pub fn locateInRing(input: Ring, point: PointLL, deadline: Deadline) error{Deadl
     var a = ring[ring.len - 1];
     for (ring, 0..) |b, i| {
         try checkAt(deadline, i);
-        if (!a.eql(b) and point.lat >= @min(a.lat, b.lat) and point.lat <= @max(a.lat, b.lat)) {
-            const side = orient(a, b, point);
-            if (side == 0 and segmentBounds(a, b).covers(point)) return .boundary;
-            // Half-open ray crossings avoid counting a shared vertex twice.
-            if ((a.lat > point.lat) != (b.lat > point.lat) and (side > 0) == (b.lat > a.lat))
-                inside = !inside;
+        switch (rayCrossing(a, b, point)) {
+            .boundary => return .boundary,
+            .inside => inside = !inside,
+            .outside => {},
         }
         a = b;
     }
     return if (inside) .inside else .outside;
+}
+
+/// Edge indices identify each edge by its ending vertex. Callers supply
+/// every edge whose closed latitude range includes the query latitude.
+pub fn locateInRingEdges(input: Ring, edges: []const u32, point: PointLL, deadline: Deadline) error{DeadlineExceeded}!Location {
+    const ring = vertices(input);
+    if (ring.len < 3 or !finite(point)) return .outside;
+    var inside = false;
+    for (edges, 0..) |edge, i| {
+        try checkAt(deadline, i);
+        const previous = if (edge == 0) ring.len - 1 else edge - 1;
+        switch (rayCrossing(ring[previous], ring[edge], point)) {
+            .boundary => return .boundary,
+            .inside => inside = !inside,
+            .outside => {},
+        }
+    }
+    return if (inside) .inside else .outside;
+}
+
+inline fn rayCrossing(a: PointLL, b: PointLL, point: PointLL) Location {
+    if (a.eql(b) or !(point.lat >= @min(a.lat, b.lat) and point.lat <= @max(a.lat, b.lat))) return .outside;
+    const side = orient(a, b, point);
+    if (side == 0 and segmentBounds(a, b).covers(point)) return .boundary;
+    // Half-open ray crossings avoid counting a shared vertex twice.
+    if ((a.lat > point.lat) != (b.lat > point.lat) and (side > 0) == (b.lat > a.lat)) return .inside;
+    return .outside;
 }
 
 pub fn segmentsIntersect(a: PointLL, b: PointLL, c: PointLL, d: PointLL) bool {

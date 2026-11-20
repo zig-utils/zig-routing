@@ -8,6 +8,10 @@ const model = @import("model.zig");
 const bundle = @import("bundle.zig");
 const admin = @import("admin.zig");
 const tags = @import("tags.zig");
+const interpolation = @import("interpolation.zig");
+const postcode_index = @import("postcode_index.zig");
+const address_index = @import("address_index.zig");
+const house = @import("house_number.zig");
 const Allocator = std.mem.Allocator;
 const eql = std.mem.eql;
 
@@ -23,6 +27,9 @@ pub const Report = struct {
     located: Counts = .{},
     streets: usize = 0,
     admins: usize = 0,
+    house_links: usize = 0,
+    interpolations: usize = 0,
+    postcodes: usize = 0,
     country: usize = 0,
     city: usize = 0,
     country_and_city: usize = 0,
@@ -62,9 +69,22 @@ pub fn build(a: Allocator, input: []const u8, output: []const u8, options: Optio
     defer extractor.deinit();
     var index = try admin.Index.build(a, owned.allocator(), &extractor.pool, source, deadline);
     defer index.deinit();
+    var postcodes: postcode_index.Builder = .{ .a = a, .pool = &extractor.pool, .admins = &index, .deadline = deadline };
+    defer postcodes.deinit();
     extractor.admins = &index;
+    extractor.postcodes = &postcodes;
     try extractor.run(.{ .files = source.files[0..1], .decode = source.decode });
-    const data = extractor.data();
+    var addresses: address_index.Builder = .{ .a = a, .pool = &extractor.pool, .streets = extractor.streets.items, .deadline = deadline };
+    defer addresses.deinit();
+    try extractor.buildAddressIndex(&addresses);
+    var address_data = try addresses.finish(owned.allocator());
+    address_data.country_codes = index.country_codes;
+    address_data.postcodes = try postcodes.records(owned.allocator());
+    extractor.report.house_links = address_data.house_links.len;
+    extractor.report.interpolations = address_data.interpolations.len;
+    extractor.report.postcodes = address_data.postcodes.len;
+    var data = extractor.data();
+    data.address_data = address_data;
     const coverage = try data.coverage(deadline);
     extractor.report.country = coverage.country;
     extractor.report.city = coverage.city;
@@ -75,7 +95,7 @@ pub fn build(a: Allocator, input: []const u8, output: []const u8, options: Optio
 
 fn identity(files: []const pbf.file.File, deadline: io.Deadline) !model.DatasetUuid {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update(if (files.len == 1) "zr-geocode-v1" else "zr-geocode-admin-v1");
+    hash.update(if (files.len == 1) "zr-geocode-v2" else "zr-geocode-admin-v2");
     for (files) |*file| {
         const bytes = file.mapping.bytes;
         if (files.len > 1) {
@@ -115,6 +135,15 @@ const WayGeometry = struct {
     anchor: ?model.Coordinate = null,
 };
 
+const InterpolationWay = struct {
+    osm_id: i64,
+    mode: interpolation.Mode,
+    street: model.Span,
+    postcode: model.Span,
+};
+
+const PostalWay = struct { osm_id: i64, code: model.Span };
+
 const RelationMember = struct {
     id: i64,
     role: enum { label, node, outer, inner, way, relation },
@@ -151,6 +180,7 @@ const Extractor = struct {
     deadline: io.Deadline,
     pool: tags.Pool,
     admins: *admin.Index = undefined,
+    postcodes: *postcode_index.Builder = undefined,
     scratch: pbf.block.Scratch = .{},
     ways: std.AutoHashMapUnmanaged(i64, WayGeometry) = .empty,
     nodes: std.AutoHashMapUnmanaged(i64, ?model.Coordinate) = .empty,
@@ -158,6 +188,8 @@ const Extractor = struct {
     relation_ids: std.AutoHashMapUnmanaged(i64, usize) = .empty,
     relation_features: std.ArrayList(Feature) = .empty,
     way_features: std.ArrayList(Feature) = .empty,
+    interpolation_ways: std.ArrayList(InterpolationWay) = .empty,
+    postal_ways: std.ArrayList(PostalWay) = .empty,
     points: std.ArrayList(geo.PointLL) = .empty,
     fragments: std.ArrayList(polygon.Fragment) = .empty,
     street_pieces: std.ArrayList(StreetPiece) = .empty,
@@ -178,6 +210,8 @@ const Extractor = struct {
         self.relation_ids.deinit(self.a);
         self.relation_features.deinit(self.a);
         self.way_features.deinit(self.a);
+        self.interpolation_ways.deinit(self.a);
+        self.postal_ways.deinit(self.a);
         self.points.deinit(self.a);
         self.fragments.deinit(self.a);
         self.street_pieces.deinit(self.a);
@@ -220,6 +254,13 @@ const Extractor = struct {
             try self.emit(feature, anchor);
         }
         try self.resolveRelations();
+        for (self.postal_ways.items) |boundary| {
+            if (self.deadline.expired()) return error.DeadlineExceeded;
+            const refs = self.ways.get(boundary.osm_id).?.refs;
+            if (refs.len < 4 or refs[0] != refs[refs.len - 1] or !try self.readPoints(refs)) continue;
+            try self.postcodes.area(try self.pool.stableText(boundary.code), .{ .outer = self.points.items });
+        }
+        try self.postcodes.relations(source);
         try self.mergeStreets();
         self.report.streets = self.streets.items.len;
         self.report.admins = self.admins.records.len;
@@ -294,7 +335,9 @@ const Extractor = struct {
         while (try entries.next()) |entry| {
             const labels = try tags.Labels.read(entry.tags);
             const feature = try self.parseFeature(entry.id, .way, labels, entry.tags);
-            if (feature == null and !self.ways.contains(entry.id)) continue;
+            const mode = interpolation.Mode.fromTag(labels.interpolation);
+            const postal = labels.postalBoundary();
+            if (feature == null and mode == null and postal.len == 0 and !self.ways.contains(entry.id)) continue;
             var out: std.ArrayList(i64) = .empty;
             var refs = entry.refs;
             while (try refs.next()) |id| {
@@ -303,6 +346,13 @@ const Extractor = struct {
             }
             try self.ways.put(self.a, entry.id, .{ .refs = out.items });
             if (feature) |present| try self.way_features.append(self.a, present);
+            if (mode) |scheme| try self.interpolation_ways.append(self.a, .{
+                .osm_id = entry.id,
+                .mode = scheme,
+                .street = try self.pool.text(labels.street),
+                .postcode = try self.pool.text(labels.postcode),
+            });
+            if (postal.len != 0) try self.postal_ways.append(self.a, .{ .osm_id = entry.id, .code = try self.pool.text(postal) });
         }
     }
 
@@ -317,7 +367,7 @@ const Extractor = struct {
     }
 
     fn parseFeature(self: *Extractor, id: i64, source: model.Source, labels: tags.Labels, input: pbf.block.TagIterator) !?Feature {
-        if (!labels.feature(source)) return null;
+        if (!labels.feature(source) and labels.postcode.len == 0) return null;
         const street = labels.isStreet(source);
         const place = tags.validKind(labels.place);
         const poi = labels.poi;
@@ -350,6 +400,9 @@ const Extractor = struct {
         record.coordinate = coordinate;
         record.hierarchy = try self.admins.lookup(coordinate);
         record.hierarchy.postcode = present.record.hierarchy.postcode;
+        if (record.hierarchy.postcode.len != 0) {
+            try self.postcodes.point(record.hierarchy.country, try self.pool.stableText(record.hierarchy.postcode), coordinate);
+        }
         if (present.place.len != 0) {
             try self.places.append(self.a, .{ .record = record, .kind = present.place, .population = present.population });
         }
@@ -525,6 +578,107 @@ const Extractor = struct {
             }
             try self.streets.append(self.a, .{ .record = record, .kind = first.kind, .ways = ways });
         }
+    }
+
+    fn buildAddressIndex(self: *Extractor, builder: *address_index.Builder) !void {
+        var shape: std.ArrayList(model.Coordinate) = .empty;
+        defer shape.deinit(self.a);
+        for (self.street_ways.items) |way| {
+            if (self.deadline.expired()) return error.DeadlineExceeded;
+            const geometry = self.ways.get(way).?;
+            if (try self.fixedShape(geometry.refs, &shape)) {
+                try builder.appendStreetShape(shape.items);
+            } else {
+                try builder.appendStreetShape(&.{geometry.anchor.?});
+            }
+        }
+        try builder.indexNames();
+
+        var endpoints: std.AutoHashMapUnmanaged(i64, usize) = .empty;
+        defer endpoints.deinit(self.a);
+        for (self.addresses.items, 0..) |address, i| {
+            if (self.deadline.expired()) return error.DeadlineExceeded;
+            try builder.addAddress(i, address);
+            if (self.interpolation_ways.items.len != 0 and address.record.attr.source == .node and self.nodes.contains(address.record.osm_id))
+                try endpoints.put(self.a, address.record.osm_id, i);
+        }
+        for (self.interpolation_ways.items) |way| {
+            if (self.deadline.expired()) return error.DeadlineExceeded;
+            const refs = self.ways.get(way.osm_id).?.refs;
+            if (refs.len < 2 or !try self.fixedShape(refs, &shape)) continue;
+            const first = try self.endpoint(endpoints.get(refs[0]), way.mode) orelse continue;
+            const last = try self.endpoint(endpoints.get(refs[refs.len - 1]), way.mode) orelse continue;
+            const overall = interpolation.Range.init(way.mode, first.label, last.label) orelse continue;
+            var previous = first;
+            var offset: usize = 0;
+            var position: f64 = 0;
+            for (refs[1..], 1..) |id, i| {
+                if (self.deadline.expired()) return error.DeadlineExceeded;
+                const is_last = i == refs.len - 1;
+                const next = if (is_last) last else try self.endpoint(endpoints.get(id), way.mode) orelse continue;
+                const fraction = if (is_last) 1 else overall.fraction(next.label) orelse continue;
+                if (fraction <= position) continue;
+                try self.addInterpolation(builder, way, previous, next, shape.items[offset .. i + 1]);
+                previous = next;
+                offset = i;
+                position = fraction;
+            }
+        }
+    }
+
+    fn fixedShape(self: *Extractor, refs: []const i64, out: *std.ArrayList(model.Coordinate)) !bool {
+        out.clearRetainingCapacity();
+        if (refs.len == 0) return false;
+        for (refs, 0..) |ref, i| {
+            if (i % 256 == 0 and self.deadline.expired()) return error.DeadlineExceeded;
+            const coordinate = self.nodes.get(ref).? orelse return false;
+            try out.append(self.a, coordinate);
+        }
+        return true;
+    }
+
+    const Endpoint = struct { address: model.Address, label: house.Label };
+
+    fn endpoint(self: *Extractor, index: ?usize, mode: interpolation.Mode) !?Endpoint {
+        const address = self.addresses.items[index orelse return null];
+        const number = try self.pool.stableText(address.number);
+        const unit = try self.pool.stableText(address.unit);
+        const label = house.parse(number, unit) catch return null;
+        if (mode.endpointRank(label) == null) return null;
+        return .{ .address = address, .label = label };
+    }
+
+    fn addInterpolation(
+        self: *Extractor,
+        builder: *address_index.Builder,
+        way: InterpolationWay,
+        first: Endpoint,
+        last: Endpoint,
+        shape: []const model.Coordinate,
+    ) !void {
+        const range = interpolation.Range.init(way.mode, first.label, last.label) orelse return;
+        const anchor = try interpolation.pointAt(shape, 0.5, self.deadline) orelse return;
+        var hierarchy = try self.admins.lookup(anchor);
+        hierarchy.postcode = way.postcode;
+        if (hierarchy.postcode.len == 0 and std.meta.eql(first.address.record.hierarchy.postcode, last.address.record.hierarchy.postcode))
+            hierarchy.postcode = first.address.record.hierarchy.postcode;
+        const start_name = try self.pool.stableText(first.address.street);
+        const end_name = try self.pool.stableText(last.address.street);
+        const street = if (way.street.len != 0)
+            try self.pool.stableText(way.street)
+        else if (start_name.len == 0 or end_name.len == 0 or std.ascii.eqlIgnoreCase(start_name, end_name))
+            if (start_name.len == 0) end_name else start_name
+        else
+            "";
+        try builder.addInterpolation(.{
+            .osm_id = way.osm_id,
+            .first = range.first,
+            .last = range.last,
+            .alphabetic_base = range.alphabetic_base,
+            .attr = .{ .mode = range.mode },
+            .shape = .{},
+            .hierarchy = hierarchy,
+        }, shape, street, anchor, first.label.first, last.label.first);
     }
 };
 

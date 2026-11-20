@@ -28,21 +28,89 @@ const Node = struct {
     leaf: bool,
 };
 
+const LatitudeBands = struct {
+    const max_bands = 256;
+    const Span = struct { first: usize, len: usize };
+
+    south: f64,
+    scale: f64,
+    bands: []Span,
+    edges: []u32,
+
+    fn init(a: Allocator, input: polygon.Ring, box: AABB, deadline: Deadline) !?LatitudeBands {
+        const ring = if (input.len > 1 and input[0].eql(input[input.len - 1])) input[0 .. input.len - 1] else input;
+        if (ring.len < 256 or ring.len > std.math.maxInt(u32) or box.height() <= 0) return null;
+        const count = @min(max_bands, ring.len / 64);
+        const scale = @as(f64, @floatFromInt(count)) / box.height();
+        if (scale <= 0 or !std.math.isFinite(scale)) return null;
+        var lengths: [max_bands]usize = @splat(0);
+        var total: usize = 0;
+        var prev = ring[ring.len - 1];
+        for (ring, 0..) |next, i| {
+            if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+            const low = bandAt(@min(prev.lat, next.lat), box.miny, scale, count);
+            const high = bandAt(@max(prev.lat, next.lat), box.miny, scale, count);
+            prev = next;
+            total += high - low + 1;
+            if (total > ring.len * 4) return null;
+            for (lengths[low .. high + 1]) |*len| len.* += 1;
+        }
+
+        const bands = try a.alloc(Span, count);
+        const edges = try a.alloc(u32, total);
+        var offset: usize = 0;
+        for (bands, lengths[0..count]) |*span, len| {
+            span.* = .{ .first = offset, .len = 0 };
+            offset += len;
+        }
+        prev = ring[ring.len - 1];
+        for (ring, 0..) |next, i| {
+            if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+            const low = bandAt(@min(prev.lat, next.lat), box.miny, scale, count);
+            const high = bandAt(@max(prev.lat, next.lat), box.miny, scale, count);
+            prev = next;
+            for (bands[low .. high + 1]) |*span| {
+                edges[span.first + span.len] = @intCast(i);
+                span.len += 1;
+            }
+        }
+        return .{ .south = box.miny, .scale = scale, .bands = bands, .edges = edges };
+    }
+
+    fn candidates(self: LatitudeBands, latitude: f64) []const u32 {
+        const span = self.bands[bandAt(latitude, self.south, self.scale, self.bands.len)];
+        return self.edges[span.first..][0..span.len];
+    }
+
+    fn bandAt(latitude: f64, south: f64, scale: f64, count: usize) usize {
+        const last: f64 = @floatFromInt(count - 1);
+        return @intFromFloat(std.math.clamp((latitude - south) * scale, 0, last));
+    }
+};
+
 pub const Index = struct {
     polygons: []const polygon.Polygon,
     entries: []const Entry,
     nodes: []const Node,
+    shells: []const ?LatitudeBands,
+    bands_storage: std.heap.ArenaAllocator,
     allocator: Allocator,
 
     /// Polygon coordinates and hole slices are borrowed and must stay immutable
     /// while the index exists. Empty shells do not get entries.
     pub fn init(gpa: Allocator, polygons: []const polygon.Polygon, deadline: Deadline) !Index {
         if (polygons.len > std.math.maxInt(u32)) return error.TooManyPolygons;
+        var bands_storage = std.heap.ArenaAllocator.init(gpa);
+        errdefer bands_storage.deinit();
+        const bands_allocator = bands_storage.allocator();
+        const shells = try bands_allocator.alloc(?LatitudeBands, polygons.len);
+        @memset(shells, null);
         var entries: std.ArrayList(Entry) = .empty;
         defer entries.deinit(gpa);
         for (polygons, 0..) |poly, i| {
             if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
             const box = try polygon.ringBounds(poly.outer, deadline) orelse continue;
+            shells[i] = try LatitudeBands.init(bands_allocator, poly.outer, box, deadline);
             try entries.append(gpa, .{ .bounds = box, .key = grid.hilbertOfPoint(16, box.center()), .id = @intCast(i) });
         }
         if (deadline.expired()) return error.DeadlineExceeded;
@@ -75,6 +143,8 @@ pub const Index = struct {
             .polygons = polygons,
             .entries = owned_entries,
             .nodes = try nodes.toOwnedSlice(gpa),
+            .shells = shells,
+            .bands_storage = bands_storage,
             .allocator = gpa,
         };
     }
@@ -82,6 +152,7 @@ pub const Index = struct {
     pub fn deinit(self: *Index) void {
         self.allocator.free(self.entries);
         self.allocator.free(self.nodes);
+        self.bands_storage.deinit();
         self.* = undefined;
     }
 
@@ -111,15 +182,55 @@ pub const Index = struct {
                 continue;
             }
             for (self.entries[node.first..][0..node.len]) |entry| {
-                if (entry.bounds.covers(point) and try self.polygons[entry.id].locate(point, deadline) != .outside)
+                if (entry.bounds.covers(point) and try self.locate(entry.id, point, deadline) != .outside)
                     try out.append(gpa, entry.id);
             }
         }
+    }
+
+    fn locate(self: Index, id: u32, point: PointLL, deadline: Deadline) !polygon.Location {
+        const shape = self.polygons[id];
+        if (self.shells[id]) |shell| {
+            const location = try polygon.locateInRingEdges(shape.outer, shell.candidates(point.lat), point, deadline);
+            return shape.locateWithShell(point, location, deadline);
+        }
+        return shape.locate(point, deadline);
     }
 };
 
 const testing = std.testing;
 const p = PointLL.init;
+
+test "latitude bands preserve exact shell, hole and boundary results" {
+    var shell: [1025]PointLL = undefined;
+    for (shell[0..1024], 0..) |*vertex, i| {
+        const angle = 2 * std.math.pi * @as(f64, @floatFromInt(i)) / 1024.0;
+        const wave = 1 + 0.12 * @cos(angle * 13);
+        vertex.* = p(wave * @cos(angle) * 2, wave * @sin(angle));
+    }
+    shell[1024] = shell[0];
+    const hole = [_]PointLL{ p(-0.4, -0.3), p(0.4, -0.3), p(0.4, 0.3), p(-0.4, 0.3) };
+    const shapes = [_]polygon.Polygon{.{ .outer = &shell, .holes = &.{&hole} }};
+    const a = testing.allocator;
+    var index = try Index.init(a, &shapes, .none);
+    defer index.deinit();
+    try testing.expect(index.shells[0] != null);
+    for (shell) |vertex|
+        try testing.expectEqual(.boundary, try index.locate(0, vertex, .none));
+    for (hole) |vertex|
+        try testing.expectEqual(.boundary, try index.locate(0, vertex, .none));
+    var state = std.Random.DefaultPrng.init(219);
+    const random = state.random();
+    var hits: std.ArrayList(u32) = .empty;
+    defer hits.deinit(a);
+    for (0..2000) |_| {
+        const location = p(random.float(f64) * 5 - 2.5, random.float(f64) * 3 - 1.5);
+        hits.clearRetainingCapacity();
+        try index.lookup(a, location, &hits, .none);
+        const expected = try shapes[0].locate(location, .none);
+        try testing.expectEqual(expected != .outside, hits.items.len == 1);
+    }
+}
 
 test "packed polygon lookup matches brute force including boundaries and holes" {
     const gpa = testing.allocator;

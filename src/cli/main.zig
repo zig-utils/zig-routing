@@ -173,6 +173,13 @@ fn createCommands(a: Allocator) !*Command {
     _ = try command(geocode_cmd, "inspect", "Verify and count geocoding bundle records", inspectGeocode, &.{}, &.{
         arg("BUNDLE", "Geocoding bundle directory"),
     });
+    _ = try command(geocode_cmd, "postcode", "Look up postcode centroids and extents", lookupGeocodePostcodes, &.{
+        option("timeout", "Time limit for bundle verification and lookup", .string),
+    }, &.{
+        arg("BUNDLE", "Geocoding bundle directory"),
+        arg("COUNTRY", "ISO 3166-1 alpha-2 country code"),
+        arg("CODE", "Postcode to look up").withVariadic(true),
+    });
     _ = try command(root, "bundle-manifest", "Write range hashes for a graph bundle", bundleManifest, &.{
         option("output", "Range manifest output file", .string).withRequired(true),
     }, &.{arg("BUNDLE", "Graph bundle directory")});
@@ -681,7 +688,68 @@ fn inspectGeocode(ctx: *Context) !u8 {
         .addresses = data.addresses.len,
         .pois = data.pois.len,
         .admins = data.admins.len,
+        .house_links = if (data.address_data) |addresses| addresses.house_links.len else 0,
+        .interpolations = if (data.address_data) |addresses| addresses.interpolations.len else 0,
+        .postcodes = if (data.address_data) |addresses| addresses.postcodes.len else 0,
         .coverage = try data.coverage(.none),
+        .attribution = geocode.model.attribution,
+        .attribution_url = geocode.model.attribution_url,
+        .license = geocode.model.license,
+    });
+    return 0;
+}
+
+fn lookupGeocodePostcodes(ctx: *Context) !u8 {
+    const geocode = routing.geocode;
+    const iso = ctx.getArgument(1).?;
+    if (iso.len != 2 or !std.ascii.isAlphabetic(iso[0]) or !std.ascii.isAlphabetic(iso[1]))
+        return badOption(ctx, "COUNTRY expects a two-letter country code");
+    const deadline: io.Deadline = if (try duration(ctx, "timeout")) |ns| .fromNow(ns) else .none;
+    var opened = try geocode.bundle.Bundle.open(ctx.getArgument(0).?, deadline);
+    defer opened.close();
+    const data = opened.data;
+    const addresses = data.address_data orelse return error.MissingGeocodeAddressIndex;
+    const a = std.heap.c_allocator;
+    var country_ids: std.ArrayList(geocode.model.AdminId) = .empty;
+    defer country_ids.deinit(a);
+    for (addresses.country_codes, 0..) |span, i| {
+        if (deadline.expired()) return error.DeadlineExceeded;
+        if (std.ascii.eqlIgnoreCase(iso, try span.get(data.text))) {
+            try country_ids.append(a, @fromBackingInt(@intCast(std.math.cast(u32, i + 1) orelse return error.GeocodeSectionTooLarge)));
+        }
+    }
+    const Result = struct {
+        query: []const u8,
+        record: ?struct {
+            postcode: []const u8,
+            center: routing.geo.PointLL,
+            min: routing.geo.PointLL,
+            max: routing.geo.PointLL,
+            address_count: u32,
+            from_boundary: bool,
+        } = null,
+    };
+    const results = try a.alloc(Result, ctx.getArgumentCount() - 2);
+    defer a.free(results);
+    for (results, 2..) |*result, i| {
+        if (deadline.expired()) return error.DeadlineExceeded;
+        result.* = .{ .query = ctx.getArgument(i).? };
+        for (country_ids.items) |country| {
+            const match = try data.lookupPostcode(country, result.query) orelse continue;
+            result.record = .{
+                .postcode = try match.code.get(data.text),
+                .center = match.center.toPoint(),
+                .min = match.min.toPoint(),
+                .max = match.max.toPoint(),
+                .address_count = match.address_count,
+                .from_boundary = match.attr.from_boundary,
+            };
+            break;
+        }
+    }
+    try ctx.writeJson(.{
+        .country = iso,
+        .results = results,
         .attribution = geocode.model.attribution,
         .attribution_url = geocode.model.attribution_url,
         .license = geocode.model.license,

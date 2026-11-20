@@ -16,6 +16,9 @@ const keys = std.StaticStringMap(enum {
     locality,
     unit,
     postcode,
+    boundary,
+    postal_code,
+    interpolation,
     population,
     capital,
     wikidata,
@@ -30,6 +33,9 @@ const keys = std.StaticStringMap(enum {
     .{ "addr:place", .locality },
     .{ "addr:unit", .unit },
     .{ "addr:postcode", .postcode },
+    .{ "boundary", .boundary },
+    .{ "postal_code", .postal_code },
+    .{ "addr:interpolation", .interpolation },
     .{ "population", .population },
     .{ "capital", .capital },
     .{ "wikidata", .wikidata },
@@ -52,6 +58,9 @@ pub const Labels = struct {
     locality: []const u8 = "",
     unit: []const u8 = "",
     postcode: []const u8 = "",
+    boundary: []const u8 = "",
+    postal_code: []const u8 = "",
+    interpolation: []const u8 = "",
     population: u32 = 0,
     capital: bool = false,
     wikidata: bool = false,
@@ -100,6 +109,10 @@ pub const Labels = struct {
 
     pub fn isAddress(self: Labels) bool {
         return self.number.len != 0 or self.house_name.len != 0;
+    }
+
+    pub fn postalBoundary(self: Labels) []const u8 {
+        return if (eql(u8, self.boundary, "postal_code")) self.postal_code else "";
     }
 
     pub fn importance(self: Labels) u16 {
@@ -160,6 +173,14 @@ pub const Pool = struct {
         try self.bytes.appendSlice(self.a, stable);
         try self.texts.put(self.a, stable, span);
         return span;
+    }
+
+    /// Retain a text reference across future insertions, which may move the
+    /// contiguous output buffer.
+    pub fn stableText(self: *const Pool, span: model.Span) ![]const u8 {
+        const value = try span.get(@as([]const u8, self.bytes.items));
+        if (value.len == 0) return "";
+        return self.texts.getKey(value) orelse error.InvalidGeocodeTextReference;
     }
 
     pub fn labels(self: *Pool, tags: pbf.TagIterator) !model.Span {
