@@ -55,8 +55,8 @@ pub const LocationType = enum { @"break", through, via, break_through };
 pub const PreferredSide = enum { either, same, opposite };
 pub const RoadClass = enum { motorway, trunk, primary, secondary, tertiary, unclassified, residential, service_other };
 
-/// The locales odin ships (locales/*.json). Unknown languages fall back to en-US.
-pub const locales = [_][]const u8{ "ar-SA", "bg-BG", "ca-ES", "cs-CZ", "da-DK", "de-DE", "el-GR", "en-AU", "en-GB", "en-US-x-pirate", "en-US", "es-ES", "et-EE", "fi-FI", "fr-FR", "he-IL", "hi-IN", "hu-HU", "it-IT", "ja-JP", "ko-KR", "mn-MN", "nb-NO", "nl-NL", "pl-PL", "pt-BR", "pt-PT", "ro-RO", "ru-RU", "sk-SK", "sl-SI", "sv-SE", "tr-TR", "uk-UA", "vi-VN", "zh-CN" };
+const dictionary = @import("../narrative/dictionary.zig");
+pub const locales = dictionary.canonical_tags;
 
 /// baldr::kMaxLevel.
 pub const max_level: f32 = std.math.floatMax(f32);
@@ -603,10 +603,7 @@ fn fromJsonWithin(arena: Allocator, doc: json.Value, action: Action, deadline: D
     }
     o.reverse = json.get(bool, root, "/reverse", false);
     if (json.getOptional([]const u8, root, "/language")) |lang| {
-        for (locales) |l| if (std.mem.eql(u8, l, lang)) {
-            o.language = l;
-            break;
-        };
+        if (dictionary.isSupported(lang)) o.language = lang;
     }
     if (json.getOptional(bool, root, "/narrative")) |n| if (!n) {
         o.directions_type = .none;
@@ -990,6 +987,16 @@ test "route request: wildloop-style pedestrian with costing options" {
     try testing.expectEqual(LocationType.through, o.locations[1].type);
     try testing.expectEqual(LocationType.@"break", o.locations[2].type);
     try testing.expectEqual(@as(f64, 0.6), json.getOptional(f64, o.costing_options.?, "/pedestrian/walkway_factor").?);
+}
+
+test "language parsing preserves a supported alias and defaults unknown spellings" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const alias = (try parseText(a, .route, "{\"language\":\"en-x-pirate\"}")).ok;
+    try testing.expectEqualStrings("en-x-pirate", alias.language);
+    const fallback = (try parseText(a, .route, "{\"language\":\"EN-us\"}")).ok;
+    try testing.expectEqualStrings("en-US", fallback.language);
 }
 
 test "defaults, unknown language and unsupported format" {

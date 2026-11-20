@@ -867,9 +867,16 @@ test "worker serves warmed keep-alive requests with zero backing allocations" {
         requests: usize = 0,
         warm_calls: usize = 0,
         stable: bool = true,
+        locale_lookup_alloc_free: bool = false,
 
         fn handle(context: *anyopaque, ctx: *Ctx, req: *const Request, res: *Response) void {
             const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.requests == 0) {
+                const before_lookup = self.counter.calls();
+                const locale = @import("../narrative/dictionary.zig").forLanguage(req.body);
+                self.locale_lookup_alloc_free = self.counter.calls() == before_lookup and
+                    std.mem.eql(u8, locale.language_tag, "pt-PT");
+            }
             if (self.requests == 1) self.warm_calls = self.counter.calls();
             if (self.requests > 1) self.stable = self.stable and self.warm_calls == self.counter.calls();
             self.requests += 1;
@@ -886,13 +893,14 @@ test "worker serves warmed keep-alive requests with zero backing allocations" {
         defer stream.close();
         var buf: [512]u8 = undefined;
         for (0..20) |_| {
-            try stream.writeAll("POST /echo?keep=1 HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}");
-            try testing.expect(std.mem.endsWith(u8, try readResponse(stream, &buf), "POST /echo q=1 keep=1 body={}"));
+            try stream.writeAll("POST /echo?keep=1 HTTP/1.1\r\nContent-Length: 2\r\n\r\npt");
+            try testing.expect(std.mem.endsWith(u8, try readResponse(stream, &buf), "POST /echo q=1 keep=1 body=pt"));
         }
     }
     // Check the worker's snapshots only after joining its thread.
     try testing.expectEqual(20, check.requests);
     try testing.expect(check.stable);
+    try testing.expect(check.locale_lookup_alloc_free);
 }
 
 fn rep(comptime ch: u8, comptime n: usize) *const [n]u8 {

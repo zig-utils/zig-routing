@@ -16,6 +16,24 @@ pub fn build(b: *std.Build) void {
     const lz4 = b.addModule("lz4", .{ .root_source_file = b.path("packages/lz4/lz4.zig"), .target = target, .optimize = optimize });
     const protobuf = b.addModule("protobuf", .{ .root_source_file = b.path("packages/protobuf/root.zig"), .target = target, .optimize = optimize });
 
+    const dictionary_types = b.createModule(.{ .root_source_file = b.path("src/narrative/dictionary_types.zig") });
+    const locale_compiler = b.addExecutable(.{
+        .name = "compile-locales",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/locale_compile.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseFast,
+            .link_libc = true,
+        }),
+    });
+    const compile_locales = b.addRunArtifact(locale_compiler);
+    compile_locales.addDirectoryArg(b.path("locales"));
+    const locale_data = b.createModule(.{
+        .root_source_file = compile_locales.addOutputFileArg("locale_data.zig"),
+        .imports = &.{.{ .name = "dictionary_types", .module = dictionary_types }},
+    });
+    const locale_catalog = b.createModule(.{ .root_source_file = compile_locales.addOutputFileArg("locale_catalog.zig") });
+
     // The library: every routing module hangs off src/root.zig.
     const lib_mod = b.addModule("routing", .{
         .root_source_file = b.path("src/root.zig"),
@@ -30,6 +48,9 @@ pub fn build(b: *std.Build) void {
             .{ .name = "lz4", .module = lz4 },
             .{ .name = "protobuf", .module = protobuf },
             .{ .name = "perf_counters", .module = perf_counters },
+            .{ .name = "dictionary_types", .module = dictionary_types },
+            .{ .name = "locale_data", .module = locale_data },
+            .{ .name = "locale_catalog", .module = locale_catalog },
         },
     });
 
@@ -373,6 +394,9 @@ pub fn build(b: *std.Build) void {
             .{ .name = "xml", .module = b.dependency("xml", .{ .target = target, .optimize = fuzz_opt }).module("xml") },
             .{ .name = "lz4", .module = fuzz_lz4 },
             .{ .name = "protobuf", .module = fuzz_protobuf },
+            .{ .name = "dictionary_types", .module = dictionary_types },
+            .{ .name = "locale_data", .module = locale_data },
+            .{ .name = "locale_catalog", .module = locale_catalog },
             .{ .name = "perf_counters", .module = perf_counters },
         },
     });

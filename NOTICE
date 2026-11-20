@@ -10,8 +10,8 @@ Licensed under the MIT License.
 
 Routing behaviour, costing models, narrative rules and locale strings are ported from
 Valhalla. Files that port a specific upstream file say so in a header comment
-("Ported from <upstream path>"). Locale files under locales/ are carried from Valhalla
-under its license.
+("Ported from <upstream path>"). The 36 locale JSON files are copied unchanged
+from Valhalla 3.9.3. The upstream MIT license is in locales/COPYING.
 
 Data built with this software from OpenStreetMap is (c) OpenStreetMap contributors and
 available under the Open Database License (ODbL). Timezone boundaries from

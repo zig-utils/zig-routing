@@ -3,6 +3,7 @@
 const std = @import("std");
 
 pub const enhanced = @import("enhanced.zig");
+pub const dictionary = @import("dictionary.zig");
 pub const maneuver = @import("maneuver.zig");
 pub const maneuvers = @import("maneuvers.zig");
 

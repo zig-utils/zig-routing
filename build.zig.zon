@@ -33,6 +33,7 @@
         "build.zig.zon",
         "src",
         "packages",
+        "locales",
         "LICENSE",
         "NOTICE",
         "README.md",
