@@ -20,6 +20,7 @@ pub fn main(init: std.process.Init) !void {
     var narrative: Narrative = .none;
     var on_foot = false;
     var multimodal = false;
+    var deadline_ms: ?u32 = null;
     while (args.next()) |option| {
         if (std.mem.eql(u8, option, "--maneuvers") and narrative == .none) {
             narrative = .maneuvers;
@@ -31,19 +32,26 @@ pub fn main(init: std.process.Init) !void {
             on_foot = true;
         } else if (std.mem.eql(u8, option, "--multimodal") and !multimodal) {
             multimodal = true;
+        } else if (std.mem.eql(u8, option, "--deadline-ms") and deadline_ms == null) {
+            deadline_ms = try std.fmt.parseInt(u32, args.next() orelse return error.InvalidOption, 10);
         } else return error.InvalidOption;
     }
     if (multimodal) {
         if (on_foot or narrative != .none) return error.InvalidOption;
-        return runScheduled(init, bundle_path, corpus_path, count);
+        return runScheduled(init, bundle_path, corpus_path, count, deadline_ms);
     }
+    if (deadline_ms != null) return error.InvalidOption;
     if (on_foot) return run(.pedestrian, init, bundle_path, corpus_path, count, narrative);
     return run(.auto, init, bundle_path, corpus_path, count, narrative);
 }
 
-fn runScheduled(init: std.process.Init, bundle_path: []const u8, corpus_path: []const u8, count: usize) !void {
+fn runScheduled(init: std.process.Init, bundle_path: []const u8, corpus_path: []const u8, count: usize, deadline_ms: ?u32) !void {
     var bundle = try routing.graph.reader.Bundle.open(bundle_path);
     defer bundle.close();
+    if (deadline_ms != null) {
+        const stop: std.atomic.Value(bool) = .init(false);
+        bundle.warm(false, &stop);
+    }
     const corpus = try io.Mapping.mapFile(corpus_path, .read_only);
     defer corpus.unmap();
     var arena = routing.infra.arena.Arena.init(init.gpa, .{});
@@ -60,6 +68,11 @@ fn runScheduled(init: std.process.Init, bundle_path: []const u8, corpus_path: []
         const a = arena.allocator();
         const control: search.search.Control = .{ .deadline = io.Deadline.fromNowMs(10_000) };
         const parsed = try request.parseHttpWithin(a, "/route", &.{}, line[tab + 1 ..], false, control.deadline);
+        if (deadline_ms) |budget| {
+            if (parsed != .ok) return error.InvalidRequest;
+            try measureDeadline(&bundle.view, &arena, &parsed.ok, writer, index, budget);
+            continue;
+        }
         const result = switch (parsed) {
             .ok => |*options| routing.api.route_action.route(&bundle.view, &arena, options, null, control) catch |err| {
                 try std.json.Stringify.value(.{ .index = index, .failure = @errorName(err) }, .{}, writer);
@@ -101,6 +114,24 @@ fn runScheduled(init: std.process.Init, bundle_path: []const u8, corpus_path: []
         try writer.writeByte('\n');
         try writer.flush();
     }
+    try writer.flush();
+}
+
+fn measureDeadline(view: *const routing.graph.reader.View, arena: *routing.infra.arena.Arena, options: *const request.Options, writer: *std.Io.Writer, index: usize, budget: u32) !void {
+    const before = io.monotonicNs();
+    const deadline: io.Deadline = .{ .at_ns = before + @as(u64, budget) * 1_000_000 };
+    const control: search.search.Control = .{ .deadline = deadline };
+    const attempt = routing.api.route_action.route(view, arena, options, null, control);
+    const after = io.monotonicNs();
+    const problem: ?[]const u8 = if (attempt) |result|
+        switch (result) {
+            .scheduled => null,
+            .failure => |failure| try std.fmt.allocPrint(arena.allocator(), "{d}", .{failure.code}),
+        }
+    else |err|
+        @errorName(err);
+    try std.json.Stringify.value(.{ .index = index, .elapsed_ns = after - before, .overrun_ns = after -| deadline.at_ns, .failure = problem }, .{}, writer);
+    try writer.writeByte('\n');
 }
 
 const Narrative = enum { none, maneuvers, instructions, verbal_instructions };

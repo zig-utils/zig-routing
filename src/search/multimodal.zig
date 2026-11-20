@@ -234,7 +234,11 @@ const Journey = struct {
 };
 
 const Label = struct {
-    step: Step,
+    step: struct {
+        movement: union(enum) { walk: endpoints.Segment, ride: u32 },
+        elapsed: Cost,
+        transition: Cost = .{},
+    },
     node: NodeId,
     predecessor: u32 = no_label,
     next_at_edge: u32 = no_label,
@@ -326,18 +330,22 @@ pub const Search = struct {
     timed_walking: walk_time.Distance,
     platforms: walk_time.Distance,
     minimum_ride: []const f32,
+    platform_components: std.AutoHashMapUnmanaged(u32, void),
 
     pub fn init(a: Allocator, view: *const View, kernel: *const Kernel, control: Control) !Search {
         try control.check();
         const table = view.transit_index;
         var platforms: walk_time.Distance = .{};
+        var components: std.AutoHashMapUnmanaged(u32, void) = .empty;
         if (table) |present| {
             var pending: queue.Heap = .{};
             defer pending.items.deinit(a);
             for (present.stops) |stop| {
                 try control.check();
-                if (stop.place.graph_node != Transit.no_id)
-                    try platforms.offer(a, &pending, stop.place.graph_node, 0);
+                const node = stop.place.graph_node;
+                if (node == Transit.no_id) continue;
+                try platforms.offer(a, &pending, node, 0);
+                if (view.components != null) try components.put(a, try view.component(@fromBackingInt(node)), {});
             }
             try platforms.propagate(a, view, &pending, kernel.walking_limit, control);
         }
@@ -349,7 +357,22 @@ pub const Search = struct {
             .timed_walking = try walk_time.Distance.init(a, view, kernel.walking.permission, kernel.walking_limit, control),
             .platforms = platforms,
             .minimum_ride = if (table) |present| try cheapestRides(a, present, kernel, control) else &.{},
+            .platform_components = components,
         };
+    }
+
+    /// A negative result proves that a street component cannot reach transit.
+    pub fn destinationHasPlatform(self: *const Search, destination: endpoints.Ranked, control: Control) !bool {
+        const timetable = &(self.timetable orelse return false);
+        if (timetable.platforms_by_node.count() == 0) return false;
+        if (self.view.components == null) return true;
+        for (destination.all) |candidate| {
+            try control.check();
+            const edge = try self.view.edge(candidate.edge);
+            const component = try self.view.component(@fromBackingInt(edge.head));
+            if (self.platform_components.contains(component)) return true;
+        }
+        return false;
     }
 
     fn cheapestRides(a: Allocator, table: Transit.View, kernel: *const Kernel, control: Control) ![]const f32 {
@@ -456,9 +479,11 @@ const Query = struct {
     ignored_filter: [2]bool,
     excluded: std.AutoHashMapUnmanaged(EdgeId, f32) = .empty,
     walk_hits: paged.Array(u32, 0) = .{},
+    transfer_hits: std.AutoHashMapUnmanaged(u64, u32) = .empty,
     timed_hits: std.AutoHashMapUnmanaged(StreetState, u32) = .empty,
     ride_hits: std.AutoHashMapUnmanaged(RideState, u32) = .empty,
     journeys: std.AutoArrayHashMapUnmanaged(Journey, void) = .empty,
+    rides: std.ArrayList(Ride) = .empty,
     labels: paged.Array(Label, undefined) = .{},
     label_count: u32 = 0,
     pending: queue.Heap = .{},
@@ -504,7 +529,14 @@ const Query = struct {
             try self.control.check();
             count -= 1;
             const label = self.labels.get(id);
-            steps[count] = label.step;
+            steps[count] = .{
+                .movement = switch (label.step.movement) {
+                    .walk => |walk| .{ .walk = walk },
+                    .ride => |index| .{ .ride = self.rides.items[index] },
+                },
+                .elapsed = label.step.elapsed,
+                .transition = label.step.transition,
+            };
             id = label.predecessor;
         }
         return .{ .steps = steps, .total = self.labels.get(end).step.elapsed, .ignored_filter = self.ignored_filter };
@@ -527,7 +559,7 @@ const Query = struct {
         return std.math.cast(u32, entry.index + 1) orelse error.TooManySearchLabels;
     }
 
-    fn offer(self: *Query, offered: Label) !void {
+    fn offer(self: *Query, offered: Label, ride: ?Ride) !void {
         var candidate = offered;
         const cost = candidate.step.elapsed.cost;
         if (cost >= self.terminal_cost) return;
@@ -553,7 +585,16 @@ const Query = struct {
         }
         const timed = candidate.step.movement == .walk and self.needsClock(candidate);
         const slot = switch (candidate.step.movement) {
-            .walk => |walk| if (timed or candidate.journey != 0) blk: {
+            .walk => |walk| if (!timed and candidate.journey == 0)
+                try self.walk_hits.at(self.a, @backingInt(walk.edge))
+            else if (!timed and candidate.can_board and !candidate.forbid_initial_uturn and
+                std.meta.eql(candidate.turn, core.TurnContext{}) and std.meta.eql(candidate.access, costing.base.AccessState{}))
+            blk: {
+                const key = (@as(u64, candidate.journey) << 32) | @backingInt(walk.edge);
+                const entry = try self.transfer_hits.getOrPut(self.a, key);
+                if (!entry.found_existing) entry.value_ptr.* = 0;
+                break :blk entry.value_ptr;
+            } else blk: {
                 const entry = try self.timed_hits.getOrPut(self.a, .{
                     .edge = walk.edge,
                     .journey = candidate.journey,
@@ -565,9 +606,9 @@ const Query = struct {
                 });
                 if (!entry.found_existing) entry.value_ptr.* = 0;
                 break :blk entry.value_ptr;
-            } else try self.walk_hits.at(self.a, @backingInt(walk.edge)),
-            .ride => |ride| blk: {
-                const entry = try self.ride_hits.getOrPut(self.a, .{ .line = ride.departure.line, .journey = candidate.journey });
+            },
+            .ride => |line| blk: {
+                const entry = try self.ride_hits.getOrPut(self.a, .{ .line = line, .journey = candidate.journey });
                 if (!entry.found_existing) entry.value_ptr.* = 0;
                 break :blk entry.value_ptr;
             },
@@ -589,6 +630,10 @@ const Query = struct {
         }
         var label = candidate;
         label.next_at_edge = slot.*;
+        if (ride) |run| {
+            label.step.movement.ride = std.math.cast(u32, self.rides.items.len) orelse return error.TooManySearchLabels;
+            try self.rides.append(self.a, run);
+        }
         const index = self.label_count;
         try self.insert(label, priority);
         slot.* = @intCast(index + 1);
@@ -654,7 +699,7 @@ const Query = struct {
             .walk_distance = length(edge, remaining),
             .forbid_initial_uturn = forbid_initial_uturn and remaining == 0,
         };
-        if (!turn.blocked() and label.walk_distance <= self.search.kernel.walking_limit) try self.offer(label);
+        if (!turn.blocked() and label.walk_distance <= self.search.kernel.walking_limit) try self.offer(label, null);
         var targets = self.targets.on(start.edge);
         while (targets.next()) |target| {
             try self.control.check();
@@ -664,7 +709,7 @@ const Query = struct {
             label.terminal = true;
             label.step.movement.walk.end = target.fraction;
             label.step.elapsed = partial(cost, fraction, start.score + target.score);
-            try self.offer(label);
+            try self.offer(label, null);
         }
     }
 
@@ -729,7 +774,7 @@ const Query = struct {
                     terminal.terminal = true;
                     terminal.step.movement.walk.end = target.fraction;
                     terminal.step.elapsed = elapsed.add(partial(cost, target.fraction, target.score));
-                    try self.offer(terminal);
+                    try self.offer(terminal, null);
                 };
             }
             if (forbidden != null or next.walk_distance > kernel.walking_limit) continue;
@@ -739,7 +784,7 @@ const Query = struct {
             const access = try self.restrictions.access.evaluate(id, edge, label.node, road, .middle);
             if (!access.allowed) continue;
             next.access = access.state;
-            try self.offer(next);
+            try self.offer(next, null);
         }
     }
 
@@ -795,10 +840,10 @@ const Query = struct {
         elapsed.secs = @floatFromInt(arrival - self.restrictions.access.timing.start.unix_time);
         try self.offer(.{
             .node = destination,
-            .step = .{ .movement = .{ .ride = .{ .departure = offered, .ready_time = now, .departure_time = scheduled.instant, .arrival_time = arrival, .service_day = scheduled.service_day } }, .elapsed = elapsed, .transition = transition },
+            .step = .{ .movement = .{ .ride = offered.line }, .elapsed = elapsed, .transition = transition },
             .journey = try self.internJourney(.{ .stop = table.lines[offered.line].destination, .trip = offered.trip, .route = offered.route, .block = offered.block, .operator = operator, .service_day = scheduled.service_day, .occurrence = occurrence, .arrived = arrival }),
             .predecessor = pred,
-        });
+        }, .{ .departure = offered, .ready_time = now, .departure_time = scheduled.instant, .arrival_time = arrival, .service_day = scheduled.service_day });
     }
 };
 

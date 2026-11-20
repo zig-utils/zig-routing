@@ -236,6 +236,38 @@ fn checkScheduledRoute(view: *const graph.reader.View) !void {
         try testing.expectError(error.Cancelled, search.run(&scratch, origin, destination, options, .{ .deadline = .{ .at_ns = 0 } }));
         if (pass != 0) try testing.expectEqual(0, counter.calls());
     }
+
+    scratch.reset();
+    try checkOvertaking(&scratch, view, origin, destination, london);
+}
+
+fn checkOvertaking(arena: *routing.infra.arena.Arena, original: *const graph.reader.View, origin: routing.search.endpoints.Ranked, destination: routing.search.endpoints.Ranked, london: graph.timezone.Id) !void {
+    const a = arena.allocator();
+    var view = original.*;
+    var table = original.transit_index.?;
+    var lines = [1]graph.transit.Line{table.lines[0]};
+    lines[0].departures = .{ .count = 2 };
+    lines[0].occurrences = .{};
+    var departures = [2]graph.transit.Departure{ table.departures[0], table.departures[0] };
+    departures[0].elapsed_time = 20 * 60;
+    departures[1].start_time += 2 * 60;
+    departures[1].elapsed_time = 60;
+    departures[1].trip += 1;
+    table.lines = &lines;
+    table.departures = &departures;
+    table.occurrences = &.{};
+    view.transit_index = table;
+
+    var warnings: std.ArrayList(routing.costing.base.Warning) = .empty;
+    var options = try routing.costing.multimodal.parse(a, .null, &warnings, .none);
+    options.pedestrian.transit_start_end_max_distance = 0;
+    const kernel = try routing.costing.multimodal.Kernel.init(a, &view, options, .none);
+    const search = try routing.search.multimodal.Search.init(a, &view, &kernel, .{});
+    const start = try graph.time_info.TimeInfo.fromLocal(&view.tz_rules.?, "2026-03-09T06:59", london, graph.timezone.utc, 0, .none);
+    try testing.expectEqual(departures[0].trip, (try table.nextDeparture(0, 0)).?.departure.trip);
+    const path = try search.run(arena, origin, destination, .{ .costing = .transit, .timing = .{ .start = start } }, .{});
+    try testing.expectEqual(departures[1].trip, path.steps[1].movement.ride.departure.trip);
+    try testing.expectEqual(240, path.total.secs);
 }
 
 fn checkTripLeg(a: std.mem.Allocator, view: *const graph.reader.View, path: routing.search.multimodal.Path, from: graph.format.EdgeId, to: graph.format.EdgeId, start: graph.time_info.TimeInfo) !void {

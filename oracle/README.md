@@ -218,11 +218,18 @@ It counts oracle and native errors separately. The default threshold is
 access and egress limit, a 150 m transfer limit and equal bus and rail
 preferences.
 
-The initial 100-request default replay returned 94 native routes. It
-matched 24 sequences of lines and stops and 21 sequences including
-boarding time. The streets were built independently from the same PBF,
-so the comparison includes street connectivity and correlation
-differences. [Issue #190](https://github.com/zig-utils/zig-routing/issues/190)
+The default replay returned 97 native routes out of 100. It matched
+25 sequences of lines and stops and 22 sequences including boarding
+time. The streets were built independently from the same PBF, so the
+comparison includes street connectivity and correlation differences.
+Same-graph replay requires the level-3 transit importer.
+[Issue #190](https://github.com/zig-utils/zig-routing/issues/190) ·
+[Issue #249](https://github.com/zig-utils/zig-routing/issues/249)
+
+Run the same requests with `--multimodal --deadline-ms 20` to measure
+cancellation after preloading the graph pages. The output gives elapsed
+time and duration after expiry in nanoseconds. Across 300 requests with
+2 ms, 20 ms and 100 ms budgets, the largest overrun was 0.954 ms.
 
 ### Timed route optimality (gate B)
 

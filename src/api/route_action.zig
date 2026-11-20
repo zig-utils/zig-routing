@@ -58,7 +58,11 @@ fn scheduled(view: *const graph.reader.View, arena: *Arena, options: *const requ
     const profiles = try costing.multimodal.parse(a, options.costing_options orelse .null, &warnings, control.deadline);
     const kernel = try costing.multimodal.Kernel.init(a, view, profiles, control.deadline);
     const defaults: snap.candidates.Defaults = .{};
-    const correlated = switch (try snap.location.correlate(view, a, options.locations, defaults, &kernel.walking, control.deadline)) {
+    const snapped = if (view.transit_index == null)
+        try snap.location.route(view, a, options.locations, defaults, &kernel.walking, control.deadline)
+    else
+        try snap.location.correlate(view, a, options.locations, defaults, &kernel.walking, control.deadline);
+    const correlated = switch (snapped) {
         .ok => |locations| locations,
         .failure => |failure| return .{ .failure = failure },
     };
@@ -77,6 +81,9 @@ fn scheduled(view: *const graph.reader.View, arena: *Arena, options: *const requ
         try control.check();
         var origin = ranked[i];
         const destination = ranked[i + 1];
+        const direct_distance = firstProjection(correlated[i]).distance(firstProjection(correlated[i + 1]));
+        if (direct_distance > 2000 and !try engine.destinationHasPlatform(destination, control))
+            return .{ .failure = .{ .code = 440 } };
         const location = options.locations[i];
         const through = i != 0 and (location.type == .through or location.type == .break_through);
         if (through) {
@@ -107,6 +114,11 @@ fn scheduled(view: *const graph.reader.View, arena: *Arena, options: *const requ
         waypoints[i + 1] = try waypoint(a, rules, clock.start, elapsed, waiting, destination.ignored_filter);
     }
     return .{ .scheduled = .{ .paths = paths, .correlations = correlated, .waypoints = waypoints, .pedestrian_type = profiles.pedestrian.transport } };
+}
+
+fn firstProjection(location: snap.candidates.PathLocation) @import("../geo/point.zig").PointLL {
+    const candidates = if (location.edges.len != 0) location.edges else location.filtered_edges;
+    return candidates[0].projected;
 }
 
 fn carryEdge(a: std.mem.Allocator, ranked: search.endpoints.Ranked, edge: graph.format.EdgeId, control: search.search.Control) !search.endpoints.Ranked {
