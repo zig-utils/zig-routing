@@ -97,11 +97,11 @@ pub const EncodedLevels = struct {
         var values = Decoder.init(rest);
         const precision = (try values.nextDelta()) orelse return error.InvalidLevels;
         // Valhalla 3.9.3 uses a factor of ten for any positive precision.
-        return .{ .values = values, .precision = if (precision > 0) 10 else 1 };
+        return .{ .values = values, .precision = if (precision > 0) 10 else 0 };
     }
 
     pub noinline fn next(self: *EncodedLevels, deadline: io.Deadline) !?LevelRange {
-        const factor: f32 = @floatFromInt(self.precision);
+        const factor: f32 = @floatFromInt(@max(1, self.precision));
         var range: ?LevelRange = null;
         var i: usize = 0;
         while (try self.values.nextDelta()) |value| : (i += 1) {

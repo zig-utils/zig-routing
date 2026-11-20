@@ -550,7 +550,7 @@ fn populateNamesAndLevels(a: std.mem.Allocator, table: graph.cold.View, record: 
     if (include_levels) {
         out.level_precision = 1;
         if (encoded_levels) |*encoded| {
-            out.level_precision = encoded.precision;
+            out.level_precision = @max(1, encoded.precision);
             var levels = try std.ArrayList(model.Level).initCapacity(a, record.indoor.levels.len);
             while (try encoded.next(control.deadline)) |range|
                 try levels.append(a, .{ .start = range.bounds.first, .end = range.bounds.last });

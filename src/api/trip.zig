@@ -174,7 +174,8 @@ pub const Edge = struct {
     lane_connectivity: []const LaneConnectivity = &.{},
     mean_elevation: i32 = 0,
     traffic_segment: []const TrafficSegment = &.{},
-    turn_lanes: []const TurnLane = &.{},
+    // Odin marks the arena-owned lane records as valid or active.
+    turn_lanes: []TurnLane = &.{},
     has_time_restrictions: bool = false,
     default_speed: f32 = 0,
     restriction: ?Restriction = null,

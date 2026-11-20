@@ -25,7 +25,7 @@ fn messageMatches(comptime FieldType: type, comptime field: protobuf.Field) bool
     const child = switch (field.presence) {
         .required => FieldType,
         .optional => if (info == .optional) info.optional.child else return false,
-        .repeated => if (info == .pointer and FieldType == []const info.pointer.child)
+        .repeated => if (info == .pointer and (FieldType == []const info.pointer.child or FieldType == []info.pointer.child))
             info.pointer.child
         else
             return false,

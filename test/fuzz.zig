@@ -139,7 +139,16 @@ fn fuzzGraphBundle(baseline: *const graph.reader.Files, s: *Smith) !void {
         _ = view.edgeSlopes(edge) catch null;
         if (view.shape(edge, gpa)) |shape| gpa.free(shape) else |_| {}
         if (view.namesWithOptions(edge, .{ .include_tagged = true })) |names| {
-            for (0..names.count()) |i| _ = names.at(i) catch null;
+            for (0..names.count()) |i| {
+                const entry = names.at(i) catch continue;
+                if (entry.tagged != .levels) continue;
+                var levels = graph.cold.EncodedLevels.parse(entry.text) catch continue;
+                var count: usize = 0;
+                while (levels.next(.none) catch break) |_| {
+                    count += 1;
+                    try std.testing.expect(count <= entry.text.len);
+                }
+            }
         } else |_| {}
         if (view.oppEdge(@fromBackingInt(@intCast(id)))) |other| {
             try std.testing.expect(@backingInt(other) < view.edges.len);

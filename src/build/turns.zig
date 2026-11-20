@@ -10,30 +10,9 @@ const DriveSide = @import("edge_class.zig").DriveSide;
 const turn_sides = @import("../graph/turn_sides.zig");
 const headings = @import("../graph/headings.zig");
 
-pub const Type = enum(u3) {
-    straight,
-    slight_right,
-    right,
-    sharp_right,
-    reverse,
-    sharp_left,
-    left,
-    slight_left,
-};
-
-pub fn turnType(degrees: u32) Type {
-    return switch (degrees % 360) {
-        0...10, 350...359 => .straight,
-        11...44 => .slight_right,
-        45...135 => .right,
-        136...159 => .sharp_right,
-        160...200 => .reverse,
-        201...224 => .sharp_left,
-        225...315 => .left,
-        316...349 => .slight_left,
-        else => unreachable,
-    };
-}
+const turn = @import("../graph/turn.zig");
+pub const Type = turn.Type;
+pub const turnType = turn.classify;
 
 pub fn encode(kind: Type, stop: u3, consistent: bool) u8 {
     return @as(u8, @backingInt(kind)) | (@as(u8, stop) << 3) | (@as(u8, @intFromBool(consistent)) << 6);
