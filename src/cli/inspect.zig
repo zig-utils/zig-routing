@@ -4,7 +4,57 @@ const io = @import("../infra/io.zig");
 const format = @import("../graph/format.zig");
 const reader = @import("../graph/reader.zig");
 const edge_keys = @import("../graph/edge_keys.zig");
+const mvt = @import("../tiles/mvt_decode.zig");
 const kinds = std.enums.values(format.SectionKind);
+
+pub fn writeTile(a: std.mem.Allocator, input: []const u8, out: *io.Writer, json: bool) !void {
+    const compressed = std.mem.startsWith(u8, input, "\x1f\x8b");
+    const data = if (compressed) try io.inflateGzip(a, input, 256 * 1024 * 1024, .none) else input;
+    defer if (compressed) a.free(data);
+    var tile = try mvt.parse(a, data, .none);
+    defer tile.deinit();
+    const LayerSummary = struct {
+        name: []const u8,
+        version: u32,
+        extent: u32,
+        features: usize,
+        points: usize = 0,
+        lines: usize = 0,
+        polygons: usize = 0,
+        keys: usize,
+        values: usize,
+    };
+    const layers = try a.alloc(LayerSummary, tile.layers.len);
+    defer a.free(layers);
+    for (tile.layers, layers) |layer, *summary| {
+        summary.* = .{
+            .name = layer.name,
+            .version = layer.version,
+            .extent = layer.extent,
+            .features = layer.features.len,
+            .keys = layer.keys.len,
+            .values = layer.values.len,
+        };
+        for (layer.features) |feature| {
+            switch (feature.kind orelse continue) {
+                .point => summary.points += 1,
+                .linestring => summary.lines += 1,
+                .polygon => summary.polygons += 1,
+            }
+        }
+    }
+    if (json) {
+        try std.json.Stringify.value(.{ .format = "mvt", .gzip = compressed, .layers = layers }, .{}, out);
+        try out.writeByte('\n');
+    } else {
+        try out.print("Mapbox vector tile with {d} layers\n", .{layers.len});
+        for (layers) |layer| {
+            try out.print("{s} v{d} extent {d}  {d} points, {d} lines, {d} polygons, {d} keys, {d} values\n", .{
+                layer.name, layer.version, layer.extent, layer.points, layer.lines, layer.polygons, layer.keys, layer.values,
+            });
+        }
+    }
+}
 
 const Key = struct {
     way_id: i64,

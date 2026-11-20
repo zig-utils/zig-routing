@@ -11,6 +11,7 @@ const http = @import("../server/http.zig");
 const request = @import("request.zig");
 const errors = @import("errors.zig");
 const json_writer = @import("json_writer.zig");
+const mvt = @import("../tiles/mvt.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Action = request.Action;
@@ -116,8 +117,46 @@ pub const Service = struct {
             res.extra_headers.clearRetainingCapacity();
             return writeError(a, res, failure, options.format);
         }
+        if (options.action == .tile and res.status == 200 and std.mem.eql(u8, res.content_type, mvt.mime_type)) {
+            try res.addHeader("Vary: Accept-Encoding");
+            if (res.body.items.len != 0 and acceptsGzip(req.header("Accept-Encoding") orelse "")) {
+                const zipped = mvt.gzip(a, res.body.items, ctx.deadline) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.DeadlineExceeded => {
+                        res.body.clearRetainingCapacity();
+                        res.status = 504;
+                        return;
+                    },
+                };
+                res.body.deinit(a);
+                res.body = .fromOwnedSlice(zipped);
+                try res.addHeader("Content-Encoding: gzip");
+            }
+        }
     }
 };
+
+fn acceptsGzip(header: []const u8) bool {
+    var encodings = std.mem.splitScalar(u8, header, ',');
+    var wildcard = false;
+    while (encodings.next()) |encoding| {
+        var parts = std.mem.splitScalar(u8, encoding, ';');
+        const token = std.mem.trim(u8, parts.first(), " \t");
+        const explicit = std.ascii.eqlIgnoreCase(token, "gzip");
+        if (!explicit and !std.mem.eql(u8, token, "*")) continue;
+        var acceptable = true;
+        if (parts.next()) |parameter| {
+            var quality = std.mem.splitScalar(u8, parameter, '=');
+            const key = std.mem.trim(u8, quality.first(), " \t");
+            const value = std.mem.trim(u8, quality.next() orelse "", " \t");
+            const q = std.fmt.parseFloat(f32, value) catch 0;
+            acceptable = std.ascii.eqlIgnoreCase(key, "q") and quality.next() == null and q > 0 and q <= 1;
+        }
+        if (explicit) return acceptable;
+        wildcard = acceptable;
+    }
+    return wildcard;
+}
 
 fn usesGraphCosting(action: Action) bool {
     return switch (action) {

@@ -796,6 +796,50 @@ pub fn inflateZlibExact(src: []const u8, dst: []u8, deadline: Deadline) InflateE
     if (input.seek != src.len or checksum.adler != stream.container_metadata.zlib.adler) return error.CorruptZlib;
 }
 
+pub fn deflateGzip(a: std.mem.Allocator, src: []const u8, deadline: Deadline) (std.mem.Allocator.Error || error{DeadlineExceeded})![]u8 {
+    if (deadline.expired()) return error.DeadlineExceeded;
+    var output: std.Io.Writer.Allocating = try .initCapacity(a, @max(64, src.len / 2));
+    defer output.deinit();
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    const Compress = std.compress.flate.Compress;
+    var stream = Compress.init(&output.writer, &window, .gzip, Compress.Options.fastest) catch return error.OutOfMemory;
+    var offset: usize = 0;
+    while (offset < src.len) {
+        if (deadline.expired()) return error.DeadlineExceeded;
+        const end = @min(offset +| window.len, src.len);
+        stream.writer.writeAll(src[offset..end]) catch return error.OutOfMemory;
+        offset = end;
+    }
+    stream.finish() catch return error.OutOfMemory;
+    if (deadline.expired()) return error.DeadlineExceeded;
+    return output.toOwnedSlice();
+}
+
+pub fn inflateGzip(a: std.mem.Allocator, src: []const u8, limit: usize, deadline: Deadline) ![]u8 {
+    if (src.len < 18) return error.CorruptGzip;
+    const len = std.mem.readInt(u32, src[src.len - 4 ..][0..4], .little);
+    if (len > limit) return error.InflateSizeMismatch;
+    const dst = try a.alloc(u8, len);
+    errdefer a.free(dst);
+    var input: std.Io.Reader = .fixed(src);
+    var output: std.Io.Writer = .fixed(dst);
+    var stream: std.compress.flate.Decompress = .init(&input, .gzip, &.{});
+    var checksum: std.hash.Crc32 = .init();
+    while (true) {
+        if (deadline.expired()) return error.DeadlineExceeded;
+        const begin = output.end;
+        _ = stream.reader.stream(&output, .limited(256 * 1024)) catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.WriteFailed => return error.InflateSizeMismatch,
+            error.ReadFailed => return error.CorruptGzip,
+        };
+        checksum.update(dst[begin..output.end]);
+    }
+    if (output.end != dst.len) return error.InflateSizeMismatch;
+    if (input.seek != src.len or checksum.final() != stream.container_metadata.gzip.crc) return error.CorruptGzip;
+    return dst;
+}
+
 pub fn peakRssBytes() Error!u64 {
     var usage: c.rusage = undefined;
     _ = try checkInt(c.getrusage(c.rusage.SELF, &usage));

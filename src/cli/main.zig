@@ -144,13 +144,14 @@ fn createCommands(a: Allocator) !*Command {
         option("keep", "Worst cases per scorer (default 10)", .int),
         option("label", "Label recorded in the report", .string),
     }, &.{ arg("A", "First server URL or graph bundle"), arg("B", "Second server URL or graph bundle") });
-    _ = try command(root, "inspect", "Inspect a graph bundle", inspectGraph, &.{
+    _ = try command(root, "inspect", "Inspect a graph bundle or vector tile", inspectGraph, &.{
         option("verify", "Verify every section payload checksum", .bool),
+        option("mvt", "Decode a raw or gzip-compressed vector tile", .bool),
         option("edge", "Print a directed edge by ID", .int),
         option("node", "Print a node by ID", .int),
         option("edge-key", "Find WAY,BEGIN,END,forward|reverse[,OCCURRENCE[,KIND]]", .string),
         option("key-for-edge", "Print the stable key for a directed edge ID", .int),
-    }, &.{arg("BUNDLE", "Graph bundle directory")});
+    }, &.{arg("INPUT", "Graph bundle directory or vector tile file")});
     const traffic_cmd = try command(root, "traffic", "Manage live and predicted speeds", null, &.{}, &.{});
     _ = try command(traffic_cmd, "set", "Apply a CSV or JSON lines file by stable edge key", setTraffic, &.{
         option("format", "Input format (csv or jsonl)", .string),
@@ -594,6 +595,14 @@ fn inspectGraph(ctx: *Context) !u8 {
         return badOption(ctx, "choose one edge-key lookup per inspection");
     const verify = std.mem.eql(u8, ctx.getOption("verify") orelse "false", "true");
     const path = ctx.getArgument(0).?;
+    if (std.mem.eql(u8, ctx.getOption("mvt") orelse "false", "true")) {
+        if (edge_id != null or node_id != null or key_edge != null or edge_key != null)
+            return badOption(ctx, "edge and node lookups require a graph bundle");
+        const mapping = try io.Mapping.mapFile(path, .read_only);
+        defer mapping.unmap();
+        try inspect.writeTile(ctx.allocator, mapping.bytes, ctx.out.?, ctx.wantsJson());
+        return 0;
+    }
     var diagnostic: routing.graph.reader.Diagnostic = .{};
     const Bundle = routing.graph.reader.Bundle;
     var bundle = if (verify)

@@ -57,10 +57,6 @@ const Projection = struct {
             .lat = @round((self.north - p.lat) / self.pixel),
         };
     }
-
-    fn point(p: Point) mvt.Point {
-        return .{ .x = @intFromFloat(p.lng), .y = @intFromFloat(p.lat) };
-    }
 };
 
 pub fn render(
@@ -144,7 +140,7 @@ pub fn render(
                     const position = projection.project(Projection.mercator(location));
                     if (!clip_box.covers(position)) continue;
                     const values = try props.nodeProperties(view, filters, node);
-                    try nodes.addPoint(raw_node, Projection.point(position), values.slice(), deadline);
+                    try nodes.addPoint(raw_node, try mvt.roundPoint(position.lng, position.lat), values.slice(), deadline);
                 }
             }
         }
@@ -196,7 +192,7 @@ const Geometry = struct {
         self.points.clearRetainingCapacity();
         for (self.clipped.items[part.start..part.end], 0..) |p, i| {
             if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
-            const point = Projection.point(.init(@round(p.lng), @round(p.lat)));
+            const point = try mvt.roundPoint(p.lng, p.lat);
             if (self.points.items.len != 0) {
                 const prev = self.points.items[self.points.items.len - 1];
                 if (point.x == prev.x and point.y == prev.y) continue;

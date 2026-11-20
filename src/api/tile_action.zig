@@ -3,6 +3,7 @@ const std = @import("std");
 const service = @import("service.zig");
 const http = @import("../server/http.zig");
 const renderer = @import("../tiles/graph_tile.zig");
+const mvt = @import("../tiles/mvt.zig");
 const Attributes = @import("attributes.zig").Controller;
 const Failure = @import("errors.zig").Failure;
 
@@ -31,7 +32,7 @@ pub fn handle(svc: *service.Service, ctx: *http.Ctx, options: *service.Options, 
         },
         else => return .{ .code = 199 },
     };
-    res.content_type = "application/vnd.mapbox-vector-tile";
+    res.content_type = mvt.mime_type;
     try res.addHeader(try std.fmt.allocPrint(res.gpa, "Cache-Control: public, max-age={s}", .{limits.max_age}));
     return null;
 }

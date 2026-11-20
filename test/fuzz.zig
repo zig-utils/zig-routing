@@ -381,6 +381,49 @@ test "fuzz predicted-speed" {
     try std.testing.fuzz({}, fuzzPredictedSpeed, .{ .corpus = corpus });
 }
 
+fn fuzzMvt(_: void, s: *Smith) !void {
+    const io = routing.infra.io;
+    const decoder = routing.tiles.mvt_decode;
+    const a = std.testing.allocator;
+    var buffer: [max_input]u8 = undefined;
+    const input = draw(s, &buffer, 0x6d767432);
+    const gzip = std.mem.startsWith(u8, input, "\x1f\x8b");
+    const data = if (gzip) io.inflateGzip(a, input, 4 * max_input, .none) catch return else input;
+    defer if (gzip) a.free(data);
+    var tile = decoder.parse(a, data, .none) catch return;
+    defer tile.deinit();
+    for (tile.layers) |layer| {
+        try std.testing.expect(layer.extent != 0);
+        for (layer.features) |feature| {
+            try std.testing.expectEqual(0, feature.tags.len % 2);
+            var tag: usize = 0;
+            while (tag < feature.tags.len) : (tag += 2) {
+                try std.testing.expect(feature.tags[tag] < layer.keys.len);
+                try std.testing.expect(feature.tags[tag + 1] < layer.values.len);
+            }
+        }
+    }
+}
+
+test "fuzz mvt" {
+    const mvt = routing.tiles.mvt;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var layer = mvt.Layer.init(a, "mixed");
+    const props: []const mvt.Property = &.{.{ .key = "level", .value = .{ .zigzag = -4 } }};
+    try layer.addPoint(0, .{ .x = -5, .y = 22 }, props, .none);
+    try layer.addPolygon(1, &.{.{
+        .points = &.{ .{ .x = 1, .y = 1 }, .{ .x = 15, .y = 2 }, .{ .x = 3, .y = 20 } },
+        .winding = .exterior,
+    }}, props, .none);
+    var raw: std.ArrayList(u8) = .empty;
+    try layer.write(&raw, .none);
+    const gzip = try mvt.gzip(a, raw.items, .none);
+    const corpus = try seeds(a, &.{ &.{}, raw.items, gzip, &.{ 31, 139 } });
+    try std.testing.fuzz({}, fuzzMvt, .{ .corpus = corpus });
+}
+
 fn fuzzLaneTags(_: void, s: *Smith) !void {
     const lane_tags = routing.build.lanes;
     const allocator = std.testing.allocator;

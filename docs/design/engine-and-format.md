@@ -320,6 +320,28 @@ Profiles above the bound use the floating-point projection.
 zig build bench-predicted-speed -Doptimize=ReleaseFast
 ```
 
+### Mapbox vector tiles
+
+The graph tile endpoint and general tile encoder share one MVT codec. A
+layer emits packed point, line, and polygon commands and deduplicates its
+attribute keys and typed values. Polygon rings take explicit exterior or
+interior roles. The encoder uses these roles to set tile-coordinate winding
+and keeps each ring's final coordinate as the cursor for the next ring.
+Ring coordinates describe simple polygons and their holes.
+[Mapbox Vector Tile Specification 2.1](https://github.com/mapbox/vector-tile-spec/tree/master/2.1)
+
+Coordinates round to the nearest integer on the layer's grid. Coordinates
+outside the extent can represent a buffer around the tile. The decoder
+checks geometry command counts, winding, extent and dictionary references.
+`zr inspect FILE --mvt` accepts raw tiles and gzip streams.
+
+The HTTP endpoint sends gzip when the client accepts it. Other requests
+receive raw MVT bytes. The gzip codec uses the Zig standard library.
+
+```sh
+zig build bench-mvt -Doptimize=ReleaseFast
+```
+
 ### Transit timetable sections
 
 A bundle with transit carries sections 27 through 38 together. They use the v1 section
