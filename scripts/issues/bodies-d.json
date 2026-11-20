@@ -835,6 +835,25 @@
     ]
   },
   {
+    "key": "P8.01a",
+    "goal": "Match the represented directed edges when a trace measurement snaps to a graph node on several incident edges.",
+    "upstream": ["src/meili/candidate_search.cc", "valhalla/meili/grid_range_query.h"],
+    "scope": [
+      "Reproduce the incident edge selection on the matched Utrecht fixture described in docs/experiments/trace-candidates.md.",
+      "Determine and preserve the candidate encounter order that controls Meili's first-per-node deduplication.",
+      "Reuse the shared spatial index and trace shape cache. Preserve the warm candidate-search latency budget."
+    ],
+    "out_of_scope": ["Changing the directed-edge parity scorer.", "Routing or scoring transitions between candidates."],
+    "notes": [
+      "The node and distance agree even when the retained incident edge differs. The existing checker reports both exact directed sets and equivalent node states."
+    ],
+    "accept": [
+      "All directed candidate sets on the matching Utrecht trace corpus agree with Valhalla 3.9.3.",
+      "Warm median candidate search remains below 5 microseconds per point.",
+      "zig build test passes."
+    ]
+  },
+  {
     "key": "P8.02",
     "goal": "The HMM's two cost models exist with the routing between candidates they need: emission cost from GPS distance and transition cost from the difference between route distance and great-circle distance, computed by bounded one-to-many searches.",
     "upstream": ["src/meili/transition_cost_model.cc", "src/meili/routing.cc", "valhalla/meili/", "src/meili/map_matcher.cc"],
