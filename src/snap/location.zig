@@ -18,6 +18,15 @@ pub const Result = union(enum) {
 /// component is a necessary condition. Directional routing still depends on
 /// costing, restrictions and the path search.
 pub fn route(view: *const graph.reader.View, arena: Allocator, locations: []const request.Location, defaults: candidates.Defaults, costing: anytype, deadline: Deadline) !Result {
+    const result = try correlate(view, arena, locations, defaults, costing, deadline);
+    if (result == .ok and view.components != null and !try connected(view, arena, result.ok, deadline))
+        return .{ .failure = .{ .code = 170 } };
+    return result;
+}
+
+/// Correlate locations for searches that can reach a different street
+/// component through a scheduled service.
+pub fn correlate(view: *const graph.reader.View, arena: Allocator, locations: []const request.Location, defaults: candidates.Defaults, costing: anytype, deadline: Deadline) !Result {
     if (locations.len < 2) return .{ .failure = .{ .code = 120 } };
     var limit: u32 = 0;
     for (locations) |location| {
@@ -35,8 +44,6 @@ pub fn route(view: *const graph.reader.View, arena: Allocator, locations: []cons
         if (result.edges.len == 0 and result.filtered_edges.len == 0)
             return .{ .failure = .{ .code = 171 } };
     }
-    if (view.components != null and !try connected(view, arena, results, deadline))
-        return .{ .failure = .{ .code = 170 } };
     return .{ .ok = results };
 }
 

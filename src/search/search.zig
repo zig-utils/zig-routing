@@ -297,11 +297,15 @@ const Status = packed struct(u32) {
 const PartialExclusion = struct { fraction: f32, seed: Status = .{} };
 const ExclusionFractions = paged.Array(?PartialExclusion, null);
 
-const TurnContext = struct {
+pub const TurnContext = struct {
     value: u32 = 0,
     alias: bool = false,
 
     const forbidden: TurnContext = .{ .value = no_index };
+
+    pub fn blocked(self: TurnContext) bool {
+        return self.value == no_index;
+    }
 
     fn present(self: TurnContext) bool {
         return self.value != 0 or self.alias;
@@ -352,7 +356,7 @@ pub const PathAccess = struct {
     }
 };
 
-const Restrictions = struct {
+pub const Restrictions = struct {
     const AliasKey = struct {
         edge: u32,
         value: u32,
@@ -369,7 +373,7 @@ const Restrictions = struct {
     keep_time: bool,
     aliases: AliasStatus = .empty,
 
-    noinline fn advance(self: *const Restrictions, context: TurnContext, previous: Label, node: NodeId, id: EdgeId) !TurnContext {
+    pub noinline fn advance(self: *const Restrictions, context: TurnContext, previous: Label, node: NodeId, id: EdgeId) !TurnContext {
         if (self.modes == 0) return .{};
         const simple = if (self.access.view.turn_restrictions) |rows| rows.len != 0 else false;
         if (!simple and self.states.len == 0) return .{};
@@ -1034,7 +1038,7 @@ fn fractionalLength(metres: u24, cut: Cut) u32 {
     return @intFromFloat(length * (cut.end - cut.begin) + 0.5);
 }
 
-fn roundedDown(value: f64) f32 {
+pub fn roundedDown(value: f64) f32 {
     const rounded: f32 = @floatCast(@min(std.math.floatMax(f32), value));
     if (rounded <= value) return rounded;
     return @bitCast(@as(u32, @bitCast(rounded)) - 1);

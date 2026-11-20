@@ -137,8 +137,12 @@ pub const Profile = extern struct {
     }
 
     pub fn edgeCost(self: Profile, use: constants.Use, departure: timetable.NextDeparture, current_time: u32) Cost {
-        const wait: f32 = @floatFromInt(departure.time -% current_time);
-        const elapsed: f32 = @floatFromInt(departure.departure.elapsed_time);
+        return self.rideCost(use, departure.departure.elapsed_time, departure.time -% current_time);
+    }
+
+    pub fn rideCost(self: Profile, use: constants.Use, elapsed_secs: u32, wait_secs: u32) Cost {
+        const wait: f32 = @floatFromInt(wait_secs);
+        const elapsed: f32 = @floatFromInt(elapsed_secs);
         return .{ .cost = wait + elapsed * self.modeWeight(use), .secs = wait + elapsed };
     }
 

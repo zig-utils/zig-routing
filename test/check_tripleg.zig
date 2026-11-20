@@ -19,6 +19,7 @@ pub fn main(init: std.process.Init) !void {
     const count = if (args.next()) |value| try std.fmt.parseInt(usize, value, 10) else std.math.maxInt(usize);
     var narrative: Narrative = .none;
     var on_foot = false;
+    var multimodal = false;
     while (args.next()) |option| {
         if (std.mem.eql(u8, option, "--maneuvers") and narrative == .none) {
             narrative = .maneuvers;
@@ -28,10 +29,78 @@ pub fn main(init: std.process.Init) !void {
             narrative = .verbal_instructions;
         } else if (std.mem.eql(u8, option, "--pedestrian") and !on_foot) {
             on_foot = true;
+        } else if (std.mem.eql(u8, option, "--multimodal") and !multimodal) {
+            multimodal = true;
         } else return error.InvalidOption;
+    }
+    if (multimodal) {
+        if (on_foot or narrative != .none) return error.InvalidOption;
+        return runScheduled(init, bundle_path, corpus_path, count);
     }
     if (on_foot) return run(.pedestrian, init, bundle_path, corpus_path, count, narrative);
     return run(.auto, init, bundle_path, corpus_path, count, narrative);
+}
+
+fn runScheduled(init: std.process.Init, bundle_path: []const u8, corpus_path: []const u8, count: usize) !void {
+    var bundle = try routing.graph.reader.Bundle.open(bundle_path);
+    defer bundle.close();
+    const corpus = try io.Mapping.mapFile(corpus_path, .read_only);
+    defer corpus.unmap();
+    var arena = routing.infra.arena.Arena.init(init.gpa, .{});
+    defer arena.deinit();
+    var buffer: [16 * 1024]u8 = undefined;
+    var stdout = io.stdoutWriter(init.io, &buffer);
+    const writer = &stdout.interface;
+    var lines = std.mem.tokenizeScalar(u8, corpus.bytes, '\n');
+    for (0..count) |index| {
+        const line = lines.next() orelse break;
+        const tab = std.mem.indexOfScalar(u8, line, '\t') orelse return error.InvalidCorpusRow;
+        if (!std.mem.eql(u8, line[0..tab], "/route")) return error.InvalidCorpusRow;
+        arena.reset();
+        const a = arena.allocator();
+        const control: search.search.Control = .{ .deadline = io.Deadline.fromNowMs(10_000) };
+        const parsed = try request.parseHttpWithin(a, "/route", &.{}, line[tab + 1 ..], false, control.deadline);
+        const result = switch (parsed) {
+            .ok => |*options| routing.api.route_action.route(&bundle.view, &arena, options, null, control) catch |err| {
+                try std.json.Stringify.value(.{ .index = index, .failure = @errorName(err) }, .{}, writer);
+                try writer.writeByte('\n');
+                try writer.flush();
+                continue;
+            },
+            .failure => |failure| routing.api.route_action.Result{ .failure = failure },
+        };
+        switch (result) {
+            .failure => |failure| try std.json.Stringify.value(.{ .index = index, .error_code = failure.code }, .{}, writer),
+            .scheduled => |route| {
+                const trip_legs = route.trip(a, &bundle.view, &parsed.ok, control) catch |err| {
+                    try std.json.Stringify.value(.{ .index = index, .failure = @errorName(err) }, .{}, writer);
+                    try writer.writeByte('\n');
+                    try writer.flush();
+                    continue;
+                };
+                const table = bundle.view.transit_index orelse return error.MissingTransitSection;
+                const Segment = struct { route: ?[]const u8, origin: ?[]const u8, destination: ?[]const u8, departure: i64, arrival: i64, trip: u32 };
+                var rides: std.ArrayList(Segment) = .empty;
+                for (route.paths) |path| for (path.steps) |step| switch (step.movement) {
+                    .walk => {},
+                    .ride => |ride| {
+                        const transit_line = table.lines[ride.departure.line];
+                        try rides.append(a, .{
+                            .route = try table.text(table.routes[transit_line.route].one_stop_id),
+                            .origin = try table.text(table.stops[transit_line.origin].place.one_stop_id),
+                            .destination = try table.text(table.stops[transit_line.destination].place.one_stop_id),
+                            .departure = ride.departure_time,
+                            .arrival = ride.arrival_time,
+                            .trip = ride.departure.trip,
+                        });
+                    },
+                };
+                try std.json.Stringify.value(.{ .index = index, .rides = rides.items, .elapsed = route.waypoints[route.waypoints.len - 1].elapsed_secs, .legs = trip_legs }, .{ .emit_null_optional_fields = false }, writer);
+            },
+        }
+        try writer.writeByte('\n');
+        try writer.flush();
+    }
 }
 
 const Narrative = enum { none, maneuvers, instructions, verbal_instructions };

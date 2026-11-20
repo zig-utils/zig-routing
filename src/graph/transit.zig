@@ -266,6 +266,32 @@ pub const NextDeparture = struct {
     time: u32,
 };
 
+pub const DepartureIterator = struct {
+    line_id: u32,
+    records: []const Departure,
+    first_record: u32,
+    occurrences: ?[]const Occurrence,
+
+    pub fn next(self: *DepartureIterator) !?NextDeparture {
+        if (self.occurrences) |slots| {
+            if (slots.len == 0) return null;
+            const slot = slots[0];
+            if (slot.departure < self.first_record or slot.departure - self.first_record >= self.records.len)
+                return error.InvalidTransitOccurrence;
+            const record = &self.records[slot.departure - self.first_record];
+            if (record.line != self.line_id or record.atOrAfter(slot.time) != slot.time)
+                return error.InvalidTransitOccurrence;
+            self.occurrences = slots[1..];
+            return .{ .departure = record, .time = slot.time };
+        }
+        if (self.records.len == 0) return null;
+        const record = &self.records[0];
+        if (record.line != self.line_id or record.flags.kind != .fixed) return error.InvalidTransitDepartureOrder;
+        self.records = self.records[1..];
+        return .{ .departure = record, .time = record.start_time };
+    }
+};
+
 /// All slices and text references borrow the bundle's mmap.
 pub const View = struct {
     metadata: Metadata,
@@ -297,24 +323,38 @@ pub const View = struct {
     /// Finds the first offered time on a line. Calendar and accessibility
     /// checks use the returned record's schedule and flags.
     pub fn nextDeparture(self: View, line_id: u32, time: u32) !?NextDeparture {
+        var iterator = try self.departureIterator(line_id, time);
+        return iterator.next();
+    }
+
+    /// Seek once to the first offered time. Iteration includes every tied
+    /// departure so the search can evaluate its service and trip state.
+    pub fn departureIterator(self: View, line_id: u32, time: u32) !DepartureIterator {
         const records = try self.departuresOn(line_id);
         const line = self.lines[line_id];
+        var iterator: DepartureIterator = .{
+            .line_id = line_id,
+            .records = records,
+            .first_record = line.departures.first,
+            .occurrences = null,
+        };
         if (line.occurrences.count == 0) {
-            const pos = lowerBound(Departure, records, "start_time", time);
-            if (pos == records.len) return null;
-            const record = &records[pos];
-            if (record.line != line_id or record.flags.kind != .fixed) return error.InvalidTransitDepartureOrder;
-            return .{ .departure = record, .time = record.start_time };
+            iterator.records = records[lowerBound(Departure, records, "start_time", time)..];
+        } else {
+            const slots = try line.occurrences.items(Occurrence, self.occurrences);
+            iterator.occurrences = slots[lowerBound(Occurrence, slots, "time", time)..];
         }
-        const slots = try line.occurrences.items(Occurrence, self.occurrences);
-        const pos = lowerBound(Occurrence, slots, "time", time);
-        if (pos == slots.len) return null;
-        const slot = slots[pos];
-        if (slot.departure < line.departures.first or slot.departure - line.departures.first >= records.len)
-            return error.InvalidTransitOccurrence;
-        const record = &self.departures[slot.departure];
-        if (record.line != line_id or record.atOrAfter(slot.time) != slot.time) return error.InvalidTransitOccurrence;
-        return .{ .departure = record, .time = slot.time };
+        return iterator;
+    }
+
+    pub fn lastDepartureTime(self: View, line_id: u32) !?u32 {
+        const records = try self.departuresOn(line_id);
+        const line = self.lines[line_id];
+        if (line.occurrences.count != 0) {
+            const slots = try line.occurrences.items(Occurrence, self.occurrences);
+            return slots[slots.len - 1].time;
+        }
+        return if (records.len != 0) records[records.len - 1].start_time else null;
     }
 
     pub fn scheduleActive(self: View, schedule_id: u32, civil_day: i32, weekday: Weekday) !bool {

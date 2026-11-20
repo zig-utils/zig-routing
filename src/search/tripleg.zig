@@ -11,6 +11,8 @@ const Control = @import("search.zig").Control;
 const Segment = @import("endpoints.zig").Segment;
 const multi = @import("multi.zig");
 const legs = @import("legs.zig");
+const transit = @import("transit_leg.zig");
+const Ride = @import("multimodal.zig").Ride;
 const Cost = @import("../costing/compiled.zig").Cost;
 const snap = @import("../snap/search.zig");
 
@@ -54,20 +56,43 @@ pub fn build(a: std.mem.Allocator, view: *const View, input: Input, control: Con
     var elapsed: Cost = .{};
     var end_node: format.NodeId = undefined;
     var previous: ?format.EdgeId = null;
+    var previous_ride: ?Ride = null;
     for (input.segments, geometry.edges, nodes[0..input.segments.len]) |segment, edge, *out| {
         try control.check();
         if (segment.edge != edge.id or edge.shape_begin > edge.shape_end or edge.shape_end >= geometry.shape.len or
             !(segment.begin >= 0 and segment.end >= segment.begin and segment.end <= 1))
             return error.InvalidRoute;
-        const directed = try view.edge(edge.id);
-        const opposite = try view.edge(try view.oppEdge(edge.id));
-        const from: format.NodeId = @fromBackingInt(opposite.head);
+        var from: format.NodeId = undefined;
+        var street: ?*const format.EdgeHot = null;
+        var platform: ?u32 = null;
+        const trip_edge = if (edge.ride) |ride| blk: {
+            const table = view.transit_index orelse return error.MissingTransitSection;
+            const ends = try transit.stops(table, ride);
+            from = try transit.node(table, ends.from);
+            end_node = try transit.node(table, ends.to);
+            platform = ends.from;
+            break :blk try rideEdge(table, ride, edge, attrs);
+        } else blk: {
+            const directed = try view.edge(edge.id);
+            street = directed;
+            const opposite = try view.edge(try view.oppEdge(edge.id));
+            from = @fromBackingInt(opposite.head);
+            end_node = @fromBackingInt(directed.head);
+            if (previous_ride) |ride| {
+                const table = view.transit_index orelse return error.MissingTransitSection;
+                platform = (try transit.stops(table, ride)).to;
+            }
+            break :blk try buildEdge(a, view, from, try view.node(from), directed, segment, edge, input, control);
+        };
         const node = try view.node(from);
-        end_node = @fromBackingInt(directed.head);
         out.* = .{
-            .edge = try buildEdge(a, view, from, node, directed, segment, edge, input, control),
+            .edge = trip_edge,
             .cost = nodeCost(attrs, elapsed, edge.transition),
         };
+        if (platform) |id| {
+            if (attrs.hasAny("node.transit_platform_info."))
+                out.transit_platform_info = try transit.platformInfo(a, view, id, previous_ride, edge.ride, attrs);
+        }
         if (attrs.has(.@"node.type"))
             out.type = std.enums.fromInt(model.NodeType, node.attr.type) orelse .kStreetIntersection;
         if (attrs.has(.@"node.traffic_signal")) out.traffic_signal = node.attr.signal != 0;
@@ -78,19 +103,22 @@ pub fn build(a: std.mem.Allocator, view: *const View, input: Input, control: Con
         }
         if (attrs.has(.@"node.admin_index"))
             out.admin_index = try adminIndex(a, &admins, try view.nodeAdmin(from), control);
-        if (attrs.hasAny("node.intersecting_edge."))
-            out.intersecting_edge = try intersections(a, view, from, edge.id, directed, previous, attrs, control);
-        if (attrs.has(.@"node.stop_impact")) {
-            if (previous) |id| {
-                const incoming = try view.edge(id);
-                if (incoming.head == @backingInt(from)) {
-                    const row = try view.turnRow(from, incoming.cls.opp_local);
-                    if (directed.cls.local >= row.len) return error.InvalidLocalEdge;
-                    out.stop_impact = (row[directed.cls.local] >> 3) & 7;
+        if (street) |directed| {
+            if (attrs.hasAny("node.intersecting_edge."))
+                out.intersecting_edge = try intersections(a, view, from, edge.id, directed, previous, attrs, control);
+            if (attrs.has(.@"node.stop_impact")) {
+                if (previous) |id| {
+                    const incoming = try view.edge(id);
+                    if (incoming.head == @backingInt(from)) {
+                        const row = try view.turnRow(from, incoming.cls.opp_local);
+                        if (directed.cls.local >= row.len) return error.InvalidLocalEdge;
+                        out.stop_impact = (row[directed.cls.local] >> 3) & 7;
+                    }
                 }
             }
         }
-        previous = edge.id;
+        previous = if (street != null) edge.id else null;
+        previous_ride = edge.ride;
         elapsed = edge.elapsed;
     }
 
@@ -124,6 +152,27 @@ pub fn build(a: std.mem.Allocator, view: *const View, input: Input, control: Con
             .has_highway = geometry.summary.has_highway,
         },
     };
+}
+
+fn rideEdge(table: graph.transit.View, ride: Ride, edge: legs.Edge, attrs: Attributes) !model.Edge {
+    if (ride.departure.route >= table.routes.len) return error.InvalidTransitRoute;
+    const route = table.routes[ride.departure.route];
+    const use = @import("../costing/transit.zig").vehicleUse(route.flags.vehicle);
+    var result: model.Edge = .{ .source_along_edge = 0, .target_along_edge = 1 };
+    if (attrs.has(.@"edge.id")) result.id = ride.departure.line;
+    if (attrs.has(.@"edge.length")) result.length_km = edge.length_m * 0.001;
+    if (attrs.has(.@"edge.speed") and edge.full_travel_secs > 0) result.speed = edge.length_m * 3.6 / edge.full_travel_secs;
+    if (attrs.has(.@"edge.begin_shape_index")) result.begin_shape_index = try shapeIndex(edge.shape_begin);
+    if (attrs.has(.@"edge.end_shape_index")) result.end_shape_index = try shapeIndex(edge.shape_end);
+    if (attrs.has(.@"edge.use")) result.use = if (use == .rail) .kRailUse else .kBusUse;
+    if (attrs.has(.@"edge.travel_mode")) result.travel_mode = .kTransit;
+    if (attrs.has(.@"edge.transit_type")) result.transit_type = switch (route.flags.vehicle) {
+        .tram, .metro, .rail, .bus, .ferry, .cable_car, .gondola, .funicular => @fromBackingInt(@as(i32, @backingInt(route.flags.vehicle))),
+        .trolleybus => .kBus,
+        else => .kRail,
+    };
+    if (attrs.hasAny("edge.transit_route_info.")) result.transit_route_info = try transit.routeInfo(table, ride, attrs);
+    return result;
 }
 
 fn latLng(point: geo.PointLL) model.LatLng {
@@ -268,15 +317,16 @@ fn shapeAttributes(a: std.mem.Allocator, view: *const View, input: Input, contro
     for (input.geometry.edges, input.segments) |edge, segment| {
         try control.check();
         if (edge.shape_end - edge.shape_begin > count - written) return error.InvalidRoute;
-        const duration = edge.elapsed.secs - edge.transition.secs - prior_time;
+        const duration = if (edge.ride != null) edge.full_travel_secs else edge.elapsed.secs - edge.transition.secs - prior_time;
         prior_time = edge.elapsed.secs;
         const travelled = if (with_time or with_speed) blk: {
+            if (edge.ride != null) break :blk @as(f64, edge.length_m);
             const directed = try view.edge(edge.id);
             const metres: f64 = @floatFromInt(directed.geom.len_m);
             break :blk metres * (@as(f64, segment.end) - segment.begin);
         } else 0;
         const speed_mps = if (travelled == 0 or duration <= 0) 0 else travelled / duration;
-        const speed_limit = if (with_limit)
+        const speed_limit = if (with_limit and edge.ride == null)
             (try view.coldRecordWithDeadline(edge.id, control.deadline)).speedLimit()
         else
             0;

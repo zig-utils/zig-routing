@@ -195,6 +195,35 @@ zig build transit-costing-parity -Doptimize=ReleaseFast -- "$sample_dir/costs.js
 The ARM64 oracle run produced 4,098 option samples and 16,392 cost calls.
 The maximum relative error for these calls was `1.184e-7`.
 
+### Scheduled transit itineraries
+
+Use the same GTFS archive and street extract to build the native bundle
+and the Valhalla 3.9.3 tiles. For Valhalla, extract the feed under a
+directory named `brockton` in `mjolnir.transit_feeds_dir`, then run
+`valhalla_ingest_transit`, `valhalla_convert_transit`, and
+`valhalla_build_tiles` with the same configuration. Start the oracle
+service on the resulting tiles.
+
+```bash
+python3 oracle/transit-itinerary-parity.py prepare "$feed_zip" 2026-11-23 corpus.tsv
+python3 oracle/transit-itinerary-parity.py fetch "$oracle_url" corpus.tsv reference.jsonl
+zig build check-tripleg -- "$native_bundle" corpus.tsv 100 --multimodal > native.jsonl
+python3 oracle/transit-itinerary-parity.py score brockton reference.jsonl native.jsonl
+```
+
+The scorer compares the ordered ride lines, the complete stop sequence
+of each ride, and the boarding time at the response's minute precision.
+It counts oracle and native errors separately. The default threshold is
+95%. Pass `--short-walk` to `prepare` for the second corpus with a 300 m
+access and egress limit, a 150 m transfer limit and equal bus and rail
+preferences.
+
+The initial 100-request default replay returned 94 native routes. It
+matched 24 sequences of lines and stops and 21 sequences including
+boarding time. The streets were built independently from the same PBF,
+so the comparison includes street connectivity and correlation
+differences. [Issue #190](https://github.com/zig-utils/zig-routing/issues/190)
+
 ### Timed route optimality (gate B)
 
 ```bash

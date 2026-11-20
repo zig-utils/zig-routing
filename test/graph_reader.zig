@@ -162,6 +162,14 @@ test "transit sections round trip every field with checked timetable access" {
     try testing.expectEqual(null, try timetable.nextDeparture(1, 90063));
     try testing.expectError(error.InvalidTransitLine, timetable.nextDeparture(2, 0));
 
+    var repeated = try timetable.departureIterator(0, 120);
+    for (slots[5..]) |slot| {
+        const actual = (try repeated.next()).?;
+        try testing.expectEqual(slot.time, actual.time);
+        try testing.expectEqual(&timetable.departures[slot.departure], actual.departure);
+    }
+    try testing.expectEqual(null, try repeated.next());
+
     const start = timetable.metadata.start_day;
     try testing.expect(try timetable.scheduleActive(0, start - 4, .sunday));
     try testing.expect(try timetable.scheduleActive(0, start, .sunday));

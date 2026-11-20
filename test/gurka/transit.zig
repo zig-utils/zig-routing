@@ -160,6 +160,8 @@ test "GTFS transit prepares a restartable graph with the same bytes across worke
     const restricted = try costing.multimodal.Kernel.init(a, &first.view, model, .none);
     try testing.expect(!try restricted.allowsDeparture(&first.view, fixed.departure));
 
+    try checkScheduledRoute(&first.view);
+
     try io.writeFile(feed_path, feed);
     var options = common;
     options.work_dir = parallel;
@@ -184,6 +186,93 @@ test "GTFS transit prepares a restartable graph with the same bytes across worke
     const stage4 = try build.checkpoint.Existing.open(testing.allocator, parallel_dir, .transit, other.dataset_uuid);
     defer stage4.close();
     try testing.expectEqualDeep(stage1.manifest.files, stage4.manifest.files);
+}
+
+fn checkScheduledRoute(view: *const graph.reader.View) !void {
+    const routing_search = routing.search;
+    const transit = view.transit_index.?;
+    const from: graph.format.NodeId = @fromBackingInt(transit.stops[0].place.graph_node);
+    const to: graph.format.NodeId = @fromBackingInt(transit.stops[1].place.graph_node);
+    const departure_edge = try view.oppEdge(@fromBackingInt((try view.outEdgeRange(from)).first));
+    const arrival_edge: graph.format.EdgeId = @fromBackingInt((try view.outEdgeRange(to)).first);
+    const origin: routing_search.endpoints.Ranked = .{
+        .all = &.{.{ .edge = departure_edge, .fraction = 1, .score = 0, .begin_node = false, .end_node = true }},
+        .preferred_count = 1,
+        .ignored_filter = false,
+    };
+    const destination: routing_search.endpoints.Ranked = .{
+        .all = &.{.{ .edge = arrival_edge, .fraction = 0, .score = 0, .begin_node = true, .end_node = false }},
+        .preferred_count = 1,
+        .ignored_filter = false,
+    };
+    var counter = routing.infra.arena.CountingAllocator.init(testing.allocator);
+    var scratch = routing.infra.arena.Arena.init(counter.allocator(), .{});
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const rules = &view.tz_rules.?;
+    const london = try rules.id("Europe/London");
+    const amsterdam = try rules.id("Europe/Amsterdam");
+    for (0..3) |pass| {
+        scratch.reset();
+        if (pass != 0) counter.resetCounts();
+        var warnings: std.ArrayList(routing.costing.base.Warning) = .empty;
+        var model = try routing.costing.multimodal.parse(a, .null, &warnings, .none);
+        model.pedestrian.transit_start_end_max_distance = 0;
+        model.transit.wheelchair = true;
+        const kernel = try routing.costing.multimodal.Kernel.init(a, view, model, .none);
+        const search = try routing_search.multimodal.Search.init(a, view, &kernel, .{});
+        const start = try graph.time_info.TimeInfo.fromLocal(rules, "2026-03-09T06:59", london, graph.timezone.utc, 0, .none);
+        var options: routing_search.endpoints.Options = .{ .costing = .multimodal, .timing = .{ .start = start } };
+        const path = try search.run(&scratch, origin, destination, options, .{});
+        try testing.expectEqual(3, path.steps.len);
+        const ride = path.steps[1].movement.ride;
+        const scheduled = try graph.time_info.TimeInfo.fromLocal(rules, "2026-03-09T08:00", amsterdam, graph.timezone.utc, 0, .none);
+        try testing.expectEqual(scheduled.unix_time, ride.departure_time);
+        try testing.expectEqual(scheduled.unix_time + 300, ride.arrival_time);
+        try testing.expectEqual(360, path.total.secs);
+        try checkTripLeg(a, view, path, departure_edge, arrival_edge, start);
+        options.timing.start = try graph.time_info.TimeInfo.fromLocal(rules, "2026-03-10T06:59", london, graph.timezone.utc, 0, .none);
+        try testing.expectError(error.NoPath, search.run(&scratch, origin, destination, options, .{}));
+        try testing.expectError(error.Cancelled, search.run(&scratch, origin, destination, options, .{ .deadline = .{ .at_ns = 0 } }));
+        if (pass != 0) try testing.expectEqual(0, counter.calls());
+    }
+}
+
+fn checkTripLeg(a: std.mem.Allocator, view: *const graph.reader.View, path: routing.search.multimodal.Path, from: graph.format.EdgeId, to: graph.format.EdgeId, start: graph.time_info.TimeInfo) !void {
+    const table = view.transit_index.?;
+    const origin = table.stops[0].place.coordinate.toTilePoint();
+    const destination = table.stops[1].place.coordinate.toTilePoint();
+    var locations = [_]routing.api.request.Location{
+        .{ .lat = origin.lat, .lng = origin.lng },
+        .{ .lat = destination.lat, .lng = destination.lng, .original_index = 1 },
+    };
+    const opts: routing.api.request.Options = .{ .action = .route, .costing = .multimodal, .locations = &locations };
+    const selected: routing.api.route_action.ScheduledRoute = .{
+        .paths = &.{path},
+        .correlations = &.{
+            .{ .edges = &.{.{ .id = from, .projected = origin, .distance = 0, .percent_along = 1, .heading = 0, .node = .end }}, .filtered_edges = &.{}, .rank_candidates = true },
+            .{ .edges = &.{.{ .id = to, .projected = destination, .distance = 0, .percent_along = 0, .heading = 0, .node = .begin }}, .filtered_edges = &.{}, .rank_candidates = true },
+        },
+        .waypoints = &.{
+            .{ .elapsed_secs = 0, .waiting_secs = 0, .date_time = null, .ignored_filter = false, .clock = start },
+            .{ .elapsed_secs = path.total.secs, .waiting_secs = 0, .date_time = null, .ignored_filter = false },
+        },
+        .pedestrian_type = .foot,
+    };
+    const legs = try selected.trip(a, view, &opts, .{});
+    try testing.expectEqual(1, legs.len);
+    try testing.expectEqual(4, legs[0].node.len);
+    const bus = legs[0].node[1];
+    try testing.expectEqual(.kTransit, bus.edge.?.travel_mode);
+    try testing.expectEqual(.kBus, bus.edge.?.transit_type);
+    try testing.expectEqualStrings("gtfs:0:route:R", bus.edge.?.transit_route_info.?.onestop_id);
+    try testing.expectEqual(0x193B58, bus.edge.?.transit_route_info.?.color);
+    try testing.expectEqualStrings("Platform One", bus.transit_platform_info.?.name);
+    try testing.expectEqualStrings("2026-03-09T08:00+01:00", bus.transit_platform_info.?.departure_date_time);
+    const exit = legs[0].node[2].transit_platform_info.?;
+    try testing.expectEqualStrings("Platform Two", exit.name);
+    try testing.expectEqualStrings("2026-03-09T08:05+01:00", exit.arrival_date_time);
+    try testing.expectEqualStrings("", exit.departure_date_time);
 }
 
 fn deleteWork(root: io.Directory, name: [:0]const u8) void {

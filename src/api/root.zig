@@ -8,6 +8,7 @@ pub const errors = @import("errors.zig");
 pub const exclusions = @import("exclusions.zig");
 pub const attributes = @import("attributes.zig");
 pub const request = @import("request.zig");
+pub const route_action = @import("route_action.zig");
 pub const service = @import("service.zig");
 pub const height_action = @import("height_action.zig");
 pub const locate_action = @import("locate_action.zig");

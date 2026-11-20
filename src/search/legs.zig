@@ -8,12 +8,16 @@ const Cost = @import("../costing/compiled.zig").Cost;
 const base = @import("../costing/base.zig");
 const Segment = @import("endpoints.zig").Segment;
 const multi = @import("multi.zig");
+const multimodal = @import("multimodal.zig");
+const transit_leg = @import("transit_leg.zig");
+const request = @import("../api/request.zig");
 const search = @import("search.zig");
 const EdgeId = graph.format.EdgeId;
 const View = graph.reader.View;
 
 pub const Edge = struct {
     id: EdgeId,
+    ride: ?multimodal.Ride = null,
     length_m: f32,
     elapsed: Cost,
     transition: Cost,
@@ -215,15 +219,7 @@ fn buildLeg(a: std.mem.Allocator, view: *const View, kernel: anytype, leg: multi
         });
         const metres: f32 = @floatFromInt(edge.geom.len_m);
 
-        const record = try view.coldRecord(segment.edge);
-        if (record.header.point_count < 2) return error.IncompleteShape;
-        try fixed.resize(a, record.header.point_count);
-        try record.decodeShape(fixed.items, control.deadline);
-        try vertices.resize(a, fixed.items.len);
-        for (fixed.items, vertices.items, 0..) |vertex, *point, j| {
-            if (j % 256 == 0) try control.check();
-            point.* = vertex.toTilePoint();
-        }
+        try streetShape(a, view, segment.edge, fixed, vertices, control);
         if (i == 0 or i + 1 == edges.len or segment.begin != 0 or segment.end != 1) {
             // A node snap supplies its node coordinate even at fraction 0 or
             // 1. EdgeInfo vertices have a different coordinate precision.
@@ -237,16 +233,7 @@ fn buildLeg(a: std.mem.Allocator, view: *const View, kernel: anytype, leg: multi
                 vertices.items[vertices.items.len - 1];
             try geo.line.trimShapeWithDeadline(segment.begin * metres, start, segment.end * metres, end, vertices, control.deadline);
         }
-        const joined = shape.items.len != 0 and shape.items[shape.items.len - 1].eql(vertices.items[0]);
-        const shape_begin = shape.items.len - @intFromBool(joined);
-        const points = vertices.items[@intFromBool(joined)..];
-        if (shape.items.len == 0) summary.bounds = geo.AABB.fromPoints(points[0], points[0]);
-        try shape.ensureUnusedCapacity(a, points.len);
-        for (points, 0..) |point, j| {
-            if (j % 256 == 0) try control.check();
-            shape.appendAssumeCapacity(point);
-            _ = summary.bounds.expandPoint(point);
-        }
+        const shape_begin = try appendShape(a, &shape, vertices.items, &summary.bounds, control);
 
         output.* = .{
             .id = segment.edge,
@@ -274,6 +261,139 @@ fn buildLeg(a: std.mem.Allocator, view: *const View, kernel: anytype, leg: multi
         .shape = shape.items,
         .encoded_shape = encoded[0..size],
         .summary = summary,
+    };
+}
+
+fn streetShape(a: std.mem.Allocator, view: *const View, id: EdgeId, fixed: *std.ArrayList(geo.FixedLL), vertices: *std.ArrayList(geo.PointLL), control: search.Control) !void {
+    const record = try view.coldRecordWithDeadline(id, control.deadline);
+    if (record.header.point_count < 2) return error.IncompleteShape;
+    try fixed.resize(a, record.header.point_count);
+    try record.decodeShape(fixed.items, control.deadline);
+    try vertices.resize(a, fixed.items.len);
+    for (fixed.items, vertices.items, 0..) |vertex, *point, i| {
+        if (i % 256 == 0) try control.check();
+        point.* = vertex.toTilePoint();
+    }
+}
+
+fn appendShape(a: std.mem.Allocator, shape: *std.ArrayList(geo.PointLL), vertices: []const geo.PointLL, bounds: *geo.AABB, control: search.Control) !usize {
+    if (vertices.len == 0) return error.IncompleteShape;
+    const joined = shape.items.len != 0 and shape.items[shape.items.len - 1].eql(vertices[0]);
+    const begin = shape.items.len - @intFromBool(joined);
+    const points = vertices[@intFromBool(joined)..];
+    if (shape.items.len == 0) bounds.* = geo.AABB.fromPoints(points[0], points[0]);
+    try shape.ensureUnusedCapacity(a, points.len);
+    for (points, 0..) |point, i| {
+        if (i % 256 == 0) try control.check();
+        shape.appendAssumeCapacity(point);
+        _ = bounds.expandPoint(point);
+    }
+    return begin;
+}
+
+pub const ScheduledLeg = struct {
+    geometry: Leg,
+    segments: []const Segment,
+    contexts: []const multi.SegmentContext,
+};
+
+pub fn buildScheduled(a: std.mem.Allocator, view: *const View, paths: []const multimodal.Path, locations: []const request.Location, correlations: []const snap.PathLocation, control: search.Control) ![]const ScheduledLeg {
+    if (paths.len == 0 or paths.len + 1 != locations.len or locations.len != correlations.len) return error.InvalidRoute;
+    var output: std.ArrayList(ScheduledLeg) = .empty;
+    var fixed: std.ArrayList(geo.FixedLL) = .empty;
+    defer fixed.deinit(a);
+    var vertices: std.ArrayList(geo.PointLL) = .empty;
+    defer vertices.deinit(a);
+    var first: usize = 0;
+    for (locations[1..], 1..) |location, last| {
+        try control.check();
+        if (last != paths.len and location.type != .@"break" and location.type != .break_through) continue;
+        const leg = try scheduledLeg(a, view, paths[first..last], first, correlations, &fixed, &vertices, control);
+        try output.append(a, leg);
+        first = last;
+    }
+    return output.items;
+}
+
+fn scheduledLeg(a: std.mem.Allocator, view: *const View, paths: []const multimodal.Path, first: usize, correlations: []const snap.PathLocation, fixed: *std.ArrayList(geo.FixedLL), vertices: *std.ArrayList(geo.PointLL), control: search.Control) !ScheduledLeg {
+    var count: usize = 0;
+    for (paths) |path| {
+        try control.check();
+        count = try std.math.add(usize, count, path.steps.len);
+    }
+    const edges = try a.alloc(Edge, count);
+    const segments = try a.alloc(Segment, count);
+    const contexts = try a.alloc(multi.SegmentContext, count);
+    var shape: std.ArrayList(geo.PointLL) = .empty;
+    var summary: Summary = .{ .bounds = undefined };
+    var offset: Cost = .{};
+    var index: usize = 0;
+    for (paths, first..) |path, pair| {
+        var prior_secs: f32 = 0;
+        for (path.steps, 0..) |step, i| {
+            try control.check();
+            const segment: Segment = switch (step.movement) {
+                .walk => |walk| walk,
+                .ride => .{ .edge = @fromBackingInt(search.no_index), .begin = 0, .end = 1 },
+            };
+            segments[index] = segment;
+            contexts[index] = .{ .pair = pair, .starts_pair = i == 0 };
+            var metres: f32 = 0;
+            var vehicle_time: f32 = 0;
+            switch (step.movement) {
+                .walk => {
+                    const edge = try view.edge(segment.edge);
+                    const class = try view.class(edge.cls.class_id);
+                    try streetShape(a, view, segment.edge, fixed, vertices, control);
+                    const full_length: f32 = @floatFromInt(edge.geom.len_m);
+                    const portion = segment.end - segment.begin;
+                    metres = full_length * portion;
+                    if (portion > 0) vehicle_time = (step.elapsed.secs - prior_secs - step.transition.secs) / portion;
+                    if (i == 0 or i + 1 == path.steps.len or segment.begin != 0 or segment.end != 1) {
+                        const start = if (i == 0 or segment.begin != 0) try projected(correlations[pair], segment.edge, segment.begin, control) else vertices.items[0];
+                        const end = if (i + 1 == path.steps.len or segment.end != 1) try projected(correlations[pair + 1], segment.edge, segment.end, control) else vertices.items[vertices.items.len - 1];
+                        try geo.line.trimShapeWithDeadline(segment.begin * full_length, start, segment.end * full_length, end, vertices, control.deadline);
+                    }
+                    summary.has_toll = summary.has_toll or class.flags.toll;
+                    summary.has_highway = summary.has_highway or class.category.road_class == @backingInt(graph.constants.RoadClass.motorway);
+                    summary.has_ferry = summary.has_ferry or class.category.use == @backingInt(graph.constants.Use.ferry);
+                },
+                .ride => |ride| {
+                    const table = view.transit_index orelse return error.MissingTransitSection;
+                    const ends = try transit_leg.stops(table, ride);
+                    try vertices.resize(a, 2);
+                    vertices.items[0] = table.stops[ends.from].place.coordinate.toTilePoint();
+                    vertices.items[1] = table.stops[ends.to].place.coordinate.toTilePoint();
+                    metres = @floatCast(vertices.items[0].distance(vertices.items[1]));
+                    vehicle_time = @floatFromInt(ride.arrival_time - ride.departure_time);
+                },
+            }
+            const begin = try appendShape(a, &shape, vertices.items, &summary.bounds, control);
+            edges[index] = .{
+                .id = segment.edge,
+                .ride = if (step.movement == .ride) step.movement.ride else null,
+                .length_m = metres,
+                .elapsed = offset.add(step.elapsed),
+                .transition = step.transition,
+                .full_travel_secs = vehicle_time,
+                .shape_begin = begin,
+                .shape_end = shape.items.len - 1,
+            };
+            summary.length_m += metres;
+            prior_secs = step.elapsed.secs;
+            index += 1;
+        }
+        offset = offset.add(path.total);
+    }
+    if (shape.items.len == 0) return error.InvalidRoute;
+    summary.time = offset.secs;
+    summary.cost = offset.cost;
+    const encoded = try a.alloc(u8, geo.polyline.maxEncodedLen(.polyline, shape.items.len));
+    const size = try geo.polyline.encodeWithDeadline(.polyline, 6, shape.items, encoded, control.deadline);
+    return .{
+        .geometry = .{ .origin = first, .destination = first + paths.len, .edges = edges, .shape = shape.items, .encoded_shape = encoded[0..size], .summary = summary },
+        .segments = segments,
+        .contexts = contexts,
     };
 }
 

@@ -236,6 +236,30 @@ one and eight workers.
 [Brockton Area Transit GTFS](https://data.trilliumtransit.com/gtfs/brockton-ma-us/brockton-ma-us.zip) ·
 [2026-11-19 Massachusetts street extract](https://download.geofabrik.de/north-america/us/massachusetts/massachusetts-261119.osm.pbf)
 
+### Scheduled multimodal routes
+
+The route action sends `transit` and `multimodal` requests to the forward
+scheduled search. Street walking uses the directed graph and pedestrian
+costing. Each platform supplies its outgoing lines from the timetable.
+The search checks accessibility, service days and explicit transfer rules
+before boarding, and carries trip, block and operator information until
+it is safe to discard it. It considers tied and later departures on each
+line, including after-midnight service from a preceding day.
+
+The request arena holds paged labels and status, the frontier, and the
+result. Reverse walking distances bound access, egress and transfer
+distance. A separate reverse cost search uses the lowest applicable
+ride and walking costs with a rounding allowance. It omits waits and
+transfer charges, so it bounds the remaining forward cost. The forward
+search distinguishes walking arrival times where timed restrictions can
+affect the route.
+
+Trip legs expose the selected route, trip and block, boarding and
+alighting platforms, and their local arrival and departure times. The
+search retains second-level precision. The trip-leg projection uses
+Valhalla's minute display convention and connects ride geometry through
+the stored platform coordinates.
+
 ## Q3. Hot loop in Zig
 
 ```zig
