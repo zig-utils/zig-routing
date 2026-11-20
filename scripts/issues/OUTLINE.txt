@@ -76,6 +76,7 @@ P3.20 | Spatial index: 1/256 degree grid, cell directory, delta-varint edge list
 P3.21 | Node ordering interface with a Hilbert order as the first implementation | build | new | S | P3.15
 P3.22 | zr build driver: stages, restartability, progress and stats | build | new | M | P3.16 P3.17 P3.18 P3.19 P3.20 P3.21
 P3.23 | Snap: candidate search, projection and PathLocation semantics | snap | port | L | P3.20 P3.13
+P3.23a | Match snap candidate ordering and reachability fallback to Valhalla | snap | port | M | P3.23 P3.24 P3.34
 P3.24 | Snap: reachability, connectivity and the no-suitable-edges error paths | snap | port | M | P3.23
 P3.25 | Compiled costing framework: options to POD, kernel interface, admissibility contract | costing | new | L | P3.14
 P3.26 | Costing base: shared option parsing and penalties (port of dynamiccost base behaviour) | costing | port | L | P3.25
@@ -185,7 +186,7 @@ P7.08 | /isochrone API: polygons, lines, denoise, generalize, reverse, GeoJSON |
 P7.09 | /expansion endpoint | api | port | S | P7.01 P3.33 P7.03 P7.08
 P7.10 | /centroid | search | port | M | P7.01 P6.13
 P7.11 | /optimized_route: port of the optimizer on top of the matrix | search | port | M | P7.03 P6.13
-P7.12 | /locate with verbose edge and node info | api | port | M | P3.23 P3.17
+P7.12 | /locate with verbose edge and node info | api | port | M | P3.23 P3.17 P3.23a P3.34a
 P7.13 | /status with verbose output | api | port | S | P1.13 P3.13 P5.06 P6.09a
 P7.14 | /tile: graph MVT with an MVT encoder | tiles | port | M | P1.07 P3.20
 P7.15 | Scheduling classes: light and heavy request pools with bounded intra-request parallelism | server | new | M | P7.02 P1.16

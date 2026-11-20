@@ -461,6 +461,23 @@
     ]
   },
   {
+    "key": "P3.23a",
+    "goal": "Match the ordered correlation candidates and reachability fallbacks from Valhalla 3.9.3 when given the same graph and options.",
+    "upstream": ["src/loki/search.cc", "src/loki/reach.cc"],
+    "scope": [
+      "Reproduce tied intersection ordering and external reachable cutoff differences from the /locate oracle validation in P7.12.",
+      "Correct the shared candidate search and any required graph or importer metadata at the source.",
+      "Preserve single-level and hierarchical input behavior, exact candidate evaluation and arena-backed scratch."
+    ],
+    "out_of_scope": ["Adding Valhalla tile identifiers to the public response.", "Changing the Gate H scorer."],
+    "notes": ["The matching Utrecht fixtures and requests are in [the locate documentation](../blob/main/docs/api/locate.md)."],
+    "accept": [
+      "Same ordered directions at the tied junction and same retained fallback candidates as the pinned oracle.",
+      "The matching Utrecht replay confirms candidate identity, order and geometry across the tested costing and filter combinations.",
+      "Shared snap tests and zig build test pass."
+    ]
+  },
+  {
     "key": "P3.24",
     "goal": "Reachability and connectivity checks for snapped locations, with the same error codes as Valhalla when no suitable edge exists.",
     "upstream": ["src/loki/reach.cc", "src/loki/search.cc", "src/loki/worker.cc"],
