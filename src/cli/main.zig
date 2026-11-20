@@ -151,7 +151,7 @@ fn createCommands(a: Allocator) !*Command {
         option("edge-key", "Find WAY,BEGIN,END,forward|reverse[,OCCURRENCE[,KIND]]", .string),
         option("key-for-edge", "Print the stable key for a directed edge ID", .int),
     }, &.{arg("BUNDLE", "Graph bundle directory")});
-    const traffic_cmd = try command(root, "traffic", "Write live speeds and closures", null, &.{}, &.{});
+    const traffic_cmd = try command(root, "traffic", "Manage live and predicted speeds", null, &.{}, &.{});
     _ = try command(traffic_cmd, "set", "Apply a CSV or JSON lines file by stable edge key", setTraffic, &.{
         option("format", "Input format (csv or jsonl)", .string),
         option("max-age", "Maximum observation age in seconds (default 300)", .int),
@@ -160,6 +160,9 @@ fn createCommands(a: Allocator) !*Command {
         option("port", "Loopback TCP port (default 8003)", .int),
         option("max-age", "Maximum observation age in seconds (default 300)", .int),
     }, &.{arg("BUNDLE", "Graph bundle directory")});
+    _ = try command(traffic_cmd, "add-predicted", "Add weekly profiles and static traffic speeds from CSV", addPredicted, &.{}, &.{
+        arg("BUNDLE", "Graph bundle directory"), arg("FILE", "CSV with edge keys and predicted speeds"),
+    });
     _ = try command(root, "bundle-manifest", "Write range hashes for a graph bundle", bundleManifest, &.{
         option("output", "Range manifest output file", .string).withRequired(true),
     }, &.{arg("BUNDLE", "Graph bundle directory")});
@@ -290,8 +293,11 @@ const Runtime = struct {
 
     fn openGraph(self: *Runtime, ctx: *Context, path: ?[]const u8) !void {
         self.bundle = routing.graph.reader.Bundle.open(path orelse return) catch |err| {
-            if (err == error.LiveTrafficDatasetUuidMismatch)
-                ctx.setDiagnostic("traffic-live.bin dataset UUID does not match the configured graph bundle");
+            switch (err) {
+                error.LiveTrafficDatasetUuidMismatch => ctx.setDiagnostic("traffic-live.bin dataset UUID does not match the configured graph bundle"),
+                error.PredictedTrafficDatasetUuidMismatch => ctx.setDiagnostic("traffic-pred.bin dataset UUID does not match the configured graph bundle"),
+                else => {},
+            }
             return err;
         };
         self.svc.graph = &self.bundle.?.view;
@@ -630,6 +636,22 @@ fn setTraffic(ctx: *Context) !u8 {
     const now = std.math.cast(u64, io.wallSeconds()) orelse return error.InvalidLiveTrafficTime;
     const report = try owned.feeder.apply(a, map.bytes, kind, now, .none);
     defer report.deinit(a);
+    try ctx.writeJson(report);
+    return 0;
+}
+
+fn addPredicted(ctx: *Context) !u8 {
+    const dir = try io.Directory.open(ctx.getArgument(0).?);
+    defer dir.close();
+    var bundle = try routing.graph.reader.Bundle.openInDir(dir, null);
+    defer bundle.close();
+    const view = &bundle.view;
+    const index = view.edge_key_index orelse return missingEdgeKeys(ctx);
+    try index.verify(view.edges.len, .none);
+    const edge_count = std.math.cast(u32, view.edges.len) orelse return error.PredictedTrafficTooLarge;
+    const map = try io.Mapping.mapFile(ctx.getArgument(1).?, .read_only);
+    defer map.unmap();
+    const report = try routing.traffic.predicted_ingest.apply(std.heap.c_allocator, dir, view.dataset_uuid, edge_count, index, map.bytes, .none);
     try ctx.writeJson(report);
     return 0;
 }

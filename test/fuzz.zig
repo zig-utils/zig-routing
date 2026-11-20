@@ -315,6 +315,72 @@ test "fuzz traffic-feed" {
     try std.testing.fuzz({}, fuzzTrafficFeed, .{ .corpus = corpus });
 }
 
+fn fuzzPredictedSpeed(_: void, s: *Smith) !void {
+    const predicted = routing.traffic.predicted;
+    const codec = routing.traffic.predicted_codec;
+    var buf: [max_input]u8 align(8) = undefined;
+    const input = draw(s, &buf, 0x70726564);
+    if (input.len < 8) return;
+    const data = input[8..];
+    switch (input[0] % 3) {
+        0, 1 => {
+            if (input[0] % 3 == 1 and data.len >= @sizeOf(predicted.Header)) {
+                const offset = @offsetOf(predicted.Header, "payload_hash");
+                std.mem.writeInt(u64, data[offset..][0..8], std.hash.XxHash3.hash(0, data[@sizeOf(predicted.Header)..]), .little);
+            }
+            const view = predicted.View.parse(data, traffic_uuid, 2, .none) catch return;
+            for (0..3) |i| {
+                const id: graph.format.EdgeId = @fromBackingInt(@as(u32, @intCast(i)));
+                if (view.speed(id, 604799)) |speed| try std.testing.expect(std.math.isFinite(speed));
+            }
+        },
+        else => {
+            const csv = routing.build.gtfs.csv;
+            var fields: std.ArrayList(csv.Field) = .empty;
+            defer fields.deinit(std.testing.allocator);
+            var source = csv.Reader.init(data, "traffic-pred");
+            var diagnostic: csv.Diagnostic = .{};
+            while (source.next(std.testing.allocator, &fields, &diagnostic, .none) catch |err| switch (err) {
+                error.InvalidQuote => return,
+                else => return err,
+            }) |record| {
+                const row = routing.traffic.predicted_ingest.parseRow(record, .none) catch continue;
+                if (row.profile) |profile| try std.testing.expect(codec.StoredProfile.init(profile).valid());
+            }
+        },
+    }
+}
+
+test "fuzz predicted-speed" {
+    const predicted = routing.traffic.predicted;
+    const codec = routing.traffic.predicted_codec;
+    const Fixture = extern struct {
+        mode: u64,
+        header: predicted.Header,
+        block: traffic.RankBlock,
+        edge: predicted.EdgeData,
+        profile: codec.StoredProfile,
+    };
+    var sample: Fixture = .{
+        .mode = 0,
+        .header = .{ .dataset_uuid = traffic_uuid, .version = 1, .edge_count = 2, .record_count = 1, .profile_count = 1, .payload_hash = 0 },
+        .block = .{ .mask = 2, .first = 0 },
+        .edge = .{ .profile = 0, .free_flow = 73 },
+        .profile = codec.StoredProfile.init(@splat(600)),
+    };
+    const end = @offsetOf(Fixture, "profile") + @sizeOf(codec.StoredProfile);
+    const start = @offsetOf(Fixture, "block");
+    sample.header.payload_hash = std.hash.XxHash3.hash(0, std.mem.asBytes(&sample)[start..end]);
+    var encoded: [codec.encoded_size]u8 = undefined;
+    const text = codec.encode(&sample.profile.coefficients, &encoded);
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const a = state.allocator();
+    const row = try std.fmt.allocPrint(a, "\x02\x00\x00\x00\x00\x00\x00\x00\"12,42,43,forward\",72,39,{s}\n", .{text});
+    const corpus = try seeds(a, &.{ &.{}, std.mem.asBytes(&sample)[0..end], row });
+    try std.testing.fuzz({}, fuzzPredictedSpeed, .{ .corpus = corpus });
+}
+
 fn fuzzLaneTags(_: void, s: *Smith) !void {
     const lane_tags = routing.build.lanes;
     const allocator = std.testing.allocator;

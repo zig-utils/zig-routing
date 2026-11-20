@@ -289,6 +289,37 @@ validation and publication path as the one-shot command.
 zig build bench-traffic-feed -Doptimize=ReleaseFast
 ```
 
+### Predicted traffic profiles
+
+`zr traffic add-predicted BUNDLE FILE` reads a CSV with a quoted stable edge
+key, free-flow speed, constrained speed and optional profile. A nonzero
+static speed updates that field and is capped at 140 kph, as in Valhalla.
+Blank fields and zero preserve the corresponding previous values. A profile
+contains 200 signed, big-endian 16-bit coefficients encoded as standard
+base64. The profile represents 2,016 five-minute buckets over one week.
+
+```csv
+edge_key,free_flow,constrained,coefficients
+"88293320,1025569552,1025568991,reverse",70,45
+```
+
+The ingester publishes `traffic-pred.bin` atomically beside the graph. Its
+64-byte header carries the dataset UUID, counts and the XXH3 payload checksum.
+Each group of 64 directed edges uses a rank block to locate the group's
+covered entries. Each covered edge stores its static overrides and a profile
+ID. The profile table stores identical coefficient sets once. The tool
+reports the number of associated edges, distinct profiles and their ratio.
+To read a newly published snapshot, reopen the bundle.
+
+The codec evaluates the Valhalla DCT with SIMD. A checked per-profile lane
+bound allows a Q15 basis for ordinary profiles. Its projection error stays
+under 0.253 kph relative to the floating-point basis before final rounding.
+Profiles above the bound use the floating-point projection.
+
+```sh
+zig build bench-predicted-speed -Doptimize=ReleaseFast
+```
+
 ### Transit timetable sections
 
 A bundle with transit carries sections 27 through 38 together. They use the v1 section

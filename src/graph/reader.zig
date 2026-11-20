@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const live = @import("../traffic/live.zig");
+const predicted = @import("../traffic/predicted.zig");
 const io = @import("../infra/io.zig");
 const format = @import("format.zig");
 const class_table = @import("class_table.zig");
@@ -29,6 +30,7 @@ pub const Bundle = struct {
     mappings: Mappings,
     view: View,
     live_overlay: ?live.Reader = null,
+    predicted_overlay: ?predicted.Reader = null,
 
     pub fn open(path: []const u8) !Bundle {
         return openDescribed(path, null);
@@ -78,10 +80,15 @@ pub const Bundle = struct {
             result.live_overlay = overlay;
             result.view.live_traffic = overlay.view;
         }
+        if (try predicted.Reader.open(dir, result.view.dataset_uuid, result.view.edges.len, deadline)) |overlay| {
+            result.predicted_overlay = overlay;
+            result.view.predicted_traffic = overlay.view;
+        }
         return result;
     }
 
     pub noinline fn close(self: *Bundle) void {
+        if (self.predicted_overlay) |overlay| overlay.close();
         if (self.live_overlay) |overlay| overlay.close();
         for (kinds) |kind| self.mappings.get(kind).unmap();
         self.* = undefined;
@@ -148,6 +155,7 @@ pub const View = struct {
     headers: Headers,
     dataset_uuid: format.DatasetUuid,
     live_traffic: ?live.View = null,
+    predicted_traffic: ?predicted.View = null,
     nodes: []const format.NodeHot,
     edges: []const format.EdgeHot,
     first_edge: []const format.FirstEdge,
@@ -476,6 +484,11 @@ pub const View = struct {
 
     pub fn speedOverlays(self: *const View, now: u64, max_age_seconds: u64) live.Overlays {
         return .init(self.live_traffic, now, max_age_seconds);
+    }
+
+    pub fn edgeWithPredictedTraffic(self: *const View, id: format.EdgeId) !format.EdgeHot {
+        const base = (try self.edge(id)).*;
+        return if (self.predicted_traffic) |overlay| overlay.applyStatic(id, base) else base;
     }
 
     pub fn node(self: *const View, id: format.NodeId) error{InvalidNodeId}!*const format.NodeHot {

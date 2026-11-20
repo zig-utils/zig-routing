@@ -389,6 +389,79 @@ test "traffic feed applies keys and preserves individual expiry across reopen" {
     try testing.expectEqual(4, restarted.writer.view.metadata().?.epoch);
 }
 
+test "predicted traffic snapshots deduplicate coefficients and preserve unrelated edge updates" {
+    const predicted = routing.traffic.predicted;
+    const codec = routing.traffic.predicted_codec;
+    const ingest = routing.traffic.predicted_ingest;
+    const fixture = try Fixture.create();
+    defer fixture.deinit();
+    var buf: [80]u8 = undefined;
+    const path = fixture.path(&buf);
+    const dir = try fixture.root.child("bundle");
+    defer dir.close();
+    defer dir.deleteFile(predicted.filename) catch {};
+    var base = try reader.Bundle.open(path);
+    defer base.close();
+    try testing.expectEqual(null, base.view.predicted_traffic);
+    const first: format.EdgeId = @fromBackingInt(0);
+    const second: format.EdgeId = @fromBackingInt(1);
+    var coefficients: codec.Profile = @splat(0);
+    coefficients[0] = 3143;
+    var wire: [codec.encoded_size]u8 = undefined;
+    const profile = codec.encode(&coefficients, &wire);
+    const input = try std.fmt.allocPrint(testing.allocator,
+        \\edge_key,free_flow,constrained,coefficients
+        \\"12,42,43,forward",210,46,{s}
+        \\"12,43,42,reverse",61,34,{s}
+        \\"12,43,42,reverse",50,54
+        \\"99,42,43,forward",78,40
+        \\"12,42,43,forward",40,30,invalid
+    , .{ profile, profile });
+    defer testing.allocator.free(input);
+    const uuid = base.view.dataset_uuid;
+    const index = base.view.edge_key_index.?;
+    const initial = try ingest.apply(testing.allocator, dir, uuid, 2, index, input, .none);
+    try testing.expectEqual(5, initial.rows);
+    try testing.expectEqual(2, initial.applied_rows);
+    try testing.expectEqual(1, initial.duplicate_rows);
+    try testing.expectEqual(1, initial.unknown_keys);
+    try testing.expectEqual(1, initial.invalid_rows);
+    try testing.expectEqual(1, initial.clamped_speeds);
+    try testing.expectEqual(1, initial.unique_profiles);
+    try testing.expectEqual(@as(?f64, 2), initial.profile_dedup_ratio);
+
+    var old = try reader.Bundle.open(path);
+    defer old.close();
+    const old_traffic = old.view.predicted_traffic.?;
+    const old_first = try old.view.edgeWithPredictedTraffic(first);
+    try testing.expectEqual(140, old_first.speed[1]);
+    try testing.expectEqual(46, old_first.speed[2]);
+    try testing.expectEqual(1, old_first.cls.pred_speed);
+    try testing.expectApproxEqAbs(@as(f32, 70), old_traffic.speed(second, 604799).?, 0.02);
+    try testing.expectEqual(old_traffic.entry(first).?.profile, old_traffic.entry(second).?.profile);
+    try testing.expectEqualDeep((try base.view.edge(first)).*, (try old.view.edge(first)).*);
+
+    const changed = try ingest.apply(testing.allocator, dir, uuid, 2, index,
+        \\"12,42,43,forward",65,0
+    , .none);
+    try testing.expectEqual(1, changed.applied_rows);
+    try testing.expectEqual(1, changed.unique_profiles);
+    var latest = try reader.Bundle.open(path);
+    defer latest.close();
+    try testing.expectEqual(65, (try latest.view.edgeWithPredictedTraffic(first)).speed[1]);
+    try testing.expectEqual(46, (try latest.view.edgeWithPredictedTraffic(first)).speed[2]);
+    try testing.expectEqual(61, (try latest.view.edgeWithPredictedTraffic(second)).speed[1]);
+    try testing.expectEqual(140, (try old.view.edgeWithPredictedTraffic(first)).speed[1]);
+
+    var wrong_uuid = uuid;
+    wrong_uuid[0] ^= 1;
+    try testing.expectError(error.PredictedTrafficDatasetUuidMismatch, predicted.Reader.open(dir, wrong_uuid, 2, .none));
+    const file = try dir.readWriteFile(predicted.filename);
+    defer file.close();
+    try file.pwriteAll(&.{0}, @sizeOf(predicted.Header));
+    try testing.expectError(error.PredictedTrafficHashMismatch, reader.Bundle.open(path));
+}
+
 test "timetable references can exceed Valhalla's twelve-bit indices" {
     const fixture = try Fixture.createWithTransit(true);
     defer fixture.deinit();

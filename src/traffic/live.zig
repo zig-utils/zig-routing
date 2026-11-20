@@ -173,14 +173,7 @@ pub const View = struct {
     }
 
     pub inline fn slot(self: View, edge: format.EdgeId) ?Slot {
-        const id = @backingInt(edge);
-        const group = id >> 6;
-        if (group >= self.blocks.len) return null;
-        const block = &self.blocks[group];
-        const bit = @as(u64, 1) << @as(u6, @truncate(id));
-        const bits = block.mask;
-        if (bits & bit == 0) return null;
-        return @fromBackingInt(block.first + @popCount(bits & (bit - 1)));
+        return rankSlot(self.blocks, edge);
     }
 
     pub inline fn load(self: View, index: Slot) ?Record {
@@ -205,6 +198,16 @@ pub const View = struct {
         return .{ .epoch = version_before >> 1, .last_update = time, .live_to_bound = ratio };
     }
 };
+
+pub inline fn rankSlot(blocks: []const RankBlock, edge: format.EdgeId) ?Slot {
+    const id = @backingInt(edge);
+    const group = id >> 6;
+    if (group >= blocks.len) return null;
+    const block = &blocks[group];
+    const bit = @as(u64, 1) << @as(u6, @truncate(id));
+    if (block.mask & bit == 0) return null;
+    return @fromBackingInt(block.first + @popCount(block.mask & (bit - 1)));
+}
 
 pub const Reader = struct {
     mapping: io.Mapping,
