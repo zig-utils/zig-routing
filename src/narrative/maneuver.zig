@@ -5,6 +5,7 @@ const directions = @import("../api/directions.zig");
 const request = @import("../api/request.zig");
 const debug = @import("debug.zig");
 const io = @import("../infra/io.zig");
+const VerbalStyle = @import("verbal_text.zig").Style;
 const lengthInUnits = @import("enhanced.zig").lengthInUnits;
 
 pub const RelativeDirection = enum { none, keep_straight, keep_right, right, reverse, left, keep_left };
@@ -22,6 +23,7 @@ pub const Maneuver = struct {
     tunnel: bool = false,
     street_names: []const trip.StreetName = &.{},
     name_style: NameStyle = .generic,
+    verbal_style: VerbalStyle = .generic,
     begin_street_names: []const trip.StreetName = &.{},
     cross_street_names: []const trip.StreetName = &.{},
     instruction: []const u8 = "",

@@ -191,14 +191,26 @@ def maneuver_types(descriptors):
     return {int(number): name for name, number in re.findall(r"^\s*(\w+)\s*=\s*(\d+)\s*;", block, re.M)}
 
 
-def compare_instructions(comparison, steps, records):
+def compare_instructions(comparison, steps, records, verbal):
     comparison.counts["instruction_legs"] += 1
     comparison.counts["instructions"] += len(records)
+    verbal_fields = {
+        12: "verbal_transition_alert_instruction",
+        13: "verbal_pre_transition_instruction",
+        14: "verbal_post_transition_instruction",
+        37: "verbal_succinct_transition_instruction",
+    }
     for step, record in zip(steps, records):
         comparison.check("maneuver.instruction", step["instruction"].encode() == get(record, 2, b""))
+        if verbal:
+            comparison.counts["verbal_fields"] += len(verbal_fields) + 1
+            for field, name in verbal_fields.items():
+                comparison.check(f"maneuver.{name}", step[name].encode() == get(record, field, b""))
+            multi_cue = step["distant_verbal_multi_cue"] or step["imminent_verbal_multi_cue"]
+            comparison.check("maneuver.verbal_multi_cue", multi_cue == bool(get(record, 23)))
 
 
-def compare_maneuvers(comparison, ours, donor, directions, result, types, highway, text=False):
+def compare_maneuvers(comparison, ours, donor, directions, result, types, highway, miles, text=False, verbal=False):
     native_nodes = ours["node"]
     donor_nodes = nested(donor, 6)
     native_edges = [node["edge"] for node in native_nodes if "edge" in node]
@@ -242,7 +254,8 @@ def compare_maneuvers(comparison, ours, donor, directions, result, types, highwa
     shape_match = ours["shape"].encode() == get(donor, 8, b"")
     summary = nested(directions, 5)[0]
     distance, time = get(summary, 1), get(summary, 2)
-    length_match = abs(ours["summary"]["length"] - distance) <= distance * 0.005
+    length = ours["summary"]["length"] * (0.621371 if miles else 1)
+    length_match = abs(length - distance) <= distance * 0.005
     time_match = abs(ours["summary"]["time"] - time) <= time * 0.01
     comparison.check("maneuver.types", type_match)
     comparison.check("maneuver.names", name_match)
@@ -251,7 +264,7 @@ def compare_maneuvers(comparison, ours, donor, directions, result, types, highwa
     comparison.check("time", time_match)
     passed = type_match and name_match and shape_match and length_match and time_match
     if text and same_path and type_match and name_match:
-        compare_instructions(comparison, steps, records)
+        compare_instructions(comparison, steps, records, verbal)
     counts["gate_d_passes"] += passed
     if highway:
         counts["within_cost_different_paths"] += not same_path
@@ -262,7 +275,7 @@ def compare_maneuvers(comparison, ours, donor, directions, result, types, highwa
                 counts[f"legs_with_{types[number]}"] += 1
 
 
-def compare_narrative_fixture(comparison, ours, donor, directions, result, types, text):
+def compare_narrative_fixture(comparison, ours, donor, directions, result, types, text, verbal):
     native_edges = [node["edge"] for node in ours["node"] if "edge" in node]
     donor_edges = [edge for node in nested(donor, 6) for edge in nested(node, 1)]
     same_path = [(edge["way_id"], edge["forward"]) for edge in native_edges] == [
@@ -281,7 +294,7 @@ def compare_narrative_fixture(comparison, ours, donor, directions, result, types
     ])
     if text:
         comparison.check("maneuver.instruction_count", len(steps) == len(records))
-        compare_instructions(comparison, steps, records)
+        compare_instructions(comparison, steps, records, verbal)
     for edge, reference in zip(native_edges, donor_edges):
         states = {0: "kInvalid", 1: "kValid", 2: "kActive"}
         received = nested(reference, 42)
@@ -308,11 +321,14 @@ def main():
                          help="compare every fixture path, maneuver sequence and turn lane state")
     parser.add_argument("--instructions", action="store_true",
                          help="require exact visual text where paths, maneuver types and names match")
+    parser.add_argument("--verbal-instructions", action="store_true",
+                        help="also compare the four spoken cues and the multi-cue flag")
     args = parser.parse_args()
-    if args.metadata_only and args.instructions:
+    text = args.instructions or args.verbal_instructions
+    if args.metadata_only and text:
         parser.error("--instructions requires maneuver output")
     comparison = Comparison(args.schema)
-    highway = args.highway_maneuvers or (args.instructions and not args.maneuvers and not args.narrative_fixtures)
+    highway = args.highway_maneuvers or (text and not args.maneuvers and not args.narrative_fixtures)
     score_maneuvers = args.maneuvers or highway
     types = maneuver_types(args.schema) if score_maneuvers or args.narrative_fixtures else {}
     with args.native.open() as rows:
@@ -327,12 +343,14 @@ def main():
             comparison.check("leg.count", len(row["legs"]) == len(reference))
             if score_maneuvers or args.narrative_fixtures:
                 directions = list(direction_legs(blob))
+                api_options = nested(decode(blob), 1)
+                miles = bool(api_options) and get(api_options[0], 1) == 1
                 comparison.check("directions.leg_count", len(row["legs"]) == len(directions))
                 for ours, donor, direction, result in zip(row["legs"], reference, directions, row["maneuvers"]):
                     if args.narrative_fixtures:
-                        compare_narrative_fixture(comparison, ours, donor, direction, result, types, args.instructions)
+                        compare_narrative_fixture(comparison, ours, donor, direction, result, types, text, args.verbal_instructions)
                     else:
-                        compare_maneuvers(comparison, ours, donor, direction, result, types, highway, args.instructions)
+                        compare_maneuvers(comparison, ours, donor, direction, result, types, highway, miles, text, args.verbal_instructions)
             else:
                 for ours, donor in zip(row["legs"], reference):
                     comparison.leg(ours, donor, args.metadata_only)
@@ -343,8 +361,10 @@ def main():
         return int(comparison.counts["matched_legs"] < args.minimum_legs or
                    comparison.counts["gate_d_passes"] * 100 < eligible * 95 or
                    any(comparison.differences[key] for key in structural) or
-                   (args.instructions and (comparison.counts["instruction_legs"] < args.minimum_legs or
-                                           comparison.differences["maneuver.instruction"] != 0)))
+                   (text and (comparison.counts["instruction_legs"] < args.minimum_legs or
+                              comparison.differences["maneuver.instruction"] != 0)) or
+                   (args.verbal_instructions and any(key.startswith("maneuver.verbal_") and count
+                                                     for key, count in comparison.differences.items())))
     return int(bool(comparison.differences) or comparison.counts["matched_legs"] < args.minimum_legs)
 
 

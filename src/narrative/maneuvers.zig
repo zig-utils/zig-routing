@@ -131,6 +131,7 @@ const max_internal_length_km: f32 = 0.032;
 const small_end_ramp_fork_threshold: f32 = 0.125;
 
 const std = @import("std");
+const VerbalStyle = @import("verbal_text.zig").Style;
 const io = @import("../infra/io.zig");
 const Maneuver = maneuver.Maneuver;
 
@@ -248,6 +249,7 @@ const Builder = struct {
             .end_node_index = @intCast(index),
             .begin_shape_index = shape_index,
             .end_shape_index = shape_index,
+            .verbal_style = VerbalStyle.forAdmin(self.leg.countryCode(index), self.leg.stateCode(index)),
         };
         copyTravel(&value, previous);
         return value;
@@ -350,6 +352,7 @@ const Builder = struct {
         value.begin_cardinal_direction = cardinalDirection(value.begin_heading);
         value.begin_node_index = @intCast(index);
         value.begin_shape_index = current.value.begin_shape_index;
+        value.verbal_style = VerbalStyle.forAdmin(self.leg.countryCode(index), self.leg.stateCode(index));
         value.time = end.elapsedTime() - node.elapsedTime();
         if (node.isElevator()) {
             value.elevator = true;

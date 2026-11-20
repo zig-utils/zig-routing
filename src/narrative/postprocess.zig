@@ -60,20 +60,22 @@ pub fn setVerbalMultiCueFlags(values: []Maneuver, deadline: io.Deadline) !void {
     for (values) |*next| {
         if (deadline.expired()) return error.DeadlineExceeded;
         if (next.pedestrian_type == .kBlind) continue;
-        if (previous) |value| {
-            if (canCombineCues(value, next)) {
-                const distant = switch (next.type) {
-                    .kSlightRight, .kRight, .kSharpRight, .kUturnRight, .kRampRight, .kExitRight, .kStayRight => value.has_right_traversable_outbound_intersecting_edge,
-                    .kSlightLeft, .kLeft, .kSharpLeft, .kUturnLeft, .kRampLeft, .kExitLeft, .kStayLeft => value.has_left_traversable_outbound_intersecting_edge,
-                    .kDestination, .kDestinationLeft, .kDestinationRight => value.has_left_traversable_outbound_intersecting_edge or value.has_right_traversable_outbound_intersecting_edge,
-                    else => false,
-                };
-                value.distant_verbal_multi_cue = distant;
-                value.imminent_verbal_multi_cue = !distant;
-            }
-        }
+        if (previous) |value| _ = markVerbalMultiCue(value, next);
         previous = next;
     }
+}
+
+pub fn markVerbalMultiCue(value: *Maneuver, next: *const Maneuver) bool {
+    if (!canCombineCues(value, next)) return false;
+    const distant = switch (next.type) {
+        .kSlightRight, .kRight, .kSharpRight, .kUturnRight, .kRampRight, .kExitRight, .kStayRight => value.has_right_traversable_outbound_intersecting_edge,
+        .kSlightLeft, .kLeft, .kSharpLeft, .kUturnLeft, .kRampLeft, .kExitLeft, .kStayLeft => value.has_left_traversable_outbound_intersecting_edge,
+        .kDestination, .kDestinationLeft, .kDestinationRight => value.has_left_traversable_outbound_intersecting_edge or value.has_right_traversable_outbound_intersecting_edge,
+        else => false,
+    };
+    value.distant_verbal_multi_cue = distant;
+    value.imminent_verbal_multi_cue = !distant;
+    return true;
 }
 
 fn canCombineCues(value: *const Maneuver, next: *const Maneuver) bool {

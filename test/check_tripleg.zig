@@ -24,6 +24,8 @@ pub fn main(init: std.process.Init) !void {
             narrative = .maneuvers;
         } else if (std.mem.eql(u8, option, "--instructions") and narrative == .none) {
             narrative = .instructions;
+        } else if (std.mem.eql(u8, option, "--verbal-instructions") and narrative == .none) {
+            narrative = .verbal_instructions;
         } else if (std.mem.eql(u8, option, "--pedestrian") and !on_foot) {
             on_foot = true;
         } else return error.InvalidOption;
@@ -32,7 +34,7 @@ pub fn main(init: std.process.Init) !void {
     return run(.auto, init, bundle_path, corpus_path, count, narrative);
 }
 
-const Narrative = enum { none, maneuvers, instructions };
+const Narrative = enum { none, maneuvers, instructions, verbal_instructions };
 
 fn run(comptime mode: request.Costing, init: std.process.Init, bundle_path: []const u8, corpus_path: []const u8, count: usize, narrative: Narrative) !void {
     const Kernel = if (mode == .pedestrian) Foot else Auto;
@@ -70,10 +72,15 @@ fn run(comptime mode: request.Costing, init: std.process.Init, bundle_path: []co
             const values = try a.alloc(ManeuverResult, legs.len);
             for (legs, values) |*leg, *result| {
                 const deadline = io.Deadline.fromNowMs(10_000);
-                const built_leg = if (narrative == .instructions)
-                    routing.narrative.instructions.build(a, leg, checked.narrative, deadline)
-                else
-                    routing.narrative.maneuvers.buildAnnotated(a, leg, .{ .roundabout_exits = checked.narrative.roundabout_exits }, deadline);
+                const built_leg = switch (narrative) {
+                    .none => unreachable,
+                    .maneuvers => routing.narrative.maneuvers.buildAnnotated(a, leg, .{ .roundabout_exits = checked.narrative.roundabout_exits }, deadline),
+                    .instructions => routing.narrative.instructions.build(a, leg, .{
+                        .roundabout_exits = checked.narrative.roundabout_exits,
+                        .language = checked.narrative.language,
+                    }, deadline),
+                    .verbal_instructions => routing.narrative.verbal_instructions.build(a, leg, checked.narrative, deadline),
+                };
                 if (built_leg) |built| {
                     leg.* = built.trip_leg;
                     result.* = .{ .steps = built.maneuvers };
@@ -97,7 +104,7 @@ const ManeuverResult = struct {
 
 const Checked = struct {
     legs: []trip.TripLeg,
-    narrative: routing.narrative.instructions.Options,
+    narrative: routing.narrative.verbal_instructions.Options,
 };
 
 fn check(comptime mode: request.Costing, engine: anytype, view: *const routing.graph.reader.View, arena: *routing.infra.arena.Arena, cache: anytype, request_json: []const u8) !Checked {
@@ -153,5 +160,9 @@ fn check(comptime mode: request.Costing, engine: anytype, view: *const routing.g
             .leg_count = @intCast(output.len),
         }, control);
     }
-    return .{ .legs = output, .narrative = .{ .roundabout_exits = opts.roundabout_exits, .language = opts.language } };
+    return .{ .legs = output, .narrative = .{
+        .roundabout_exits = opts.roundabout_exits,
+        .language = opts.language,
+        .units = opts.units,
+    } };
 }

@@ -30,6 +30,9 @@ pub fn build(arena: std.mem.Allocator, leg: *const trip.TripLeg, options: Option
 }
 
 const Value = format.Value;
+const present = format.present;
+const direction = format.direction;
+const forkDirection = format.forkDirection;
 const PhraseMap = dictionary.types.PhraseMap;
 
 const Phrase = struct {
@@ -64,7 +67,7 @@ const Builder = struct {
         var out = io.Writer.Allocating.init(arena);
         errdefer out.deinit();
         try out.writer.writeAll(prefix);
-        try format.writePhrase(&out.writer, selected.text, selected.fields, deadline);
+        try format.writePhrase(&out.writer, selected.text, selected.fields, .{ .deadline = deadline });
         const bytes = try out.toOwnedSlice();
         if (selected.articulate and std.mem.eql(u8, self.locale.language_tag, "it-IT")) {
             const len = try format.articulateItalian(bytes[prefix.len..], deadline);
@@ -103,7 +106,7 @@ const Builder = struct {
 
     fn start(self: Builder, step: *const Maneuver) !Phrase {
         const subset = self.locale.start_subset;
-        const street_names = try self.startNames(step, &subset.empty_street_name_labels);
+        const street_names = try format.startNames(step, &subset.empty_street_name_labels, 0, self.sign_limits.deadline);
         const offset: u8 = switch (step.travel_mode) {
             .kDrive => 4,
             .kPedestrian => 8,
@@ -137,7 +140,7 @@ const Builder = struct {
     fn goOn(self: Builder, step: *const Maneuver) !Phrase {
         const subset = self.locale.continue_subset;
         const street_name = try self.street(step, &subset.empty_street_name_labels, 0);
-        const sign = try self.junctionOrGuide(step, 2, 3);
+        const sign = try format.junctionOrGuide(step, self.sign_limits, 2, 3);
         return Phrase.init(subset.phrases, sign.id orelse present(!street_name.isEmpty()), .{
             .STREET_NAMES = street_name,
             .JUNCTION_NAME = sign.junction,
@@ -146,8 +149,8 @@ const Builder = struct {
     }
 
     fn turn(self: Builder, step: *const Maneuver, subset: dictionary.types.TurnSubset) !Phrase {
-        const street_names = try self.startNames(step, &subset.empty_street_name_labels);
-        const sign = try self.junctionOrGuide(step, 4, 5);
+        const street_names = try format.startNames(step, &subset.empty_street_name_labels, 0, self.sign_limits.deadline);
+        const sign = try format.junctionOrGuide(step, self.sign_limits, 4, 5);
         const id: u8 = sign.id orelse if (step.to_stay_on) 3 else if (!street_names.begin.isEmpty()) 2 else present(!street_names.street.isEmpty());
         return Phrase.init(subset.phrases, id, .{
             .RELATIVE_DIRECTION = direction(step, subset.relative_directions),
@@ -162,7 +165,7 @@ const Builder = struct {
         const subset = self.locale.uturn_subset;
         const street_name = try self.street(step, &subset.empty_street_name_labels, 0);
         const cross = try self.names(step.cross_street_names);
-        const sign = try self.junctionOrGuide(step, 6, 7);
+        const sign = try format.junctionOrGuide(step, self.sign_limits, 6, 7);
         const street_id: u8 = if (street_name.isEmpty()) 0 else 1 + present(step.to_stay_on);
         return Phrase.init(subset.phrases, sign.id orelse street_id + 3 * present(!cross.isEmpty()), .{
             .RELATIVE_DIRECTION = direction(step, subset.relative_directions),
@@ -187,13 +190,7 @@ const Builder = struct {
         if (step.type == .kRampStraight) return Phrase.init(self.locale.ramp_straight_subset.phrases, id, fields);
         const subset = self.locale.ramp_subset;
         fields.RELATIVE_DIRECTION = direction(step, subset.relative_directions);
-        const offset: u8 = switch (step.begin_relative_direction) {
-            .left, .right => 5,
-            .keep_left => if (step.drive_on_right) 0 else 10,
-            .keep_right => if (step.drive_on_right) 10 else 0,
-            else => 0,
-        };
-        return Phrase.init(subset.phrases, offset + id, fields);
+        return Phrase.init(subset.phrases, format.rampDirectionOffset(step) + id, fields);
     }
 
     fn exit(self: Builder, step: *const Maneuver) !Phrase {
@@ -206,7 +203,7 @@ const Builder = struct {
             4 * present(sign.exit_toward_locations.len != 0) + 8 * present(name);
         return Phrase.init(subset.phrases, id, .{
             .RELATIVE_DIRECTION = direction(step, subset.relative_directions),
-            .NUMBER_SIGN = try self.exitNumbers(sign),
+            .NUMBER_SIGN = try format.exitNumbers(sign, self.sign_limits.deadline),
             .BRANCH_SIGN = try self.sign_limits.signs(sign.exit_onto_streets),
             .TOWARD_SIGN = try self.sign_limits.signs(sign.exit_toward_locations),
             .NAME_SIGN = if (name) try self.sign_limits.signs(sign.exit_names) else .empty,
@@ -216,26 +213,13 @@ const Builder = struct {
     fn keep(self: Builder, step: *const Maneuver) !Phrase {
         const subset = self.locale.keep_subset;
         const sign = step.signs;
-        var street_name: Value = .empty;
-        var toward: Value = .empty;
-        if (step.hasGuideSign()) {
-            street_name = try self.sign_limits.signs(sign.guide_onto_streets);
-            toward = try self.sign_limits.signs(sign.guide_toward_locations);
-        } else {
-            if (step.ramp and sign.exit_onto_streets.len != 0) {
-                street_name = try self.sign_limits.signs(sign.exit_onto_streets);
-            } else {
-                street_name = try self.street(step, &subset.empty_street_name_labels, self.sign_limits.count);
-                if (street_name.isEmpty()) street_name = try self.sign_limits.signs(sign.exit_onto_streets);
-            }
-            toward = try self.sign_limits.signs(sign.exit_toward_locations);
-        }
-        const id = present(sign.exit_numbers.len != 0) + 2 * present(!street_name.isEmpty()) + 4 * present(!toward.isEmpty());
+        const names_and_signs = try format.keepNames(step, &subset.empty_street_name_labels, self.sign_limits);
+        const id = present(sign.exit_numbers.len != 0) + 2 * present(!names_and_signs.street.isEmpty()) + 4 * present(!names_and_signs.toward.isEmpty());
         return Phrase.init(subset.phrases, id, .{
             .RELATIVE_DIRECTION = forkDirection(step, subset.relative_directions),
-            .NUMBER_SIGN = try self.exitNumbers(sign),
-            .STREET_NAMES = street_name,
-            .TOWARD_SIGN = toward,
+            .NUMBER_SIGN = try format.exitNumbers(sign, self.sign_limits.deadline),
+            .STREET_NAMES = names_and_signs.street,
+            .TOWARD_SIGN = names_and_signs.toward,
         });
     }
 
@@ -246,7 +230,7 @@ const Builder = struct {
         const id = present(sign.exit_numbers.len != 0) + 2 * present(!toward.isEmpty());
         return Phrase.init(subset.phrases, id, .{
             .RELATIVE_DIRECTION = forkDirection(step, subset.relative_directions),
-            .NUMBER_SIGN = try self.exitNumbers(sign),
+            .NUMBER_SIGN = try format.exitNumbers(sign, self.sign_limits.deadline),
             .STREET_NAMES = try self.street(step, &subset.empty_street_name_labels, self.sign_limits.count),
             .TOWARD_SIGN = toward,
         });
@@ -292,7 +276,7 @@ const Builder = struct {
 
     fn exitRoundabout(self: Builder, step: *const Maneuver) !Phrase {
         const subset = self.locale.exit_roundabout_subset;
-        const street_names = try self.startNames(step, &subset.empty_street_name_labels);
+        const street_names = try format.startNames(step, &subset.empty_street_name_labels, 0, self.sign_limits.deadline);
         const guide = step.hasGuideSign();
         const id = if (guide) @as(u8, 3) else present(!street_names.street.isEmpty()) + present(!street_names.begin.isEmpty());
         return Phrase.init(subset.phrases, id, .{
@@ -345,46 +329,7 @@ const Builder = struct {
     fn street(self: Builder, step: *const Maneuver, labels: []const []const u8, limit: usize) !Value {
         return format.streetNames(step, step.street_names, labels, limit, self.sign_limits.deadline);
     }
-
-    const StartNames = struct { street: Value, begin: Value };
-
-    fn startNames(self: Builder, step: *const Maneuver, labels: []const []const u8) !StartNames {
-        const begin = try self.names(step.begin_street_names);
-        if (step.contains_obvious_maneuver and !begin.isEmpty()) return .{ .street = begin, .begin = .empty };
-        return .{ .street = try self.street(step, labels, 0), .begin = begin };
-    }
-
-    const JunctionOrGuide = struct { id: ?u8 = null, junction: Value = .empty, guide: Value = .empty };
-
-    fn junctionOrGuide(self: Builder, step: *const Maneuver, junction_id: u8, guide_id: u8) !JunctionOrGuide {
-        if (step.hasGuideSign()) return .{ .id = guide_id, .guide = try self.sign_limits.guide(step.signs) };
-        if (step.signs.junction_names.len != 0) return .{ .id = junction_id, .junction = try self.sign_limits.signs(step.signs.junction_names) };
-        return .{};
-    }
-
-    fn exitNumbers(self: Builder, sign: trip.Sign) !Value {
-        const unlimited: format.SignLimits = .{ .count = 0, .consecutive = false, .deadline = self.sign_limits.deadline };
-        return unlimited.signs(sign.exit_numbers);
-    }
 };
-
-fn present(value: bool) u8 {
-    return @intFromBool(value);
-}
-
-fn direction(step: *const Maneuver, labels: [2][]const u8) Value {
-    return .{ .text = labels[@intFromBool(step.isRightType())] };
-}
-
-fn forkDirection(step: *const Maneuver, labels: [3][]const u8) Value {
-    const index: usize = switch (step.type) {
-        .kStayLeft => 0,
-        .kStayStraight => 1,
-        .kStayRight => 2,
-        else => unreachable,
-    };
-    return .{ .text = labels[index] };
-}
 
 test "Valhalla visual instruction snapshots" {
     const fixtures = @import("instruction_fixtures.zig");

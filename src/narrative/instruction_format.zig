@@ -3,11 +3,40 @@ const std = @import("std");
 const io = @import("../infra/io.zig");
 const trip = @import("../api/trip.zig");
 const Maneuver = @import("maneuver.zig").Maneuver;
+const verbal_text = @import("verbal_text.zig");
+const locale_format = @import("locale_format.zig");
+const Length = @import("verbal_distances.zig").Length;
+
+pub const Speech = struct {
+    text_formatter: *verbal_text.Formatter,
+    style: verbal_text.Style,
+    numbers: locale_format.Numbers,
+    delimiter: []const u8 = ", ",
+};
+
+pub const Context = struct {
+    deadline: io.Deadline,
+    speech: ?Speech = null,
+
+    fn writeName(self: Context, out: *io.Writer, text: []const u8, pronunciation: ?trip.Pronunciation) !void {
+        if (self.speech) |speech| {
+            try speech.text_formatter.write(out, speech.style, text, pronunciation);
+        } else {
+            try out.writeAll(text);
+        }
+    }
+
+    fn delimiter(self: Context) []const u8 {
+        return if (self.speech) |speech| speech.delimiter else "/";
+    }
+};
 
 /// A substitution borrows its source data. Lists write directly into the final instruction.
 pub const Value = union(enum) {
     empty,
     text: []const u8,
+    spoken: []const u8,
+    length: Length,
     names: []const trip.StreetName,
     signs: []const trip.SignElement,
     guide: struct { branch: []const trip.SignElement, toward: []const trip.SignElement },
@@ -15,7 +44,8 @@ pub const Value = union(enum) {
     pub fn isEmpty(self: Value) bool {
         return switch (self) {
             .empty => true,
-            .text => |bytes| bytes.len == 0,
+            .text, .spoken => |bytes| bytes.len == 0,
+            .length => |value| value.text.len == 0,
             .names => |list| list.len == 0,
             .signs => |list| list.len == 0,
             .guide => false,
@@ -33,20 +63,22 @@ pub const Value = union(enum) {
         return last.len >= label.len and std.ascii.eqlIgnoreCase(last[last.len - label.len ..], label);
     }
 
-    fn write(self: Value, out: *io.Writer, deadline: io.Deadline) !void {
+    pub fn write(self: Value, out: *io.Writer, context: Context) !void {
         switch (self) {
             .empty => {},
             .text => |bytes| try out.writeAll(bytes),
+            .spoken => |bytes| try context.writeName(out, bytes, null),
+            .length => |value| try value.write(out, if (context.speech) |voice| voice.numbers else .{}, context.deadline),
             .names => |list| for (list, 0..) |name, index| {
-                if (deadline.expired()) return error.DeadlineExceeded;
-                if (index != 0) try out.writeByte('/');
-                try out.writeAll(name.value);
+                if (context.deadline.expired()) return error.DeadlineExceeded;
+                if (index != 0) try out.writeAll(context.delimiter());
+                try context.writeName(out, name.value, name.pronunciation);
             },
-            .signs => |list| try writeSigns(list, out, deadline),
+            .signs => |list| try writeSigns(list, out, context),
             .guide => |pair| {
-                try writeSigns(pair.branch, out, deadline);
-                try out.writeByte('/');
-                try writeSigns(pair.toward, out, deadline);
+                try writeSigns(pair.branch, out, context);
+                try out.writeAll(context.delimiter());
+                try writeSigns(pair.toward, out, context);
             },
         }
     }
@@ -76,6 +108,43 @@ pub fn streetNames(maneuver: *const Maneuver, list: []const trip.StreetName, lab
     };
     // The building subsets have no blind-way labels.
     return if (index < labels.len) .{ .text = labels[index] } else .empty;
+}
+
+pub const StreetPair = struct { street: Value = .empty, begin: Value = .empty };
+
+pub fn startNames(step: *const Maneuver, labels: []const []const u8, limit: usize, deadline: io.Deadline) !StreetPair {
+    const begin = try names(step.begin_street_names, limit, deadline);
+    if (step.contains_obvious_maneuver and !begin.isEmpty()) return .{ .street = begin };
+    return .{ .street = try streetNames(step, step.street_names, labels, limit, deadline), .begin = begin };
+}
+
+pub const JunctionOrGuide = struct { id: ?u8 = null, junction: Value = .empty, guide: Value = .empty };
+
+pub fn junctionOrGuide(step: *const Maneuver, limits: SignLimits, junction_id: u8, guide_id: u8) !JunctionOrGuide {
+    if (step.hasGuideSign()) return .{ .id = guide_id, .guide = try limits.guide(step.signs) };
+    if (step.signs.junction_names.len != 0) return .{ .id = junction_id, .junction = try limits.signs(step.signs.junction_names) };
+    return .{};
+}
+
+pub const KeepNames = struct { street: Value, toward: Value };
+
+pub fn keepNames(step: *const Maneuver, labels: []const []const u8, limits: SignLimits) !KeepNames {
+    const sign = step.signs;
+    if (step.hasGuideSign()) return .{
+        .street = try limits.signs(sign.guide_onto_streets),
+        .toward = try limits.signs(sign.guide_toward_locations),
+    };
+    var street: Value = if (step.ramp and sign.exit_onto_streets.len != 0)
+        try limits.signs(sign.exit_onto_streets)
+    else
+        try streetNames(step, step.street_names, labels, limits.count, limits.deadline);
+    if (street.isEmpty() and !step.ramp) street = try limits.signs(sign.exit_onto_streets);
+    return .{ .street = street, .toward = try limits.signs(sign.exit_toward_locations) };
+}
+
+pub fn exitNumbers(sign: trip.Sign, deadline: io.Deadline) !Value {
+    const unlimited: SignLimits = .{ .count = 0, .consecutive = false, .deadline = deadline };
+    return unlimited.signs(sign.exit_numbers);
 }
 
 pub const SignLimits = struct {
@@ -116,12 +185,12 @@ pub const SignLimits = struct {
     }
 };
 
-fn writeSigns(list: []const trip.SignElement, out: *io.Writer, deadline: io.Deadline) !void {
+fn writeSigns(list: []const trip.SignElement, out: *io.Writer, context: Context) !void {
     var started = false;
     for (list) |sign| {
-        if (deadline.expired()) return error.DeadlineExceeded;
-        if (started) try out.writeByte('/');
-        try out.writeAll(sign.text);
+        if (context.deadline.expired()) return error.DeadlineExceeded;
+        if (started) try out.writeAll(context.delimiter());
+        try context.writeName(out, sign.text, sign.pronunciation);
         started = started or sign.text.len != 0;
     }
 }
@@ -145,13 +214,18 @@ pub const Fields = struct {
     FERRY_LABEL: ?Value = null,
     LEVEL: ?Value = null,
     OBJECT_LABEL: ?Value = null,
+    LENGTH: ?Value = null,
+    CURRENT_VERBAL_CUE: ?Value = null,
+    NEXT_VERBAL_CUE: ?Value = null,
+    TRANSIT_STOP: ?Value = null,
+    TIME: ?Value = null,
 };
 
-pub fn writePhrase(out: *io.Writer, pattern: []const u8, fields: Fields, deadline: io.Deadline) !void {
+pub fn writePhrase(out: *io.Writer, pattern: []const u8, fields: Fields, context: Context) !void {
     const Field = std.meta.FieldEnum(Fields);
     var rest = pattern;
     while (std.mem.indexOfScalar(u8, rest, '<')) |start| {
-        if (deadline.expired()) return error.DeadlineExceeded;
+        if (context.deadline.expired()) return error.DeadlineExceeded;
         const close = std.mem.indexOfScalarPos(u8, rest, start + 1, '>') orelse break;
         const tag = std.meta.stringToEnum(Field, rest[start + 1 .. close]);
         const value = if (tag) |field| switch (field) {
@@ -159,10 +233,12 @@ pub fn writePhrase(out: *io.Writer, pattern: []const u8, fields: Fields, deadlin
         } else null;
         if (value) |replacement| {
             try out.writeAll(rest[0..start]);
-            try replacement.write(out, deadline);
+            try replacement.write(out, context);
         } else {
-            // Preserve literal text and upstream locale typos.
-            try out.writeAll(rest[0 .. close + 1]);
+            // A literal opening bracket may precede a valid locale tag.
+            try out.writeAll(rest[0 .. start + 1]);
+            rest = rest[start + 1 ..];
+            continue;
         }
         rest = rest[close + 1 ..];
     }
@@ -195,4 +271,31 @@ fn replaceInPlace(bytes: []u8, comptime before: []const u8, comptime after: []co
         }
     }
     return written;
+}
+
+pub fn present(value: bool) u8 {
+    return @intFromBool(value);
+}
+
+pub fn direction(step: *const Maneuver, labels: [2][]const u8) Value {
+    return .{ .text = labels[@intFromBool(step.isRightType())] };
+}
+
+pub fn forkDirection(step: *const Maneuver, labels: [3][]const u8) Value {
+    const index: usize = switch (step.type) {
+        .kStayLeft => 0,
+        .kStayStraight => 1,
+        .kStayRight => 2,
+        else => unreachable,
+    };
+    return .{ .text = labels[index] };
+}
+
+pub fn rampDirectionOffset(step: *const Maneuver) u8 {
+    return switch (step.begin_relative_direction) {
+        .left, .right => 5,
+        .keep_left => if (step.drive_on_right) 0 else 10,
+        .keep_right => if (step.drive_on_right) 10 else 0,
+        else => 0,
+    };
 }

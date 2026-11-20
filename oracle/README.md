@@ -803,6 +803,10 @@ Score each locale separately with
 `compare-triplegs.py native.jsonl REFERENCE_DIR DESCRIPTORS --minimum-legs 180 --instructions`.
 The instruction check requires byte equality for every maneuver on legs with
 matching directed paths and maneuver type and street name sequences.
+Use `--verbal-instructions` with both programs to compare succinct, alert,
+pre-transition and post-transition cues and the multi-cue flag on the same
+legs. The pinned narration snapshots exercise metric and US customary units,
+route-number formatting, and the phoneme template independently.
 
 For pedestrian facilities and active lanes, generate fixtures with their
 request corpora. Use the same PBF and right-hand traffic on both builders,

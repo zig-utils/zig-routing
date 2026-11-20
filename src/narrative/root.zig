@@ -7,6 +7,9 @@ pub const dictionary = @import("dictionary.zig");
 pub const instructions = @import("instructions.zig");
 pub const maneuver = @import("maneuver.zig");
 pub const maneuvers = @import("maneuvers.zig");
+pub const markup = @import("markup.zig");
+pub const verbal_instructions = @import("verbal_instructions.zig");
+pub const verbal_text = @import("verbal_text.zig");
 
 test {
     std.testing.refAllDecls(@This());
