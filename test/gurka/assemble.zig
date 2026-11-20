@@ -4499,6 +4499,7 @@ test "Gurka trip leg retains a near-end trim, an interior via and the physical i
             .{ .key = "name:pronunciation", .value = "ʁy ɔʁjɑ̃" },
             .{ .key = "tunnel", .value = "yes" },
             .{ .key = "tunnel:name", .value = "East Tunnel" },
+            .{ .key = "bicycle", .value = "dismount" },
             .{ .key = "level", .value = "1.2" },
         } },
         .{ .label = "BD", .tags = &.{
@@ -4616,6 +4617,14 @@ test "Gurka trip leg retains a near-end trim, an interior via and the physical i
         \\ "filters":{"action":"include","attributes":["shape","edge.length","shape_attributes.length"]}}
     );
     try testing.expect(parsed == .ok);
+    var bike_input = input;
+    bike_input.travel = .{ .bicycle = .kMountain };
+    const bike_leg = try tripleg.build(arena.allocator(), view, bike_input, .{});
+    try testing.expectEqual(.kBicycle, bike_leg.node[0].edge.?.travel_mode);
+    try testing.expectEqual(.kMountain, bike_leg.node[0].edge.?.bicycle_type);
+    try testing.expectEqual(.kPedestrian, bike_leg.node[1].edge.?.travel_mode);
+    try testing.expectEqual(.kFoot, bike_leg.node[1].edge.?.pedestrian_type);
+
     var narrowed = input;
     narrowed.attributes = try parsed.ok.tripAttributes(true, .none);
     var without_cold = view.*;

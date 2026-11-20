@@ -17,20 +17,24 @@ pub fn main(init: std.process.Init) !void {
     const bundle_path = args.next() orelse return error.MissingBundle;
     const corpus_path = args.next() orelse return error.MissingCorpus;
     const count = if (args.next()) |value| try std.fmt.parseInt(usize, value, 10) else std.math.maxInt(usize);
-    var with_maneuvers = false;
+    var narrative: Narrative = .none;
     var on_foot = false;
     while (args.next()) |option| {
-        if (std.mem.eql(u8, option, "--maneuvers") and !with_maneuvers) {
-            with_maneuvers = true;
+        if (std.mem.eql(u8, option, "--maneuvers") and narrative == .none) {
+            narrative = .maneuvers;
+        } else if (std.mem.eql(u8, option, "--instructions") and narrative == .none) {
+            narrative = .instructions;
         } else if (std.mem.eql(u8, option, "--pedestrian") and !on_foot) {
             on_foot = true;
         } else return error.InvalidOption;
     }
-    if (on_foot) return run(.pedestrian, init, bundle_path, corpus_path, count, with_maneuvers);
-    return run(.auto, init, bundle_path, corpus_path, count, with_maneuvers);
+    if (on_foot) return run(.pedestrian, init, bundle_path, corpus_path, count, narrative);
+    return run(.auto, init, bundle_path, corpus_path, count, narrative);
 }
 
-fn run(comptime mode: request.Costing, init: std.process.Init, bundle_path: []const u8, corpus_path: []const u8, count: usize, with_maneuvers: bool) !void {
+const Narrative = enum { none, maneuvers, instructions };
+
+fn run(comptime mode: request.Costing, init: std.process.Init, bundle_path: []const u8, corpus_path: []const u8, count: usize, narrative: Narrative) !void {
     const Kernel = if (mode == .pedestrian) Foot else Auto;
     const Engine = search.search.Search(Kernel, search.queue.Heap);
     const Cache = if (mode == .pedestrian) pedestrian.Cache else auto.Cache;
@@ -61,11 +65,16 @@ fn run(comptime mode: request.Costing, init: std.process.Init, bundle_path: []co
             continue;
         };
         const legs = checked.legs;
-        if (with_maneuvers) {
+        if (narrative != .none) {
             const a = arena.allocator();
             const values = try a.alloc(ManeuverResult, legs.len);
             for (legs, values) |*leg, *result| {
-                if (routing.narrative.maneuvers.buildAnnotated(a, leg, checked.narrative, io.Deadline.fromNowMs(10_000))) |built| {
+                const deadline = io.Deadline.fromNowMs(10_000);
+                const built_leg = if (narrative == .instructions)
+                    routing.narrative.instructions.build(a, leg, checked.narrative, deadline)
+                else
+                    routing.narrative.maneuvers.buildAnnotated(a, leg, .{ .roundabout_exits = checked.narrative.roundabout_exits }, deadline);
+                if (built_leg) |built| {
                     leg.* = built.trip_leg;
                     result.* = .{ .steps = built.maneuvers };
                 } else |err| {
@@ -88,7 +97,7 @@ const ManeuverResult = struct {
 
 const Checked = struct {
     legs: []trip.TripLeg,
-    narrative: routing.narrative.maneuvers.Options,
+    narrative: routing.narrative.instructions.Options,
 };
 
 fn check(comptime mode: request.Costing, engine: anytype, view: *const routing.graph.reader.View, arena: *routing.infra.arena.Arena, cache: anytype, request_json: []const u8) !Checked {
@@ -130,6 +139,10 @@ fn check(comptime mode: request.Costing, engine: anytype, view: *const routing.g
             .segments = leg.segments,
             .geometry = shape,
             .attributes = attrs,
+            .travel = if (mode == .pedestrian)
+                .{ .pedestrian = @fromBackingInt(@backingInt(options.transport)) }
+            else
+                .{ .drive = .kCar },
             .locations = .{
                 .requested = opts.locations,
                 .correlations = correlated,
@@ -140,5 +153,5 @@ fn check(comptime mode: request.Costing, engine: anytype, view: *const routing.g
             .leg_count = @intCast(output.len),
         }, control);
     }
-    return .{ .legs = output, .narrative = .{ .roundabout_exits = opts.roundabout_exits } };
+    return .{ .legs = output, .narrative = .{ .roundabout_exits = opts.roundabout_exits, .language = opts.language } };
 }

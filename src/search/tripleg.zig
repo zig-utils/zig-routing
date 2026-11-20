@@ -448,6 +448,10 @@ fn buildEdge(a: std.mem.Allocator, view: *const View, from: format.NodeId, node:
             break :blk .kPedestrian;
         },
         .bicycle => |bicycle| blk: {
+            if (class.flags.dismount or class.category.use == @backingInt(graph.constants.Use.steps)) {
+                if (attrs.has(.@"edge.pedestrian_type")) result.pedestrian_type = .kFoot;
+                break :blk .kPedestrian;
+            }
             if (attrs.has(.@"edge.bicycle_type")) result.bicycle_type = bicycle;
             break :blk .kBicycle;
         },

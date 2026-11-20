@@ -151,7 +151,7 @@ pub fn buildWithOptions(arena: std.mem.Allocator, path: *const trip.TripLeg, opt
 
 pub const BuildResult = struct {
     trip_leg: trip.TripLeg,
-    maneuvers: []const Maneuver,
+    maneuvers: []Maneuver,
 };
 
 /// The returned leg carries lane states and any lanes inherited by moved internal edges.
