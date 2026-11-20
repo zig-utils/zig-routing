@@ -74,7 +74,7 @@ pub const Relation = struct { members: []const Member, tags: Tags = &.{} };
 
 pub const OsmNode = struct { id: i64, label: []const u8, location: Point, tags: Tags };
 pub const OsmWay = struct { id: i64, label: []const u8, refs: []const i64, tags: Tags };
-pub const OsmMember = struct { kind: MemberKind, id: i64, role: []const u8 };
+pub const OsmMember = struct { kind: enum(i32) { node, way, relation }, id: i64, role: []const u8 };
 pub const OsmRelation = struct { id: i64, members: []const OsmMember, tags: Tags };
 pub const Dataset = struct {
     nodes: []const OsmNode,
@@ -245,7 +245,7 @@ fn makeDataset(arena: Allocator, layout: *const NodeLayout, ways: []const Way, n
         const members = try arena.alloc(OsmMember, spec.members.len);
         for (members, spec.members) |*osm_member, member| {
             osm_member.* = .{
-                .kind = member.kind,
+                .kind = @fromBackingInt(@intCast(@backingInt(member.kind))),
                 .role = member.role,
                 .id = switch (member.kind) {
                     .node => node_ids[member.ref[0]],

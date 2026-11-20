@@ -164,6 +164,15 @@ fn createCommands(a: Allocator) !*Command {
     _ = try command(traffic_cmd, "add-predicted", "Add weekly profiles and static traffic speeds from CSV", addPredicted, &.{}, &.{
         arg("BUNDLE", "Graph bundle directory"), arg("FILE", "CSV with edge keys and predicted speeds"),
     });
+    const geocode_cmd = try command(root, "geocode", "Manage geocoding data", null, &.{}, &.{});
+    _ = try command(geocode_cmd, "build", "Extract geocoding records from OpenStreetMap", buildGeocode, &.{
+        option("threads", "Number of PBF decode workers", .int),
+        option("timeout", "Time limit for extraction", .string),
+        option("admin-pbf", "Additional boundary extract from the same OSM snapshot", .string).withRepeatable(true),
+    }, &.{ arg("PBF", "Source OSM PBF file"), arg("OUTPUT", "New geocoding bundle directory") });
+    _ = try command(geocode_cmd, "inspect", "Verify and count geocoding bundle records", inspectGeocode, &.{}, &.{
+        arg("BUNDLE", "Geocoding bundle directory"),
+    });
     _ = try command(root, "bundle-manifest", "Write range hashes for a graph bundle", bundleManifest, &.{
         option("output", "Range manifest output file", .string).withRequired(true),
     }, &.{arg("BUNDLE", "Graph bundle directory")});
@@ -646,6 +655,37 @@ fn setTraffic(ctx: *Context) !u8 {
     const report = try owned.feeder.apply(a, map.bytes, kind, now, .none);
     defer report.deinit(a);
     try ctx.writeJson(report);
+    return 0;
+}
+
+fn buildGeocode(ctx: *Context) !u8 {
+    const workers = (try unsigned(ctx, usize, "threads")) orelse 0;
+    const deadline: io.Deadline = if (try duration(ctx, "timeout")) |ns| .fromNow(ns) else .none;
+    const report = try routing.geocode.extract.build(std.heap.c_allocator, ctx.getArgument(0).?, ctx.getArgument(1).?, .{
+        .workers = workers,
+        .admin_sources = ctx.getOptionValues("admin-pbf"),
+    }, deadline);
+    try ctx.writeJson(report);
+    return 0;
+}
+
+fn inspectGeocode(ctx: *Context) !u8 {
+    const geocode = routing.geocode;
+    var opened = try geocode.bundle.Bundle.open(ctx.getArgument(0).?, .none);
+    defer opened.close();
+    const data = opened.data;
+    try ctx.writeJson(.{
+        .places = data.places.len,
+        .streets = data.streets.len,
+        .street_ways = data.street_ways.len,
+        .addresses = data.addresses.len,
+        .pois = data.pois.len,
+        .admins = data.admins.len,
+        .coverage = try data.coverage(.none),
+        .attribution = geocode.model.attribution,
+        .attribution_url = geocode.model.attribution_url,
+        .license = geocode.model.license,
+    });
     return 0;
 }
 

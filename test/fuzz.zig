@@ -20,7 +20,7 @@
 //! `costing-reference` (gate A samples and paths), `speed-config` (default speed tables),
 //! `motor-tags` (motor vehicle access and unit normalization), `admin-index`
 //! (stored administrative boundaries), `timezone-geojson`, `timezone-rules`,
-//! `datetime`, `time-domain`, `lane-tags` and `name-tags`.
+//! `datetime`, `time-domain`, `lane-tags`, `name-tags` and `geocode-bundle`.
 //!
 //! The contract for every parser: malformed input returns an error, never
 //! panics, overflows or reads out of bounds. The fuzz step builds ReleaseSafe
@@ -422,6 +422,48 @@ test "fuzz mvt" {
     const gzip = try mvt.gzip(a, raw.items, .none);
     const corpus = try seeds(a, &.{ &.{}, raw.items, gzip, &.{ 31, 139 } });
     try std.testing.fuzz({}, fuzzMvt, .{ .corpus = corpus });
+}
+
+fn fuzzGeocodeBundle(_: void, s: *Smith) !void {
+    const geocode = routing.geocode;
+    const model = geocode.model;
+    const sections = std.enums.values(model.Section);
+    var input: [2048]u8 = undefined;
+    const bytes = draw(s, &input, 0x67656f63);
+    if (bytes.len < 3) return;
+    const section = sections[bytes[0] % sections.len];
+    var storage: [model.payload_offset + input.len]u8 align(@alignOf(model.Header)) = @splat(0);
+    const payload = bytes[3..];
+    @memcpy(storage[model.payload_offset..][0..payload.len], payload);
+    inline for (sections) |kind| {
+        if (section == kind) {
+            const header: model.Header = .{
+                .magic_tag = model.magic,
+                .format_version = model.version,
+                .kind = @backingInt(kind),
+                .dataset_uuid = @splat(0),
+                .record_size = @sizeOf(kind.Item()),
+                .count = payload.len / @sizeOf(kind.Item()),
+                .payload_hash = try model.checksum(payload, .none),
+            };
+            @memcpy(storage[0..@sizeOf(model.Header)], std.mem.asBytes(&header));
+            if (bytes[1] != 0) storage[bytes[1] % @sizeOf(model.Header)] ^= bytes[2];
+            const read = model.readSection(kind, storage[0 .. model.payload_offset + payload.len], @splat(0), .none) catch return;
+            var data: geocode.bundle.Data = .{};
+            @field(data, @tagName(kind)) = read.records;
+            data.validate(.none) catch return;
+            try std.testing.expectEqual(payload.len, read.records.len * @sizeOf(kind.Item()));
+        }
+    }
+}
+
+test "fuzz geocode-bundle" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var admin_row: [27]u8 = @splat(0);
+    admin_row[0] = 4;
+    const inputs = &.{ "", "\x06\x00\x00town", "\x00\x00\x00", "\x05\x08\x04", &admin_row };
+    try std.testing.fuzz({}, fuzzGeocodeBundle, .{ .corpus = try seeds(arena.allocator(), inputs) });
 }
 
 fn fuzzLaneTags(_: void, s: *Smith) !void {

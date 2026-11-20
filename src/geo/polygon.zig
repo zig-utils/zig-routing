@@ -19,6 +19,18 @@ pub const Polygon = struct {
     outer: Ring,
     holes: []const Ring = &.{},
 
+    /// Prefer an interior representative. A shell vertex is still part of
+    /// the polygon when both interior candidates fall in a hole.
+    pub fn representative(self: Polygon, deadline: Deadline) !?PointLL {
+        const bounds = try ringBounds(self.outer, deadline) orelse return null;
+        const center = bounds.center();
+        if (try self.locate(center, deadline) == .inside) return center;
+        if (try interiorPoint(self.outer, deadline)) |inside| {
+            if (try self.locate(inside, deadline) == .inside) return inside;
+        }
+        return self.outer[0];
+    }
+
     pub fn locate(self: Polygon, point: PointLL, deadline: Deadline) error{DeadlineExceeded}!Location {
         const shell = try locateInRing(self.outer, point, deadline);
         if (shell != .inside) return shell;
