@@ -143,7 +143,9 @@ P5.15 | Time-dependent search: depart_at, arrive_by, current, invariant, across 
 P5.16 | Avoid and exclude: locations, polygons, edges and closures | snap | port | M | P3.23 P3.29
 P5.17 | Destination-only, private access and not-thru semantics in an exact search | search | port | M | P5.11
 P5.18 | Alternates by the penalty method with stretch, sharing and local-optimality filters | search | new | M | P5.11 P4.07
-P5.19 | Recost, recostings and linear_cost_factors | costing | port | M | P5.11
+P5.19 | Fixed-path recost and named costing requests | costing | port | M | P5.11
+P5.19a | Resolve and apply linear cost factors along exact edge walks | snap | port | M | P5.19 P8.04
+P5.19b | Serialize named recosts and score same-graph routes in zr diff | api | port | M | P5.19 P3.33 P6.13 P6.14
 P5.20 | Port the gurka suites for access, restrictions, time-dependence and closures | infra | test | L | P5.10 P5.15 P5.16 P5.17
 P5.21 | Experiment E7: time-dependent long route and synthetic congestion | search | experiment | S | P5.15 P4.07
 P5.22 | Phase 5 gate: auto and truck corpora at cost parity, suites green | costing | gate | M | P5.12 P5.13 P5.18 P5.19 P5.20 P5.21

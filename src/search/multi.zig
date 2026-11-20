@@ -20,6 +20,7 @@ pub const Waypoint = struct {
     time_zone_offset: []const u8 = "",
     time_zone_name: []const u8 = "",
     ignored_filter: bool,
+    clock: TimeInfo = .{},
 };
 
 pub const SegmentContext = struct {
@@ -41,6 +42,7 @@ pub const Route = struct {
     waypoints: []const Waypoint,
     total: Cost,
     retried: bool,
+    invariant_time: bool = false,
 };
 
 pub const Options = struct {
@@ -86,7 +88,7 @@ pub fn route(engine: anytype, arena: *scratch.Arena, kernel: anytype, locations:
         retried = true;
         break :blk try findPairs(engine, arena, kernel, locations, reachable, options, false, control);
     };
-    return assemble(a, engine.view, locations, ranked, paths, retried, control);
+    return assemble(a, engine.view, locations, ranked, paths, retried, options.search.timing.invariant, control);
 }
 
 fn isThrough(kind: api.LocationType) bool {
@@ -131,9 +133,7 @@ fn findPairs(engine: anytype, arena: *scratch.Arena, kernel: anytype, locations:
     const anchor = if (reverse) locations.len - 1 else 0;
     var clock = options.search.timing;
     if (!clock.start.valid and options.date_time_type != .no_time and candidates[anchor].all.len != 0) {
-        const text = locations[anchor].date_time orelse if (options.date_time_type == .current) "current" else "";
-        const node = try edgeHead(engine.view, candidates[anchor].all[0].edge);
-        clock.start = try TimeInfo.fromNode(engine.view, node, text, options.now.?, control.deadline);
+        clock = try startTiming(engine.view, candidates[anchor].all[0].edge, options.date_time_type, locations[anchor].date_time, options.now.?, control);
     }
     const times: []TimeInfo = if (clock.start.valid) try a.alloc(TimeInfo, locations.len) else &.{};
     var carried: ?EdgeId = null;
@@ -184,6 +184,15 @@ fn findPairs(engine: anytype, arena: *scratch.Arena, kernel: anytype, locations:
     return .{ .paths = paths, .times = times };
 }
 
+pub fn startTiming(view: *const graph.reader.View, edge: EdgeId, mode: api.DateTimeType, date: ?[]const u8, now: i64, control: search.Control) !search.Timing {
+    if (mode == .no_time) return .{};
+    const text = date orelse if (mode == .current) "current" else "";
+    return .{
+        .start = try TimeInfo.fromNode(view, try edgeHead(view, edge), text, now, control.deadline),
+        .invariant = mode == .invariant,
+    };
+}
+
 fn edgeHead(view: *const graph.reader.View, edge: EdgeId) !graph.format.NodeId {
     return @fromBackingInt((try view.edge(edge)).head);
 }
@@ -194,7 +203,7 @@ fn waypointWait(locations: []const api.Location, index: usize) f32 {
     return if (std.math.isFinite(place.waiting_secs)) @max(0, place.waiting_secs) else 0;
 }
 
-fn assemble(a: std.mem.Allocator, view: *const graph.reader.View, locations: []const api.Location, ranked: []const endpoints.Ranked, pairs: PairPaths, reach_retry: bool, control: search.Control) !Route {
+fn assemble(a: std.mem.Allocator, view: *const graph.reader.View, locations: []const api.Location, ranked: []const endpoints.Ranked, pairs: PairPaths, reach_retry: bool, invariant_time: bool, control: search.Control) !Route {
     const paths = pairs.paths;
     var leg_count: usize = 1;
     var segment_count: usize = 0;
@@ -263,7 +272,7 @@ fn assemble(a: std.mem.Allocator, view: *const graph.reader.View, locations: []c
             length_km = 0;
         }
     }
-    return .{ .legs = legs, .waypoints = waypoints, .total = total, .retried = retried };
+    return .{ .legs = legs, .waypoints = waypoints, .total = total, .retried = retried, .invariant_time = invariant_time };
 }
 
 fn atNode(segment: endpoints.Segment) bool {
@@ -279,10 +288,11 @@ fn timing(a: std.mem.Allocator, view: *const graph.reader.View, locations: []con
         .ignored_filter = ranked[index].ignored_filter,
     };
     if (times.len == 0) return result;
+    result.clock = times[index];
     result.waiting_secs = waypointWait(locations, index);
     const buffer = try a.alloc(u8, 22);
     const rules = if (view.tz_rules) |*present| present else null;
-    if (try times[index].display(rules, buffer)) |formatted| {
+    if (try result.clock.display(rules, buffer)) |formatted| {
         result.date_time = formatted.date_time;
         result.time_zone_offset = formatted.time_zone_offset;
         result.time_zone_name = formatted.time_zone_name;

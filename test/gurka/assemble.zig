@@ -1828,6 +1828,8 @@ fn MotorTestCost(comptime model: type) type {
 test "Gurka timed motor routes use free flow at night and constrained flow by day" {
     const auto = routing.costing.auto;
     const Adapter = MotorTestCost(auto);
+    const Recost = routing.search.legs.Recost;
+    const Segment = routing.search.endpoints.Segment;
     var storage: std.heap.ArenaAllocator = .init(testing.allocator);
     defer storage.deinit();
     const a = storage.allocator();
@@ -1879,6 +1881,21 @@ test "Gurka timed motor routes use free flow at night and constrained flow by da
             for (cases) |case| {
                 const result = try engine.run(&arena, cost, .{ .origin = from, .destination = to, .direction = direction, .timing = case.time }, search.Zero{}, .{});
                 try expectWayPath(&view, &fixture, result, direction, case.path);
+                var segments: [2]Segment = undefined;
+                var index = result.index;
+                for (0..segments.len) |i| {
+                    const label = result.labels[index];
+                    segments[if (direction == .forward) segments.len - 1 - i else i] = .{ .edge = label.edgeId(), .begin = 0, .end = 1 };
+                    index = label.pred;
+                }
+                var steps: [segments.len]Recost.Step = undefined;
+                const recosted = switch (direction) {
+                    .forward => try Recost.walk(&view, cost, &segments, &steps, .forward, .{ .timing = case.time, .ignore_access = false }),
+                    .reverse => try Recost.walk(&view, cost, &segments, &steps, .reverse, .{ .timing = case.time, .ignore_access = false }),
+                };
+                try testing.expectApproxEqRel(result.best().cost, recosted.cost, 1e-4);
+                try testing.expectApproxEqRel(result.best().secs, recosted.secs, 1e-4);
+                try testing.expectEqual(recosted, steps[if (direction == .forward) 1 else 0].elapsed);
                 arena.reset();
             }
         }
@@ -2046,6 +2063,7 @@ test "not-thru labels do not remove routes through a required entrance" {
 
 test "a destination-only endpoint still respects a timed access denial" {
     const endpoints = routing.search.endpoints;
+    const Recost = routing.search.legs.Recost;
     var storage: std.heap.ArenaAllocator = .init(testing.allocator);
     defer storage.deinit();
     const a = storage.allocator();
@@ -2073,9 +2091,13 @@ test "a destination-only endpoint still respects a timed access denial" {
     const open = try endpoints.route(&engine, &arena, RestrictionMotor{}, origin, target, options, search.Zero{}, .{});
     try testing.expectEqual(bc, open.segments[open.segments.len - 1].edge);
     try testing.expect(!open.retried);
+    const open_cost = try Recost.walk(view, RestrictionMotor{}, open.segments, null, .forward, .{ .timing = options.timing, .ignore_access = false });
+    try testing.expectApproxEqRel(open.cost, open_cost.cost, 1e-4);
+    const sections = [2]endpoints.Segment{ open.segments[0], open.segments[1] };
     arena.reset();
     options.timing = try restrictionTiming("2026-11-02T08:00", false);
     try testing.expectError(error.NoPath, endpoints.route(&engine, &arena, RestrictionMotor{}, origin, target, options, search.Zero{}, .{}));
+    try testing.expectError(error.InvalidRouteAccess, Recost.walk(view, RestrictionMotor{}, &sections, null, .forward, .{ .timing = options.timing, .ignore_access = false }));
 }
 
 // Ported from test/gurka/test_truck.cc.
@@ -3052,6 +3074,11 @@ test "timed routes price each leg at its clock, apply break waiting and report l
             try testing.expectEqual(@as(usize, 1), leg.segments.len);
             try testing.expectEqual(ab, leg.segments[0].edge);
         }
+        seen = .{ false, false };
+        const leg_clocks: [2]i64 = .{ departure, if (mode == .invariant) departure else departure + 180 };
+        const trip = try routing.search.legs.build(arena.allocator(), view, FixedCost{ .expected_times = leg_clocks, .seen = &seen }, route, &correlations, .{});
+        try testing.expectEqual([2]bool{ true, true }, seen);
+        try testing.expectEqual(@as(f64, route.total.secs), trip.summary.time);
         arena.reset();
     }
 

@@ -12,12 +12,7 @@ const search = routing.search.search;
 const View = graph.reader.View;
 const EdgeId = graph.format.EdgeId;
 const Arena = std.mem.Allocator;
-const Movements = std.AutoHashMapUnmanaged(u64, void);
 const RouteGate = enum { timed, access };
-
-fn movementKey(incoming: EdgeId, outgoing: EdgeId) u64 {
-    return (@as(u64, @backingInt(incoming)) << 32) | @backingInt(outgoing);
-}
 
 fn Probe(comptime model: type) type {
     return struct {
@@ -29,7 +24,6 @@ fn Probe(comptime model: type) type {
         previous_internal: ?*auto.InternalTurn = null,
         previous_destination_only: ?*bool = null,
         routed: bool = false,
-        fixed_movements: ?*const Movements = null,
 
         pub fn edgeCost(self: Self, view: *const View, _: EdgeId, edge: *const graph.format.EdgeHot, _: search.Direction) !compiled.Cost {
             return (try self.traversal(view, edge, self.profile.untimedSpeed(edge.*))).cost;
@@ -63,9 +57,6 @@ fn Probe(comptime model: type) type {
         }
 
         pub fn allowedTurn(self: Self, view: *const View, movement: search.Transition, _: search.Label, direction: search.Direction) !bool {
-            if (self.fixed_movements) |fixed| {
-                if (!fixed.contains(movementKey(movement.incoming, movement.outgoing))) return false;
-            }
             if (!self.profile.allowedNode(try view.node(movement.node))) return false;
             const from = try view.class(movement.incoming_edge.cls.class_id);
             const to = try view.class(movement.outgoing_edge.cls.class_id);
@@ -197,6 +188,8 @@ const ProfileResult = struct {
 fn compareRoutes(init: std.process.Init, view: *const View, reference: *parity.Reference, uuid: []const u8, minimum: u64, gate: RouteGate) !void {
     const api = routing.api.request;
     const multi = routing.search.multi;
+    const Segment = routing.search.endpoints.Segment;
+    const Recost = routing.search.legs.Recost;
     var arena = routing.infra.arena.Arena.init(init.gpa, .{});
     defer arena.deinit();
     var engine = try search.Search(Probe(auto), routing.search.queue.Heap).init(init.gpa, view);
@@ -246,46 +239,53 @@ fn compareRoutes(init: std.process.Init, view: *const View, reference: *parity.R
                 return err;
             };
             if (gate == .access and actual.retried) return error.UnexpectedAccessRetry;
-
-            var allowed: Movements = .empty;
-            for (path.segments[0 .. path.segments.len - 1], path.segments[1..], 0..) |from, to, i| {
+            const actual_segments = actual.legs[0].segments;
+            const pinned_segments = try a.alloc(Segment, path.segments.len);
+            for (path.segments, pinned_segments, 0..) |pinned, *native, i| {
                 if (i % 256 == 0) try control.check();
-                try allowed.put(a, movementKey(@fromBackingInt(from.edge), @fromBackingInt(to.edge)), {});
+                native.* = .{ .edge = @fromBackingInt(pinned.edge), .begin = pinned.begin, .end = pinned.end };
             }
-            var replay = probe;
-            replay.fixed_movements = &allowed;
-            const oracle_path = multi.route(&engine, &arena, replay, input.locations, &snapped, options, control) catch |err| {
-                try stderr.interface.print("{s} replay: {s}\n", .{ path.request, @errorName(err) });
-                try stderr.interface.flush();
-                return err;
+            const reverse = input.date_time_type == .arrive_by;
+            const anchor = if (reverse) destination.id else origin.id;
+            const date = input.locations[@intFromBool(reverse)].date_time;
+            const timing = try multi.startTiming(view, anchor, input.date_time_type, date, 0, control);
+            const recost: Recost.Options = .{ .timing = timing, .control = control };
+            const native_cost, const oracle_cost = if (reverse) .{
+                try Recost.walk(view, probe, actual_segments, null, .reverse, recost),
+                try Recost.walk(view, probe, pinned_segments, null, .reverse, recost),
+            } else .{
+                try Recost.walk(view, probe, actual_segments, null, .forward, recost),
+                try Recost.walk(view, probe, pinned_segments, null, .forward, recost),
             };
-            const replayed = oracle_path.legs[0].segments;
-            if (replayed.len != path.segments.len) return error.ReferencePathChanged;
-            for (replayed, path.segments) |native, pinned| {
-                if (@backingInt(native.edge) != pinned.edge or native.begin != pinned.begin or native.end != pinned.end)
-                    return error.ReferencePathChanged;
+            if (@abs(actual.total.cost - native_cost.cost) > 1e-4 * @max(1, actual.total.cost) or
+                @abs(actual.total.secs - native_cost.secs) > 1e-4 * @max(1, actual.total.secs))
+            {
+                try stderr.interface.print("{s}: search {d}/{d}, recost {d}/{d}\n", .{
+                    path.request, actual.total.cost, actual.total.secs, native_cost.cost, native_cost.secs,
+                });
+                try stderr.interface.flush();
+                return error.SearchRecostMismatch;
             }
             cases += 1;
-            if (actual.total.cost <= oracle_path.total.cost) {
+            if (native_cost.cost <= oracle_cost.cost) {
                 passed += 1;
             } else {
-                max_excess = @max(max_excess, actual.total.cost - oracle_path.total.cost);
+                max_excess = @max(max_excess, native_cost.cost - oracle_cost.cost);
                 try stderr.interface.print("{s}: weighted cost {d} exceeds oracle path {d}\n", .{
-                    path.request, actual.total.cost, oracle_path.total.cost,
+                    path.request, native_cost.cost, oracle_cost.cost,
                 });
             }
-            const actual_segments = actual.legs[0].segments;
             if (gate == .timed) {
                 const untimed = try multi.route(&engine, &arena, probe, input.locations, &snapped, .{
                     .search = .{ .costing = .auto, .direction = if (input.date_time_type == .arrive_by) .reverse else .forward },
                 }, control);
                 if (samePath(actual_segments, untimed.legs[0].segments)) same_as_static += 1;
-            } else if (samePath(actual_segments, replayed)) {
+            } else if (samePath(actual_segments, pinned_segments)) {
                 same_as_oracle += 1;
             } else {
-                if (actual.total.cost < oracle_path.total.cost) cheaper += 1;
-                if (actual.total.cost == oracle_path.total.cost) equal_cost_different_path += 1;
-                try stderr.interface.print("{s}: native weighted cost {d}, oracle path {d}\n", .{ path.request, actual.total.cost, oracle_path.total.cost });
+                if (native_cost.cost < oracle_cost.cost) cheaper += 1;
+                if (native_cost.cost == oracle_cost.cost) equal_cost_different_path += 1;
+                try stderr.interface.print("{s}: native weighted cost {d}, oracle path {d}\n", .{ path.request, native_cost.cost, oracle_cost.cost });
                 for (actual_segments) |segment| {
                     const class = try view.class((try view.edge(segment.edge)).cls.class_id);
                     try stderr.interface.print(" native edge {d} ({d}..{d}, destination-only {}, not-thru {})\n", .{

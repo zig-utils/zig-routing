@@ -176,9 +176,9 @@ The runner builds a complete local graph for each pinned extract with
 Valhalla's hierarchy and shortcuts disabled. It selects eight auto requests
 and adds morning and evening departures, an arrival time, and an invariant
 time. Both searches use the same directed endpoint edges and fractional cuts.
-Native search also replays the pinned oracle's path with only its movements
-available and checks each edge and cut before comparing weighted costs. Gate B
-requires the native route to cost at most as much as that replay.
+The shared fixed-path recost walks both routes' directed edges and cuts with
+the request clock before comparing weighted costs. Gate B requires the native
+route to cost at most as much as the replay of the oracle path.
 
 All 64 routes met Gate B with zero excess cost. In the two pinned extracts
 the timed paths also matched all 64 static paths. Gurka fixtures cover changes

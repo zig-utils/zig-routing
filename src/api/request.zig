@@ -105,6 +105,12 @@ pub const Location = struct {
     original_index: u32 = 0,
 };
 
+pub const Recosting = struct {
+    costing: Costing,
+    name: []const u8,
+    options: json.Value,
+};
+
 pub const Options = struct {
     action: Action = .no_action,
     format: Format = .json,
@@ -115,6 +121,7 @@ pub const Options = struct {
     costing: Costing = .none,
     /// The whole `costing_options` object, parsed later by the costing model.
     costing_options: ?json.Value = null,
+    recostings: []const Recosting = &.{},
     ignore_closures: ?bool = null,
     filter_closures: bool = true,
     verbose: bool = false,
@@ -649,6 +656,9 @@ fn fromJsonWithin(arena: Allocator, doc: json.Value, action: Action, deadline: D
         if (try parseLocationField(arena, root, &o, "/shape", .shape, 134, deadline)) |failure| return failure;
     }
 
+    if (json.array(root, "/recostings")) |items| {
+        if (try parseRecostings(arena, items, &o, deadline)) |failure| return failure;
+    }
     if (try parseLocationField(arena, root, &o, "/locations", .locations, 130, deadline)) |failure| return failure;
     if (try parseLocationField(arena, root, &o, "/sources", .sources, 131, deadline)) |failure| return failure;
     if (try parseLocationField(arena, root, &o, "/targets", .targets, 132, deadline)) |failure| return failure;
@@ -672,6 +682,28 @@ fn fromJsonWithin(arena: Allocator, doc: json.Value, action: Action, deadline: D
 const LocationsResult = union(enum) { ok: []Location, failure: errors.Failure };
 
 const LocationField = enum { shape, locations, sources, targets, exclude_locations };
+
+// Ported from parse_recostings in src/worker.cc (Valhalla 3.9.3).
+noinline fn parseRecostings(arena: Allocator, items: []const json.Value, out: *Options, deadline: Deadline) ParseError!?Result {
+    const recostings = try arena.alloc(Recosting, items.len);
+    var names: std.json.ObjectMap = .empty;
+    for (items, recostings, 0..) |item, *recosting, i| {
+        if (i % 64 == 0 and deadline.expired()) return error.DeadlineExceeded;
+        const requested = json.getOptional([]const u8, item, "/costing") orelse return fail(127);
+        const costing = parseEnum(Costing, requested) orelse return failExtra(125, try std.fmt.allocPrint(arena, "'{s}'", .{requested}));
+        const name = switch (costing) {
+            .multimodal, .bikeshare, .auto_pedestrian => return fail(127),
+            .bus, .taxi, .none, .transit => requested,
+            else => json.getOptional([]const u8, item, "/name") orelse requested,
+        };
+        const entry = try names.getOrPut(arena, name);
+        if (entry.found_existing) return fail(128);
+        entry.value_ptr.* = .null;
+        recosting.* = .{ .costing = costing, .name = name, .options = item };
+    }
+    out.recostings = recostings;
+    return null;
+}
 
 fn parseLocationField(arena: Allocator, doc: json.Value, o: *Options, path: []const u8, comptime field: LocationField, code: u16, deadline: Deadline) ParseError!?Result {
     switch (try parseLocations(arena, doc, path, o, deadline)) {
@@ -865,6 +897,34 @@ const testing = std.testing;
 fn parseText(arena: Allocator, action: Action, text: []const u8) !Result {
     const doc = try json.parse(arena, text);
     return fromJson(arena, doc, action);
+}
+
+// Ported from the error_request and api cases in test/gurka/test_recost.cc.
+test "recostings keep ordered named profiles and reject invalid or duplicate costings" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const valid = (try parseText(a, .route,
+        \\{"costing":"auto","recostings":[{"costing":"auto"},
+        \\{"costing":"auto","name":"avoid_highways","use_highways":0.1},
+        \\{"costing":"bicycle","name":"slower"},
+        \\{"costing":"pedestrian","name":"slowest","walking_speed":2}]}
+    )).ok.recostings;
+    try testing.expectEqual(4, valid.len);
+    try testing.expectEqualStrings("auto", valid[0].name);
+    try testing.expectEqualStrings("avoid_highways", valid[1].name);
+    try testing.expectEqual(.bicycle, valid[2].costing);
+    try testing.expectEqual(@as(f32, 2), json.get(f32, valid[3].options, "/walking_speed", 0));
+    for ([_]struct { items: []const u8, code: u16 }{
+        .{ .items = "[{\"frosting\":\"chocolate\"}]", .code = 127 },
+        .{ .items = "[{\"costing\":\"foo\"}]", .code = 125 },
+        .{ .items = "[{\"name\":\"foo\"}]", .code = 127 },
+        .{ .items = "[{\"costing\":\"auto\"},{\"costing\":\"auto\"}]", .code = 128 },
+        .{ .items = "[{\"costing\":\"auto\",\"name\":\"same\"},{\"costing\":\"auto\",\"name\":\"same\"}]", .code = 128 },
+    }) |case| {
+        const body = try std.fmt.allocPrint(a, "{{\"costing\":\"auto\",\"locations\":[],\"recostings\":{s}}}", .{case.items});
+        try testing.expectEqual(case.code, (try parseText(a, .route, body)).failure.code);
+    }
 }
 
 test "request time modes attach dates to the selected locations" {

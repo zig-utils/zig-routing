@@ -5,6 +5,7 @@ const geo = @import("../geo/root.zig");
 const graph = @import("../graph/root.zig");
 const snap = @import("../snap/search.zig");
 const Cost = @import("../costing/compiled.zig").Cost;
+const base = @import("../costing/base.zig");
 const Segment = @import("endpoints.zig").Segment;
 const multi = @import("multi.zig");
 const search = @import("search.zig");
@@ -47,7 +48,7 @@ pub const Trip = struct {
     summary: Summary,
 };
 
-/// Recompute traversal and transition cost along a path in travel order.
+/// Recompute traversal and transition cost along a fixed directed path.
 pub const Recost = struct {
     elapsed: Cost = .{},
     previous: search.Label = .{},
@@ -55,41 +56,111 @@ pub const Recost = struct {
     pub const Step = struct {
         length_m: f32,
         transition: Cost,
+        elapsed: Cost,
+    };
+
+    pub const Options = struct {
+        timing: search.Timing = .{},
+        control: search.Control = .{},
+        ignore_access: bool = true,
     };
 
     pub fn add(self: *Recost, view: *const View, kernel: anytype, segment: Segment, edge: *const graph.format.EdgeHot, starts_pair: bool) !Step {
+        return self.addDirected(view, kernel, segment, edge, starts_pair, false, .forward, .{});
+    }
+
+    /// Steps use physical path order. Their cumulative costs start at the
+    /// endpoint from which the walk begins.
+    pub fn walk(view: *const View, kernel: anytype, path: []const Segment, steps: ?[]Step, comptime direction: search.Direction, options: Options) !Cost {
+        if (steps) |out| if (out.len != path.len) return error.InvalidRoute;
+        var recost: Recost = .{};
+        for (0..path.len) |i| {
+            try options.control.check();
+            const index = if (direction == .forward) i else path.len - 1 - i;
+            const segment = path[index];
+            const step = try recost.addDirected(view, kernel, segment, try view.edge(segment.edge), false, i + 1 == path.len, direction, options);
+            if (steps) |out| out[index] = step;
+        }
+        return recost.elapsed;
+    }
+
+    inline fn addDirected(self: *Recost, view: *const View, kernel: anytype, segment: Segment, edge: *const graph.format.EdgeHot, starts_pair: bool, terminal: bool, comptime direction: search.Direction, options: Options) !Step {
         if (!(segment.begin >= 0 and segment.end >= segment.begin and segment.end <= 1)) return error.InvalidRoute;
-        var transition: Cost = .{};
         if (starts_pair) self.previous = .{};
-        if (self.previous.edge != search.no_index) {
-            const incoming = try view.edge(self.previous.edgeId());
-            const node: graph.format.NodeId = @fromBackingInt(incoming.head);
+        const first = self.previous.edge == search.no_index;
+        const previous = if (first) null else try view.edge(self.previous.edgeId());
+        const node: graph.format.NodeId = @fromBackingInt(if (direction == .reverse)
+            edge.head
+        else if (previous) |incoming|
+            incoming.head
+        else if (options.timing.start.valid)
+            (try view.edge(try view.oppEdge(segment.edge))).head
+        else
+            edge.head);
+        const time: graph.time_info.TimeInfo = if (options.timing.start.valid) try options.timing.at(view, node, self.previous.secs, direction) else .{};
+        const traversal = try search.priceEdge(view, kernel, segment.edge, edge, direction, time, false);
+        if (traversal.cost.cost == std.math.inf(f32)) return error.InvalidRouteCost;
+
+        var access: base.AccessState = .{};
+        if (comptime @hasDecl(@TypeOf(kernel), "restrictionPermission")) {
+            const permission = kernel.restrictionPermission();
+            const policy: search.PathAccess = .{
+                .view = view,
+                .permission = permission,
+                .timing = options.timing,
+                .direction = direction,
+                .control = options.control,
+                .check_access = !permission.flags.contains(.ignore_restrictions),
+            };
+            const evaluation = try policy.evaluate(segment.edge, edge, node, self.previous, if (first) .start else if (terminal) .end else .middle);
+            const class = try view.class(edge.cls.class_id);
+            if (!options.ignore_access and (!evaluation.allowed or !permission.allowedClass(class))) return error.InvalidRouteAccess;
+            access = evaluation.state;
+        }
+
+        var transition: Cost = .{};
+        if (previous) |preceding| {
+            const incoming = if (direction == .forward) preceding else edge;
+            const outgoing = if (direction == .forward) edge else preceding;
+            const outgoing_id = if (direction == .forward) segment.edge else self.previous.edgeId();
             const row = try view.turnRow(node, incoming.cls.opp_local);
             const range = try view.outEdgeRange(node);
-            if (edge.cls.local >= row.len or range.first + edge.cls.local != @backingInt(segment.edge)) return error.DisconnectedPath;
-            transition = try kernel.turnCost(view, .{
+            if (outgoing.cls.local >= row.len or range.first + outgoing.cls.local != @backingInt(outgoing_id)) return error.DisconnectedPath;
+            const prior = self.previous.accessState();
+            const movement: search.Transition = .{
                 .node = node,
-                .incoming = self.previous.edgeId(),
+                .incoming = if (direction == .forward) self.previous.edgeId() else segment.edge,
                 .incoming_edge = incoming,
-                .outgoing = segment.edge,
-                .outgoing_edge = edge,
-                .row = row[edge.cls.local],
-            }, self.previous, .forward);
+                .outgoing = outgoing_id,
+                .outgoing_edge = outgoing,
+                .row = row[outgoing.cls.local],
+                .incoming_access = if (direction == .forward) prior else access,
+                .outgoing_access = if (direction == .forward) access else prior,
+                .measured_speed = if (direction == .forward) self.previous.measuredSpeed() else traversal.measured_speed,
+            };
+            if (comptime @hasDecl(@TypeOf(kernel), "allowedTurn")) {
+                if (!options.ignore_access and !try kernel.allowedTurn(view, movement, self.previous, direction)) return error.InvalidRouteAccess;
+            }
+            transition = try search.priceTurn(view, kernel, movement, self.previous, direction, time);
+            if (transition.cost == std.math.inf(f32)) return error.InvalidRouteCost;
         }
-        const full = try kernel.edgeCost(view, segment.edge, edge, .forward);
-        if (full.cost == std.math.inf(f32) or transition.cost == std.math.inf(f32)) return error.InvalidRouteCost;
+
         const fraction = segment.end - segment.begin;
         const scale = @max(fraction, std.math.floatEps(f32));
-        self.elapsed = self.elapsed.add(transition.add(.{ .cost = full.cost * scale, .secs = full.secs * scale }));
+        const full = traversal.cost;
+        const step = transition.add(.{ .cost = full.cost * scale, .secs = full.secs * scale });
+        self.elapsed = self.elapsed.add(step);
+        const pair = (Cost{ .cost = self.previous.cost, .secs = self.previous.secs }).add(step);
         const length = @as(f32, @floatFromInt(edge.geom.len_m)) * fraction;
         self.previous = .{
             .edge = @backingInt(segment.edge),
-            .cost = self.elapsed.cost,
-            .secs = self.elapsed.secs,
+            .cost = pair.cost,
+            .secs = pair.secs,
             .dist_m = self.previous.dist_m +| @as(u32, @intFromFloat(@round(length))),
             .tcost = transition.cost,
         };
-        return .{ .length_m = length, .transition = transition };
+        self.previous.setTraversal(access, traversal);
+        return .{ .length_m = length, .transition = transition, .elapsed = self.elapsed };
     }
 };
 
@@ -105,7 +176,7 @@ pub fn build(a: std.mem.Allocator, view: *const View, kernel: anytype, route: mu
     var summary: Summary = undefined;
     for (route.legs, legs, 0..) |leg, *output, i| {
         try control.check();
-        output.* = try buildLeg(a, view, kernel, leg, correlations, &fixed, &vertices, control);
+        output.* = try buildLeg(a, view, kernel, leg, route, correlations, &fixed, &vertices, control);
         const step = output.summary;
         if (i == 0) {
             summary = step;
@@ -123,18 +194,23 @@ pub fn build(a: std.mem.Allocator, view: *const View, kernel: anytype, route: mu
     return .{ .legs = legs, .summary = summary };
 }
 
-fn buildLeg(a: std.mem.Allocator, view: *const View, kernel: anytype, leg: multi.Leg, correlations: []const snap.PathLocation, fixed: *std.ArrayList(geo.FixedLL), vertices: *std.ArrayList(geo.PointLL), control: search.Control) !Leg {
+fn buildLeg(a: std.mem.Allocator, view: *const View, kernel: anytype, leg: multi.Leg, route: multi.Route, correlations: []const snap.PathLocation, fixed: *std.ArrayList(geo.FixedLL), vertices: *std.ArrayList(geo.PointLL), control: search.Control) !Leg {
     if (leg.segments.len == 0 or leg.segments.len != leg.segment_contexts.len or leg.origin >= leg.destination or leg.destination >= correlations.len) return error.InvalidRoute;
     const edges = try a.alloc(Edge, leg.segments.len);
     var shape: std.ArrayList(geo.PointLL) = .empty;
     var summary: Summary = .{ .bounds = undefined };
     var recost: Recost = .{};
+    var timing: search.Timing = .{ .invariant = route.invariant_time };
     for (leg.segments, leg.segment_contexts, edges, 0..) |segment, context, *output, i| {
         try control.check();
         if (context.pair < leg.origin or context.pair >= leg.destination) return error.InvalidRoute;
         const edge = try view.edge(segment.edge);
         const class = try view.class(edge.cls.class_id);
-        const step = try recost.add(view, kernel, segment, edge, context.starts_pair);
+        if (i == 0 or context.starts_pair) timing.start = route.waypoints[context.pair].clock;
+        const step = try recost.addDirected(view, kernel, segment, edge, context.starts_pair, i + 1 == edges.len, .forward, .{
+            .timing = timing,
+            .control = control,
+        });
         const metres: f32 = @floatFromInt(edge.geom.len_m);
 
         const record = try view.coldRecord(segment.edge);
@@ -165,7 +241,7 @@ fn buildLeg(a: std.mem.Allocator, view: *const View, kernel: anytype, leg: multi
         output.* = .{
             .id = segment.edge,
             .length_m = step.length_m,
-            .elapsed = recost.elapsed,
+            .elapsed = step.elapsed,
             .transition = step.transition,
             .shape_begin = shape_begin,
             .shape_end = shape.items.len - 1,

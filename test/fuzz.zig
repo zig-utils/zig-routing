@@ -1138,6 +1138,8 @@ const request_seeds = [_][]const u8{
     "\x81{\"encoded_polyline\":\"_p~iF~ps|U_ulLnnqC_mqNvxq`@\",\"shape_format\":\"polyline5\",\"range\":false}",
     "\x08{\"verbose\":true}",
     "\x00{\"locations\":[]}",
+    "\x00{\"costing\":\"auto\",\"recostings\":[{\"costing\":\"auto\"},{\"costing\":\"pedestrian\",\"name\":\"slow\",\"walking_speed\":2}]}",
+    "\x00{\"costing\":\"auto\",\"recostings\":[{\"costing\":\"auto\"},{\"costing\":\"auto\"}]}",
     "\x00[1,2,3]",
     "\x00{\"locations\":[{\"lat\":\"x\",\"lon\":1e999}],\"costing\":7}",
     "\x00{\"costing\":\"auto\",\"avoid_polygons\":[[],[[1.01,2.01],[1.02,2.02],[1.03,2.03]]],\"exclude_locations\":[{\"lat\":2,\"lon\":1}]}",

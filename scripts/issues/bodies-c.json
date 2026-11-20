@@ -1129,25 +1129,62 @@
   },
   {
     "key": "P5.19",
-    "goal": "A fixed path can be re-costed under any costing, which powers `recostings` in responses, elapsed-time computation and the parity gates themselves.",
+    "goal": "Recompute a fixed directed path under a costing profile for route summaries and same-graph parity.",
     "upstream": [
       "src/sif/recost.cc",
-      "valhalla/sif/dynamiccost.h"
+      "src/worker.cc"
     ],
     "scope": [
       "Port recost: walk a path's edges with a costing and TimeInfo, returning cost and elapsed time per edge, forward and reverse.",
-      "`recostings` request option with named costings; results serialised per leg and maneuver as upstream.",
-      "`linear_cost_factors`: per-request cost factors along given shapes, resolved to edges at snap time and applied in edge cost, with the scalar floor declared for I4.",
-      "Use recost as the single implementation behind parity gates B and C in `zr diff`."
+      "Parse the named `recostings` profiles in request order with Valhalla's validation and error codes.",
+      "Reuse the path walker for trip-leg costing and same-graph replay in the parity runner."
     ],
-    "out_of_scope": [],
-    "notes": [
-      "Per-edge user cost factors below 1 are the non-monotone case of I4: the request must supply the floor that scales potentials."
+    "out_of_scope": [
+      "Mirror named recosts into response serializers and wire native path replay into `zr diff` (P5.19b).",
+      "Resolve and apply `linear_cost_factors` (P5.19a)."
     ],
     "accept": [
-      "Upstream recost tests ported and green.",
-      "Recost of a path found by the search reproduces the search's own cost within 1e-4.",
-      "Admissibility fuzzer covers linear_cost_factors below and above 1.",
+      "Upstream fixed-path and request-validation recost cases ported and green.",
+      "Recost of a path found by the search reproduces the search's own cost within 1e-4, including clocked forward and reverse paths.",
+      "Same-graph path replay uses the shared recost engine and passes the timed and access Gate B comparisons.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P5.19a",
+    "goal": "Apply per-request `linear_cost_factors` to the directed edge ranges covered by supplied shapes.",
+    "upstream": [
+      "src/loki/linear_cost_factors.cc",
+      "src/thor/route_matcher.cc",
+      "valhalla/sif/dynamiccost.h"
+    ],
+    "scope": [
+      "Parse Valhalla's GeoJSON and encoded shape inputs and resolve them with the exact edge walker at snap time.",
+      "Apply factors to the covered edge ranges in search and fixed-path recost. Preserve the specified allow and exclude behavior and declare the request's scalar cost floor for I4.",
+      "Resolve the pinned partial-overlap discrepancy while preserving I3. Valhalla 3.9.3 reports negative cost and elapsed time on an 80 m subsegment when a factor of 0.5 covers a longer interval and the route ends inside that interval."
+    ],
+    "accept": [
+      "Pinned shape, endpoint fraction, tolerance and error cases pass, with the partial-overlap discrepancy reproduced and its behavior documented.",
+      "Admissibility fuzzing covers factors below and above 1 and overlapping cuts.",
+      "Recost reproduces search costs on linear-factor routes within 1e-4.",
+      "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P5.19b",
+    "goal": "Expose named recosts in route responses and use the shared path recost to drive weighted parity in `zr diff`.",
+    "upstream": [
+      "src/thor/triplegbuilder.cc",
+      "src/tyr/route_serializer_valhalla.cc",
+      "src/tyr/route_serializer_osrm.cc"
+    ],
+    "scope": [
+      "Port Valhalla's named recost values and nulls for failed recosts in route, leg and maneuver output, including OSRM.",
+      "Feed same-graph candidate and oracle paths to the shared recost implementation behind `zr diff` gates B and C."
+    ],
+    "accept": [
+      "Pinned `test/gurka/test_recost.cc` response cases match names, values, and nulls at each level.",
+      "`zr diff` runs gates B and C against the same graph with recorded native path costs.",
       "`zig build test` green."
     ]
   },
