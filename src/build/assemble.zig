@@ -27,6 +27,7 @@ const turn_restrictions = @import("turn_restrictions.zig");
 const mode_turns = @import("../graph/turn_restrictions.zig");
 const automaton = @import("../graph/restriction_automaton.zig");
 const automaton_builder = @import("restriction_automaton.zig");
+const conditional_access = @import("conditional_access.zig");
 
 const Allocator = std.mem.Allocator;
 const max_degree = turns.max_degree;
@@ -134,8 +135,8 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
         .apply_country_overrides = options.apply_country_overrides,
         .deadline = options.deadline,
     };
-    var restriction_program: []automaton.State = &.{};
-    defer gpa.free(restriction_program);
+    var restriction_program: automaton_builder.Program = .{};
+    defer restriction_program.deinit(gpa);
     var table = blk: {
         var base = try populate(gpa, &shared, options.workers);
         defer base.deinit();
@@ -150,7 +151,7 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     defer if (terrain) |*present| present.deinit();
     var turn_pool = turns.Pool.init(gpa);
     defer turn_pool.deinit();
-    var resolved = try resolveTurns(gpa, &shared, &plan, restrictions.source());
+    var resolved = try resolveTurns(gpa, &shared, &plan, restrictions.source(), null);
     defer resolved.deinit(gpa);
     const turn_sides = try buildTurns(&shared, table.classes, metadata.name_ids.items, resolved.hard.items, &turn_pool, gpa);
     defer gpa.free(turn_sides);
@@ -158,7 +159,8 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     try writeTopology(writer, options.scratch_dir, &topology, table.classes, turn_pool.bytes.items, if (terrain) |present| present.slopes.data else null);
     try writer.write(.turn_sides, turn_sides);
     if (resolved.modes.items.len != 0) try writer.write(.turn_restrictions, resolved.modes.items);
-    if (restriction_program.len != 0) try writer.write(.restriction_automaton, restriction_program);
+    if (restriction_program.states.len != 0) try writer.write(.restriction_automaton, restriction_program.states);
+    if (restriction_program.conditions.len != 0) try writer.write(.restriction_conditions, restriction_program.conditions);
     try writeAdmins(writer, options.admin_index, shared.admin_ids);
     if (options.timezone_source) |source_tz| try writeTimezones(gpa, writer, source_tz, topology.coordinates, options.scratch_dir);
     const topology_ns = timer.read();
@@ -279,14 +281,15 @@ pub fn buildStaged(
         const start = io.Timer.start();
         var tx = try session.begin(.enhance);
         defer tx.deinit();
-        var restriction_program: []automaton.State = &.{};
-        defer gpa.free(restriction_program);
+        var restriction_program: automaton_builder.Program = .{};
+        defer restriction_program.deinit(gpa);
         const enhanced = try enhanceGraph(gpa, &shared, &plan, edge_classes.?, options, restrictions, &restriction_program);
         gpa.free(enhanced.remap);
         gpa.free(edge_classes.?);
         edge_classes = enhanced.classes;
         try saveAttributes(&topology, enhanced.classes, &tx);
-        if (restriction_program.len != 0) try tx.writeArray(restriction_program, .restriction_states);
+        if (restriction_program.states.len != 0) try tx.writeArray(restriction_program.states, .restriction_states);
+        if (restriction_program.conditions.len != 0) try tx.writeArray(restriction_program.conditions, .restriction_conditions);
         try session.commit(&tx, topology.output.data.len, start);
     }
     if (session.endsAt(.enhance)) return;
@@ -315,7 +318,7 @@ pub fn buildStaged(
         const start = io.Timer.start();
         var tx = try session.begin(.turns);
         defer tx.deinit();
-        var resolved = try resolveTurns(gpa, &shared, &plan, restrictions);
+        var resolved = try resolveTurns(gpa, &shared, &plan, restrictions, null);
         defer resolved.deinit(gpa);
         const turn_sides = try buildTurns(&shared, edge_classes.?, metadata.name_ids.items, resolved.hard.items, &turn_pool, gpa);
         defer gpa.free(turn_sides);
@@ -387,6 +390,11 @@ noinline fn saveColdStage(session: *checkpoint.Session, shared: *const Shared, m
         const rows = try enhancement.map(.restriction_states, options.deadline);
         defer rows.unmap();
         try writer.write(.restriction_automaton, try checkpoint.array(automaton.State, rows));
+    }
+    if (enhancement.manifest.files.get(.restriction_conditions) != null) {
+        const rows = try enhancement.map(.restriction_conditions, options.deadline);
+        defer rows.unmap();
+        try writer.write(.restriction_conditions, try checkpoint.array(automaton.Condition, rows));
     }
     const cold_bytes = try buildCold(gpa, shared, metadata, &writer, options.scratch_dir, means);
     try tx.writeJson(gpa, cold_bytes, .source_stats);
@@ -492,10 +500,18 @@ pub const Metadata = struct {
     nodes: std.AutoHashMapUnmanaged(i64, format.NodeHot) = .empty,
     controls: std.AutoHashMapUnmanaged(i64, enhance.NodeControls) = .empty,
     ways: Ways = .empty,
-    motor_limits: std.AutoHashMapUnmanaged(i64, access_restriction.Set) = .empty,
+    access_limits: std.AutoHashMapUnmanaged(i64, std.ArrayList(access_restriction.Entry)) = .empty,
+    access_scratch: std.ArrayList(access_restriction.Entry) = .empty,
+    conditional: conditional_access.Parser,
 
     pub fn init(gpa: Allocator, options: Options) Metadata {
-        return .{ .gpa = gpa, .drive_side = options.drive_side, .deadline = options.deadline, .strings = .init(gpa) };
+        return .{
+            .gpa = gpa,
+            .drive_side = options.drive_side,
+            .deadline = options.deadline,
+            .strings = .init(gpa),
+            .conditional = .init(gpa, options.deadline),
+        };
     }
 
     pub fn saveNodes(self: *const Metadata, tx: *checkpoint.Transaction) !void {
@@ -570,18 +586,18 @@ pub const Metadata = struct {
         try names.sync();
         try tx.writeArray(self.name_ids.items, .name_refs);
         try tx.writeArray(self.levels.items, .levels);
-        if (self.motor_limits.count() != 0) try self.saveMotorLimits(tx);
+        if (self.access_limits.count() != 0) try self.saveAccessLimits(tx);
     }
 
-    fn saveMotorLimits(self: *const Metadata, tx: *checkpoint.Transaction) !void {
+    fn saveAccessLimits(self: *const Metadata, tx: *checkpoint.Transaction) !void {
         const file = try tx.create(.motor_limits);
         defer file.close();
         var rows: [256]LimitEntry = undefined;
         var count: usize = 0;
         var offset: u64 = 0;
-        var iter = self.motor_limits.iterator();
+        var iter = self.access_limits.iterator();
         while (iter.next()) |entry| {
-            for (entry.value_ptr.entries()) |limit| {
+            for (entry.value_ptr.items) |limit| {
                 rows[count] = .{ .way_id = entry.key_ptr.*, .limit = limit };
                 count += 1;
                 if (count != rows.len) continue;
@@ -636,20 +652,17 @@ pub const Metadata = struct {
             for (try checkpoint.array(LimitEntry, limits), 0..) |entry, i| {
                 try checkDeadline(self.deadline, i);
                 if (!entry.limit.valid() or !self.ways.contains(entry.way_id)) return error.InvalidCheckpoint;
-                const set = try self.motor_limits.getOrPut(self.gpa, entry.way_id);
-                if (!set.found_existing) set.value_ptr.* = .{};
-                if (set.value_ptr.len == access_restriction.max_per_way) return error.InvalidCheckpoint;
-                set.value_ptr.items[set.value_ptr.len] = entry.limit;
-                set.value_ptr.len += 1;
+                const set = try self.access_limits.getOrPutValue(self.gpa, entry.way_id, .empty);
+                try set.value_ptr.append(self.gpa, entry.limit);
             }
         }
         var iter = self.ways.iterator();
         var i: usize = 0;
         while (iter.next()) |entry| : (i += 1) {
             try checkDeadline(self.deadline, i);
-            const limits = self.motor_limits.getPtr(entry.key_ptr.*);
-            for (entry.value_ptr.by_direction, 0..) |class, dir| {
-                const modes = if (limits) |set| set.modes(dir == 0) else 0;
+            const limits = if (self.access_limits.get(entry.key_ptr.*)) |set| set.items else &.{};
+            const masks = try accessMasks(limits, self.deadline);
+            for (entry.value_ptr.by_direction, masks) |class, modes| {
                 if (class.detail.access_restriction != modes) return error.InvalidCheckpoint;
             }
         }
@@ -659,7 +672,11 @@ pub const Metadata = struct {
         self.nodes.deinit(self.gpa);
         self.controls.deinit(self.gpa);
         self.ways.deinit(self.gpa);
-        self.motor_limits.deinit(self.gpa);
+        var sets = self.access_limits.valueIterator();
+        while (sets.next()) |set| set.deinit(self.gpa);
+        self.access_limits.deinit(self.gpa);
+        self.access_scratch.deinit(self.gpa);
+        self.conditional.deinit();
         self.name_ids.deinit(self.gpa);
         self.levels.deinit(self.gpa);
         self.strings.deinit();
@@ -710,7 +727,8 @@ pub const Metadata = struct {
         }
         const entry = try self.ways.getOrPut(self.gpa, id);
         if (entry.found_existing) return error.DuplicateWay;
-        if (attrs.motor_limits.len != 0) try self.motor_limits.put(self.gpa, id, attrs.motor_limits);
+        const access_masks = try self.wayAccess(id, &attrs.motor_limits, raw_tags);
+        for (&pair, access_masks) |*class, modes| class.detail.access_restriction = modes;
         const indexed = try self.strings.indexWay(attrs, raw_tags, .{}, self.deadline);
         const name_start = try self.nameOffset();
         const ref_first = attrs.road_class == .motorway or attrs.road_class == .trunk;
@@ -750,6 +768,30 @@ pub const Metadata = struct {
             .ref_end = ref_end,
             .name_end = @min(name_end, name_start +| graph.cold.max_names),
         };
+    }
+
+    noinline fn wayAccess(self: *Metadata, id: i64, unconditional: *const access_restriction.Set, raw_tags: pbf.block.TagIterator) ![2]u16 {
+        const scratch = &self.access_scratch;
+        scratch.clearRetainingCapacity();
+        try scratch.appendSlice(self.gpa, unconditional.entries());
+        try self.conditional.append(raw_tags, scratch);
+        if (scratch.items.len == 0) return .{ 0, 0 };
+        const masks = try accessMasks(scratch.items, self.deadline);
+        if (scratch.items.len > unconditional.len) std.sort.heap(access_restriction.Entry, scratch.items, {}, access_restriction.Entry.before);
+        const owned = try self.gpa.dupe(access_restriction.Entry, scratch.items);
+        errdefer self.gpa.free(owned);
+        try self.access_limits.put(self.gpa, id, .fromOwnedSlice(owned));
+        return masks;
+    }
+
+    fn accessMasks(limits: []const access_restriction.Entry, deadline: io.Deadline) ![2]u16 {
+        var modes: [2]u16 = @splat(0);
+        for (limits, 0..) |limit, i| {
+            try checkDeadline(deadline, i);
+            if (limit.applies(true)) modes[0] |= limit.modes();
+            if (limit.applies(false)) modes[1] |= limit.modes();
+        }
+        return modes;
     }
 
     fn nameOffset(self: *const Metadata) !u32 {
@@ -1228,6 +1270,7 @@ const Job = struct {
                     const motorroad = way.attr.motorroad and (!is_ferry or way.attr.ferry_duration);
                     country_access.apply(&class, from_country.rules, access_tags, motorroad);
                 }
+                if (class.access.forward == 0) class.detail.access_restriction = 0;
                 const encoded_len = try encodeLength(segment.length_m);
                 const curvature = try computeCurvature(try segmentShape(shared.shape_points, segment), shared.deadline);
                 topo.output.data[slot] = .{
@@ -1476,7 +1519,7 @@ const EdgeEnhanceJob = struct {
     }
 };
 
-fn enhanceGraph(gpa: Allocator, shared: *const Shared, plan: *const Layout, base: []const classes.EdgeClass, options: Options, restrictions: turn_restrictions.Source, program: *[]automaton.State) !classes.Table {
+noinline fn enhanceGraph(gpa: Allocator, shared: *const Shared, plan: *const Layout, base: []const classes.EdgeClass, options: Options, restrictions: turn_restrictions.Source, program: *automaton_builder.Program) !classes.Table {
     const topo = shared.topology;
     const deadline = options.deadline;
     const aliases = try Scratch(u32).init(if (plan.split_nodes == 0) 0 else topo.nodes.len, options.scratch_dir);
@@ -1788,6 +1831,7 @@ const IncidentTurnEdge = struct {
 
 // Matches EdgeClass.restrictions, with the forward mask in the low half.
 const RestrictionStarts = std.AutoHashMapUnmanaged(u32, u32);
+const RestrictionSink = struct { builder: *automaton_builder.Builder, starts: *RestrictionStarts };
 
 // Ported from src/mjolnir/restrictionbuilder.cc (Valhalla 3.9.3).
 const ComplexWalk = struct {
@@ -1889,8 +1933,8 @@ const ComplexWalk = struct {
         return path[0..0];
     }
 
-    noinline fn prohibit(self: ComplexWalk, builder: *automaton_builder.Builder, starts: *RestrictionStarts, path: []u32, modes: u16, only: bool) !void {
-        if (!only) return forbidSequence(builder, starts, path, modes);
+    noinline fn prohibit(self: ComplexWalk, sink: RestrictionSink, path: []u32, modes: u16, only: bool) !void {
+        if (!only) return forbidSequence(sink, path, modes, 0);
         // Each wrong exit from a mandatory prefix is a forbidden sequence.
         // Reversing those sequences preserves legality in reverse search too.
         for (1..path.len) |index| {
@@ -1901,23 +1945,36 @@ const ComplexWalk = struct {
                 try checkDeadline(self.shared.deadline, i);
                 if (exit == prescribed or !allowed(self.classFor(exit), modes)) continue;
                 path[index] = exit;
-                try forbidSequence(builder, starts, path[0 .. index + 1], modes);
+                try forbidSequence(sink, path[0 .. index + 1], modes, 0);
             }
             path[index] = prescribed;
         }
     }
 };
 
-fn forbidSequence(builder: *automaton_builder.Builder, starts: *RestrictionStarts, path: []const u32, modes: u16) !void {
-    try builder.forbid(path, modes);
-    const forward = try starts.getOrPutValue(builder.a, path[0], 0);
+fn forbidSequence(sink: RestrictionSink, path: []const u32, modes: u16, domain: u64) !void {
+    try sink.builder.forbidWhen(path, modes, domain);
+    const forward = try sink.starts.getOrPutValue(sink.builder.a, path[0], 0);
     forward.value_ptr.* |= modes;
-    const reverse = try starts.getOrPutValue(builder.a, path[path.len - 1], 0);
+    const reverse = try sink.starts.getOrPutValue(sink.builder.a, path[path.len - 1], 0);
     reverse.value_ptr.* |= @as(u32, modes) << 16;
 }
 
-noinline fn compileComplexTurns(gpa: Allocator, shared: *const Shared, layout: *const Layout, base: []const classes.EdgeClass, order: []const u32, source: turn_restrictions.Source, starts: *RestrictionStarts) ![]automaton.State {
-    if (source.complex.len == 0) return &.{};
+noinline fn compileComplexTurns(gpa: Allocator, shared: *const Shared, layout: *const Layout, base: []const classes.EdgeClass, order: []const u32, source: turn_restrictions.Source, starts: *RestrictionStarts) !automaton_builder.Program {
+    if (source.complex.len == 0 and source.simple_domains.len == 0) return .{};
+    var builder: automaton_builder.Builder = .{ .a = gpa, .deadline = shared.deadline };
+    defer builder.deinit();
+    const sink: RestrictionSink = .{ .builder = &builder, .starts = starts };
+    if (source.simple_domains.len != 0) {
+        var timed = try resolveTurns(gpa, shared, layout, source, sink);
+        timed.deinit(gpa);
+    }
+    if (source.complex.len != 0) try addComplexTurns(shared, layout, base, order, source, sink);
+    return builder.finish(shared.topology.output.data.len);
+}
+
+noinline fn addComplexTurns(shared: *const Shared, layout: *const Layout, base: []const classes.EdgeClass, order: []const u32, source: turn_restrictions.Source, sink: RestrictionSink) !void {
+    const gpa = sink.builder.a;
     const Origin = struct { segment: u32, next: u32 };
     var origins: std.AutoHashMapUnmanaged(i64, u32) = .empty;
     defer origins.deinit(gpa);
@@ -1937,8 +1994,6 @@ noinline fn compileComplexTurns(gpa: Allocator, shared: *const Shared, layout: *
         }
     }
     const walk: ComplexWalk = .{ .shared = shared, .layout = layout, .classes = base, .order = order };
-    var builder: automaton_builder.Builder = .{ .a = gpa, .deadline = shared.deadline };
-    defer builder.deinit();
     const topo = shared.topology;
     for (source.complex, 0..) |row, i| {
         try checkDeadline(shared.deadline, i);
@@ -1957,11 +2012,10 @@ noinline fn compileComplexTurns(gpa: Allocator, shared: *const Shared, layout: *
                 if (!ComplexWalk.allowed(walk.classFor(placement.slot), row.attr.modes)) continue;
                 var storage: [automaton.max_edges]u32 = undefined;
                 const path = try walk.find(placement.slot, ways[0 .. via.len + 1], row.attr.modes, &storage);
-                if (path.len != 0) try walk.prohibit(&builder, starts, path, row.attr.modes, kind.only());
+                if (path.len != 0) try walk.prohibit(sink, path, row.attr.modes, kind.only());
             }
         }
     }
-    return builder.finish(topo.output.data.len);
 }
 
 fn turnIncidents(a: Allocator, shared: *const Shared, node: Node, incident: *std.ArrayList(IncidentTurnEdge)) !void {
@@ -1993,12 +2047,13 @@ fn restrictionEntryBefore(_: void, a: mode_turns.Entry, b: mode_turns.Entry) boo
 
 // The pinned tile stores eight outgoing bits in Valhalla's incident-edge order.
 // Find those arcs without changing native CSR indices.
-noinline fn resolveTurns(a: Allocator, shared: *const Shared, plan: *const Layout, source: turn_restrictions.Source) !ResolvedTurns {
+noinline fn resolveTurns(a: Allocator, shared: *const Shared, plan: *const Layout, source: turn_restrictions.Source, sink: ?RestrictionSink) !ResolvedTurns {
     const topo = shared.topology;
     const valhalla_mask_width = 8;
     var result: ResolvedTurns = .{ .stats = source.stats };
     errdefer result.deinit(a);
     if (source.entries.len == 0) return result;
+    if (source.simple_domains.len != 0 and source.simple_domains.len != source.entries.len) return error.InvalidCheckpoint;
     var incident: std.ArrayList(IncidentTurnEdge) = .empty;
     defer incident.deinit(a);
     var preceding_via: ?i64 = null;
@@ -2006,6 +2061,9 @@ noinline fn resolveTurns(a: Allocator, shared: *const Shared, plan: *const Layou
     for (source.entries, 0..) |restriction, row| {
         try checkDeadline(shared.deadline, row);
         const kind = try restriction.kind();
+        const domain = if (source.simple_domains.len == 0) 0 else source.simple_domains[row];
+        if (sink != null and domain == 0) continue;
+        if (domain != 0 and !restriction.attr.mode_specific) return error.InvalidCheckpoint;
         const logical = plan.by_id.get(restriction.via) orelse {
             result.stats.missing_via += 1;
             continue;
@@ -2042,7 +2100,12 @@ noinline fn resolveTurns(a: Allocator, shared: *const Shared, plan: *const Layou
                 for (incident.items, 0..) |in, i| {
                     try checkDeadline(shared.deadline, i);
                     if (in.way != restriction.from) continue;
-                    if (!specific and in.node == out.node) {
+                    if (domain != 0) {
+                        const active = sink orelse continue;
+                        const opposing = topo.output.data[in.slot];
+                        const incoming = topo.first_edge[opposing.head] + opposing.cls.opp_local;
+                        try forbidSequence(active, &.{ incoming, out.slot }, restriction.attr.modes, domain);
+                    } else if (!specific and in.node == out.node) {
                         const local = topo.output.data[out.slot].cls.local;
                         try result.hard.append(a, .{ .slot = in.slot, .exits = @as(u32, 1) << local });
                     } else {
@@ -2154,6 +2217,8 @@ fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *const Metadata, w
     var builder = try ColdBuilder.init(gpa, &metadata.strings, scratch_dir, shared.deadline);
     defer builder.deinit();
     var refs: [graph.cold.max_names]u32 = undefined;
+    var access_scratch: std.ArrayList(access_restriction.Entry) = .empty;
+    defer access_scratch.deinit(gpa);
     for (topo.nodes, 0..) |_, node| {
         try checkDeadline(shared.deadline, node);
         const first = topo.first_edge[node];
@@ -2178,10 +2243,14 @@ fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *const Metadata, w
                 };
                 const shape = try segmentShape(shared.shape_points, seg);
                 try coverage.addShape(shape, writer.deadline);
-                const limits = metadata.motor_limits.getPtr(seg.way_id);
+                const limits = metadata.access_limits.get(seg.way_id);
+                const access_limits = if (limits) |set| try accessForDirections(gpa, &access_scratch, set.items, .{
+                    topo.output.data[if (reverse) opposite else slot].cls.cold_checks != 0,
+                    topo.output.data[if (reverse) slot else opposite].cls.cold_checks != 0,
+                }, shared.deadline) else &.{};
                 break :blk try builder.appendFull(@bitCast(seg.way_id), way.speeds.limit, mean, shape, active, .{
                     .indoor = indoor,
-                    .access_limits = if (limits) |set| set.entries() else &.{},
+                    .access_limits = access_limits,
                 });
             } else try builder.append(0, 0, graph.cold.no_elevation, &.{ topo.coordinates[node], topo.coordinates[edge.head] }, &.{}, .{});
             index.data[slot] = graph.cold.directedIndex(record, reverse);
@@ -2192,6 +2261,20 @@ fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *const Metadata, w
     try writer.write(.cold_idx, index.data);
     if (coverage.finish()) |bounds| try writer.write(.coverage, &.{bounds});
     return builder.write(writer);
+}
+
+noinline fn accessForDirections(gpa: Allocator, scratch: *std.ArrayList(access_restriction.Entry), limits: []const access_restriction.Entry, enabled: [2]bool, deadline: io.Deadline) ![]const access_restriction.Entry {
+    if (enabled[0] and enabled[1]) return limits;
+    if (!enabled[0] and !enabled[1]) return &.{};
+    scratch.clearRetainingCapacity();
+    for (limits, 0..) |limit, i| {
+        try checkDeadline(deadline, i);
+        if (!limit.applies(enabled[0])) continue;
+        var present = limit;
+        present.attr.direction = if (enabled[0]) .forward else .backward;
+        try scratch.append(gpa, present);
+    }
+    return scratch.items;
 }
 
 const SpatialJob = struct {

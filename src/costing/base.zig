@@ -584,7 +584,87 @@ pub const Permission = struct {
     }
 
     pub fn allowsTurnRestriction(self: Permission, turn: Turn) bool {
-        return !turn.restricted() or self.flags.contains(.ignore_restrictions) or self.flags.contains(.ignore_non_vehicular_restrictions);
+        return !turn.restricted() or self.ignoresTurnRestrictions();
+    }
+
+    pub fn restrictionModes(self: Permission) u16 {
+        if (self.ignoresTurnRestrictions()) return 0;
+        return @bitCast(self.access_mask);
+    }
+
+    fn ignoresTurnRestrictions(self: Permission) bool {
+        return self.flags.contains(.ignore_restrictions) or self.flags.contains(.ignore_non_vehicular_restrictions);
+    }
+
+    pub noinline fn startingAccess(self: Permission, limits: []align(1) const graph.cold.access_restriction.Entry, forward: bool, local: ?graph.datetime.Local, deadline: Deadline) !AccessState {
+        if (self.flags.contains(.ignore_restrictions)) return .{};
+        const modes: u16 = @bitCast(self.access_mask);
+        var result: AccessState = .{};
+        for (limits, 0..) |limit, i| {
+            if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+            if (!limit.applies(forward) or limit.modes() & modes == 0) continue;
+            if (limit.attr.kind == .destination_allowed) {
+                if (local) |now| {
+                    const domain: graph.time_domain.TimeDomain = @bitCast(limit.value);
+                    result.destination_only = result.destination_only or domain.active(now);
+                }
+            }
+            if (limit.attr.except_destination and !self.allow_destination_only)
+                result.vehicle_exceptions |= limit.attr.kind.exceptionMask();
+        }
+        return result;
+    }
+
+    /// EvaluateRestrictions uses upstream record ordering. An active allow or
+    /// destination condition stops later time checks while dimensional limits
+    /// continue to the costing's mode-specific checks.
+    pub noinline fn evaluateRestrictions(
+        self: Permission,
+        limits: []align(1) const graph.cold.access_restriction.Entry,
+        forward: bool,
+        local: ?graph.datetime.Local,
+        previous: AccessState,
+        predicate: anytype,
+        deadline: Deadline,
+    ) !AccessEvaluation {
+        if (self.flags.contains(.ignore_restrictions)) return .{};
+        const modes: u16 = @bitCast(self.access_mask);
+        const check_time = !self.flags.contains(.ignore_non_vehicular_restrictions);
+        var result: AccessEvaluation = .{};
+        var time_allowed = false;
+        var time_in_range = false;
+        var index: usize = 0;
+        for (limits, 0..) |limit, i| {
+            if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+            if (!limit.applies(forward) or limit.modes() & modes == 0) continue;
+            defer index += 1;
+            const kind = limit.attr.kind;
+            if (kind.timed() and !time_in_range and check_time) {
+                result.restriction_index = @truncate(index);
+                if (local) |now| {
+                    time_allowed = time_allowed or kind == .timed_allowed;
+                    const domain: graph.time_domain.TimeDomain = @bitCast(limit.value);
+                    if (domain.active(now)) {
+                        if (kind == .timed_denied) return result.deny();
+                        if (kind == .destination_allowed) {
+                            result.state.destination_only = true;
+                            if (!self.allow_destination_only and !previous.destination_only) return result.deny();
+                        }
+                        time_in_range = true;
+                    }
+                }
+            }
+            if (limit.attr.except_destination) {
+                const mask = kind.exceptionMask();
+                result.state.vehicle_exceptions |= mask;
+                if (self.allow_destination_only or previous.vehicle_exceptions & mask != 0) continue;
+            }
+            if (comptime @TypeOf(predicate) != @TypeOf(null)) {
+                if (!predicate.allowed(limit)) return result.deny();
+            }
+        }
+        if (time_allowed and !time_in_range) return result.deny();
+        return result;
     }
 
     /// Check a transition in travel order. Reverse search swaps its operands.
@@ -604,6 +684,53 @@ pub const Permission = struct {
             !(self.flags.contains(.exclude_ferries) and isFerry(to.category.use) and !isFerry(from.category.use));
     }
 };
+
+pub const AccessState = struct {
+    destination_only: bool = false,
+    vehicle_exceptions: u7 = 0,
+};
+
+pub const AccessEvaluation = struct {
+    allowed: bool = true,
+    state: AccessState = .{},
+    restriction_index: ?u8 = null,
+
+    fn deny(self: AccessEvaluation) AccessEvaluation {
+        var denied = self;
+        denied.allowed = false;
+        return denied;
+    }
+};
+
+// Ported from the mixed timed and dimensional cases in
+// test/gurka/test_conditional_restrictions.cc (Valhalla 3.9.3).
+test "a scheduled opening preserves the mode-specific and local access checks" {
+    const t = std.testing;
+    const Entry = graph.cold.access_restriction.Entry;
+    const Domain = graph.time_domain.TimeDomain;
+    const Predicate = struct {
+        fn allowed(_: @This(), entry: Entry) bool {
+            return entry.attr.kind != .maxheight;
+        }
+    };
+    const limits = &[_]Entry{
+        .{ .value = @bitCast(Domain{ .begin_hour = 9, .end_hour = 12 }), .attr = .{ .kind = .timed_allowed, .direction = .both, .modes = 8 } },
+        .{ .value = 400, .attr = .{ .kind = .maxheight, .direction = .both, .except_destination = true } },
+        .{ .value = @bitCast(Domain{ .begin_hour = 13, .end_hour = 14 }), .attr = .{ .kind = .timed_denied, .direction = .both, .modes = 4095 } },
+    };
+    var permission: Permission = .{ .flags = .empty, .flow = .{}, .access_mask = .{ .truck = true }, .filter_closures = false, .allow_destination_only = false };
+    const opening = graph.datetime.Local.parse("2020-10-10T10:00").?;
+    const closed = graph.datetime.Local.parse("2020-10-10T16:00").?;
+    const exempt = try permission.startingAccess(limits, true, null, .none);
+    try t.expectEqual(2, exempt.vehicle_exceptions);
+    try t.expect(!(try permission.evaluateRestrictions(limits, true, opening, .{}, Predicate{}, .none)).allowed);
+    try t.expect((try permission.evaluateRestrictions(limits, true, opening, exempt, Predicate{}, .none)).allowed);
+    try t.expect(!(try permission.evaluateRestrictions(limits, true, closed, exempt, Predicate{}, .none)).allowed);
+    try t.expect((try permission.evaluateRestrictions(limits, true, null, exempt, Predicate{}, .none)).allowed);
+    permission.flags.insert(.ignore_non_vehicular_restrictions);
+    try t.expect((try permission.evaluateRestrictions(limits, true, closed, exempt, Predicate{}, .none)).allowed);
+    try t.expect(!(try permission.evaluateRestrictions(limits, true, closed, .{}, Predicate{}, .none)).allowed);
+}
 
 fn isFerry(use: u6) bool {
     return use == @backingInt(Use.ferry) or use == @backingInt(Use.rail_ferry);

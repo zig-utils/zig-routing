@@ -53,6 +53,12 @@ pub const Local = struct {
     hour: u8,
     minute: u8,
 
+    pub fn fromSeconds(local: i64) ?Local {
+        const date = civilFromDays(@divFloor(local, seconds_per_day)) orelse return null;
+        const minutes: u16 = @intCast(@divTrunc(@mod(local, seconds_per_day), 60));
+        return .{ .date = date, .hour = @intCast(minutes / 60), .minute = @intCast(minutes % 60) };
+    }
+
     pub fn parse(text: []const u8) ?Local {
         if (text.len != 10 and text.len != 16) return null;
         const date = parseDate(text[0..10]) orelse return null;
@@ -152,7 +158,7 @@ fn storeDigits(buffer: []u8, value: u32) void {
     }
 }
 
-fn daysInMonth(year: u16, month: u8) u8 {
+pub fn daysInMonth(year: u16, month: u8) u8 {
     const lengths = [_]u8{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
     return lengths[month - 1] + @intFromBool(month == 2 and std.time.epoch.isLeapYear(year));
 }

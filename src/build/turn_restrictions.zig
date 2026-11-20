@@ -3,6 +3,7 @@ const std = @import("std");
 const io = @import("../infra/io.zig");
 const pbf = @import("pbf/root.zig");
 const Access = @import("../graph/constants.zig").AccessMask;
+const time_parsing = @import("time_parsing.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Kind = enum(u4) {
@@ -83,6 +84,7 @@ pub const Stats = struct {
     missing_to: u64 = 0,
     mask_truncated: u64 = 0,
     complex: u64 = 0,
+    invalid_condition: u64 = 0,
 };
 
 pub const Source = struct {
@@ -90,6 +92,7 @@ pub const Source = struct {
     stats: Stats = .{},
     complex: []const Complex = &.{},
     via_ways: []const i64 = &.{},
+    simple_domains: []const u64 = &.{},
 };
 
 const general_modes = bits(.{
@@ -126,6 +129,10 @@ pub const Catalog = struct {
     entries: std.ArrayList(Record) = .empty,
     complex: std.ArrayList(Complex) = .empty,
     via_ways: std.ArrayList(i64) = .empty,
+    simple_domains: std.ArrayList(u64) = .empty,
+    parsed_domains: std.ArrayList(u64) = .empty,
+    condition_text: std.ArrayList(u8) = .empty,
+    time_parser: ?time_parsing.Parser = null,
     seen: std.AutoHashMapUnmanaged(i64, void) = .empty,
     stats: Stats = .{},
 
@@ -133,19 +140,29 @@ pub const Catalog = struct {
         self.entries.deinit(self.a);
         self.complex.deinit(self.a);
         self.via_ways.deinit(self.a);
+        self.simple_domains.deinit(self.a);
+        self.parsed_domains.deinit(self.a);
+        self.condition_text.deinit(self.a);
+        if (self.time_parser) |*parser| parser.deinit();
         self.seen.deinit(self.a);
     }
 
     pub fn source(self: *const Catalog) Source {
-        return .{ .entries = self.entries.items, .stats = self.stats, .complex = self.complex.items, .via_ways = self.via_ways.items };
+        return .{
+            .entries = self.entries.items,
+            .stats = self.stats,
+            .complex = self.complex.items,
+            .via_ways = self.via_ways.items,
+            .simple_domains = self.simple_domains.items,
+        };
     }
 
     pub noinline fn add(self: *Catalog, relation: pbf.block.Relation) !void {
         var tags = relation.tags;
         var is_restriction = false;
-        var timed = false;
+        var conditional: ?Annotated = null;
         var probable = false;
-        var legacy_time = false;
+        var legacy: Legacy = .{};
         var ordinary: ?Kind = null;
         var modes: std.EnumArray(Kind, u16) = .initFill(0);
         var has_modes = false;
@@ -161,29 +178,29 @@ pub const Catalog = struct {
             } else if (std.mem.startsWith(u8, tag.key, "restriction:")) {
                 const name = tag.key["restriction:".len..];
                 if (eql(name, "conditional")) {
-                    timed = try annotated(tag.value, self.deadline);
+                    conditional = try annotated(tag.value, self.deadline);
                 } else if (eql(name, "probable")) {
-                    probable = try annotated(tag.value, self.deadline);
+                    probable = (try annotated(tag.value, self.deadline)) != null;
                 } else if (mode_names.get(name)) |mode| {
                     if (std.meta.stringToEnum(Kind, tag.value)) |kind| {
                         modes.getPtr(kind).* |= mode;
                         has_modes = true;
                     }
                 }
-            } else if (eql(tag.key, "hour_on") or eql(tag.key, "hour_off") or
-                eql(tag.key, "day_on") or eql(tag.key, "day_off"))
-            {
-                legacy_time = true;
+            } else if (std.meta.stringToEnum(LegacyKey, tag.key)) |key| {
+                legacy.fields.getPtr(key).* = tag.value;
+                legacy.present = true;
             }
         }
-        if (!is_restriction and !timed and !probable) return;
+        if (!is_restriction and conditional == null and !probable) return;
         const entry = try self.seen.getOrPut(self.a, relation.id);
         if (entry.found_existing) return;
         self.stats.parsed += 1;
-        if (timed or legacy_time or (ordinary == null and probable)) {
+        if (ordinary == null and conditional == null and probable) {
             self.stats.deferred += 1;
             return;
         }
+        if (ordinary == null and conditional != null) ordinary = conditional.?.kind;
         if (ordinary == null and !has_modes) {
             self.stats.unsupported_type += 1;
             return;
@@ -222,6 +239,14 @@ pub const Catalog = struct {
             self.stats.invalid_members += 1;
             return;
         }
+        const timed = conditional != null or legacy.present;
+        // The pinned parser writes a date domain when it promotes a
+        // via-node relation. Via-way relations use the ordinary sequence.
+        const domains = if (timed and via_count == 0) try self.parseDomains(conditional, legacy) else &[_]u64{0};
+        if (domains.len == 0) {
+            self.stats.invalid_condition += 1;
+            return;
+        }
         const first = std.math.cast(u32, self.via_ways.items.len) orelse return error.TooManyRestrictionVias;
         if (via_count != 0) {
             try self.via_ways.appendSlice(self.a, via_ways[0..via_count]);
@@ -231,39 +256,102 @@ pub const Catalog = struct {
             for (std.enums.values(Kind), modes.values) |kind, mask| {
                 if (mask == 0) continue;
                 row.attr = .{ .kind = @backingInt(kind), .modes = mask, .mode_specific = true };
-                try self.append(row, first, @intCast(via_count));
+                try self.appendDomains(row, first, @intCast(via_count), domains);
             }
         } else {
             row.attr = .{
                 .kind = @backingInt(ordinary.?),
-                .modes = if (exceptions.len == 0) simple_modes else try exceptModes(exceptions, self.deadline),
-                .mode_specific = exceptions.len != 0,
+                .modes = if (exceptions.len == 0) (if (timed) general_modes else simple_modes) else try exceptModes(exceptions, self.deadline),
+                .mode_specific = exceptions.len != 0 or timed,
             };
-            try self.append(row, first, @intCast(via_count));
+            try self.appendDomains(row, first, @intCast(via_count), domains);
         }
     }
 
-    fn append(self: *Catalog, row: Record, first: u32, count: u5) !void {
-        if (count == 0) return self.entries.append(self.a, row);
-        try self.complex.append(self.a, .{
-            .from = row.from,
-            .to = row.to,
-            .first_via = first,
-            .attr = .{
-                .via_count = count,
-                .kind = row.attr.kind,
-                .modes = if (row.attr.mode_specific) row.attr.modes else general_modes,
-            },
-        });
+    noinline fn appendDomains(self: *Catalog, row: Record, first: u32, count: u5, domains: []const u64) !void {
+        for (domains, 0..) |domain, i| {
+            if (i % 256 == 0 and self.deadline.expired()) return error.DeadlineExceeded;
+            if (count == 0) {
+                try self.appendDomain(&self.simple_domains, self.entries.items.len, domain);
+                try self.entries.append(self.a, row);
+            } else {
+                try self.complex.append(self.a, .{
+                    .from = row.from,
+                    .to = row.to,
+                    .first_via = first,
+                    .attr = .{
+                        .via_count = count,
+                        .kind = row.attr.kind,
+                        .modes = if (row.attr.mode_specific) row.attr.modes else general_modes,
+                    },
+                });
+            }
+        }
+    }
+
+    fn appendDomain(self: *Catalog, output: *std.ArrayList(u64), preceding: usize, domain: u64) !void {
+        if (domain == 0 and output.items.len == 0) return;
+        try output.appendNTimes(self.a, 0, preceding - output.items.len);
+        try output.append(self.a, domain);
+    }
+
+    noinline fn parseDomains(self: *Catalog, annotated_tag: ?Annotated, legacy: Legacy) ![]const u64 {
+        if (self.time_parser == null) self.time_parser = .{ .a = self.a, .deadline = self.deadline };
+        self.parsed_domains.clearRetainingCapacity();
+        const explicit = if (annotated_tag) |tag| tag.condition else "";
+        const condition = if (explicit.len != 0) explicit else try self.legacyCondition(legacy);
+        try self.time_parser.?.parse(condition, &self.parsed_domains);
+        return self.parsed_domains.items;
+    }
+
+    fn legacyCondition(self: *Catalog, legacy: Legacy) ![]const u8 {
+        const text = &self.condition_text;
+        text.clearRetainingCapacity();
+        const day_on = legacy.fields.get(.day_on);
+        const day_off = legacy.fields.get(.day_off);
+        if (day_on.len != 0 and day_off.len != 0) try self.appendRange(day_on, day_off);
+        const hour_on = legacy.fields.get(.hour_on);
+        const hour_off = legacy.fields.get(.hour_off);
+        if (std.mem.indexOfScalar(u8, hour_on, ';') != null) {
+            var starts = std.mem.tokenizeScalar(u8, hour_on, ';');
+            var ends = std.mem.tokenizeScalar(u8, hour_off, ';');
+            var count: usize = 0;
+            try text.append(self.a, ' ');
+            while (starts.next()) |begin| {
+                if (self.deadline.expired()) return error.DeadlineExceeded;
+                const end = ends.next() orelse return "";
+                if (count != 0) try text.append(self.a, ',');
+                try self.appendRange(begin, end);
+                count += 1;
+            }
+            if (count < 2 or ends.next() != null) return "";
+        } else if (hour_on.len != 0 and hour_off.len != 0) {
+            try text.append(self.a, ' ');
+            try self.appendRange(hour_on, hour_off);
+        }
+        return text.items;
+    }
+
+    fn appendRange(self: *Catalog, begin: []const u8, end: []const u8) !void {
+        try self.condition_text.appendSlice(self.a, begin);
+        try self.condition_text.append(self.a, '-');
+        try self.condition_text.appendSlice(self.a, end);
     }
 };
 
-fn annotated(text: []const u8, deadline: io.Deadline) !bool {
+const LegacyKey = enum { day_on, day_off, hour_on, hour_off };
+const Legacy = struct { fields: std.EnumArray(LegacyKey, []const u8) = .initFill(""), present: bool = false };
+const Annotated = struct { kind: Kind, condition: []const u8 };
+
+fn annotated(text: []const u8, deadline: io.Deadline) !?Annotated {
     for (text, 0..) |char, i| {
         if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
-        if (char == '@') return std.meta.stringToEnum(Kind, std.mem.trimEnd(u8, text[0..i], " ")) != null;
+        if (char == '@') {
+            const kind = std.meta.stringToEnum(Kind, std.mem.trimEnd(u8, text[0..i], " ")) orelse return null;
+            return .{ .kind = kind, .condition = text[i + 1 ..] };
+        }
     }
-    return false;
+    return null;
 }
 
 fn exceptModes(text: []const u8, deadline: io.Deadline) !u16 {

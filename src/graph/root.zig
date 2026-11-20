@@ -7,6 +7,7 @@ pub const admin = @import("admin.zig");
 pub const timezone = @import("timezone.zig");
 pub const datetime = @import("datetime.zig");
 pub const time_info = @import("time_info.zig");
+pub const time_domain = @import("time_domain.zig");
 pub const constants = @import("constants.zig");
 pub const format = @import("format.zig");
 pub const turn_sides = @import("turn_sides.zig");

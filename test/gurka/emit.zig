@@ -18,6 +18,8 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, name, "simple-turns")) break :blk try examples.simpleTurns(arena);
         if (std.mem.eql(u8, name, "only-turns")) break :blk try examples.onlyTurns(arena, .many_neighbours);
         if (std.mem.eql(u8, name, "multi-via-turns")) break :blk try examples.multiViaTurns(arena);
+        if (std.mem.eql(u8, name, "timed-access")) break :blk try examples.conditionalAccess(arena);
+        if (std.mem.eql(u8, name, "timed-turns")) break :blk try examples.timedTurns(arena, false);
         return error.UnknownFixture;
     } else try examples.intersection(arena);
     if (args.next() != null) return error.ExtraArguments;

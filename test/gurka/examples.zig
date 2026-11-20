@@ -170,6 +170,84 @@ pub fn multiViaTurns(arena: Allocator) !gurka.Map {
     }});
 }
 
+// Ported from test/gurka/test_conditional_restrictions.cc (Valhalla 3.9.3).
+pub fn conditionalAccess(arena: Allocator) !gurka.Map {
+    const service: gurka.Tag = .{ .key = "highway", .value = "service" };
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "residential" }};
+    const hours = "(Mar 00:00-07:00;Mar 17:30-24:00;Apr 00:00-07:00;Apr 19:00-24:00;Aug 00:00-07:00;Aug 19:00-24:00)";
+    const denied = "no @ " ++ hours;
+    const allowed = "yes @ " ++ hours;
+    const destination = "destination @ " ++ hours;
+    const delivery = "delivery @ " ++ hours;
+    const private = "private @ " ++ hours;
+    const designated = "designated @ " ++ hours;
+    return gurka.Map.init(arena, try gurka.mapToCoordinates(
+        \\A----B
+        \\|    |
+        \\D    C
+        \\ \  /
+        \\  E
+        \\
+        \\F----G----H----I----J----K----L
+        \\                    |    |
+        \\                    M----N
+        \\
+        \\R---S---T---U
+    , 100), &.{
+        .{ .label = "AD", .tags = &.{ service, .{ .key = "motorcar", .value = "no" }, .{ .key = "bicycle", .value = "yes" }, .{ .key = "foot", .value = "yes" }, .{ .key = "bicycle:conditional", .value = allowed }, .{ .key = "foot:conditional", .value = private } } },
+        .{ .label = "AB", .tags = &.{
+            service,                                                 .{ .key = "motorcar:conditional", .value = delivery },
+            .{ .key = "motorcycle:conditional", .value = delivery }, .{ .key = "moped:conditional", .value = delivery },
+            .{ .key = "psv:conditional", .value = delivery },        .{ .key = "taxi:conditional", .value = delivery },
+            .{ .key = "bus:conditional", .value = delivery },        .{ .key = "hov:conditional", .value = delivery },
+            .{ .key = "emergency:conditional", .value = delivery },  .{ .key = "bicycle:conditional", .value = denied },
+            .{ .key = "foot:conditional", .value = designated },
+        } },
+        .{ .label = "BC", .tags = &.{ service, .{ .key = "motorcar:conditional", .value = destination } } },
+        .{ .label = "CD", .tags = &.{ service, .{ .key = "motorcar:conditional", .value = allowed }, .{ .key = "bicycle:conditional", .value = denied }, .{ .key = "foot:conditional", .value = private } } },
+        .{ .label = "DE", .tags = &.{ service, .{ .key = "motorcar:conditional", .value = delivery }, .{ .key = "bicycle:conditional", .value = denied }, .{ .key = "foot:conditional", .value = designated } } },
+        .{ .label = "CE", .tags = &.{ service, .{ .key = "motorcar:conditional", .value = destination }, .{ .key = "bicycle:conditional", .value = denied }, .{ .key = "foot:conditional", .value = allowed } } },
+        .{ .label = "FG", .tags = road },
+        .{ .label = "GH", .tags = road },
+        .{ .label = "IJ", .tags = road },
+        .{ .label = "HI", .tags = &.{ road[0], .{ .key = "motor_vehicle:conditional", .value = destination } } },
+        .{ .label = "JK", .tags = &.{ road[0], .{ .key = "motor_vehicle:conditional", .value = destination } } },
+        .{ .label = "KL", .tags = road },
+        .{ .label = "JM", .tags = road },
+        .{ .label = "MN", .tags = road },
+        .{ .label = "NK", .tags = road },
+        .{ .label = "RS", .tags = road },
+        .{ .label = "ST", .tags = &.{ road[0], .{ .key = "access:conditional", .value = denied } } },
+        .{ .label = "TU", .tags = road },
+    }, &.{}, &.{});
+}
+
+// Ported from test/gurka/test_time_dependent_restrictions.cc (Valhalla 3.9.3).
+pub fn timedTurns(arena: Allocator, only: bool) !gurka.Map {
+    const road: gurka.Tags = if (only) &.{.{ .key = "highway", .value = "primary" }} else &.{.{ .key = "highway", .value = "motorway" }};
+    const tags: gurka.Tags = if (only) &.{
+        .{ .key = "type", .value = "restriction" },
+        .{ .key = "restriction:conditional", .value = "only_straight_on @ (Mo-Fr 07:00-19:00)" },
+        .{ .key = "except", .value = "bicycle" },
+    } else &.{
+        .{ .key = "type", .value = "restriction" },
+        .{ .key = "restriction", .value = "no_left_turn" },
+        .{ .key = "hour_on", .value = "07:00" },
+        .{ .key = "hour_off", .value = "19:00" },
+    };
+    return gurka.Map.init(arena, try gurka.mapToCoordinates("D----B----A\n|    |\n|    |\nE----C----F", 10), &.{
+        .{ .label = "AB", .tags = road }, .{ .label = "BC", .tags = road }, .{ .label = "BD", .tags = road },
+        .{ .label = "CF", .tags = road }, .{ .label = "DE", .tags = road }, .{ .label = "EC", .tags = road },
+    }, &.{}, &.{.{
+        .members = &.{
+            .{ .kind = .way, .ref = "AB", .role = "from" },
+            .{ .kind = .way, .ref = "BC", .role = "to" },
+            .{ .kind = .node, .ref = "B", .role = "via" },
+        },
+        .tags = tags,
+    }});
+}
+
 // Ported from test/gurka/test_truck.cc (Valhalla 3.9.3). The middle
 // restrictions and the one-way clearance exercise storage in both directions.
 pub fn motorVehicle(arena: Allocator) !gurka.Map {

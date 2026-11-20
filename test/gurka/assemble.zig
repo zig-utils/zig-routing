@@ -890,22 +890,225 @@ test "Gurka no turn and only turn restrictions follow travel direction" {
 const RestrictionMotor = struct {
     modes: u16 = 1,
     ignore: bool = false,
+    ignore_access: bool = false,
+    allow_destination_only: bool = true,
+    destination_penalty: f32 = 0,
 
-    pub fn restrictionModes(self: RestrictionMotor) u16 {
-        return if (self.ignore) 0 else self.modes;
+    pub fn restrictionPermission(self: RestrictionMotor) routing.costing.base.Permission {
+        var permission: routing.costing.base.Permission = .{ .flags = .empty, .flow = .{}, .access_mask = @bitCast(self.modes), .filter_closures = false };
+        if (self.ignore) permission.flags.insert(.ignore_restrictions);
+        if (self.ignore_access) permission.flags.insert(.ignore_access);
+        permission.allow_destination_only = self.allow_destination_only;
+        return permission;
     }
 
     pub fn edgeCost(self: RestrictionMotor, view: *const graph.reader.View, _: format.EdgeId, edge: *const format.EdgeHot, _: search.Direction) !Cost {
-        if ((try view.class(edge.cls.class_id)).access.forward & self.modes == 0) return .forbidden;
+        if (!self.restrictionPermission().allowedClass(try view.class(edge.cls.class_id))) return .forbidden;
         return .{ .cost = @floatFromInt(edge.geom.len_m), .secs = @floatFromInt(edge.geom.len_m) };
     }
 
-    pub fn turnCost(_: RestrictionMotor, _: *const graph.reader.View, _: search.Transition, _: search.Label, _: search.Direction) !Cost {
-        return .{};
+    pub fn allowedTurn(self: RestrictionMotor, view: *const graph.reader.View, turn: search.Transition, _: search.Label, _: search.Direction) !bool {
+        const backtrack = turn.incoming_edge.cls.opp_local == turn.outgoing_edge.cls.local;
+        if (backtrack and (try view.outEdgeRange(turn.node)).count() > 1) return false;
+        return self.ignore or turn.row & 0x80 == 0;
+    }
+
+    pub fn turnCost(self: RestrictionMotor, _: *const graph.reader.View, turn: search.Transition, _: search.Label, direction: search.Direction) !Cost {
+        const previous = if (direction == .forward) turn.incoming_access else turn.outgoing_access;
+        const next = if (direction == .forward) turn.outgoing_access else turn.incoming_access;
+        return .{ .cost = if (!previous.destination_only and next.destination_only) self.destination_penalty else 0 };
     }
 };
 
 const RestrictionSearch = search.Search(RestrictionMotor, routing.search.queue.Heap);
+
+fn restrictionTiming(text: []const u8, invariant: bool) !search.Timing {
+    return .{ .start = try graph.time_info.TimeInfo.fromLocal(null, text, graph.timezone.utc, graph.timezone.utc, 0, .none), .invariant = invariant };
+}
+
+fn expectWayPath(view: *const graph.reader.View, fixture: *const gurka.Map, result: search.Result, direction: search.Direction, expected: []const []const u8) !void {
+    var index = result.index;
+    for (0..expected.len) |i| {
+        try testing.expect(index != search.no_index);
+        const label = result.labels[index];
+        const position = if (direction == .forward) expected.len - 1 - i else i;
+        try testing.expectEqual(@as(u64, @intCast(fixture.findWay(expected[position]).?.id)), try view.wayId(label.edgeId()));
+        index = label.pred;
+    }
+    try testing.expectEqual(search.no_index, index);
+}
+
+// Ported from the forward and reverse cases in test_time_dependent_restrictions.cc.
+test "Gurka timed turn conditions switch the legal movement only within the window" {
+    for ([_]bool{ false, true }) |only| {
+        var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer storage.deinit();
+        const fixture = try @import("examples.zig").timedTurns(storage.allocator(), only);
+        var built = try Built.assemble(fixture.osm, 2);
+        defer built.deinit();
+        const view = &built.bundle.view;
+        try view.verify(.none, null);
+        try testing.expect(view.restriction_conditions != null);
+        try testing.expectEqual(1, built.stats.simple_turns.resolved);
+        try testing.expectEqual(0, built.stats.simple_turns.deferred);
+        const a = try at(view, fixture.findNode("A").?.location.toFixed());
+        const finish = try at(view, fixture.findNode(if (only) "D" else "F").?.location.toFixed());
+        const first = try directedBetween(view, &fixture, "A", "B");
+        const last = try directedBetween(view, &fixture, if (only) "B" else "C", if (only) "D" else "F");
+        var engine = try RestrictionSearch.init(testing.allocator, view);
+        defer engine.deinit();
+        var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+        defer arena.deinit();
+        const cases = [_]struct { text: []const u8, active: bool }{
+            .{ .text = "", .active = false },
+            .{ .text = "2021-04-02T06:30", .active = false },
+            .{ .text = "2021-04-02T14:00", .active = true },
+            .{ .text = "2021-04-02T19:20", .active = false },
+        };
+        for (cases) |case| {
+            for ([_]search.Direction{ .forward, .reverse }) |direction| {
+                for ([_]bool{ false, true }) |invariant| {
+                    errdefer std.debug.print("\nonly={any} date={s} direction={s} invariant={any}\n", .{ only, case.text, @tagName(direction), invariant });
+                    const request: search.Request = .{ .origin = a, .destination = finish, .direction = direction, .timing = try restrictionTiming(case.text, invariant) };
+                    const result = try engine.run(&arena, .{}, request, search.Zero{}, .{});
+                    const path: []const []const u8 = if (only)
+                        (if (case.active) &.{ "AB", "BC", "EC", "DE" } else &.{ "AB", "BD" })
+                    else if (case.active)
+                        &.{ "AB", "BD", "DE", "EC", "CF" }
+                    else
+                        &.{ "AB", "BC", "CF" };
+                    try expectWayPath(view, &fixture, result, direction, path);
+                    arena.reset();
+                    if (!only) {
+                        const endpoints = routing.search.endpoints;
+                        const options: endpoints.Options = .{ .costing = .auto, .direction = direction, .timing = request.timing };
+                        const from = snapLocation(&.{snapEdge(first, 0.25, 0)}, &.{});
+                        const to = snapLocation(&.{snapEdge(last, 0.75, 0)}, &.{});
+                        const partial = try endpoints.route(&engine, &arena, RestrictionMotor{}, from, to, options, search.Zero{}, .{});
+                        try testing.expectEqual(path.len, partial.segments.len);
+                        for (partial.segments, path) |segment, way| {
+                            try testing.expectEqual(@as(u64, @intCast(fixture.findWay(way).?.id)), try view.wayId(segment.edge));
+                        }
+                        try testing.expectEqual(@as(f32, 0.25), partial.segments[0].begin);
+                        try testing.expectEqual(@as(f32, 0.75), partial.segments[partial.segments.len - 1].end);
+                        arena.reset();
+                    }
+                    if (only and case.active) {
+                        const bicycle = try engine.run(&arena, .{ .modes = 4 }, request, search.Zero{}, .{});
+                        try expectWayPath(view, &fixture, bicycle, direction, &.{ "AB", "BD" });
+                        arena.reset();
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "via-way relation annotations follow the pinned untimed representation" {
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    var fixture = try @import("examples.zig").multiViaTurns(a);
+    const relations = try a.dupe(gurka.OsmRelation, fixture.osm.relations);
+    const tags = try a.alloc(gurka.Tag, relations[0].tags.len + 1);
+    @memcpy(tags[0 .. tags.len - 1], relations[0].tags);
+    tags[tags.len - 1] = .{ .key = "restriction:conditional", .value = "no_straight_on @ (Mo-Fr 07:00-19:00)" };
+    relations[0].tags = tags;
+    fixture.osm.relations = relations;
+    var built = try Built.assemble(fixture.osm, 2);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    try testing.expect(view.restriction_conditions == null);
+    const states = view.restriction_automaton orelse return error.MissingTestRestriction;
+    var ordinary: usize = 0;
+    for (states) |state| {
+        if (state.attr.forbidden & 1 != 0) ordinary += 1;
+    }
+    try testing.expectEqual(2, ordinary);
+}
+
+// Ported from test/gurka/test_conditional_restrictions.cc.
+test "Gurka conditional access distinguishes unknown time, modes and destination traffic" {
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const fixture = try @import("examples.zig").conditionalAccess(storage.allocator());
+    var built = try Built.assemble(fixture.osm, 2);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    try view.verify(.none, null);
+    const ab = try directedBetween(view, &fixture, "A", "B");
+    try testing.expect((try view.coldRecord(ab)).access_limits.len > 17);
+    const all = try directedBetween(view, &fixture, "S", "T");
+    const all_class = try view.class((try view.edge(all)).cls.class_id);
+    try testing.expectEqual(4095, all_class.detail.access_restriction);
+    try testing.expectEqual(1, (try view.edge(all)).cls.cold_checks);
+    var engine = try RestrictionSearch.init(testing.allocator, view);
+    defer engine.deinit();
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+
+    const cases = [_]struct {
+        from: []const u8,
+        to: []const u8,
+        date: []const u8,
+        modes: u16 = 1,
+        path: ?[]const []const u8,
+        forward_only: bool = false,
+    }{
+        .{ .from = "A", .to = "E", .date = "", .path = &.{ "AB", "BC", "CE" } },
+        .{ .from = "A", .to = "E", .date = "2020-04-15T06:00", .path = &.{ "AB", "BC", "CE" } },
+        .{ .from = "A", .to = "E", .date = "2020-04-02T12:00", .path = &.{ "AB", "BC", "CE" }, .forward_only = true },
+        .{ .from = "A", .to = "E", .date = "", .modes = 4, .path = &.{ "AD", "DE" } },
+        .{ .from = "A", .to = "E", .date = "2020-04-02T12:00", .modes = 4, .path = &.{ "AD", "DE" }, .forward_only = true },
+        .{ .from = "A", .to = "E", .date = "2020-04-02T20:00", .modes = 4, .path = null, .forward_only = true },
+        .{ .from = "A", .to = "E", .date = "", .modes = 2, .path = &.{ "AD", "DE" } },
+        .{ .from = "A", .to = "E", .date = "2020-04-02T20:00", .modes = 2, .path = &.{ "AD", "DE" }, .forward_only = true },
+        .{ .from = "A", .to = "E", .date = "2020-04-02T12:00", .modes = 2, .path = null, .forward_only = true },
+        .{ .from = "F", .to = "I", .date = "2020-04-04T20:00", .path = &.{ "FG", "GH", "HI" } },
+        .{ .from = "F", .to = "I", .date = "2020-04-04T12:00", .path = &.{ "FG", "GH", "HI" } },
+        .{ .from = "F", .to = "J", .date = "2020-04-04T20:00", .path = &.{ "FG", "GH", "HI", "IJ" } },
+        .{ .from = "F", .to = "J", .date = "2020-04-04T12:00", .path = &.{ "FG", "GH", "HI", "IJ" } },
+        .{ .from = "I", .to = "L", .date = "2020-04-04T20:00", .path = &.{ "IJ", "JM", "MN", "NK", "KL" } },
+        .{ .from = "I", .to = "L", .date = "2020-04-04T12:00", .path = &.{ "IJ", "JK", "KL" } },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("\n{s} to {s}, {s}, mode {d}\n", .{ case.from, case.to, case.date, case.modes });
+        const origin = try at(view, fixture.findNode(case.from).?.location.toFixed());
+        const destination = try at(view, fixture.findNode(case.to).?.location.toFixed());
+        for ([_]search.Direction{ .forward, .reverse }) |direction| {
+            if (case.forward_only and direction == .reverse) continue;
+            const request: search.Request = .{ .origin = origin, .destination = destination, .direction = direction, .timing = try restrictionTiming(case.date, false) };
+            const kernel: RestrictionMotor = .{ .modes = case.modes, .destination_penalty = if (case.modes == 1) 2000 else 0 };
+            const result = engine.run(&arena, kernel, request, search.Zero{}, .{});
+            if (case.path) |expected| {
+                try expectWayPath(view, &fixture, try result, direction, expected);
+            } else try testing.expectError(error.NoPath, result);
+            arena.reset();
+        }
+    }
+    const r = try at(view, fixture.findNode("R").?.location.toFixed());
+    const u = try at(view, fixture.findNode("U").?.location.toFixed());
+    for ([_]u16{ 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024 }) |mode| {
+        for ([_]search.Direction{ .forward, .reverse }) |direction| {
+            var request: search.Request = .{ .origin = r, .destination = u, .direction = direction };
+            const kernel: RestrictionMotor = .{ .modes = mode, .ignore_access = true };
+            const expected = &.{ "RS", "ST", "TU" };
+            const unknown = try engine.run(&arena, kernel, request, search.Zero{}, .{});
+            try expectWayPath(view, &fixture, unknown, direction, expected);
+            arena.reset();
+            request.timing = try restrictionTiming("2020-04-02T12:00", false);
+            const outside = try engine.run(&arena, kernel, request, search.Zero{}, .{});
+            try expectWayPath(view, &fixture, outside, direction, expected);
+            arena.reset();
+            request.timing = try restrictionTiming("2020-04-02T20:00", false);
+            try testing.expectError(error.NoPath, engine.run(&arena, kernel, request, search.Zero{}, .{}));
+            arena.reset();
+            const ignored = try engine.run(&arena, .{ .modes = mode, .ignore = true, .ignore_access = true }, request, search.Zero{}, .{});
+            try expectWayPath(view, &fixture, ignored, direction, expected);
+            arena.reset();
+        }
+    }
+}
 
 // Ported from test/gurka/test_only_restrictions.cc (Valhalla 3.9.3).
 test "Gurka complex only turns forbid leaving every prefix in both searches" {
@@ -1020,7 +1223,7 @@ test "Gurka split via ways preserve a more expensive legal label on the same edg
     }
 }
 
-test "complex restriction state crosses junction aliases without steady-state heap calls" {
+test "turn restriction history crosses junction aliases without steady-state heap calls" {
     const leaf_count = 34;
     var storage: std.heap.ArenaAllocator = .init(testing.allocator);
     defer storage.deinit();
@@ -1041,44 +1244,46 @@ test "complex restriction state crosses junction aliases without steady-state he
         way.* = .{ .id = @intCast(i + 1), .label = "", .tags = tags, .refs = try a.dupe(i64, &refs) };
     }
     ways[leaf_count] = .{ .id = leaf_count + 1, .label = "", .tags = tags, .refs = &.{ leaf_count + 1, leaf_count + 2 } };
-    var built = try Built.assemble(.{ .nodes = nodes, .ways = ways, .relations = &.{.{
-        .id = 1,
-        .members = &.{
-            .{ .kind = .way, .id = 1, .role = "from" },
-            .{ .kind = .way, .id = leaf_count, .role = "via" },
-            .{ .kind = .way, .id = leaf_count + 1, .role = "to" },
-        },
-        .tags = &.{ .{ .key = "type", .value = "restriction" }, .{ .key = "restriction", .value = "no_right_turn" } },
-    }} }, 2);
-    defer built.deinit();
-    const view = &built.bundle.view;
-    try testing.expectEqual(1, built.stats.connectors);
-    try testing.expect(view.restriction_automaton != null);
-    const origin = try at(view, nodes[1].location.toFixed());
-    const destination = try at(view, nodes[nodes.len - 1].location.toFixed());
-    var counting = routing.infra.arena.CountingAllocator.init(testing.allocator);
-    var engine = try RestrictionSearch.init(counting.allocator(), view);
-    defer engine.deinit();
-    var arena = routing.infra.arena.Arena.init(counting.allocator(), .{});
-    defer arena.deinit();
-    for (0..3) |round| {
-        if (round == 1) counting.resetCounts();
-        for ([_]search.Direction{ .forward, .reverse }) |direction| {
-            const request: search.Request = .{ .origin = origin, .destination = destination, .direction = direction };
-            try testing.expectError(error.NoPath, engine.run(&arena, .{}, request, search.Zero{}, .{}));
-            arena.reset();
-            const path = try engine.run(&arena, .{ .ignore = true }, request, search.Zero{}, .{});
-            var label = path.best();
-            var crossed = false;
-            while (label.pred != search.no_index) : (label = &path.labels[label.pred]) {
-                const edge = try view.edge(label.edgeId());
-                crossed = crossed or (try view.class(edge.cls.class_id)).flags.node_connector;
+    for ([_]bool{ false, true }) |node_via| {
+        var built = try Built.assemble(.{ .nodes = nodes, .ways = ways, .relations = &.{.{
+            .id = 1,
+            .members = &.{
+                .{ .kind = .way, .id = 1, .role = "from" },
+                .{ .kind = if (node_via) .node else .way, .id = if (node_via) 1 else leaf_count, .role = "via" },
+                .{ .kind = .way, .id = if (node_via) leaf_count else leaf_count + 1, .role = "to" },
+            },
+            .tags = &.{ .{ .key = "type", .value = "restriction" }, .{ .key = if (node_via) "restriction:motorcar" else "restriction", .value = "no_right_turn" } },
+        }} }, 2);
+        defer built.deinit();
+        const view = &built.bundle.view;
+        try testing.expectEqual(1, built.stats.connectors);
+        try testing.expect(if (node_via) view.turn_restrictions != null else view.restriction_automaton != null);
+        const origin = try at(view, nodes[1].location.toFixed());
+        const destination = try at(view, nodes[nodes.len - 1].location.toFixed());
+        var counting = routing.infra.arena.CountingAllocator.init(testing.allocator);
+        var engine = try RestrictionSearch.init(counting.allocator(), view);
+        defer engine.deinit();
+        var arena = routing.infra.arena.Arena.init(counting.allocator(), .{});
+        defer arena.deinit();
+        for (0..3) |round| {
+            if (round == 1) counting.resetCounts();
+            for ([_]search.Direction{ .forward, .reverse }) |direction| {
+                const request: search.Request = .{ .origin = origin, .destination = destination, .direction = direction };
+                try testing.expectError(error.NoPath, engine.run(&arena, .{}, request, search.Zero{}, .{}));
+                arena.reset();
+                const path = try engine.run(&arena, .{ .ignore = true }, request, search.Zero{}, .{});
+                var label = path.best();
+                var crossed = false;
+                while (label.pred != search.no_index) : (label = &path.labels[label.pred]) {
+                    const edge = try view.edge(label.edgeId());
+                    crossed = crossed or (try view.class(edge.cls.class_id)).flags.node_connector;
+                }
+                try testing.expect(crossed);
+                arena.reset();
             }
-            try testing.expect(crossed);
-            arena.reset();
         }
+        try testing.expectEqual(0, counting.calls());
     }
-    try testing.expectEqual(0, counting.calls());
 }
 
 test "country defaults apply within borders and preserve explicitly tagged modes" {
@@ -1784,7 +1989,9 @@ test "complex restriction search matches explicit state expansion on random grap
         }
         view.edges = edges;
         view.classes = classes;
-        view.restriction_automaton = try builder.finish(edges.len);
+        const program = try builder.finish(edges.len);
+        defer program.deinit(a);
+        view.restriction_automaton = program.states;
         var engine = try SearchTest.init(testing.allocator, &view);
         defer engine.deinit();
         var arena = routing.infra.arena.Arena.init(testing.allocator, .{});

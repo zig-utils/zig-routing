@@ -146,6 +146,10 @@ pub const View = struct {
     }
 
     pub fn record(self: View, index: u32) !Record {
+        return self.recordWithDeadline(index, .none);
+    }
+
+    pub fn recordWithDeadline(self: View, index: u32, deadline: io.Deadline) !Record {
         const id: usize = @as(u31, @truncate(index));
         if (id >= self.header.record_count) return error.InvalidColdIndex;
         const chunk = id / chunk_size;
@@ -159,7 +163,7 @@ pub const View = struct {
             return error.InvalidColdChunk;
         const local = (id % chunk_size) * @sizeOf(u64);
         const data = try bounds(chunk_bytes[records_start..], readInt(u64, chunk_bytes, local), readInt(u64, chunk_bytes, local + @sizeOf(u64)));
-        return Record.parse(data, index & high_bit != 0);
+        return Record.parse(data, index & high_bit != 0, deadline);
     }
 
     fn name(self: View, reference: u32) !Name {
@@ -208,7 +212,7 @@ pub const Record = struct {
     indoor: Indoor,
     access_limits: []align(1) const access_restriction.Entry = &.{},
 
-    fn parse(bytes: []const u8, reverse: bool) !Record {
+    fn parse(bytes: []const u8, reverse: bool, deadline: io.Deadline) !Record {
         if (bytes.len < @sizeOf(RecordHeader)) return error.TruncatedColdRecord;
         const header = std.mem.bytesToValue(RecordHeader, bytes[0..@sizeOf(RecordHeader)]);
         const data = bytes[@sizeOf(RecordHeader)..];
@@ -238,11 +242,12 @@ pub const Record = struct {
                 const limit_bytes = extra[refs_end..];
                 if (rev.restrictions) {
                     const size_of_entry = @sizeOf(access_restriction.Entry);
-                    if (limit_bytes.len == 0 or limit_bytes.len % size_of_entry != 0 or
-                        limit_bytes.len / size_of_entry > access_restriction.max_per_way)
-                        return error.InvalidColdAccessLimits;
+                    if (limit_bytes.len == 0 or limit_bytes.len % size_of_entry != 0) return error.InvalidColdAccessLimits;
                     access_limits = std.mem.bytesAsSlice(access_restriction.Entry, limit_bytes);
-                    for (access_limits) |entry| if (!entry.valid()) return error.InvalidColdAccessLimits;
+                    for (access_limits, 0..) |entry, i| {
+                        if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+                        if (!entry.valid()) return error.InvalidColdAccessLimits;
+                    }
                 } else if (limit_bytes.len != 0) return error.InvalidColdReverseNames;
             }
             break :blk .{ .layer = info.layer, .levels = std.mem.bytesAsSlice(LevelRange, payload[0..size]) };
@@ -335,8 +340,10 @@ pub const Trailer = struct {
 
 pub fn appendFullRecord(out: *std.ArrayList(u8), allocator: Allocator, way_id: u64, speed_limit: u8, mean_elevation: i16, vertices: []const point.FixedLL, refs: []const u32, trailer: Trailer, deadline: io.Deadline) !void {
     if (vertices.len < 2) return error.IncompleteShape;
-    if (trailer.access_limits.len > access_restriction.max_per_way) return error.InvalidColdAccessLimits;
-    for (trailer.access_limits) |entry| if (!entry.valid()) return error.InvalidColdAccessLimits;
+    for (trailer.access_limits, 0..) |entry, i| {
+        if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+        if (!entry.valid()) return error.InvalidColdAccessLimits;
+    }
     const point_count = std.math.cast(u32, vertices.len) orelse return error.ShapeTooLarge;
     const name_count = std.math.cast(u8, refs.len) orelse return error.TooManyEdgeNames;
     const start = out.items.len;
@@ -400,8 +407,8 @@ test "cold record preserves an E7 shape over 64 KiB and 255 name references" {
     try testing.expectError(error.DeadlineExceeded, appendRecord(&bytes, arena, 0, 0, no_elevation, vertices, &.{}, .{}, .{ .at_ns = 0 }));
     try testing.expectEqual(0, bytes.items.len);
     try appendRecord(&bytes, arena, 0x0123_4567_89ab_cdef, 255, no_elevation, vertices, &refs, .{}, .none);
-    const forward = try Record.parse(bytes.items, false);
-    const backward = try Record.parse(bytes.items, true);
+    const forward = try Record.parse(bytes.items, false, .none);
+    const backward = try Record.parse(bytes.items, true, .none);
     try testing.expect(forward.encoded.len > std.math.maxInt(u16));
     try testing.expectEqual(0x0123_4567_89ab_cdef, forward.wayId());
     try testing.expectEqual(255, forward.speedLimit());
@@ -430,8 +437,8 @@ test "motor limits share a cold record with independent reverse names" {
         .reverse_refs = &.{23},
         .access_limits = &entries,
     }, .none);
-    const forward = try Record.parse(bytes.items, false);
-    const backward = try Record.parse(bytes.items, true);
+    const forward = try Record.parse(bytes.items, false, .none);
+    const backward = try Record.parse(bytes.items, true, .none);
     try testing.expectEqual(17, readInt(u32, forward.references, 0));
     try testing.expectEqual(23, readInt(u32, backward.reverse_references.?, 0));
     var f = forward.restrictions();
@@ -441,9 +448,9 @@ test "motor limits share a cold record with independent reverse names" {
     try testing.expectEqual(entries[0], r.next().?);
     try testing.expectEqual(entries[1], r.next().?);
     try testing.expectEqual(null, r.next());
-    try testing.expectError(error.InvalidColdAccessLimits, Record.parse(bytes.items[0 .. bytes.items.len - 1], false));
+    try testing.expectError(error.InvalidColdAccessLimits, Record.parse(bytes.items[0 .. bytes.items.len - 1], false, .none));
     bytes.items[bytes.items.len - 1] = 0x80;
-    try testing.expectError(error.InvalidColdAccessLimits, Record.parse(bytes.items, false));
+    try testing.expectError(error.InvalidColdAccessLimits, Record.parse(bytes.items, false, .none));
 }
 
 test "cold directory locates the last record in a full chunk and the following chunk" {
@@ -483,13 +490,13 @@ test "cold indoor metadata is optional and validates its range count" {
     const shape = [_]point.FixedLL{ .{ .lng = 0, .lat = 0 }, .{ .lng = 100, .lat = 200 } };
     const ranges = [_]LevelRange{ .init(-2, -1), .init(1.5, 1.5), .init(3, 6) };
     try appendRecord(&bytes, testing.allocator, 42, 10, no_elevation, &shape, &.{}, .{ .layer = -1, .levels = &ranges }, .none);
-    const record = try Record.parse(bytes.items, true);
+    const record = try Record.parse(bytes.items, true, .none);
     try testing.expectEqual(-1, record.indoor.layer);
     try testing.expect(try record.indoor.includes(5, .none));
     try testing.expect(try record.indoor.includes(-1, .none));
     try testing.expect(!try record.indoor.includes(0, .none));
-    try testing.expectError(error.InvalidColdIndoorData, Record.parse(bytes.items[0 .. bytes.items.len - 1], false));
-    const old = try Record.parse(bytes.items[0 .. bytes.items.len - @sizeOf(IndoorHeader) - @sizeOf(@TypeOf(ranges))], false);
+    try testing.expectError(error.InvalidColdIndoorData, Record.parse(bytes.items[0 .. bytes.items.len - 1], false, .none));
+    const old = try Record.parse(bytes.items[0 .. bytes.items.len - @sizeOf(IndoorHeader) - @sizeOf(@TypeOf(ranges))], false, .none);
     try testing.expectEqual(0, old.indoor.layer);
     try testing.expectEqual(0, old.indoor.levels.len);
 }

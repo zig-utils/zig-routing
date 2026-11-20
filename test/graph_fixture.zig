@@ -77,8 +77,12 @@ pub fn records(comptime kind: format.SectionKind) []const kind.Record() {
             .{ .edge = std.math.maxInt(u32), .first = 3, .end = 4, .failure = 1, .attr = .{ .reverse = true } },
             .{ .edge = 0, .first = 4, .end = 5, .failure = 0, .attr = .{ .depth = 1 } },
             .{ .edge = 1, .first = 5, .end = 6, .failure = 1, .attr = .{ .depth = 1, .reverse = true } },
-            .{ .edge = 1, .first = 6, .end = 6, .failure = 0, .attr = .{ .depth = 2, .forbidden = 1 } },
-            .{ .edge = 0, .first = 6, .end = 6, .failure = 1, .attr = .{ .depth = 2, .reverse = true, .forbidden = 1 } },
+            .{ .edge = 1, .first = 6, .end = 6, .failure = 0, .attr = .{ .depth = 2, .forbidden = 1, .timed = true } },
+            .{ .edge = 0, .first = 6, .end = 6, .failure = 1, .attr = .{ .depth = 2, .reverse = true, .forbidden = 1, .timed = true } },
+        },
+        .restriction_conditions => &.{
+            .{ .state = 4, .attr = .{ .modes = 4 }, .domain = 23622321788 },
+            .{ .state = 5, .attr = .{ .modes = 4 }, .domain = 23622321788 },
         },
     };
 }

@@ -594,14 +594,21 @@ pub const Mapping = struct {
 
 /// Bounds- and alignment-checked typed view over raw bytes.
 pub fn typedSlice(comptime T: type, bytes: []const u8, offset: usize, count: usize) Error![]const T {
-    const size = std.math.mul(usize, @sizeOf(T), count) catch return error.OutOfBounds;
-    const end = std.math.add(usize, offset, size) catch return error.OutOfBounds;
-    if (end > bytes.len) return error.OutOfBounds;
+    const addr = try checkedSliceAddress(bytes, offset, count, @sizeOf(T), @alignOf(T));
     if (count == 0) return &.{};
-    const addr = @intFromPtr(bytes.ptr) + offset;
-    if (addr % @alignOf(T) != 0) return error.Misaligned;
     const base: [*]const T = @ptrFromInt(addr);
     return base[0..count];
+}
+
+/// Bundle sections share the same width and alignment checks across types.
+noinline fn checkedSliceAddress(bytes: []const u8, offset: usize, count: usize, record_size: usize, alignment: usize) Error!usize {
+    const size = std.math.mul(usize, record_size, count) catch return error.OutOfBounds;
+    const end = std.math.add(usize, offset, size) catch return error.OutOfBounds;
+    if (end > bytes.len) return error.OutOfBounds;
+    if (count == 0) return 0;
+    const addr = @intFromPtr(bytes.ptr) + offset;
+    if (addr & (alignment - 1) != 0) return error.Misaligned;
+    return addr;
 }
 
 // ---------------------------------------------------------------------------

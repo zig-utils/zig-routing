@@ -218,6 +218,13 @@ pub const Result = struct {
     threads: usize = 0,
     client_counters: ?perf.Counts = null,
 
+    fn reset(self: *Result, threads: usize) void {
+        // Clear the counters in place instead of copying a default histogram.
+        self.* = .{ .hist = .{ .counts = undefined }, .status = undefined, .threads = threads };
+        @memset(&self.hist.counts, 0);
+        @memset(&self.status, 0);
+    }
+
     pub fn errorCount(self: *const Result) u64 {
         var n = self.transport_errors + self.timeouts;
         for (self.status, 0..) |count, code| {
@@ -267,7 +274,7 @@ const Worker = struct {
     threads: usize,
     conns: []Conn,
     poller: io.Poller,
-    result: Result = .{},
+    result: Result,
     /// Measured requests this thread may issue in request-count mode.
     quota: u64 = std.math.maxInt(u64),
     issued_measured: u64 = 0,
@@ -552,8 +559,10 @@ pub fn run(gpa: Allocator, opts: Options, corpus: *const Corpus) !Result {
             .threads = threads,
             .conns = conns[first_conn .. first_conn + n],
             .poller = try io.Poller.init(),
+            .result = undefined,
             .next_req = t,
         };
+        w.result.reset(0);
         made += 1;
         first_conn += n;
         if (opts.requests) |total| w.quota = total / threads + @intFromBool(t < total % threads);
@@ -579,7 +588,8 @@ pub fn run(gpa: Allocator, opts: Options, corpus: *const Corpus) !Result {
     }
     for (handles) |h| h.join();
 
-    var result: Result = .{ .threads = threads };
+    var result: Result = undefined;
+    result.reset(threads);
     var client_counters: ?perf.Counts = if (opts.measure_counters and (opts.requests orelse 1) != 0) .{} else null;
     var last_done: u64 = 0;
     for (workers) |*w| {

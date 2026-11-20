@@ -114,12 +114,13 @@ pub const SectionKind = enum(u32) {
     timezone_rules = 18,
     turn_restrictions = 19,
     restriction_automaton = 20,
+    restriction_conditions = 21,
 
     pub fn placement(kind: SectionKind) Placement {
         return switch (kind) {
             .nodes, .edges, .first_edge, .turns, .classes, .turn_sides => .hot,
             .coordinates, .spatial, .components, .metadata, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules => .warm,
-            .turn_restrictions, .restriction_automaton => .warm,
+            .turn_restrictions, .restriction_automaton, .restriction_conditions => .warm,
             .cold_idx, .cold, .slopes => .cold,
         };
     }
@@ -146,6 +147,7 @@ pub const SectionKind = enum(u32) {
             .timezone_rules => "timezone_rules.bin",
             .turn_restrictions => "turn_restrictions.bin",
             .restriction_automaton => "restr.bin",
+            .restriction_conditions => "restr_domains.bin",
         };
     }
 
@@ -168,6 +170,7 @@ pub const SectionKind = enum(u32) {
             .components, .turn_sides => u32,
             .turn_restrictions => turn_restrictions.Entry,
             .restriction_automaton => restriction_automaton.State,
+            .restriction_conditions => restriction_automaton.Condition,
         };
     }
 

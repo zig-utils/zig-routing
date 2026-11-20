@@ -15,6 +15,12 @@ pub const TimeInfo = struct {
     second_of_week: u32 = invalid_second_of_week,
     seconds_from_now: i64 = 0,
 
+    pub fn local(self: TimeInfo, rules: ?*const timezone.Rules) !?datetime.Local {
+        if (!self.valid or self.unix_time == 0) return null;
+        const shift = (try offsetAt(rules, self.zone, self.unix_time)) orelse return null;
+        return datetime.Local.fromSeconds(try std.math.add(i64, self.unix_time, shift));
+    }
+
     pub fn fromNode(view: *const reader.View, node: NodeId, value: []const u8, now: i64, deadline: io.Deadline) !TimeInfo {
         const rules = if (view.tz_rules) |*present| present else null;
         return fromLocal(rules, value, try view.nodeTimezone(node), timezone.utc, now, deadline);

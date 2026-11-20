@@ -215,6 +215,7 @@ pub const Options = struct {
     /// omitted the pedestrian and bicycle defaults follow Valhalla.
     allow_filtered_retry: ?bool = null,
     forbid_initial_uturn: bool = false,
+    timing: core.Timing = .{},
 };
 
 pub fn route(engine: anytype, arena: *Arena, kernel: anytype, origin: snap.PathLocation, destination: snap.PathLocation, options: Options, potential: anytype, control: core.Control) !Path {
@@ -261,6 +262,7 @@ fn attempt(engine: anytype, arena: *Arena, kernel: anytype, start: Ranked, goal:
         .targets = &targets,
         .direction = options.direction,
         .forbid_initial_uturn = options.forbid_initial_uturn,
+        .timing = options.timing,
     }, potential, control);
 }
 

@@ -226,54 +226,7 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
         if (@backingInt(options.from) <= @backingInt(Stage.edges)) {
             try buildSegments(&session, &metadata, inputs, graph_options, options.pbf_buffer_bytes, diagnostic);
         }
-        if (@backingInt(options.to) >= @backingInt(Stage.order)) {
-            const prior = try session.open(.edges);
-            defer prior.close();
-            const source_stats = try prior.readJson(edges.Stats, gpa, .source_stats, options.deadline);
-            defer source_stats.deinit();
-            if (@backingInt(options.from) > @backingInt(Stage.edges)) {
-                try metadata.loadWays(prior);
-                if (session.runs(.order)) {
-                    const nodes = try session.open(.node_store);
-                    defer nodes.close();
-                    try metadata.loadNodes(nodes);
-                }
-            }
-            const edge_file = try prior.read(.segments, options.deadline);
-            defer edge_file.close();
-            const shape_file = try prior.read(.shape_points, options.deadline);
-            defer shape_file.close();
-            const tagged = try session.open(.tags);
-            defer tagged.close();
-            var admin_mapping: ?io.Mapping = null;
-            defer if (admin_mapping) |mapped| mapped.unmap();
-            var assembly_options = graph_options;
-            if (tagged.manifest.files.get(.admin_index) != null) {
-                admin_mapping = try tagged.map(.admin_index, options.deadline);
-                assembly_options.admin_index = try graph.admin.View.parse(admin_mapping.?.bytes);
-            }
-            var restriction_rows: ?io.Mapping = null;
-            defer if (restriction_rows) |mapped| mapped.unmap();
-            var complex_rows: ?io.Mapping = null;
-            defer if (complex_rows) |mapped| mapped.unmap();
-            var via_ways: ?io.Mapping = null;
-            defer if (via_ways) |mapped| mapped.unmap();
-            var restriction_source: turn_restrictions.Source = .{};
-            if (session.runs(.turns) and tagged.manifest.files.get(.simple_turn_relations) != null) {
-                restriction_rows = try tagged.map(.simple_turn_relations, options.deadline);
-                restriction_source.entries = try checkpoint.array(turn_restrictions.Record, restriction_rows.?);
-                const counts = try tagged.readJson(turn_restrictions.Stats, gpa, .simple_turn_stats, options.deadline);
-                defer counts.deinit();
-                restriction_source.stats = counts.value;
-            }
-            if (session.runs(.enhance) and tagged.manifest.files.get(.complex_turn_relations) != null) {
-                complex_rows = try tagged.map(.complex_turn_relations, options.deadline);
-                via_ways = try tagged.map(.restriction_via_ways, options.deadline);
-                restriction_source.complex = try checkpoint.array(turn_restrictions.Complex, complex_rows.?);
-                restriction_source.via_ways = try checkpoint.array(i64, via_ways.?);
-            }
-            try assemble.buildStaged(&session, &metadata, source_stats.value, edge_file, shape_file, assembly_options, restriction_source);
-        }
+        if (@backingInt(options.to) >= @backingInt(Stage.order)) try runAssembly(&session, &metadata, graph_options);
     }
     if (session.runs(.validate)) try validate(&session);
     if (session.runs(.finalize)) try finalize(&session, options.output.?);
@@ -289,6 +242,63 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
     const report = try std.json.Stringify.valueAlloc(a, result, .{ .whitespace = .indent_2 });
     try root.writeAtomic("build-stats.json", report);
     return result;
+}
+
+noinline fn runAssembly(session: *checkpoint.Session, metadata: *assemble.Metadata, graph_options: assemble.Options) !void {
+    const gpa = session.gpa;
+    const deadline = session.deadline;
+    const prior = try session.open(.edges);
+    defer prior.close();
+    const source_stats = try prior.readJson(edges.Stats, gpa, .source_stats, deadline);
+    defer source_stats.deinit();
+    if (@backingInt(session.from) > @backingInt(Stage.edges)) {
+        try metadata.loadWays(prior);
+        if (session.runs(.order)) {
+            const nodes = try session.open(.node_store);
+            defer nodes.close();
+            try metadata.loadNodes(nodes);
+        }
+    }
+    const edge_file = try prior.read(.segments, deadline);
+    defer edge_file.close();
+    const shape_file = try prior.read(.shape_points, deadline);
+    defer shape_file.close();
+    const tagged = try session.open(.tags);
+    defer tagged.close();
+    var admin_mapping: ?io.Mapping = null;
+    defer if (admin_mapping) |mapped| mapped.unmap();
+    var assembly_options = graph_options;
+    if (tagged.manifest.files.get(.admin_index) != null) {
+        admin_mapping = try tagged.map(.admin_index, deadline);
+        assembly_options.admin_index = try graph.admin.View.parse(admin_mapping.?.bytes);
+    }
+    var restriction_rows: ?io.Mapping = null;
+    defer if (restriction_rows) |mapped| mapped.unmap();
+    var complex_rows: ?io.Mapping = null;
+    defer if (complex_rows) |mapped| mapped.unmap();
+    var via_ways: ?io.Mapping = null;
+    defer if (via_ways) |mapped| mapped.unmap();
+    var simple_domains: ?io.Mapping = null;
+    defer if (simple_domains) |mapped| mapped.unmap();
+    var restriction_source: turn_restrictions.Source = .{};
+    if ((session.runs(.enhance) or session.runs(.turns)) and tagged.manifest.files.get(.simple_turn_relations) != null) {
+        restriction_rows = try tagged.map(.simple_turn_relations, deadline);
+        restriction_source.entries = try checkpoint.array(turn_restrictions.Record, restriction_rows.?);
+        const counts = try tagged.readJson(turn_restrictions.Stats, gpa, .simple_turn_stats, deadline);
+        defer counts.deinit();
+        restriction_source.stats = counts.value;
+        if (tagged.manifest.files.get(.simple_turn_domains) != null) {
+            simple_domains = try tagged.map(.simple_turn_domains, deadline);
+            restriction_source.simple_domains = try checkpoint.array(u64, simple_domains.?);
+        }
+    }
+    if (session.runs(.enhance) and tagged.manifest.files.get(.complex_turn_relations) != null) {
+        complex_rows = try tagged.map(.complex_turn_relations, deadline);
+        via_ways = try tagged.map(.restriction_via_ways, deadline);
+        restriction_source.complex = try checkpoint.array(turn_restrictions.Complex, complex_rows.?);
+        restriction_source.via_ways = try checkpoint.array(i64, via_ways.?);
+    }
+    try assemble.buildStaged(session, metadata, source_stats.value, edge_file, shape_file, assembly_options, restriction_source);
 }
 
 fn readRestrictionStats(session: *checkpoint.Session) !?turn_restrictions.Stats {
@@ -475,6 +485,7 @@ fn buildSegments(session: *checkpoint.Session, metadata: *assemble.Metadata, inp
             try tx.writeArray(restrictions.complex.items, .complex_turn_relations);
             try tx.writeArray(restrictions.via_ways.items, .restriction_via_ways);
         }
+        if (restrictions.simple_domains.items.len != 0) try tx.writeArray(restrictions.simple_domains.items, .simple_turn_domains);
         try session.commit(&tx, prep.selected_ways, start);
     } else {
         const tags = try session.open(.tags);

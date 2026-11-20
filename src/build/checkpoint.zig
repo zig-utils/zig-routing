@@ -126,6 +126,9 @@ pub const Artifact = enum {
     complex_turn_relations,
     restriction_via_ways,
     restriction_states,
+    restriction_conditions,
+    bundle_restriction_conditions,
+    simple_turn_domains,
 
     fn filename(self: Artifact) [:0]const u8 {
         return switch (self) {
@@ -147,15 +150,16 @@ pub const Manifest = struct {
     metric: Metric,
     files: std.EnumArray(Artifact, ?Fingerprint),
 
+    const Disk = struct {
+        version: u32,
+        identity: format.DatasetUuid,
+        parent: ?u64,
+        metric: Metric,
+        files: struct { values: []const ?Fingerprint },
+    };
+
     pub fn parse(allocator: Allocator, bytes: []const u8) !Manifest {
         if (bytes.len > manifest_limit) return error.InvalidCheckpoint;
-        const Disk = struct {
-            version: u32,
-            identity: format.DatasetUuid,
-            parent: ?u64,
-            metric: Metric,
-            files: struct { values: []const ?Fingerprint },
-        };
         const decoded = try std.json.parseFromSlice(Disk, allocator, bytes, .{});
         defer decoded.deinit();
         const stored = decoded.value;
@@ -170,6 +174,19 @@ pub const Manifest = struct {
         if (stored.files.values.len > manifest.files.values.len) return error.InvalidCheckpoint;
         @memcpy(manifest.files.values[0..stored.files.values.len], stored.files.values);
         return manifest;
+    }
+
+    fn encode(self: *const Manifest, allocator: Allocator) ![]u8 {
+        var end = self.files.values.len;
+        while (end != 0 and self.files.values[end - 1] == null) end -= 1;
+        const disk: Disk = .{
+            .version = self.version,
+            .identity = self.identity,
+            .parent = self.parent,
+            .metric = self.metric,
+            .files = .{ .values = self.files.values[0..end] },
+        };
+        return std.json.Stringify.valueAlloc(allocator, disk, .{});
     }
 
     fn digest(self: *const Manifest) u64 {
@@ -426,7 +443,7 @@ pub const Transaction = struct {
         manifest.metric.elapsed_ns = started.read();
         manifest.metric.rows_per_second = @as(f64, @floatFromInt(rows)) * std.time.ns_per_s /
             @as(f64, @floatFromInt(@max(manifest.metric.elapsed_ns, 1)));
-        const bytes = try std.json.Stringify.valueAlloc(gpa, manifest, .{});
+        const bytes = try manifest.encode(gpa);
         defer gpa.free(bytes);
         const file = try self.dir.createFile(manifest_name);
         defer file.close();

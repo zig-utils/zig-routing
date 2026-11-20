@@ -3,31 +3,48 @@ const std = @import("std");
 const io = @import("../infra/io.zig");
 const machine = @import("../graph/restriction_automaton.zig");
 const State = machine.State;
+const Condition = machine.Condition;
 const Allocator = std.mem.Allocator;
+
+pub const Program = struct {
+    states: []State = &.{},
+    conditions: []Condition = &.{},
+
+    pub fn deinit(self: Program, a: Allocator) void {
+        a.free(self.states);
+        a.free(self.conditions);
+    }
+};
 
 pub const Builder = struct {
     a: Allocator,
     deadline: io.Deadline,
     nodes: std.ArrayList(State) = .empty,
     transitions: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    timed: std.ArrayList(Condition) = .empty,
 
     pub fn deinit(self: *Builder) void {
         self.nodes.deinit(self.a);
         self.transitions.deinit(self.a);
+        self.timed.deinit(self.a);
     }
 
     pub fn forbid(self: *Builder, edges: []const u32, modes: u16) !void {
+        return self.forbidWhen(edges, modes, 0);
+    }
+
+    pub fn forbidWhen(self: *Builder, edges: []const u32, modes: u16, domain: u64) !void {
         if (edges.len < 2 or edges.len > machine.max_edges or modes & 0xf800 != 0)
             return error.InvalidRestrictionSequence;
         if (modes == 0) return;
         if (self.nodes.items.len == 0) try self.nodes.appendSlice(self.a, &.{
             State.root(machine.forward_root), State.root(machine.reverse_root),
         });
-        try self.insert(false, edges, modes);
-        try self.insert(true, edges, modes);
+        try self.insert(false, edges, modes, domain);
+        try self.insert(true, edges, modes, domain);
     }
 
-    noinline fn insert(self: *Builder, reverse: bool, edges: []const u32, modes: u16) !void {
+    noinline fn insert(self: *Builder, reverse: bool, edges: []const u32, modes: u16, domain: u64) !void {
         const root = if (reverse) machine.reverse_root else machine.forward_root;
         var parent = root;
         for (0..edges.len) |i| {
@@ -47,7 +64,12 @@ pub const Builder = struct {
             }
             parent = entry.value_ptr.*;
         }
-        self.nodes.items[parent].attr.forbidden |= modes;
+        if (domain == 0) {
+            self.nodes.items[parent].attr.forbidden |= modes;
+        } else {
+            try self.timed.append(self.a, .{ .state = parent, .attr = .{ .modes = modes }, .domain = domain });
+            self.nodes.items[parent].attr.timed = true;
+        }
     }
 
     const Link = struct {
@@ -59,9 +81,9 @@ pub const Builder = struct {
         }
     };
 
-    pub noinline fn finish(self: *Builder, edge_count: usize) ![]State {
+    pub noinline fn finish(self: *Builder, edge_count: usize) !Program {
         const nodes = self.nodes.items;
-        if (nodes.len == 0) return &.{};
+        if (nodes.len == 0) return .{};
         const a = self.a;
         const links = try a.alloc(Link, self.transitions.count());
         defer a.free(links);
@@ -105,10 +127,43 @@ pub const Builder = struct {
                 const fallback = machine.advance(result, state.failure, child.edge);
                 child.failure = fallback;
                 child.attr.forbidden |= result[fallback].attr.forbidden;
+                child.attr.timed = child.attr.timed or result[fallback].attr.timed;
             }
         }
         try machine.verify(result, edge_count, self.deadline);
-        return result;
+        const conditions = try self.finishConditions(order);
+        errdefer a.free(conditions);
+        try machine.verifyConditions(result, conditions, self.deadline);
+        return .{ .states = result, .conditions = conditions };
+    }
+
+    noinline fn finishConditions(self: *const Builder, order: []const u32) ![]Condition {
+        if (self.timed.items.len == 0) return &.{};
+        const a = self.a;
+        const ids = try a.alloc(u32, order.len);
+        defer a.free(ids);
+        for (order, 0..) |original, state| {
+            try self.check(state);
+            ids[original] = @intCast(state);
+        }
+        const sorted = try a.dupe(Condition, self.timed.items);
+        errdefer a.free(sorted);
+        for (sorted, 0..) |*row, i| {
+            try self.check(i);
+            row.state = ids[row.state];
+        }
+        std.sort.heap(Condition, sorted, {}, Condition.before);
+        var count: usize = 0;
+        for (sorted, 0..) |row, i| {
+            try self.check(i);
+            if (count != 0 and row.state == sorted[count - 1].state and row.domain == sorted[count - 1].domain) {
+                sorted[count - 1].attr.modes |= row.attr.modes;
+            } else {
+                sorted[count] = row;
+                count += 1;
+            }
+        }
+        return a.realloc(sorted, count);
     }
 
     fn check(self: Builder, index: usize) !void {
@@ -123,16 +178,24 @@ test "complex restriction automata inherit overlapping suffixes in both directio
     try builder.forbid(&.{ 0, 1, 2, 3 }, 1);
     try builder.forbid(&.{ 1, 2, 3 }, 2);
     try builder.forbid(&.{ 0, 1, 2 }, 4);
-    const states = try builder.finish(4);
-    defer t.allocator.free(states);
+    try builder.forbidWhen(&.{ 1, 2, 3 }, 8, 23622321788);
+    try builder.forbidWhen(&.{ 1, 2, 3 }, 16, 23622321788);
+    const program = try builder.finish(4);
+    defer program.deinit(t.allocator);
+    const states = program.states;
     var forward = machine.forward_root;
     for ([_]u32{ 0, 1, 2 }) |edge| forward = machine.advance(states, forward, edge);
     try t.expectEqual(4, states[forward].attr.forbidden);
     forward = machine.advance(states, forward, 3);
     try t.expectEqual(3, states[forward].attr.forbidden);
+    const local = @import("../graph/datetime.zig").Local.parse("2026-11-16T09:00").?;
+    try t.expect(try machine.blocksTimed(states, program.conditions, forward, 8, local, .none));
+    try t.expectEqual(2, program.conditions.len);
+    try t.expectEqual(24, program.conditions[0].attr.modes);
     var reverse = machine.reverse_root;
     for ([_]u32{ 3, 2, 1 }) |edge| reverse = machine.advance(states, reverse, edge);
     try t.expectEqual(2, states[reverse].attr.forbidden);
+    try t.expect(try machine.blocksTimed(states, program.conditions, reverse, 16, local, .none));
     reverse = machine.advance(states, reverse, 0);
     try t.expectEqual(5, states[reverse].attr.forbidden);
 }

@@ -17,7 +17,7 @@
 //! `costing-reference` (gate A samples and paths), `speed-config` (default speed tables),
 //! `motor-tags` (motor vehicle access and unit normalization), `admin-index`
 //! (stored administrative boundaries), `timezone-geojson`, `timezone-rules`,
-//! and `datetime`.
+//! `datetime` and `time-domain`.
 //!
 //! The contract for every parser: malformed input returns an error, never
 //! panics, overflows or reads out of bounds. The fuzz step builds ReleaseSafe
@@ -304,6 +304,34 @@ test "fuzz datetime" {
     }) });
 }
 
+fn fuzzTimeDomain(_: void, s: *Smith) !void {
+    var buf: [max_input]u8 = undefined;
+    const text = draw(s, &buf, 0x7464_6f6d);
+    const a = std.testing.allocator;
+    var parser: routing.build.time_parsing.Parser = .{ .a = a, .deadline = routing.infra.io.Deadline.fromNowMs(20) };
+    defer parser.deinit();
+    var values: std.ArrayList(u64) = .empty;
+    defer values.deinit(a);
+    parser.parse(text, &values) catch |err| switch (err) {
+        error.DeadlineExceeded => return,
+        else => return err,
+    };
+    const sample = graph.datetime.Local.parse("2026-11-16T09:30").?;
+    for (values.items) |value| {
+        const domain: graph.time_domain.TimeDomain = @bitCast(value);
+        try std.testing.expect(domain.valid());
+        _ = domain.active(sample);
+    }
+}
+
+test "fuzz time-domain" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    try std.testing.fuzz({}, fuzzTimeDomain, .{ .corpus = try seeds(state.allocator(), &.{
+        "", "Mo-Fr 07:00-09:30,15:30-18:30", "Oct Su[-1]-Mar Su[4] Su 09:00-16:00", "PH off; noon; 24/7", "Mo [1,-1]\xff 00:00-24:00",
+    }) });
+}
+
 fn fuzzValhallaTile(_: void, s: *Smith) !void {
     const source = valhalla_import.tile_format;
     var buf: [max_input]u8 = undefined;
@@ -547,6 +575,7 @@ fn visitPrimitives(block: routing.build.pbf.block.Block, gpa: std.mem.Allocator)
         _ = try row.kind();
         for (try row.vias(restrictions.via_ways.items)) |via| try std.testing.expect(via != 0);
     }
+    for (restrictions.simple_domains.items) |domain| try std.testing.expect(@as(graph.time_domain.TimeDomain, @bitCast(domain)).valid());
 }
 
 fn osmPrimitiveSeed(buffer: []u8) ![]const u8 {
@@ -555,8 +584,8 @@ fn osmPrimitiveSeed(buffer: []u8) ![]const u8 {
     var raw: [512]u8 = undefined;
     const data = try pbf.PrimitiveBlock.encode(&raw, .{
         .stringtable = .{ .s = &.{
-            "",     "name",        "A",            "highway", "residential", "maxspeed", "30 mph", "name:en", "Avenue",
-            "type", "restriction", "no_left_turn", "from",    "via",         "to",
+            "",     "name",        "A",            "highway", "residential", "maxspeed", "30 mph",                  "name:en",                                "Avenue",
+            "type", "restriction", "no_left_turn", "from",    "via",         "to",       "restriction:conditional", "only_straight_on @ (Mo-Fr 08:00-19:00)",
         } },
         .primitivegroup = &.{
             .{ .dense = .{ .id = &.{1}, .lat = &.{-2}, .lon = &.{3}, .keys_vals = &.{ 1, 2, 0 } } },
@@ -578,6 +607,14 @@ fn osmPrimitiveSeed(buffer: []u8) ![]const u8 {
                     .roles_sid = &.{ 12, 13, 13, 14 },
                     .memids = &.{ 3, 1, 1, 1 },
                     .types = &.{ 1, 1, 1, 1 },
+                },
+                .{
+                    .id = 6,
+                    .keys = &.{ 9, 15 },
+                    .vals = &.{ 10, 16 },
+                    .roles_sid = &.{ 12, 13, 14 },
+                    .memids = &.{ 3, -1, 3 },
+                    .types = &.{ 1, 0, 1 },
                 },
             } },
         },

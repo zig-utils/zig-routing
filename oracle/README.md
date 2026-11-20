@@ -326,6 +326,38 @@ the motor stub. Both settled and popped the same number of labels at every
 source. Individual timings varied. The loop for bundles without an automaton
 is compiled without restriction checks.
 
+### Timed access and turn restrictions
+
+The two fixtures port the upstream conditional access and timed turn cases.
+They exercise bicycle, pedestrian and motor access, destination-only edges,
+missing request time, and transitions in both search directions. The condition
+parser tests compare 238 packed values from 161 upstream test and extract
+inputs against Valhalla 3.9.3. The calendar evaluator also passes the 135
+local date and time assertions in the upstream restriction test.
+
+```bash
+zig build gurka-pbf -- timed-access.osm.pbf timed-access
+zig build gurka-pbf -- timed-turns.osm.pbf timed-turns
+zig build test
+```
+
+Build the same PBFs through the reference `restrictions` stage with hierarchy
+and shortcuts disabled. Pair directed edges by OSM way and directed geometry,
+then compare the type, mode mask, packed condition and destination exemption.
+For turns, compare each sequence and its condition in each search direction.
+
+| Input | Timed access records matched | Forward timed turns matched | Reverse timed turns matched |
+| --- | ---: | ---: | ---: |
+| Gurka timed access fixture | 300 | 0 | 0 |
+| Gurka timed turn fixture | 0 | 1 | 1 |
+| Utrecht | 10 | 0 | 0 |
+| Luxembourg | 437 | 0 | 0 |
+
+The pinned builder emits a timed sequence for a conditional via-node turn and
+an ordinary sequence for a via-way relation with the same annotation. The
+native builder preserves both representations. The tests also exercise a timed
+automaton output reached through a failure link.
+
 ### Way splitting and edge counts
 
 ```bash

@@ -33,24 +33,33 @@ pub const Bundle = struct {
 
     /// Check payload integrity before giving the caller a view of the bundle.
     pub fn openVerified(path: []const u8, deadline: io.Deadline, diagnostic: ?*Diagnostic) !Bundle {
-        var bundle = try openDescribed(path, diagnostic);
+        var bundle = try openPath(path, deadline, diagnostic);
         errdefer bundle.close();
         try bundle.view.verify(deadline, diagnostic);
         return bundle;
     }
 
     pub fn openDescribed(path: []const u8, diagnostic: ?*Diagnostic) !Bundle {
+        return openPath(path, .none, diagnostic);
+    }
+
+    fn openPath(path: []const u8, deadline: io.Deadline, diagnostic: ?*Diagnostic) !Bundle {
         note(diagnostic, null);
         const dir = try io.Directory.open(path);
         defer dir.close();
-        return openInDir(dir, diagnostic);
+        return openDir(dir, deadline, diagnostic);
     }
 
     pub fn openInDir(dir: io.Directory, diagnostic: ?*Diagnostic) !Bundle {
+        return openDir(dir, .none, diagnostic);
+    }
+
+    noinline fn openDir(dir: io.Directory, deadline: io.Deadline, diagnostic: ?*Diagnostic) !Bundle {
         var result: Bundle = .{ .mappings = .initFill(.{ .bytes = &.{} }), .view = undefined };
         errdefer result.close();
         var files: Files = .initFill(null);
         for (kinds) |kind| {
+            if (deadline.expired()) return error.DeadlineExceeded;
             note(diagnostic, kind);
             const file = dir.readFile(kind.filename()) catch |err| {
                 if (err == error.FileNotFound and !format.required_sections.contains(kind)) continue;
@@ -61,7 +70,7 @@ pub const Bundle = struct {
             result.mappings.set(kind, mapping);
             files.set(kind, mapping.bytes);
         }
-        result.view = try View.parse(files, diagnostic);
+        result.view = try View.parseWithDeadline(files, diagnostic, deadline);
         return result;
     }
 
@@ -155,8 +164,13 @@ pub const View = struct {
     tz_rules: ?timezone.Rules = null,
     turn_restrictions: ?[]const restrictions.Entry = null,
     restriction_automaton: ?[]const automaton.State = null,
+    restriction_conditions: ?[]const automaton.Condition = null,
 
     pub fn parse(files: Files, diagnostic: ?*Diagnostic) !View {
+        return parseWithDeadline(files, diagnostic, .none);
+    }
+
+    fn parseWithDeadline(files: Files, diagnostic: ?*Diagnostic, deadline: io.Deadline) !View {
         var headers: Headers = .initFill(null);
         for (kinds) |kind| {
             note(diagnostic, kind);
@@ -302,7 +316,12 @@ pub const View = struct {
         }
         if (graph.restriction_automaton) |states| {
             note(diagnostic, .restriction_automaton);
-            try automaton.verify(states, graph.edges.len, .none);
+            try automaton.verify(states, graph.edges.len, deadline);
+            note(diagnostic, .restriction_conditions);
+            try automaton.verifyConditions(states, graph.restriction_conditions orelse &.{}, deadline);
+        } else if (graph.restriction_conditions != null) {
+            note(diagnostic, .restriction_automaton);
+            return error.MissingSection;
         }
         note(diagnostic, null);
         return graph;
@@ -435,9 +454,13 @@ pub const View = struct {
     }
 
     pub fn coldRecord(self: *const View, id: format.EdgeId) !cold.Record {
+        return self.coldRecordWithDeadline(id, .none);
+    }
+
+    pub fn coldRecordWithDeadline(self: *const View, id: format.EdgeId, deadline: io.Deadline) !cold.Record {
         _ = try self.edge(id);
         const table = self.cold_data orelse return error.MissingColdData;
-        return table.record(self.cold_idx.?[@backingInt(id)]);
+        return table.recordWithDeadline(self.cold_idx.?[@backingInt(id)], deadline);
     }
 
     pub fn edgeSlopes(self: *const View, id: format.EdgeId) !format.Slopes {
@@ -461,7 +484,7 @@ pub const View = struct {
     }
 
     pub fn shapeWithDeadline(self: *const View, id: format.EdgeId, arena: std.mem.Allocator, deadline: io.Deadline) ![]format.Coordinate {
-        return (try self.coldRecord(id)).shape(arena, deadline);
+        return (try self.coldRecordWithDeadline(id, deadline)).shape(arena, deadline);
     }
 
     pub fn verify(self: *const View, deadline: io.Deadline, diagnostic: ?*Diagnostic) !void {
@@ -470,7 +493,7 @@ pub const View = struct {
             note(diagnostic, kind);
             if (deadline.expired()) return error.DeadlineExceeded;
             const bytes: []const u8 = switch (kind) {
-                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata, .components, .turn_sides, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules, .turn_restrictions, .restriction_automaton => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
+                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata, .components, .turn_sides, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules, .turn_restrictions, .restriction_automaton, .restriction_conditions => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
                 inline else => |section| std.mem.sliceAsBytes(@field(self, @tagName(section))),
             };
             var hash = std.hash.XxHash3.init(0);
