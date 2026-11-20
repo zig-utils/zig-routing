@@ -3,16 +3,17 @@
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 motor=
-if [ "${1:-}" = "--motor" ] || [ "${1:-}" = "--truck" ] || [ "${1:-}" = "--motorcycle" ] || [ "${1:-}" = "--timed" ]; then
+case "${1:-}" in
+--motor|--truck|--motorcycle|--timed|--access)
   motor="$1"
-  shift
-fi
+  shift;;
+esac
 [ "$#" -ge 2 ] && [ "$#" -le 3 ] ||
-  die "usage: $0 [--motor|--truck|--motorcycle|--timed] DATASET REPORT.json [CASES_PER_PROFILE]"
+  die "usage: $0 [--motor|--truck|--motorcycle|--timed|--access] DATASET REPORT.json [CASES_PER_PROFILE]"
 dataset="$1"
 report="$2"
 default_cases=50000
-if [ "$motor" = "--timed" ]; then
+if [ "$motor" = "--timed" ] || [ "$motor" = "--access" ]; then
   default_cases=1
 fi
 cases="${3:-$default_cases}"
@@ -23,7 +24,11 @@ if [ -n "$motor" ]; then
   corpus="$repo/bench/corpora/route-auto-10km.$dataset.tsv"
 fi
 [ -x "$zr" ] || die "build zr in ReleaseFast or set ZR"
-[ -f "$corpus" ] || die "generate the route corpora before running the parity gate"
+if [ "$motor" = "--access" ]; then
+  [ "$dataset" = "access-regions" ] || die "use the access-regions fixture with --access"
+else
+  [ -f "$corpus" ] || die "generate the route corpora before running the parity gate"
+fi
 data="$ORACLE_DATA/$dataset"
 image=$(awk '$1 == "image:" { print $2; exit }' "$ORACLE_DIR/compose.yaml")
 mkdir -p "$repo/bench/results" "$(dirname "$report")"
@@ -31,20 +36,34 @@ work=$(mktemp -d "$repo/bench/results/costing-parity.XXXXXX")
 echo "costing parity artifacts in $work" >&2
 
 archive="$data/tiles.tar"
-if [ "$motor" = "--timed" ]; then
+if [ "$motor" = "--timed" ] || [ "$motor" = "--access" ]; then
   # Gate B needs the complete local graph on both sides. Building it flat
   # preserves connections that are represented by upper-level transitions.
-  "$ORACLE_DIR/fetch.sh" "$dataset"
+  if [ "$motor" = "--access" ]; then
+    (
+      cd "$repo"
+      "${ZIG:-zig}" build gurka-pbf -Doptimize=ReleaseFast -- "$work/access-regions.osm.pbf" access-regions "$work/profiles.jsonl"
+    )
+    data="$work"
+    pbf=access-regions.osm.pbf
+  else
+    "$ORACLE_DIR/fetch.sh" "$dataset"
+    pbf=extract.osm.pbf
+  fi
   docker run --rm --platform "$ORACLE_PLATFORM" \
     --mount "type=bind,source=$data,target=/data,readonly" \
     --mount "type=bind,source=$work,target=/work" \
     --entrypoint bash "$image" -euc '
-      valhalla_build_config --mjolnir-tile-dir /work/tiles --mjolnir-tile-extract /work/tiles.tar \
+      pbf="$1"
+      args=(--mjolnir-tile-dir /work/tiles --mjolnir-tile-extract /work/tiles.tar \
         --mjolnir-concurrency 6 --mjolnir-hierarchy false --mjolnir-shortcuts false \
-        --additional-data-elevation /data/elevation --loki-use-connectivity false > /work/valhalla.json
-      valhalla_build_tiles -c /work/valhalla.json /data/extract.osm.pbf
+        --loki-use-connectivity false --service-limits-max-distance-disable-hierarchy-culling 5000000)
+      if [ "$pbf" = extract.osm.pbf ]; then args+=(--additional-data-elevation /data/elevation); fi
+      valhalla_build_config "${args[@]}" > /work/valhalla.json
+      valhalla_build_tiles -c /work/valhalla.json "/data/$pbf"
       valhalla_build_extract -c /work/valhalla.json -v
-    ' > "$work/build.log" 2>&1 || die "could not build the flat oracle graph. See $work/build.log"
+    ' build-flat "$pbf" > "$work/build.log" 2>&1 ||
+    die "could not build the flat oracle graph. See $work/build.log"
   archive="$work/tiles.tar"
 else
   ensure_built "$dataset"
@@ -76,7 +95,21 @@ fi
 
 "$zr" import-valhalla "$archive" --output "$work/bundle"
 uuid=$("$zr" inspect "$work/bundle" --json | python3 -c 'import json, sys; print(json.load(sys.stdin)["dataset_uuid"])')
-python3 "$ORACLE_DIR/costing-profiles.py" "$corpus" ${motor:+"$motor"} > "$work/profiles.jsonl"
+if [ "$motor" = "--access" ]; then
+  python3 - "$work/profiles.jsonl" > "$work/profiles-unpruned.jsonl" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as profiles:
+    for line in profiles:
+        profile = json.loads(line)
+        for request in profile["paths"]:
+            request["costing_options"]["auto"]["disable_hierarchy_pruning"] = True
+        print(json.dumps(profile, separators=(",", ":")))
+PY
+else
+  python3 "$ORACLE_DIR/costing-profiles.py" "$corpus" ${motor:+"$motor"} > "$work/profiles.jsonl"
+fi
 docker run --rm --platform "$ORACLE_PLATFORM" \
   --mount "type=bind,source=$data,target=/data,readonly" \
   --mount "type=bind,source=$work,target=/work" \
@@ -89,16 +122,36 @@ docker run --rm --platform "$ORACLE_PLATFORM" \
       /costing-reference.cc -o /work/reference -lvalhalla -lprotobuf-lite -lprime_server -lz \
       -l:libcurl.so.4 -l:liblz4.so.1 -l:libtiff.so.6 -l:libgeotiff.so.5 -pthread
     /work/reference /work/valhalla.json /work/profiles.jsonl "$1" "$2" /work/costs.bin
-  ' costing-reference "$cases" "$uuid" > "$work/oracle.log" 2>&1 ||
+    if [ "$3" = "--access" ]; then
+      /work/reference /work/valhalla.json /work/profiles-unpruned.jsonl "$1" "$2" /work/unpruned.bin
+    fi
+  ' costing-reference "$cases" "$uuid" "$motor" > "$work/oracle.log" 2>&1 ||
   die "could not generate the oracle reference. See $work/oracle.log"
 
-if [ "$motor" = "--timed" ]; then
+if [ "$motor" = "--timed" ] || [ "$motor" = "--access" ]; then
   minimum=$(python3 -c 'import json,sys; print(sum(len(json.loads(line)["paths"]) for line in sys.stdin))' < "$work/profiles.jsonl")
+  default_report="$report"
+  if [ "$motor" = "--access" ]; then default_report="$work/default.json"; fi
   (
     cd "$repo"
-    "${ZIG:-zig}" build motor-costing-parity -Doptimize=ReleaseFast -- "$work/bundle" "$work/costs.bin" --timed "$minimum"
-  ) > "$report" 2> "$work/failures.log" ||
-    die "timed route gate failed. See $report and $work/failures.log"
+    "${ZIG:-zig}" build motor-costing-parity -Doptimize=ReleaseFast -- "$work/bundle" "$work/costs.bin" "$motor" "$minimum"
+  ) > "$default_report" 2> "$work/default-diagnostics.log" ||
+    die "route gate failed. See $default_report and $work/default-diagnostics.log"
+  if [ "$motor" = "--access" ]; then
+    (
+      cd "$repo"
+      "${ZIG:-zig}" build motor-costing-parity -Doptimize=ReleaseFast -- "$work/bundle" "$work/unpruned.bin" --access "$minimum"
+    ) > "$work/unpruned.json" 2> "$work/unpruned-diagnostics.log" ||
+      die "route gate failed. See $work/unpruned.json and $work/unpruned-diagnostics.log"
+    python3 - "$work" > "$report" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+work = Path(sys.argv[1])
+print(json.dumps({mode: json.loads((work / (mode + ".json")).read_text()) for mode in ("default", "unpruned")}))
+PY
+  fi
 elif [ -n "$motor" ]; then
   (
     cd "$repo"

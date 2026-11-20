@@ -185,6 +185,32 @@ the timed paths also matched all 64 static paths. Gurka fixtures cover changes
 from populated speed layers and timed restrictions, waiting at break stops,
 and local waypoint times across a timezone boundary and a DST transition.
 
+### Destination-only, private access and not-thru routes
+
+```bash
+oracle/costing-parity.sh --access access-regions bench/results/access-regions.json
+```
+
+The Gurka fixture tests destinations on private roads, the default penalty
+for entering a destination-only road, a private gate, and a turn restriction
+that requires travelling through a not-thru entrance and leaving by the
+same road. The runner compares both hierarchy settings on the same flat
+fixture. Native search uses the oracle's endpoint cuts and completes every
+case on its first search.
+
+Gate B passed all 18 comparisons, with nine routes per hierarchy setting.
+Seven routes in each setting had the same directed edges and endpoint cuts.
+The remaining two were the same crossing in opposite directions with
+`destination_only_penalty: 0`. Native search used the restricted shortcut
+at weighted costs of 162.89 in both directions. Valhalla's first pass chose
+the public detour through a private gate at costs of 689.86 and 680.86.
+These Gate D differences are due to destination-only pruning. Toggling
+hierarchy pruning left the two differences unchanged.
+
+On the stock Utrecht graph, the hierarchy control route changed shape and
+weighted cost from 10,107.671 to 10,090.671 when Valhalla accepted the
+pruning opt-out. [Hierarchy check](#hierarchy-pruning)
+
 ### Speed resolution
 
 Synthetic overlays exercise live coverage and the one-hour fade, predicted

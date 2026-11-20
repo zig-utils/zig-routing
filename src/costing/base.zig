@@ -591,6 +591,10 @@ pub const Permission = struct {
         return @bitCast(self.access_mask);
     }
 
+    pub inline fn destinationOnly(self: Permission, edge: *const EdgeClass) bool {
+        return if (self.access_mask.truck) edge.flags.destination_only_hgv else edge.flags.destination_only;
+    }
+
     fn ignoresTurnRestrictions(self: Permission) bool {
         return self.flags.contains(.ignore_restrictions) or self.flags.contains(.ignore_non_vehicular_restrictions);
     }

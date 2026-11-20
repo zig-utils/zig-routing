@@ -13,6 +13,7 @@ const View = graph.reader.View;
 const EdgeId = graph.format.EdgeId;
 const Arena = std.mem.Allocator;
 const Movements = std.AutoHashMapUnmanaged(u64, void);
+const RouteGate = enum { timed, access };
 
 fn movementKey(incoming: EdgeId, outgoing: EdgeId) u64 {
     return (@as(u64, @backingInt(incoming)) << 32) | @backingInt(outgoing);
@@ -111,19 +112,22 @@ pub fn main(init: std.process.Init) !void {
     const path = args.next() orelse return error.MissingBundle;
     const samples = args.next() orelse return error.MissingCostingReference;
     const family_or_minimum = args.next();
-    const timing_routes = if (family_or_minimum) |value| std.mem.eql(u8, value, "--timed") else false;
     const motor_modes: []const parity.Mode = &.{ .auto, .bus, .taxi };
     var min_arg = family_or_minimum;
+    var route_gate: ?RouteGate = null;
     const tested: []const parity.Mode = if (family_or_minimum) |value| blk: {
         if (!std.mem.startsWith(u8, value, "--")) break :blk motor_modes;
         min_arg = args.next();
         if (std.mem.eql(u8, value, "--truck")) break :blk &.{.truck};
         if (std.mem.eql(u8, value, "--motorcycle")) break :blk &.{ .motorcycle, .motor_scooter };
-        if (timing_routes) break :blk &.{.auto};
+        if (std.meta.stringToEnum(RouteGate, value[2..])) |gate| {
+            route_gate = gate;
+            break :blk &.{.auto};
+        }
         if (std.mem.eql(u8, value, "--motor")) break :blk motor_modes;
         return error.InvalidCostingFamily;
     } else motor_modes;
-    const minimum: u64 = if (min_arg) |value| try std.fmt.parseInt(u64, value, 10) else if (timing_routes) 1 else parity.minimum_calls;
+    const minimum: u64 = if (min_arg) |value| try std.fmt.parseInt(u64, value, 10) else if (route_gate != null) 1 else parity.minimum_calls;
     if (args.next() != null) return error.TooManyArguments;
     const files = try io.File.open(samples, .read_only);
     defer files.close();
@@ -136,7 +140,7 @@ pub fn main(init: std.process.Init) !void {
     const uuid = std.fmt.bytesToHex(view.dataset_uuid, .lower);
     if (!std.mem.eql(u8, reference.uuid, &uuid) or reference.nodes != view.nodes.len or reference.edges.len != view.edges.len)
         return error.CostingReferenceGraphMismatch;
-    if (timing_routes) return compareTimedRoutes(init, view, &reference, &uuid, minimum);
+    if (route_gate) |gate| return compareRoutes(init, view, &reference, &uuid, minimum, gate);
 
     var err_buffer: [4096]u8 = undefined;
     var stderr = io.stderrWriter(init.io, &err_buffer);
@@ -190,7 +194,7 @@ const ProfileResult = struct {
     raw_only: bool,
 };
 
-fn compareTimedRoutes(init: std.process.Init, view: *const View, reference: *parity.Reference, uuid: []const u8, minimum: u64) !void {
+fn compareRoutes(init: std.process.Init, view: *const View, reference: *parity.Reference, uuid: []const u8, minimum: u64, gate: RouteGate) !void {
     const api = routing.api.request;
     const multi = routing.search.multi;
     var arena = routing.infra.arena.Arena.init(init.gpa, .{});
@@ -200,6 +204,9 @@ fn compareTimedRoutes(init: std.process.Init, view: *const View, reference: *par
     var cases: u64 = 0;
     var passed: u64 = 0;
     var same_as_static: u64 = 0;
+    var same_as_oracle: u64 = 0;
+    var equal_cost_different_path: u64 = 0;
+    var cheaper: u64 = 0;
     var max_excess: f32 = 0;
     var error_buffer: [4096]u8 = undefined;
     var stderr = io.stderrWriter(init.io, &error_buffer);
@@ -219,8 +226,9 @@ fn compareTimedRoutes(init: std.process.Init, view: *const View, reference: *par
             const mark = arena.mark();
             defer arena.rewind(mark);
             const parsed = try api.parseHttp(a, "/route", &.{}, path.request);
-            if (parsed != .ok or parsed.ok.locations.len != 2 or parsed.ok.date_time_type == .no_time or parsed.ok.date_time_type == .current)
-                return error.InvalidTimedReferenceRequest;
+            if (parsed != .ok or parsed.ok.locations.len != 2 or parsed.ok.date_time_type == .current or
+                (gate == .timed) != (parsed.ok.date_time_type != .no_time))
+                return error.InvalidReferenceRequest;
             const input = parsed.ok;
             const first = path.segments[0];
             const last = path.segments[path.segments.len - 1];
@@ -233,10 +241,11 @@ fn compareTimedRoutes(init: std.process.Init, view: *const View, reference: *par
             const options: multi.Options = .{ .search = .{ .costing = .auto }, .date_time_type = input.date_time_type, .now = 0 };
             const control: search.Control = .{ .deadline = io.Deadline.fromNowMs(20_000) };
             const actual = multi.route(&engine, &arena, probe, input.locations, &snapped, options, control) catch |err| {
-                try stderr.interface.print("timed {s} native search: {s}\n", .{ path.request, @errorName(err) });
+                try stderr.interface.print("{s} native search: {s}\n", .{ path.request, @errorName(err) });
                 try stderr.interface.flush();
                 return err;
             };
+            if (gate == .access and actual.retried) return error.UnexpectedAccessRetry;
 
             var allowed: Movements = .empty;
             for (path.segments[0 .. path.segments.len - 1], path.segments[1..], 0..) |from, to, i| {
@@ -246,37 +255,46 @@ fn compareTimedRoutes(init: std.process.Init, view: *const View, reference: *par
             var replay = probe;
             replay.fixed_movements = &allowed;
             const oracle_path = multi.route(&engine, &arena, replay, input.locations, &snapped, options, control) catch |err| {
-                try stderr.interface.print("timed {s} replay: {s}\n", .{ path.request, @errorName(err) });
+                try stderr.interface.print("{s} replay: {s}\n", .{ path.request, @errorName(err) });
                 try stderr.interface.flush();
                 return err;
             };
             const replayed = oracle_path.legs[0].segments;
-            if (replayed.len != path.segments.len) return error.TimedReferencePathChanged;
+            if (replayed.len != path.segments.len) return error.ReferencePathChanged;
             for (replayed, path.segments) |native, pinned| {
                 if (@backingInt(native.edge) != pinned.edge or native.begin != pinned.begin or native.end != pinned.end)
-                    return error.TimedReferencePathChanged;
+                    return error.ReferencePathChanged;
             }
             cases += 1;
             if (actual.total.cost <= oracle_path.total.cost) {
                 passed += 1;
             } else {
                 max_excess = @max(max_excess, actual.total.cost - oracle_path.total.cost);
-                try stderr.interface.print("timed {s}: weighted cost {d} exceeds oracle path {d}\n", .{
+                try stderr.interface.print("{s}: weighted cost {d} exceeds oracle path {d}\n", .{
                     path.request, actual.total.cost, oracle_path.total.cost,
                 });
             }
-            const untimed = try multi.route(&engine, &arena, probe, input.locations, &snapped, .{
-                .search = .{ .costing = .auto, .direction = if (input.date_time_type == .arrive_by) .reverse else .forward },
-            }, control);
-            const timed_path = actual.legs[0].segments;
-            const static_path = untimed.legs[0].segments;
-            if (timed_path.len == static_path.len) {
-                same_as_static += @intFromBool(blk: {
-                    for (timed_path, static_path) |timed_segment, static_segment| {
-                        if (!std.meta.eql(timed_segment, static_segment)) break :blk false;
-                    }
-                    break :blk true;
-                });
+            const actual_segments = actual.legs[0].segments;
+            if (gate == .timed) {
+                const untimed = try multi.route(&engine, &arena, probe, input.locations, &snapped, .{
+                    .search = .{ .costing = .auto, .direction = if (input.date_time_type == .arrive_by) .reverse else .forward },
+                }, control);
+                if (samePath(actual_segments, untimed.legs[0].segments)) same_as_static += 1;
+            } else if (samePath(actual_segments, replayed)) {
+                same_as_oracle += 1;
+            } else {
+                if (actual.total.cost < oracle_path.total.cost) cheaper += 1;
+                if (actual.total.cost == oracle_path.total.cost) equal_cost_different_path += 1;
+                try stderr.interface.print("{s}: native weighted cost {d}, oracle path {d}\n", .{ path.request, actual.total.cost, oracle_path.total.cost });
+                for (actual_segments) |segment| {
+                    const class = try view.class((try view.edge(segment.edge)).cls.class_id);
+                    try stderr.interface.print(" native edge {d} ({d}..{d}, destination-only {}, not-thru {})\n", .{
+                        reference.edges[@backingInt(segment.edge)], segment.begin, segment.end, class.flags.destination_only, class.flags.not_thru,
+                    });
+                }
+                for (path.segments) |segment| {
+                    try stderr.interface.print(" oracle edge {d} ({d}..{d})\n", .{ reference.edges[segment.edge], segment.begin, segment.end });
+                }
             }
         }
         arena.reset();
@@ -290,13 +308,24 @@ fn compareTimedRoutes(init: std.process.Init, view: *const View, reference: *par
         .oracle_version = "3.9.3",
         .cases = cases,
         .optimal = passed,
-        .same_as_static = same_as_static,
+        .same_as_static = if (gate == .timed) @as(?u64, same_as_static) else null,
+        .same_as_oracle = if (gate == .access) @as(?u64, same_as_oracle) else null,
+        .cheaper = if (gate == .access) @as(?u64, cheaper) else null,
+        .equal_cost_different_path = if (gate == .access) @as(?u64, equal_cost_different_path) else null,
         .max_excess = max_excess,
         .passed = success,
-    }, .{}, &stdout.interface);
+    }, .{ .emit_null_optional_fields = false }, &stdout.interface);
     try stdout.interface.writeByte('\n');
     try stdout.interface.flush();
-    if (!success) return error.TimedRouteParityFailed;
+    if (!success) return error.RouteParityFailed;
+}
+
+fn samePath(a: []const routing.search.endpoints.Segment, b: []const routing.search.endpoints.Segment) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!std.meta.eql(left, right)) return false;
+    }
+    return true;
 }
 
 fn referenceCandidate(id: EdgeId, fraction: f32) routing.snap.candidates.PathEdge {

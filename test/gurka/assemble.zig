@@ -1760,6 +1760,10 @@ fn MotorTestCost(comptime model: type) type {
         profile: *const model.Profile,
         tables: *const compiled.Compiled,
 
+        pub fn restrictionPermission(self: Self) routing.costing.base.Permission {
+            return self.profile.permission;
+        }
+
         pub fn edgeCost(self: Self, view: *const graph.reader.View, edge_id: format.EdgeId, edge: *const format.EdgeHot, direction: search.Direction) !Cost {
             return (try self.edgeTraversal(view, edge_id, edge, direction)).cost;
         }
@@ -1785,13 +1789,14 @@ fn MotorTestCost(comptime model: type) type {
         }
 
         pub fn allowedTurn(self: Self, view: *const graph.reader.View, movement: search.Transition, _: search.Label, direction: search.Direction) !bool {
+            if (!self.profile.permission.allowedNode(try view.node(movement.node))) return false;
             const from = try view.class(movement.incoming_edge.cls.class_id);
             const to = try view.class(movement.outgoing_edge.cls.class_id);
             const previous = if (direction == .forward) from else to;
             const check: model.PathCheck = .{
                 .backtrack = movement.incoming_edge.cls.opp_local == movement.outgoing_edge.cls.local,
                 .previous_dead_end = previous.flags.dead_end or (try view.outEdgeRange(movement.node)).count() == 1,
-                .previous_access = .{ .destination_only = if (truck) previous.flags.destination_only_hgv else previous.flags.destination_only },
+                .previous_access = if (direction == .forward) movement.incoming_access else movement.outgoing_access,
             };
             const turn: routing.costing.base.Turn = .{ .row = movement.row };
             const admission = if (truck) switch (direction) {
@@ -1808,7 +1813,8 @@ fn MotorTestCost(comptime model: type) type {
             const from = try view.class(movement.incoming_edge.cls.class_id);
             const to = try view.class(movement.outgoing_edge.cls.class_id);
             var turn = try model.Turn.read(view, movement.node, movement.incoming, movement.outgoing, testing.allocator, .none);
-            if (truck) turn.movement.base_turn.previous_destination_only = from.flags.destination_only_hgv;
+            turn.movement.base_turn.previous_destination_only = movement.incoming_access.destination_only;
+            turn.movement.base_turn.next_destination_only = movement.outgoing_access.destination_only;
             turn.measured_speed = movement.measured_speed;
             const node = try view.node(movement.node);
             return switch (direction) {
@@ -1909,6 +1915,167 @@ fn checkMotorTrip(comptime model: type, mode: if (model == routing.costing.truck
 
 fn checkTruckTrip(a: std.mem.Allocator, view: *const graph.reader.View, fixture: *const gurka.Map, origin: []const u8, destination: []const u8, settings: []const u8, expected: ?[]const []const u8) !void {
     return checkMotorTrip(routing.costing.truck, {}, a, view, fixture, origin, destination, settings, expected);
+}
+
+// Ported from test/gurka/test_destination_only.cc.
+test "destination-only shortcuts compete at their entry cost in both directions" {
+    const auto = routing.costing.auto;
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const road = gurka.Tag{ .key = "highway", .value = "unclassified" };
+    const layout = try gurka.mapToCoordinates(
+        \\A----B----C----D----E
+        \\     |         |    |
+        \\     |         |    |
+        \\     I----H----G----F
+    , 100);
+    const regular: []const []const u8 = &.{ "AB", "BC", "CD", "DE", "EF", "FG", "GH", "HI" };
+    for ([_][]const u8{ "motor_vehicle", "hgv" }) |mode_tag| {
+        const fixture = try gurka.Map.init(a, layout, &.{
+            .{ .label = "AB", .tags = &.{road} },
+            .{ .label = "BC", .tags = &.{road} },
+            .{ .label = "CD", .tags = &.{road} },
+            .{ .label = "DE", .tags = &.{road} },
+            .{ .label = "EF", .tags = &.{road} },
+            .{ .label = "FG", .tags = &.{road} },
+            .{ .label = "GH", .tags = &.{road} },
+            .{ .label = "HI", .tags = &.{road} },
+            .{ .label = "DG", .tags = &.{ road, .{ .key = mode_tag, .value = "destination" } } },
+            .{ .label = "BI", .tags = &.{ road, .{ .key = "access", .value = "private" } } },
+        }, &.{}, &.{});
+        var built = try Built.assemble(fixture.osm, 1);
+        defer built.deinit();
+        const view = &built.bundle.view;
+        const hgv = std.mem.eql(u8, mode_tag, "hgv");
+        try checkMotorTrip(auto, .auto, a, view, &fixture, "A", "I", "{}", if (hgv) &.{ "AB", "BC", "CD", "DG", "GH", "HI" } else regular);
+        try checkMotorTrip(auto, .auto, a, view, &fixture, "A", "I", "{\"destination_only_penalty\":0}", &.{ "AB", "BI" });
+        if (hgv) try checkTruckTrip(a, view, &fixture, "A", "I", "{}", regular);
+    }
+}
+
+test "consecutive destination-only edges charge one entry in either direction" {
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const fixture = try @import("examples.zig").accessRegions(storage.allocator());
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const from = try at(view, fixture.findNode("A").?.location.toFixed());
+    const to = try at(view, fixture.findNode("F").?.location.toFixed());
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    var engine = try RestrictionSearch.init(testing.allocator, view);
+    defer engine.deinit();
+    for ([_]search.Direction{ .forward, .reverse }) |direction| {
+        const request: search.Request = .{ .origin = from, .destination = to, .direction = direction };
+        const baseline = (try engine.run(&arena, RestrictionMotor{}, request, search.Zero{}, .{})).best().*;
+        arena.reset();
+        const priced = try engine.run(&arena, RestrictionMotor{ .destination_penalty = 17 }, request, search.Zero{}, .{});
+        try expectWayPath(view, &fixture, priced, direction, &.{ "AB", "BC", "CD", "DE", "EF" });
+        try testing.expectEqual(baseline.cost + 17, priced.best().cost);
+        try testing.expectEqual(baseline.secs, priced.best().secs);
+        arena.reset();
+    }
+}
+
+// Ported from test/gurka/test_access.cc and test/gurka/test_deadend_barrier.cc.
+test "private driveways admit their endpoints while tagged barriers retain access" {
+    const auto = routing.costing.auto;
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "primary" }};
+    const layout = try gurka.mapToCoordinates("A---B---C\n    |   |\n    D   E", 10);
+    for ([_][]const u8{ "private", "no" }) |access| {
+        const fixture = try gurka.Map.init(a, layout, &.{
+            .{ .label = "AB", .tags = road },
+            .{ .label = "BC", .tags = road },
+            .{ .label = "BD", .tags = &.{ .{ .key = "highway", .value = "service" }, .{ .key = "service", .value = "driveway" }, .{ .key = "access", .value = "private" } } },
+            .{ .label = "CE", .tags = road },
+        }, &.{.{ .label = "C", .tags = &.{ .{ .key = "barrier", .value = "gate" }, .{ .key = "access", .value = access } } }}, &.{});
+        var built = try Built.assemble(fixture.osm, 1);
+        defer built.deinit();
+        const view = &built.bundle.view;
+        try checkMotorTrip(auto, .auto, a, view, &fixture, "A", "D", "{}", &.{ "AB", "BD" });
+        try checkMotorTrip(auto, .auto, a, view, &fixture, "D", "A", "{}", &.{ "BD", "AB" });
+        try checkMotorTrip(auto, .auto, a, view, &fixture, "A", "E", "{}", if (std.mem.eql(u8, access, "private")) &.{ "AB", "BC", "CE" } else null);
+    }
+}
+
+// As in test/gurka/test_not_thru_pruning.cc, mark directed edges to model
+// existing bundles with not-thru regions whose only entrance is required.
+test "not-thru labels do not remove routes through a required entrance" {
+    const auto = routing.costing.auto;
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "residential" }};
+    const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates("A---B---C---D---E", 25), &.{
+        .{ .label = "AB", .tags = road },
+        .{ .label = "BC", .tags = road },
+        .{ .label = "CD", .tags = road },
+        .{ .label = "DE", .tags = road },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    var view = built.bundle.view;
+    const base_classes = view.classes.?;
+    const classes = try a.alloc(graph.class_table.EdgeClass, base_classes.len + 1);
+    @memcpy(classes[0..base_classes.len], base_classes);
+    view.classes = classes;
+    const edges = try a.dupe(format.EdgeHot, view.edges);
+    view.edges = edges;
+    const bc = try directedBetween(&view, &fixture, "B", "C");
+    const bc_edge = &edges[@backingInt(bc)];
+    classes[base_classes.len] = base_classes[bc_edge.cls.class_id];
+    classes[base_classes.len].flags.not_thru = true;
+    bc_edge.cls.class_id = @intCast(base_classes.len);
+    try checkMotorTrip(auto, .auto, a, &view, &fixture, "A", "E", "{}", &.{ "AB", "BC", "CD", "DE" });
+    try checkMotorTrip(auto, .auto, a, &view, &fixture, "A", "C", "{}", &.{ "AB", "BC" });
+    try checkMotorTrip(auto, .auto, a, &view, &fixture, "B", "E", "{}", &.{ "BC", "CD", "DE" });
+
+    const loop = try @import("examples.zig").accessRegions(a);
+    var built_loop = try Built.assemble(loop.osm, 1);
+    defer built_loop.deinit();
+    const loop_view = &built_loop.bundle.view;
+    const lp = try directedBetween(loop_view, &loop, "L", "P");
+    try testing.expect((try loop_view.class((try loop_view.edge(lp)).cls.class_id)).flags.not_thru);
+    try checkMotorTrip(auto, .auto, a, loop_view, &loop, "K", "N", "{}", &.{ "KL", "LP", "PQRSP", "PQRSP", "LP", "LM", "MN" });
+}
+
+test "a destination-only endpoint still respects a timed access denial" {
+    const endpoints = routing.search.endpoints;
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const road = gurka.Tag{ .key = "highway", .value = "residential" };
+    const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates("A---B---C", 10), &.{
+        .{ .label = "AB", .tags = &.{road} },
+        .{ .label = "BC", .tags = &.{
+            road,
+            .{ .key = "access", .value = "private" },
+            .{ .key = "motor_vehicle:conditional", .value = "no @ (Mo-Fr 07:00-09:00)" },
+        } },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const ab = try directedBetween(view, &fixture, "A", "B");
+    const bc = try directedBetween(view, &fixture, "B", "C");
+    const origin = snapLocation(&.{snapEdge(ab, 0.5, 0)}, &.{});
+    const target = snapLocation(&.{snapEdge(bc, 0.5, 0)}, &.{});
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    var engine = try RestrictionSearch.init(testing.allocator, view);
+    defer engine.deinit();
+    var options: endpoints.Options = .{ .costing = .auto, .timing = try restrictionTiming("2026-11-02T06:00", false) };
+    const open = try endpoints.route(&engine, &arena, RestrictionMotor{}, origin, target, options, search.Zero{}, .{});
+    try testing.expectEqual(bc, open.segments[open.segments.len - 1].edge);
+    try testing.expect(!open.retried);
+    arena.reset();
+    options.timing = try restrictionTiming("2026-11-02T08:00", false);
+    try testing.expectError(error.NoPath, endpoints.route(&engine, &arena, RestrictionMotor{}, origin, target, options, search.Zero{}, .{}));
 }
 
 // Ported from test/gurka/test_truck.cc.

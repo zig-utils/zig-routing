@@ -41,6 +41,46 @@ pub fn intersection(arena: Allocator) !gurka.Map {
     });
 }
 
+// Access costs from test_destination_only.cc and a required return through
+// the entrance from test_not_thru_pruning.cc (Valhalla 3.9.3).
+pub fn accessRegions(arena: Allocator) !gurka.Map {
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "residential" }};
+    return gurka.Map.init(arena, try gurka.mapToCoordinates(
+        \\A---B---C---D---E---F
+        \\    |           |
+        \\    H-----------G
+        \\
+        \\K---L---M---N
+        \\    |
+        \\    P---Q
+        \\    |   |
+        \\    S---R
+    , 100), &.{
+        .{ .label = "AB", .tags = road },
+        .{ .label = "BC", .tags = &.{ road[0], .{ .key = "motor_vehicle", .value = "destination" } } },
+        .{ .label = "CD", .tags = &.{ road[0], .{ .key = "access", .value = "private" } } },
+        .{ .label = "DE", .tags = road },
+        .{ .label = "EF", .tags = road },
+        .{ .label = "BH", .tags = road },
+        .{ .label = "HG", .tags = road },
+        .{ .label = "GE", .tags = road },
+        .{ .label = "KL", .tags = road },
+        .{ .label = "LM", .tags = road },
+        .{ .label = "MN", .tags = road },
+        .{ .label = "LP", .tags = road },
+        .{ .label = "PQRSP", .tags = road },
+    }, &.{.{ .label = "H", .tags = &.{ .{ .key = "barrier", .value = "gate" }, .{ .key = "access", .value = "private" } } }}, &.{
+        .{
+            .members = &.{
+                .{ .kind = .way, .ref = "KL", .role = "from" },
+                .{ .kind = .node, .ref = "L", .role = "via" },
+                .{ .kind = .way, .ref = "LM", .role = "to" },
+            },
+            .tags = &.{ .{ .key = "type", .value = "restriction" }, .{ .key = "restriction", .value = "no_straight_on" } },
+        },
+    });
+}
+
 // Ported from test/gurka/test_simple_restrictions.cc (Valhalla 3.9.3).
 pub fn simpleTurns(arena: Allocator) !gurka.Map {
     const primary: gurka.Tags = &.{.{ .key = "highway", .value = "primary" }};

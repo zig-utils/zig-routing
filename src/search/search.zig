@@ -304,11 +304,21 @@ const Restrictions = struct {
         return if (next < automaton.first_context) .{} else .{ .value = next };
     }
 
-    noinline fn evaluateAccess(self: *const Restrictions, id: EdgeId, edge: *const EdgeHot, node: NodeId, previous: Label, position: Position) !base.AccessEvaluation {
-        if (!self.check_access) return .{};
+    inline fn evaluateAccess(self: *const Restrictions, id: EdgeId, edge: *const EdgeHot, node: NodeId, previous: Label, position: Position) !base.AccessEvaluation {
         const class = try self.view.class(edge.cls.class_id);
+        // The directed not_thru bit is Valhalla's search hint. Admission
+        // here follows the edge's access rules on the first search.
+        const restricted = self.permission.destinationOnly(class);
         const access_modes: u16 = @bitCast(self.permission.access_mask);
-        if (class.detail.access_restriction & access_modes == 0) return .{};
+        var evaluation: base.AccessEvaluation = .{};
+        if (self.check_access and edge.cls.cold_checks != 0 and class.detail.access_restriction & access_modes != 0) {
+            evaluation = try self.evaluateConditionalAccess(id, node, previous, position);
+        }
+        evaluation.state.destination_only = evaluation.state.destination_only or restricted;
+        return evaluation;
+    }
+
+    noinline fn evaluateConditionalAccess(self: *const Restrictions, id: EdgeId, node: NodeId, previous: Label, position: Position) !base.AccessEvaluation {
         const local = try self.timing.local(self.view, node, previous.secs, self.direction);
         try self.control.check();
         const record = try self.view.coldRecordWithDeadline(id, self.control.deadline);
@@ -320,7 +330,7 @@ const Restrictions = struct {
         var prior = previous.accessState();
         if (previous.edge != no_index and !prior.destination_only) {
             const previous_class = try self.view.class((try self.view.edge(previous.edgeId())).cls.class_id);
-            prior.destination_only = previous_class.flags.destination_only;
+            prior.destination_only = self.permission.destinationOnly(previous_class);
         }
         var permission = self.permission;
         permission.allow_destination_only = permission.allow_destination_only or position == .end;
@@ -372,6 +382,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
         const Self = @This();
         const Pool = memory.PagePool(16 * 1024);
         const timed_costs = @hasDecl(K, "edgeCostAt") or @hasDecl(K, "turnCostAt") or @hasDecl(K, "endpointCostAt");
+        const model_access = @hasDecl(K, "restrictionPermission");
 
         view: *const View,
         allocator: std.mem.Allocator,
@@ -428,7 +439,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
         }
 
         fn runDirection(self: *Self, comptime direction: Direction, arena: *memory.Arena, kernel: K, query: anytype, potential: anytype, control: Control) !Result {
-            const permission: base.Permission = if (comptime @hasDecl(K, "restrictionPermission")) kernel.restrictionPermission() else .{
+            const permission: base.Permission = if (model_access) kernel.restrictionPermission() else .{
                 .flags = .empty,
                 .flow = .{},
                 .access_mask = if (comptime @hasDecl(K, "restrictionModes")) @bitCast(kernel.restrictionModes()) else .{ .auto = true },
@@ -436,11 +447,10 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             };
             const modes = permission.restrictionModes();
             const simple = if (self.view.turn_restrictions) |rows| rows.len != 0 else false;
-            const check_access = !permission.flags.contains(.ignore_restrictions) and
-                (query.timing.start.valid or @hasDecl(K, "restrictionPermission"));
+            const check_access = !permission.flags.contains(.ignore_restrictions) and (query.timing.start.valid or model_access);
             const keep_time = query.timing.start.valid and !query.timing.invariant and
                 try self.keepTime(kernel, permission, check_access, control);
-            if (check_access or (timed_costs and query.timing.start.valid) or (modes != 0 and (simple or self.view.restriction_automaton != null)))
+            if (model_access or check_access or (timed_costs and query.timing.start.valid) or (modes != 0 and (simple or self.view.restriction_automaton != null)))
                 return self.runLoop(direction, true, arena, kernel, query, potential, control, permission, check_access, keep_time);
             return self.runLoop(direction, false, arena, kernel, query, potential, control, permission, false, false);
         }
@@ -569,12 +579,18 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     const closed = try self.edgeClosed(kernel, permission, next_id);
                     if (closed and last.flags & Label.prune_closures != 0) continue;
                     const head: NodeId = @fromBackingInt(outward.head);
-                    const access = if (with_restrictions and next.cls.cold_checks != 0)
+                    const access = if (with_restrictions and (model_access or (check_access and next.cls.cold_checks != 0)))
                         try tracker.evaluateAccess(next_id, next, at, last, if (target != null and head == target.?) .end else .middle)
                     else
                         base.AccessEvaluation{};
-                    const destination_endpoint = partial and targets.index != 0 and access.state.destination_only;
-                    if (!access.allowed and !destination_endpoint) continue;
+                    if (!access.allowed) {
+                        if (!partial or targets.index == 0 or permission.allow_destination_only) continue;
+                        const endpoint_access = if (with_restrictions)
+                            try tracker.evaluateAccess(next_id, next, at, last, .end)
+                        else
+                            base.AccessEvaluation{};
+                        if (!endpoint_access.allowed) continue;
+                    }
                     const previous_access: base.AccessState = if (with_restrictions) last.accessState() else .{};
                     const row = if (direction == .forward)
                         forward_row[local]
@@ -688,7 +704,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 const edge_cost = traversal.cost;
                 if (edge_cost.cost == std.math.inf(f32)) continue;
                 const here: NodeId = @fromBackingInt(outward.head);
-                const access = if (@TypeOf(tracker) != @TypeOf(null) and edge.cls.cold_checks != 0)
+                const access = if (@TypeOf(tracker) != @TypeOf(null) and (model_access or (tracker.check_access and edge.cls.cold_checks != 0)))
                     try tracker.evaluateAccess(id, edge, start, .{}, .start)
                 else
                     base.AccessEvaluation{};
@@ -720,11 +736,11 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 const closed = try self.edgeClosed(kernel, permission, id);
                 if (closed and permission.filter_closures) continue;
                 const price_at_time = timed_costs and query.timing.start.valid;
-                const check_access = @TypeOf(tracker) != @TypeOf(null) and edge.cls.cold_checks != 0;
-                const tail: NodeId = if (price_at_time or check_access)
+                const check_limits = @TypeOf(tracker) != @TypeOf(null) and tracker.check_access and edge.cls.cold_checks != 0;
+                const tail: NodeId = if (price_at_time or check_limits)
                     @fromBackingInt(if (direction == .forward) (try self.view.edge(try self.view.oppEdge(id))).head else edge.head)
                 else
-                    undefined;
+                    @fromBackingInt(edge.head);
                 const time: graph.time_info.TimeInfo = if (price_at_time) try query.timing.at(self.view, tail, 0, direction) else .{};
                 const traversal = try self.priceEdge(kernel, id, edge, direction, time, true);
                 const full = traversal.cost;
@@ -734,9 +750,10 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 const portion: Cut = if (direction == .forward) .{ .begin = candidate.fraction } else .{ .end = candidate.fraction };
                 const at_node = if (direction == .forward) candidate.end_node else candidate.begin_node;
                 const cost = scale(full, @max(portion.end - portion.begin, std.math.floatEps(f32)), candidate.score);
-                const access = if (check_access) access: {
-                    break :access try tracker.evaluateAccess(id, edge, tail, .{}, .start);
-                } else base.AccessEvaluation{};
+                const access = if (@TypeOf(tracker) != @TypeOf(null) and (model_access or check_limits))
+                    try tracker.evaluateAccess(id, edge, tail, .{}, .start)
+                else
+                    base.AccessEvaluation{};
                 if (!access.allowed) continue;
                 try cuts.append(a, portion);
                 const context: TurnContext = if (@TypeOf(tracker) == @TypeOf(null)) .{} else try tracker.advance(.{}, .{}, node, id);
