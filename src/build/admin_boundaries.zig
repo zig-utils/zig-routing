@@ -6,6 +6,7 @@ const io = @import("../infra/io.zig");
 const polygon = @import("../geo/polygon.zig");
 const point = @import("../geo/point.zig");
 const tags = @import("admin_tags.zig");
+const turns = @import("turn_restrictions.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Boundary = struct {
@@ -27,12 +28,23 @@ pub const Catalog = struct {
 /// Read relations, resolve their way members, then acquire only the nodes
 /// referenced by those ways. The stream can represent multiple extracts.
 pub fn collect(gpa: Allocator, source: anytype, deadline: io.Deadline) !Catalog {
+    return collectRelations(gpa, source, deadline, true, null);
+}
+
+pub fn collectRelations(gpa: Allocator, source: anytype, deadline: io.Deadline, boundaries: bool, restrictions: ?*turns.Catalog) !Catalog {
     var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();
     var storage: std.heap.ArenaAllocator = .init(gpa);
     errdefer storage.deinit();
     const owned = storage.allocator();
-    var collector: Collector = .{ .a = scratch.allocator(), .owned = owned, .gpa = gpa, .deadline = deadline };
+    var collector: Collector = .{
+        .a = scratch.allocator(),
+        .owned = owned,
+        .gpa = gpa,
+        .deadline = deadline,
+        .boundaries = boundaries,
+        .restrictions = restrictions,
+    };
     defer collector.block.deinit(gpa);
     try source.forEach(gpa, deadline, &collector, Collector.visit);
     if (collector.relations.items.len == 0) return .{
@@ -79,6 +91,8 @@ const Collector = struct {
     owned: Allocator,
     gpa: Allocator,
     deadline: io.Deadline,
+    boundaries: bool,
+    restrictions: ?*turns.Catalog,
     phase: enum { relations, ways, nodes } = .relations,
     block: pbf.block.Scratch = .{},
     relations: std.ArrayList(Relation) = .empty,
@@ -98,6 +112,8 @@ const Collector = struct {
     fn readRelations(self: *Collector, block: pbf.block.Block) !void {
         var entries = block.relations();
         while (try entries.next()) |relation| {
+            if (self.restrictions) |present| try present.add(relation);
+            if (!self.boundaries) continue;
             if (self.relation_ids.contains(relation.id)) continue;
             var attrs = try tags.transform(relation.tags, self.deadline) orelse continue;
             var members: std.ArrayList(Member) = .empty;

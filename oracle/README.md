@@ -257,6 +257,31 @@ zig-out/bin/zr diff "$native_url" "$valhalla_url" --corpus oracle/corpora/date-t
 
 All 24 requests match the stock service's status, JSON schema and error code.
 
+### Simple turn restrictions
+
+The build resolves ordinary single-node restrictions into the existing turn
+byte. It preserves Valhalla's first-match rule and eight-exit mask even when
+native local edge indices differ. The reader exposes sparse mode masks for
+tagged mode restrictions and movements across aliases for the P5.10 checks.
+The build report counts parsed and resolved relations, deferred forms,
+missing members and truncated masks.
+
+Build the same input PBF with both builders. For the reference, run
+`valhalla_build_tiles --end enhance`, then run its `validate` stage to
+set the opposing indices before importing the local tiles.
+
+```bash
+zig build gurka-pbf -- fixture.osm.pbf simple-turns
+zig-out/bin/zr import-valhalla --output reference-bundle valhalla-tile-dir/2
+python3 oracle/compare-turn-restrictions.py native-bundle reference-bundle
+```
+
+| Input | Paired directed edges | Turn movements | Restricted movements matched |
+| --- | ---: | ---: | ---: |
+| Gurka fixture | 22 | 50 | 3 |
+| Liechtenstein | 15,760 | 44,574 | 2 |
+| Utrecht | 85,336 | 261,602 | 296 |
+
 ### Way splitting and edge counts
 
 ```bash

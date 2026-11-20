@@ -828,6 +828,64 @@ fn directedBetween(view: *const graph.reader.View, fixture: *const gurka.Map, fi
     return error.TestEdgeNotFound;
 }
 
+fn restrictedMovement(view: *const graph.reader.View, incoming: format.EdgeId, outgoing: format.EdgeId) !bool {
+    const entry = try view.edge(incoming);
+    const exit = try view.edge(outgoing);
+    const row = try view.turnRow(@fromBackingInt(entry.head), entry.cls.opp_local);
+    return row[exit.cls.local] & 0x80 != 0;
+}
+
+test "Gurka no turn and only turn restrictions follow travel direction" {
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const fixture = try @import("examples.zig").simpleTurns(storage.allocator());
+    var built = try Built.assemble(fixture.osm, 2);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    try view.verify(.none, null);
+    const cb = try directedBetween(view, &fixture, "C", "B");
+    const be = try directedBetween(view, &fixture, "B", "E");
+    const ab = try directedBetween(view, &fixture, "A", "B");
+    try testing.expect(try restrictedMovement(view, cb, be));
+    try testing.expect(!try restrictedMovement(view, try view.oppEdge(be), try view.oppEdge(cb)));
+    try testing.expect(!try restrictedMovement(view, ab, be));
+    const kl = try directedBetween(view, &fixture, "K", "L");
+    const lm = try directedBetween(view, &fixture, "L", "M");
+    const ln = try directedBetween(view, &fixture, "L", "N");
+    try testing.expect(!try restrictedMovement(view, kl, lm));
+    try testing.expect(try restrictedMovement(view, kl, ln));
+    try testing.expect(try restrictedMovement(view, kl, try view.oppEdge(kl)));
+
+    const ad = try directedBetween(view, &fixture, "A", "D");
+    const de = try directedBetween(view, &fixture, "D", "E");
+    const bike = view.turnRestrictionModes(try view.oppEdge(de), try view.oppEdge(ad));
+    try testing.expectEqual(@as(u16, @bitCast(graph.constants.AccessMask{ .bicycle = true })), bike);
+    const except: graph.constants.AccessMask = @bitCast(view.turnRestrictionModes(ad, de));
+    try testing.expect(except.auto and except.truck and !except.bus and !except.taxi and !except.bicycle);
+    try testing.expect(!try restrictedMovement(view, ad, de));
+    try testing.expect((try view.node(@fromBackingInt((try view.edge(ad)).head))).attr.has_turn_restrictions);
+    try testing.expectEqual(5, built.stats.simple_turns.parsed);
+    try testing.expectEqual(4, built.stats.simple_turns.resolved);
+    try testing.expectEqual(1, built.stats.simple_turns.deferred);
+
+    const from = try at(view, fixture.findNode("C").?.location.toFixed());
+    const to = try at(view, fixture.findNode("F").?.location.toFixed());
+    var engine = try SearchTest.init(testing.allocator, view);
+    defer engine.deinit();
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    for ([_]search.Direction{ .forward, .reverse }) |direction| {
+        const request: search.Request = .{ .origin = from, .destination = to, .direction = direction };
+        const potential = try search.L2.init(view, if (direction == .forward) to else from, 1);
+        const limited = try engine.run(&arena, .{ .seed = 1 }, request, potential, .{});
+        const limited_cost = limited.best().cost;
+        arena.reset();
+        const ignored = try engine.run(&arena, .{ .seed = 1, .ignore_turn_restrictions = true }, request, potential, .{});
+        try testing.expect(limited_cost > ignored.best().cost);
+        arena.reset();
+    }
+}
+
 test "country defaults apply within borders and preserve explicitly tagged modes" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -1265,6 +1323,7 @@ const Cost = routing.costing.compiled.Cost;
 const SearchTestCost = struct {
     seed: u32,
     omit: bool = false,
+    ignore_turn_restrictions: bool = false,
 
     fn lengthCost(kernel: SearchTestCost, edge: format.EdgeId, len: u24) Cost {
         const weight = (@backingInt(edge) *% 2_654_435_761 +% kernel.seed) % 43;
@@ -1281,6 +1340,10 @@ const SearchTestCost = struct {
 
     pub fn edgeCost(kernel: SearchTestCost, _: *const graph.reader.View, edge: format.EdgeId, hot: *const format.EdgeHot, _: search.Direction) !Cost {
         return kernel.lengthCost(edge, hot.geom.len_m);
+    }
+
+    pub fn allowedTurn(kernel: SearchTestCost, _: *const graph.reader.View, turn: search.Transition, _: search.Label, _: search.Direction) !bool {
+        return kernel.ignore_turn_restrictions or turn.row & 0x80 == 0;
     }
 
     pub fn turnCost(kernel: SearchTestCost, _: *const graph.reader.View, turn: search.Transition, _: search.Label, _: search.Direction) !Cost {

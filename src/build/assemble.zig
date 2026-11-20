@@ -23,6 +23,8 @@ const node_order = @import("order.zig");
 const admin_index = @import("admin_index.zig");
 const country_access = @import("country_access.zig");
 const timezones = @import("timezones.zig");
+const turn_restrictions = @import("turn_restrictions.zig");
+const mode_turns = @import("../graph/turn_restrictions.zig");
 
 const Allocator = std.mem.Allocator;
 const max_degree = turns.max_degree;
@@ -73,6 +75,7 @@ pub const Stats = struct {
     elevation: elevation.Coverage,
     spatial: graph.spatial.Stats,
     assembly_ns: u64,
+    simple_turns: turn_restrictions.Stats,
 };
 
 /// Build the topology, validate it, and write it to the caller's staging
@@ -80,7 +83,9 @@ pub const Stats = struct {
 /// Parallel builds require an allocator and admin resolver that support concurrent use.
 pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWriter, supplied: Options) !Stats {
     var options = supplied;
-    var compiled_admins = if (options.admin_index == null) try admin_index.build(gpa, source, options.deadline) else null;
+    var restrictions: turn_restrictions.Catalog = .{ .a = gpa, .deadline = options.deadline };
+    defer restrictions.deinit();
+    var compiled_admins = try admin_index.build(gpa, source, options.deadline, options.admin_index == null, &restrictions);
     defer if (compiled_admins) |*index| index.deinit();
     if (compiled_admins) |index| options.admin_index = index.view;
     const edge_file = try io.File.temporary(options.scratch_dir);
@@ -141,11 +146,14 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     defer if (terrain) |*present| present.deinit();
     var turn_pool = turns.Pool.init(gpa);
     defer turn_pool.deinit();
-    const turn_sides = try buildTurns(&shared, table.classes, metadata.name_ids.items, &turn_pool, gpa);
+    var resolved = try resolveTurns(gpa, &shared, &plan, .{ .entries = restrictions.entries.items, .stats = restrictions.stats });
+    defer resolved.deinit(gpa);
+    const turn_sides = try buildTurns(&shared, table.classes, metadata.name_ids.items, resolved.hard.items, &turn_pool, gpa);
     defer gpa.free(turn_sides);
 
     try writeTopology(writer, options.scratch_dir, &topology, table.classes, turn_pool.bytes.items, if (terrain) |present| present.slopes.data else null);
     try writer.write(.turn_sides, turn_sides);
+    if (resolved.modes.items.len != 0) try writer.write(.turn_restrictions, resolved.modes.items);
     try writeAdmins(writer, options.admin_index, shared.admin_ids);
     if (options.timezone_source) |source_tz| try writeTimezones(gpa, writer, source_tz, topology.coordinates, options.scratch_dir);
     const topology_ns = timer.read();
@@ -171,6 +179,7 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
         .elevation = if (terrain) |present| present.coverage else .{ .total_edges = segments.len },
         .spatial = spatial,
         .assembly_ns = topology_ns,
+        .simple_turns = resolved.stats,
     };
 }
 
@@ -183,6 +192,7 @@ pub fn buildStaged(
     edge_file: io.File,
     shape_file: io.File,
     options: Options,
+    restrictions: turn_restrictions.Source,
 ) !void {
     const gpa = session.gpa;
     const edge_map = try io.Mapping.mapFd(edge_file, .read_only);
@@ -297,11 +307,15 @@ pub fn buildStaged(
         const start = io.Timer.start();
         var tx = try session.begin(.turns);
         defer tx.deinit();
-        const turn_sides = try buildTurns(&shared, edge_classes.?, metadata.name_ids.items, &turn_pool, gpa);
+        var resolved = try resolveTurns(gpa, &shared, &plan, restrictions);
+        defer resolved.deinit(gpa);
+        const turn_sides = try buildTurns(&shared, edge_classes.?, metadata.name_ids.items, resolved.hard.items, &turn_pool, gpa);
         defer gpa.free(turn_sides);
         try tx.writeArray(topology.nodes, .nodes);
         try tx.writeArray(turn_pool.bytes.items, .turn_pool);
         try tx.writeArray(turn_sides, .turn_sides);
+        if (resolved.modes.items.len != 0) try tx.writeArray(resolved.modes.items, .mode_turns);
+        if (resolved.stats.parsed != 0) try tx.writeJson(gpa, resolved.stats, .simple_turn_stats);
         try tx.writeJson(gpa, turn_pool.indices.count(), .turn_stats);
         try session.commit(&tx, topology.nodes.len, start);
     }
@@ -353,6 +367,11 @@ noinline fn saveColdStage(session: *checkpoint.Session, shared: *const Shared, m
         const side_data = try saved_turns.map(.turn_sides, options.deadline);
         defer side_data.unmap();
         try writer.write(.turn_sides, try checkpoint.array(u32, side_data));
+    }
+    if (saved_turns.manifest.files.get(.mode_turns) != null) {
+        const rows = try saved_turns.map(.mode_turns, options.deadline);
+        defer rows.unmap();
+        try writer.write(.turn_restrictions, try checkpoint.array(mode_turns.Entry, rows));
     }
     const cold_bytes = try buildCold(gpa, shared, metadata, &writer, options.scratch_dir, means);
     try tx.writeJson(gpa, cold_bytes, .source_stats);
@@ -1714,13 +1733,165 @@ fn remapEdges(rows: []format.EdgeHot, ids: []const classes.ClassId, deadline: io
     }
 }
 
-fn buildTurns(shared: *const Shared, edge_classes: []const classes.EdgeClass, name_ids: []const tags.names.Id, pool: *turns.Pool, gpa: Allocator) ![]u32 {
+const TurnMask = struct {
+    slot: u32,
+    exits: u32,
+
+    fn before(_: void, a: TurnMask, b: TurnMask) bool {
+        return a.slot < b.slot;
+    }
+};
+
+const ResolvedTurns = struct {
+    hard: std.ArrayList(TurnMask) = .empty,
+    modes: std.ArrayList(mode_turns.Entry) = .empty,
+    stats: turn_restrictions.Stats,
+
+    fn deinit(self: *ResolvedTurns, a: Allocator) void {
+        self.hard.deinit(a);
+        self.modes.deinit(a);
+    }
+};
+
+const IncidentTurnEdge = struct {
+    way: i64,
+    node: u32,
+    slot: u32,
+    rank: u8,
+
+    fn before(_: void, a: IncidentTurnEdge, b: IncidentTurnEdge) bool {
+        return if (a.rank == b.rank) a.slot < b.slot else a.rank < b.rank;
+    }
+};
+
+fn turnIncidents(a: Allocator, shared: *const Shared, node: Node, incident: *std.ArrayList(IncidentTurnEdge)) !void {
+    incident.clearRetainingCapacity();
+    try incident.ensureTotalCapacity(a, node.degree);
+    const topo = shared.topology;
+    for (node.first_alias..node.first_alias + aliasCount(node.degree)) |alias| {
+        const first = topo.first_edge[alias];
+        for (first..first + topo.groups[alias].real_degree) |slot| {
+            try checkDeadline(shared.deadline, incident.items.len);
+            const ref = topo.slot_refs.data[slot];
+            const segment = shared.segments[ref / 2];
+            const way = shared.ways.get(segment.way_id) orelse return error.MissingWayAttributes;
+            const access = way.by_direction[ref & 1].forwardAccess();
+            incident.appendAssumeCapacity(.{
+                .way = segment.way_id,
+                .node = @intCast(alias),
+                .slot = @intCast(slot),
+                .rank = graph.constants.incidentEdgeRank(access.auto, way.attr.importance, way.attr.has_names),
+            });
+        }
+    }
+    std.sort.heap(IncidentTurnEdge, incident.items, {}, IncidentTurnEdge.before);
+}
+
+fn restrictionEntryBefore(_: void, a: mode_turns.Entry, b: mode_turns.Entry) bool {
+    return a.key() < b.key();
+}
+
+// The pinned tile stores eight outgoing bits in Valhalla's incident-edge order.
+// Find those arcs without changing native CSR indices.
+noinline fn resolveTurns(a: Allocator, shared: *const Shared, plan: *const Layout, source: turn_restrictions.Source) !ResolvedTurns {
+    const topo = shared.topology;
+    const valhalla_mask_width = 8;
+    var result: ResolvedTurns = .{ .stats = source.stats };
+    errdefer result.deinit(a);
+    if (source.entries.len == 0) return result;
+    var incident: std.ArrayList(IncidentTurnEdge) = .empty;
+    defer incident.deinit(a);
+    var preceding_via: ?i64 = null;
+    var resolved_relation: ?i64 = null;
+    for (source.entries, 0..) |restriction, row| {
+        try checkDeadline(shared.deadline, row);
+        const kind = try restriction.kind();
+        const logical = plan.by_id.get(restriction.via) orelse {
+            result.stats.missing_via += 1;
+            continue;
+        };
+        const via = plan.nodes.items[logical];
+        if (preceding_via != restriction.via) {
+            try turnIncidents(a, shared, via, &incident);
+            preceding_via = restriction.via;
+        }
+        var has_from = false;
+        var has_to = false;
+        for (incident.items, 0..) |edge, i| {
+            try checkDeadline(shared.deadline, i);
+            has_from = has_from or edge.way == restriction.from;
+            has_to = has_to or edge.way == restriction.to;
+        }
+        if (!has_from) {
+            result.stats.missing_from += 1;
+            continue;
+        }
+        if (!has_to and !kind.only()) {
+            result.stats.missing_to += 1;
+            continue;
+        }
+        const mode_start = result.modes.items.len;
+        var truncated = false;
+        const specific = restriction.attr.mode_specific;
+        for (incident.items, 0..) |out, rank| {
+            try checkDeadline(shared.deadline, rank);
+            if ((out.way == restriction.to) == kind.only()) continue;
+            if (!specific and rank >= valhalla_mask_width) {
+                truncated = true;
+            } else if (restriction.attr.modes != 0) {
+                for (incident.items, 0..) |in, i| {
+                    try checkDeadline(shared.deadline, i);
+                    if (in.way != restriction.from) continue;
+                    if (!specific and in.node == out.node) {
+                        const local = topo.output.data[out.slot].cls.local;
+                        try result.hard.append(a, .{ .slot = in.slot, .exits = @as(u32, 1) << local });
+                    } else {
+                        const opposing = topo.output.data[in.slot];
+                        const incoming = topo.first_edge[opposing.head] + opposing.cls.opp_local;
+                        try result.modes.append(a, .{
+                            .incoming = incoming,
+                            .outgoing = out.slot,
+                            .attr = .{ .modes = restriction.attr.modes },
+                        });
+                    }
+                }
+            }
+            if (!kind.only() and !specific) break;
+        }
+        if (result.modes.items.len != mode_start) {
+            for (via.first_alias..via.first_alias + aliasCount(via.degree)) |node| {
+                try checkDeadline(shared.deadline, node - via.first_alias);
+                topo.nodes[node].attr.has_turn_restrictions = true;
+            }
+        }
+        result.stats.mask_truncated += @intFromBool(truncated);
+        result.stats.resolved += @intFromBool(resolved_relation != restriction.relation);
+        resolved_relation = restriction.relation;
+    }
+    std.sort.heap(TurnMask, result.hard.items, {}, TurnMask.before);
+    std.sort.heap(mode_turns.Entry, result.modes.items, {}, restrictionEntryBefore);
+    var count: usize = 0;
+    for (result.modes.items, 0..) |entry, i| {
+        try checkDeadline(shared.deadline, i);
+        if (count != 0 and entry.key() == result.modes.items[count - 1].key()) {
+            result.modes.items[count - 1].attr.modes |= entry.attr.modes;
+        } else {
+            result.modes.items[count] = entry;
+            count += 1;
+        }
+    }
+    result.modes.shrinkRetainingCapacity(count);
+    return result;
+}
+
+fn buildTurns(shared: *const Shared, edge_classes: []const classes.EdgeClass, name_ids: []const tags.names.Id, restrictions: []const TurnMask, pool: *turns.Pool, gpa: Allocator) ![]u32 {
     const topo = shared.topology;
     var side_pool = try turns.SidePool.init(gpa, topo.nodes.len);
     defer side_pool.deinit();
     var approaches: [max_degree]turns.Approach = undefined;
     var entries: [turns.max_matrix_size]u8 = undefined;
     var sides: [turns.max_matrix_size]u2 = undefined;
+    var restriction_index: usize = 0;
     for (topo.nodes, 0..) |*node, i| {
         try checkDeadline(shared.deadline, i);
         const first = topo.first_edge[i];
@@ -1739,6 +1910,16 @@ fn buildTurns(shared: *const Shared, edge_classes: []const classes.EdgeClass, na
         const side: edge_class.DriveSide = if (node.attr.drive_on_left) .left else .right;
         const turn_sides = sides[0..matrix.len];
         try turns.matrix(approaches[0..degree], node.attr.signal != 0, side, matrix, turn_sides, shared.deadline);
+        while (restriction_index < restrictions.len and restrictions[restriction_index].slot < first + degree) : (restriction_index += 1) {
+            try checkDeadline(shared.deadline, restriction_index);
+            const restriction = restrictions[restriction_index];
+            const start = (restriction.slot - first) * degree;
+            var exits = restriction.exits;
+            while (exits != 0) {
+                matrix[start + @ctz(exits)] |= 0x80;
+                exits &= exits - 1;
+            }
+        }
         node.turn_off = try pool.intern(matrix);
         try side_pool.append(i, turn_sides);
     }

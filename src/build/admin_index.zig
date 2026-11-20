@@ -7,6 +7,7 @@ const polygon_grid = @import("polygon_grid.zig");
 const io = @import("../infra/io.zig");
 const boundary = @import("admin_boundaries.zig");
 const checkpoint = @import("checkpoint.zig");
+const turns = @import("turn_restrictions.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Index = struct {
@@ -21,8 +22,8 @@ pub const Index = struct {
 const Piece = polygon_grid.Piece;
 const Grid = []std.ArrayList(Piece);
 
-pub fn build(gpa: Allocator, source: anytype, deadline: io.Deadline) !?Index {
-    var catalog = try boundary.collect(gpa, source, deadline);
+pub fn build(gpa: Allocator, source: anytype, deadline: io.Deadline, boundaries: bool, restrictions: *turns.Catalog) !?Index {
+    var catalog = try boundary.collectRelations(gpa, source, deadline, boundaries, restrictions);
     defer catalog.deinit();
     if (catalog.regions.len == 0) return null;
     return try pack(gpa, catalog.regions, deadline);

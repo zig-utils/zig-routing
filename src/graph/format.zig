@@ -3,6 +3,7 @@ const std = @import("std");
 const io = @import("../infra/io.zig");
 const class_table = @import("class_table.zig");
 const constants = @import("constants.zig");
+const turn_restrictions = @import("turn_restrictions.zig");
 
 pub const magic = "ZRGRAPH\x00".*;
 pub const version: u32 = 1;
@@ -44,7 +45,7 @@ pub const NodeHot = extern struct {
         tagged_access: bool = false,
         private_access: bool = false,
         cash_only_toll: bool = false,
-        _pad: u1 = 0,
+        has_turn_restrictions: bool = false,
     },
 };
 
@@ -110,11 +111,13 @@ pub const SectionKind = enum(u32) {
     node_admins = 16,
     node_timezones = 17,
     timezone_rules = 18,
+    turn_restrictions = 19,
 
     pub fn placement(kind: SectionKind) Placement {
         return switch (kind) {
             .nodes, .edges, .first_edge, .turns, .classes, .turn_sides => .hot,
             .coordinates, .spatial, .components, .metadata, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules => .warm,
+            .turn_restrictions => .warm,
             .cold_idx, .cold, .slopes => .cold,
         };
     }
@@ -139,6 +142,7 @@ pub const SectionKind = enum(u32) {
             .node_admins => "node_admins.bin",
             .node_timezones => "node_timezones.bin",
             .timezone_rules => "timezone_rules.bin",
+            .turn_restrictions => "turn_restrictions.bin",
         };
     }
 
@@ -159,6 +163,7 @@ pub const SectionKind = enum(u32) {
             .admins, .timezone_rules => u8,
             .node_admins, .node_timezones => u16,
             .components, .turn_sides => u32,
+            .turn_restrictions => turn_restrictions.Entry,
         };
     }
 

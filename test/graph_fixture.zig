@@ -71,6 +71,7 @@ pub fn records(comptime kind: format.SectionKind) []const kind.Record() {
         .node_admins => &.{ 0, 0 },
         .node_timezones => &.{ 292, 0 },
         .timezone_rules => @embedFile("fuzz/seeds/timezone-rules.bin"),
+        .turn_restrictions => &.{},
     };
 }
 

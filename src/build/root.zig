@@ -21,6 +21,7 @@ pub const admin_boundaries = @import("admin_boundaries.zig");
 pub const admin_tags = @import("admin_tags.zig");
 pub const country_access = @import("country_access.zig");
 pub const timezones = @import("timezones.zig");
+pub const turn_restrictions = @import("turn_restrictions.zig");
 
 test {
     std.testing.refAllDecls(@This());

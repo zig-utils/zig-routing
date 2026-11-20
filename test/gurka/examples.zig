@@ -41,6 +41,73 @@ pub fn intersection(arena: Allocator) !gurka.Map {
     });
 }
 
+// Ported from test/gurka/test_simple_restrictions.cc (Valhalla 3.9.3).
+pub fn simpleTurns(arena: Allocator) !gurka.Map {
+    const primary: gurka.Tags = &.{.{ .key = "highway", .value = "primary" }};
+    return gurka.Map.init(arena, try gurka.mapToCoordinates(
+        \\A---B----C     K---L---M
+        \\|   |              |
+        \\D---E----F         N
+        \\|
+        \\G---H----I
+    , 50), &.{
+        .{ .label = "AB", .tags = primary },
+        .{ .label = "BC", .tags = primary },
+        .{ .label = "DEF", .tags = primary },
+        .{ .label = "GHI", .tags = primary },
+        .{ .label = "ADG", .tags = primary },
+        .{ .label = "BE", .tags = primary },
+        .{ .label = "KL", .tags = primary },
+        .{ .label = "LM", .tags = primary },
+        .{ .label = "LN", .tags = primary },
+    }, &.{}, &.{
+        .{
+            .members = &.{
+                .{ .kind = .way, .ref = "BC", .role = "from" },
+                .{ .kind = .node, .ref = "B", .role = "via" },
+                .{ .kind = .way, .ref = "BE", .role = "to" },
+            },
+            .tags = &.{ .{ .key = "type", .value = "restriction" }, .{ .key = "restriction", .value = "no_left_turn" } },
+        },
+        .{
+            .members = &.{
+                .{ .kind = .way, .ref = "KL", .role = "from" },
+                .{ .kind = .node, .ref = "L", .role = "via" },
+                .{ .kind = .way, .ref = "LM", .role = "to" },
+            },
+            .tags = &.{ .{ .key = "type", .value = "restriction" }, .{ .key = "restriction", .value = "only_straight_on" } },
+        },
+        .{
+            .members = &.{
+                .{ .kind = .way, .ref = "DEF", .role = "from" },
+                .{ .kind = .node, .ref = "D", .role = "via" },
+                .{ .kind = .way, .ref = "ADG", .role = "to" },
+            },
+            .tags = &.{ .{ .key = "type", .value = "restriction" }, .{ .key = "restriction:bicycle", .value = "no_right_turn" } },
+        },
+        .{
+            .members = &.{
+                .{ .kind = .way, .ref = "ADG", .role = "from" },
+                .{ .kind = .node, .ref = "D", .role = "via" },
+                .{ .kind = .way, .ref = "DEF", .role = "to" },
+            },
+            .tags = &.{
+                .{ .key = "type", .value = "restriction" },
+                .{ .key = "restriction", .value = "no_left_turn" },
+                .{ .key = "except", .value = "psv;bicycle" },
+            },
+        },
+        .{
+            .members = &.{
+                .{ .kind = .way, .ref = "GHI", .role = "from" },
+                .{ .kind = .way, .ref = "ADG", .role = "via" },
+                .{ .kind = .way, .ref = "AB", .role = "to" },
+            },
+            .tags = &.{ .{ .key = "type", .value = "restriction" }, .{ .key = "restriction", .value = "no_entry" } },
+        },
+    });
+}
+
 // Ported from test/gurka/test_truck.cc (Valhalla 3.9.3). The middle
 // restrictions and the one-way clearance exercise storage in both directions.
 pub fn motorVehicle(arena: Allocator) !gurka.Map {

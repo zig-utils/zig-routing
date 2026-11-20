@@ -6,6 +6,7 @@ const hgt = @import("../elevation/hgt.zig");
 const checkpoint = @import("checkpoint.zig");
 const assemble = @import("assemble.zig");
 const admin_index = @import("admin_index.zig");
+const turn_restrictions = @import("turn_restrictions.zig");
 const speeds = @import("speeds.zig");
 const edges = @import("edges.zig");
 const node_store = @import("node_store.zig");
@@ -45,6 +46,7 @@ pub const Result = struct {
     dataset_uuid: graph.format.DatasetUuid,
     finalized: bool,
     stages: []const checkpoint.Metric,
+    turn_restrictions: ?turn_restrictions.Stats = null,
 
     pub fn deinit(self: Result, allocator: Allocator) void {
         allocator.free(self.stages);
@@ -250,7 +252,17 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
                 admin_mapping = try tagged.map(.admin_index, options.deadline);
                 assembly_options.admin_index = try graph.admin.View.parse(admin_mapping.?.bytes);
             }
-            try assemble.buildStaged(&session, &metadata, source_stats.value, edge_file, shape_file, assembly_options);
+            var restriction_rows: ?io.Mapping = null;
+            defer if (restriction_rows) |mapped| mapped.unmap();
+            var restriction_source: turn_restrictions.Source = .{};
+            if (session.runs(.turns) and tagged.manifest.files.get(.simple_turn_relations) != null) {
+                restriction_rows = try tagged.map(.simple_turn_relations, options.deadline);
+                restriction_source.entries = try checkpoint.array(turn_restrictions.Record, restriction_rows.?);
+                const counts = try tagged.readJson(turn_restrictions.Stats, gpa, .simple_turn_stats, options.deadline);
+                defer counts.deinit();
+                restriction_source.stats = counts.value;
+            }
+            try assemble.buildStaged(&session, &metadata, source_stats.value, edge_file, shape_file, assembly_options, restriction_source);
         }
     }
     if (session.runs(.validate)) try validate(&session);
@@ -258,10 +270,26 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
     diagnostic.* = .{};
     const stages = try session.metrics.toOwnedSlice(gpa);
     errdefer gpa.free(stages);
-    const result: Result = .{ .dataset_uuid = id, .finalized = session.runs(.finalize), .stages = stages };
+    const result: Result = .{
+        .dataset_uuid = id,
+        .finalized = session.runs(.finalize),
+        .stages = stages,
+        .turn_restrictions = try readRestrictionStats(&session),
+    };
     const report = try std.json.Stringify.valueAlloc(a, result, .{ .whitespace = .indent_2 });
     try root.writeAtomic("build-stats.json", report);
     return result;
+}
+
+fn readRestrictionStats(session: *checkpoint.Session) !?turn_restrictions.Stats {
+    if (@backingInt(session.to) < @backingInt(Stage.tags)) return null;
+    const stage: Stage = if (@backingInt(session.to) >= @backingInt(Stage.turns)) .turns else .tags;
+    const saved = try session.open(stage);
+    defer saved.close();
+    if (saved.manifest.files.get(.simple_turn_stats) == null) return null;
+    const json = try saved.readJson(turn_restrictions.Stats, session.gpa, .simple_turn_stats, session.deadline);
+    defer json.deinit();
+    return json.value;
 }
 
 const SpeedInput = struct {
@@ -422,10 +450,16 @@ fn buildSegments(session: *checkpoint.Session, metadata: *assemble.Metadata, inp
         try prep.selectWays(source, &referenced.?);
         try prep.saveTags(&tx);
         try edges.saveUsage(&tx, &referenced.?, .usage_directory, .usage_leaves);
-        if (try admin_index.build(gpa, source, deadline)) |compiled| {
+        var restrictions: turn_restrictions.Catalog = .{ .a = gpa, .deadline = deadline };
+        defer restrictions.deinit();
+        if (try admin_index.build(gpa, source, deadline, true, &restrictions)) |compiled| {
             var index = compiled;
             defer index.deinit();
             try admin_index.save(index.view, &tx);
+        }
+        if (restrictions.stats.parsed != 0) {
+            try tx.writeArray(restrictions.entries.items, .simple_turn_relations);
+            try tx.writeJson(gpa, restrictions.stats, .simple_turn_stats);
         }
         try session.commit(&tx, prep.selected_ways, start);
     } else {

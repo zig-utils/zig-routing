@@ -533,25 +533,39 @@ fn visitPrimitives(block: routing.build.pbf.block.Block, gpa: std.mem.Allocator)
         while (try way.refs.next()) |_| {}
     }
     var relations = block.relations();
+    var restrictions: routing.build.turn_restrictions.Catalog = .{ .a = gpa, .deadline = .none };
+    defer restrictions.deinit();
     while (try relations.next()) |item| {
         var relation = item;
         try visitTags(relation.tags);
         _ = try routing.build.admin_tags.transform(relation.tags, .none);
+        try restrictions.add(relation);
         while (try relation.members.next()) |_| {}
     }
+    for (restrictions.entries.items) |row| _ = try row.kind();
 }
 
 fn osmPrimitiveSeed(buffer: []u8) ![]const u8 {
     const pbf = routing.build.pbf.schema;
     const none = protobuf.no_deadline;
-    var raw: [256]u8 = undefined;
+    var raw: [512]u8 = undefined;
     const data = try pbf.PrimitiveBlock.encode(&raw, .{
-        .stringtable = .{ .s = &.{ "", "name", "A", "highway", "residential", "maxspeed", "30 mph", "name:en", "Avenue" } },
+        .stringtable = .{ .s = &.{
+            "",     "name",        "A",            "highway", "residential", "maxspeed", "30 mph", "name:en", "Avenue",
+            "type", "restriction", "no_left_turn", "from",    "via",         "to",
+        } },
         .primitivegroup = &.{
             .{ .dense = .{ .id = &.{1}, .lat = &.{-2}, .lon = &.{3}, .keys_vals = &.{ 1, 2, 0 } } },
             .{ .nodes = &.{.{ .id = 2, .lat = 0, .lon = 0 }} },
             .{ .ways = &.{.{ .id = 3, .refs = &.{ 2, -1 }, .keys = &.{ 1, 3, 5, 7 }, .vals = &.{ 2, 4, 6, 8 } }} },
-            .{ .relations = &.{.{ .id = 4, .roles_sid = &.{2}, .memids = &.{3}, .types = &.{1} }} },
+            .{ .relations = &.{.{
+                .id = 4,
+                .keys = &.{ 9, 10 },
+                .vals = &.{ 10, 11 },
+                .roles_sid = &.{ 12, 13, 14 },
+                .memids = &.{ 3, -1, 3 },
+                .types = &.{ 1, 0, 1 },
+            }} },
         },
     }, none);
     const blob: pbf.Blob.Values = .{ .raw = data };
@@ -571,7 +585,7 @@ test "fuzz osm-pbf" {
     const raw = "\x00\x00\x00\x0b\x0a\x07OSMData\x18\x06\x0a\x04\x0a\x02\x0a\x00";
     const zlib = "\x00\x00\x00\x0b\x0a\x07OSMData\x18\x10\x1a\x0cx\x9c\xe3b\xe2b\x00\x00\x00F\x00\x17\x10\x04";
     const lz4_blob = "\x00\x00\x00\x0b\x0a\x07OSMData\x18\x09\x32\x05\x40\x0a\x02\x0a\x00\x10\x04";
-    var primitive_frame: [256]u8 = undefined;
+    var primitive_frame: [512]u8 = undefined;
     const framed_primitives = try osmPrimitiveSeed(&primitive_frame);
     const primitive_file = try std.mem.concat(state.allocator(), u8, &.{ header, framed_primitives });
     var ctx: PbfStreamFuzz = .{ .file = try routing.infra.io.File.temporary(".") };
@@ -604,7 +618,7 @@ test "fuzz osm-primitives" {
     defer state.deinit();
     const a = state.allocator();
     const header = "\x00\x00\x00\x0d\x0a\x09OSMHeader\x18\x12\x0a\x10\x22\x0eOsmSchema-V0.6";
-    var frame: [256]u8 = undefined;
+    var frame: [512]u8 = undefined;
     const sample = try std.mem.concat(a, u8, &.{ header, try osmPrimitiveSeed(&frame) });
     try std.testing.fuzz({}, fuzzOsmPrimitives, .{ .corpus = try seeds(a, &.{
         "", try unpackSeed(a, sample), try unpackSeed(a, pbf_fixtures[0]), try unpackSeed(a, pbf_fixtures[1]),

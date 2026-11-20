@@ -9,6 +9,7 @@ const timezone = @import("timezone.zig");
 const cold = @import("cold.zig");
 const spatial = @import("spatial.zig");
 const turn_sides = @import("turn_sides.zig");
+const restrictions = @import("turn_restrictions.zig");
 const Kind = format.SectionKind;
 const Header = format.SectionHeader;
 const kinds = std.enums.values(Kind);
@@ -151,6 +152,7 @@ pub const View = struct {
     node_timezones: ?[]const timezone.Id = null,
     timezone_rules: ?[]const u8 = null,
     tz_rules: ?timezone.Rules = null,
+    turn_restrictions: ?[]const restrictions.Entry = null,
 
     pub fn parse(files: Files, diagnostic: ?*Diagnostic) !View {
         var headers: Headers = .initFill(null);
@@ -421,6 +423,11 @@ pub const View = struct {
         return index.at(@backingInt(id), degree, from, to);
     }
 
+    pub fn turnRestrictionModes(self: *const View, incoming: format.EdgeId, outgoing: format.EdgeId) u16 {
+        const entries = self.turn_restrictions orelse return 0;
+        return restrictions.modes(entries, @backingInt(incoming), @backingInt(outgoing));
+    }
+
     pub fn coldRecord(self: *const View, id: format.EdgeId) !cold.Record {
         _ = try self.edge(id);
         const table = self.cold_data orelse return error.MissingColdData;
@@ -457,7 +464,7 @@ pub const View = struct {
             note(diagnostic, kind);
             if (deadline.expired()) return error.DeadlineExceeded;
             const bytes: []const u8 = switch (kind) {
-                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata, .components, .turn_sides, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
+                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata, .components, .turn_sides, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules, .turn_restrictions => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
                 inline else => |section| std.mem.sliceAsBytes(@field(self, @tagName(section))),
             };
             var hash = std.hash.XxHash3.init(0);
@@ -486,6 +493,21 @@ pub const View = struct {
             for (self.node_timezones.?, 0..) |id, i| {
                 if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
                 if (id != timezone.unknown and try rules.name(id) == null) return error.InvalidNodeTimezone;
+            }
+        }
+        if (self.turn_restrictions) |entries| {
+            note(diagnostic, .turn_restrictions);
+            var previous: ?u64 = null;
+            for (entries, 0..) |entry, i| {
+                if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
+                const key = entry.key();
+                if (entry.incoming >= self.edges.len or entry.outgoing >= self.edges.len or
+                    entry.attr.modes == 0 or entry.attr.modes & 0xf800 != 0 or entry.attr.reserved != 0 or
+                    (previous != null and key <= previous.?))
+                    return error.InvalidTurnRestrictions;
+                const via = try self.node(@fromBackingInt(self.edges[entry.incoming].head));
+                if (!via.attr.has_turn_restrictions) return error.InvalidTurnRestrictions;
+                previous = key;
             }
         }
         note(diagnostic, null);

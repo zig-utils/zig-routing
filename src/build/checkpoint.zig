@@ -118,6 +118,10 @@ pub const Artifact = enum {
     bundle_node_admins,
     bundle_node_timezones,
     bundle_timezone_rules,
+    simple_turn_relations,
+    simple_turn_stats,
+    mode_turns,
+    bundle_turn_restrictions,
 
     fn filename(self: Artifact) [:0]const u8 {
         return switch (self) {
