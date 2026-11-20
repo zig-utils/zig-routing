@@ -553,7 +553,8 @@
     "out_of_scope": ["Request parsing and GeoJSON output (P7.08).", "GeoTIFF output (later, note in P7.08)."],
     "notes": [
       "Upstream comment: the isogrid update is not the bottleneck, the graph expansion is (docs/upstream/valhalla-perf-issues.md, theme c).",
-      "Contouring comes from P1.06."
+      "Contouring comes from P1.06.",
+      "Matched edge reach validation requires P3.34a to preserve the oracle's restriction records in the imported graph."
     ],
     "accept": [
       "Upstream isochrone unit tests ported and green.",

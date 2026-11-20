@@ -675,6 +675,26 @@
     ]
   },
   {
+    "key": "P3.34a",
+    "goal": "The test importer preserves the turn and access restrictions needed to compare settled edges against Valhalla on the same graph.",
+    "upstream": ["valhalla/baldr/graphtile.h", "src/baldr/graphtile.cc", "valhalla/baldr/complexrestriction.h", "valhalla/baldr/accessrestriction.h", "valhalla/sif/dynamiccost.h"],
+    "scope": [
+      "Decode forward and reverse complex turn restriction records, per-edge access restrictions and conditional data with bounds checks.",
+      "Map the local and cross-tile graph IDs into the native turn restriction tables, automaton, conditions and cold access records. Reuse the production builders and search policy.",
+      "Preserve directional and mode masks, rule sequences, time conditions and probability fields represented by the native graph.",
+      "Replay the Utrecht divergence from #164 and add fixtures with allowed and barred approaches to the same edge."
+    ],
+    "notes": [
+      "In Utrecht built without hierarchy or shortcuts, the 9.1-minute auto expansion at 52.078937, 5.115321 follows the tile-local 22355 to 22352 movement in the native import. Valhalla's DynamicCost::Restricted rejects the predecessor chain. The first downstream mismatch at edge 22394 is about 21 seconds."
+    ],
+    "accept": [
+      "The previously accepted Utrecht predecessor chain is rejected in both engines.",
+      "Forward and reverse native search match the pinned oracle for the imported multi-via, conditional and access fixtures.",
+      "New tile sections have fuzz seeds and malformed or truncated records return an error.",
+      "The full suite passes and imports are deterministic for directory, tar and reordered inputs."
+    ]
+  },
+  {
     "key": "P3.35",
     "goal": "The costing parity harness for gate A: compare our edge and transition costs call by call with Valhalla's, so a wrong formula is caught before any route is compared.",
     "upstream": ["src/sif/pedestriancost.cc", "src/sif/bicyclecost.cc", "src/sif/dynamiccost.cc", "src/sif/recost.cc"],

@@ -87,6 +87,7 @@ P3.31 | Search: multi-location routes with break, through, via and break_through
 P3.32 | Path to legs: shape assembly, summaries, elapsed time by recost | search | port | M | P3.30 P3.17
 P3.33 | /route serializer for directions_type none: units, shape formats, ids | api | port | M | P3.32 P1.13
 P3.34 | zr import-valhalla: test-only reader of Valhalla tiles into our format | cli | test | L | P3.12 P3.14
+P3.34a | Preserve complex turn and access restrictions in the Valhalla test importer | cli | port | L | P3.34 P5.09 P5.10 P5.20a
 P3.35 | Costing parity harness (gate A): per-call edge and transition cost against the oracle | costing | test | M | P3.27 P3.28 P0.04
 P3.36 | Experiment E1: label throughput of the search core on Germany | search | experiment | S | P3.29 P3.22 P0.12 P0.13
 P3.37 | Zero steady-state allocation tests for /height and /route | infra | perf | S | P3.33
@@ -179,7 +180,7 @@ P7.03 | /sources_to_targets API and serializers (verbose, shapes, date_time, pbf
 P7.04 | Experiment E6: urban 50x50 and regional 200x200 matrices on v1 | search | experiment | S | P7.03
 P7.05 | Matrix v2: turn-aware multilevel overlay on the separator tree, customised per metric | accel | new | L | P7.04 P4.05
 P7.06 | Matrix v2 queries: one-to-many sweeps, many-to-many, memory budget | search | new | L | P7.05
-P7.07 | Isochrone expansion into the grid with multiple time and distance contours | search | port | M | P7.01 P1.06
+P7.07 | Isochrone expansion into the grid with multiple time and distance contours | search | port | M | P7.01 P1.06 P3.34a
 P7.08 | /isochrone API: polygons, lines, denoise, generalize, reverse, GeoJSON | api | port | M | P7.07
 P7.09 | /expansion endpoint | api | port | S | P7.01
 P7.10 | /centroid | search | port | M | P7.01
