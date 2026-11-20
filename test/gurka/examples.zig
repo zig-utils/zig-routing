@@ -152,6 +152,63 @@ pub fn adminBoundaries(arena: Allocator) !gurka.Map {
     });
 }
 
+// The Dutch cycleways from test/countryaccess.cc (Valhalla 3.9.3)
+// run alongside Belgian and border-crossing trunks in this graph.
+pub fn countryAccess(arena: Allocator) !gurka.Map {
+    var fixture = try adminBoundaries(arena);
+    const ways = try arena.alloc(gurka.OsmWay, fixture.osm.ways.len + 1);
+    @memcpy(ways[0..fixture.osm.ways.len], fixture.osm.ways);
+    const eql = std.mem.eql;
+    for (ways[0..fixture.osm.ways.len]) |*way| {
+        if (eql(u8, way.label, "QR")) way.tags = &.{
+            .{ .key = "highway", .value = "cycleway" },
+            .{ .key = "moped", .value = "designated" },
+        };
+        if (eql(u8, way.label, "ST")) way.tags = &.{
+            .{ .key = "highway", .value = "trunk" },
+            .{ .key = "foot", .value = "yes" },
+            .{ .key = "moped", .value = "no" },
+        };
+        if (eql(u8, way.label, "UV")) way.tags = &.{
+            .{ .key = "highway", .value = "cycleway" },
+            .{ .key = "oneway", .value = "yes" },
+            .{ .key = "moped", .value = "designated" },
+        };
+        if (eql(u8, way.label, "WX")) way.tags = &.{
+            .{ .key = "highway", .value = "primary" },
+            .{ .key = "motorroad", .value = "yes" },
+        };
+    }
+    ways[ways.len - 1] = .{
+        .id = ways[ways.len - 2].id + 1,
+        .label = "RS",
+        .refs = try arena.dupe(i64, &.{ fixture.findNode("R").?.id, fixture.findNode("S").?.id }),
+        .tags = &.{.{ .key = "highway", .value = "trunk" }},
+    };
+    fixture.osm.ways = ways;
+    const relations = try arena.dupe(gurka.OsmRelation, fixture.osm.relations);
+    for (relations) |*relation| {
+        const name = gurka.tagValue(relation.tags, "name").?;
+        if (eql(u8, name, "United Kingdom")) relation.tags = &.{
+            .{ .key = "type", .value = "boundary" },
+            .{ .key = "boundary", .value = "administrative" },
+            .{ .key = "admin_level", .value = "2" },
+            .{ .key = "name", .value = "Nederland" },
+            .{ .key = "name:en", .value = "Netherlands" },
+            .{ .key = "ISO3166-1:alpha2", .value = "NL" },
+        };
+        if (eql(u8, name, "Testshire")) relation.tags = &.{
+            .{ .key = "type", .value = "boundary" },
+            .{ .key = "boundary", .value = "administrative" },
+            .{ .key = "admin_level", .value = "4" },
+            .{ .key = "name", .value = "Testshire" },
+            .{ .key = "ISO3166-2", .value = "NL-TST" },
+        };
+    }
+    fixture.osm.relations = relations;
+    return fixture;
+}
+
 test "fixture resolves labels, names and relation references" {
     var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer state.deinit();

@@ -22,6 +22,7 @@ pub const Config = struct {
         data_processing: struct {
             infer_turn_channels: ?bool = null,
             infer_internal_intersections: ?bool = null,
+            apply_country_overrides: ?bool = null,
         } = .{},
     };
 

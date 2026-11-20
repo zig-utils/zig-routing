@@ -129,7 +129,7 @@ P5.01 | Enhance (full): port of graphenhancer.cc (speed assignment, density, tur
 P5.02 | Link reclassification and name consistency (linkclassification.cc) | build | port | M | P5.01
 P5.03 | Tag transform: truck attributes, hazmat, tolls, HOV, motorcycle and moped tags | build | port | M | P3.07 P3.08
 P5.04 | Admins: boundary relations to polygons, packed polygon index, admin lookup | build | new | L | P1.05 P3.02
-P5.05 | Country access defaults and driving side (countryaccess.cc) | build | port | M | P5.04 P3.07
+P5.05 | Country access defaults and driving side (countryaccess.cc) | build | port | M | P5.04 P3.07 P5.02
 P5.06 | Timezones: polygon ingest, index and IANA rules with correct DST | graph | new | L | P1.05
 P5.07 | Date and time: port of baldr datetime (date_time types, seconds of week, TimeInfo) | graph | port | M | P5.06
 P5.08 | Simple turn restrictions in the build and turn entries | build | port | M | P3.16

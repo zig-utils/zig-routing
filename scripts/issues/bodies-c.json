@@ -762,7 +762,7 @@
       "Admin polygon construction (P5.04)."
     ],
     "notes": [
-      "This changes access masks, so it must run before the edge class table is finalised."
+      "Apply country access after link reclassification and before the edge class table is finalised. The motorroad fallback depends on the reclassified road class."
     ],
     "accept": [
       "Upstream country access tests (unit and gurka) ported and green.",

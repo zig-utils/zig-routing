@@ -19,6 +19,7 @@ pub const order = @import("order.zig");
 pub const tags = @import("tags/root.zig");
 pub const admin_boundaries = @import("admin_boundaries.zig");
 pub const admin_tags = @import("admin_tags.zig");
+pub const country_access = @import("country_access.zig");
 
 test {
     std.testing.refAllDecls(@This());

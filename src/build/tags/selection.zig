@@ -83,13 +83,6 @@ const Flags = struct {
 };
 
 pub const Selection = struct {
-    pub const Explicit = struct {
-        auto: bool,
-        truck: bool,
-        pedestrian: bool,
-        bicycle: bool,
-    };
-
     road_class: attr.RoadClass,
     forward: attr.AccessMask,
     backward: attr.AccessMask,
@@ -102,7 +95,8 @@ pub const Selection = struct {
     bicycle_only: bool,
     other_modes_denied: bool,
     forward_pedestrian_denied: bool,
-    explicit: Explicit,
+    explicit: attr.AccessMask,
+    motorroad: bool,
 };
 
 fn any(tags: *const Scratch, kind: defaults.Boolean, key: Key, deadline: io.Deadline) !?bool {
@@ -173,11 +167,12 @@ pub fn select(tags: *const Scratch, deadline: io.Deadline) !?Selection {
     const is_emergency = access == .emergency or emergency == .yes or service == .emergency_access;
     const has_highway = tags.get(.highway) != null;
 
-    var explicit: Selection.Explicit = .{
+    var explicit: attr.AccessMask = .{
         .auto = tags.get(.auto_tag) != null,
         .truck = tags.get(.truck_tag) != null,
         .pedestrian = tags.get(.foot_tag) != null,
         .bicycle = tags.get(.bike_tag) != null,
+        .hov = true,
     };
     var forward: Flags = .{ .emergency = Flag.fromBool((has_highway or ferry or rail) and is_emergency) };
     var backward: Flags = .{};
@@ -217,26 +212,34 @@ pub fn select(tags: *const Scratch, deadline: io.Deadline) !?Selection {
             defaults.single(.bicycle, tags.id(.cyclestreet)) orelse vehicle;
         const auto = try any(tags, .motor_vehicle, .motorcar, deadline) orelse motor;
         const foot = try any(tags, .foot, .foot, deadline) orelse defaults.single(.foot, tags.id(.pedestrian));
+        const bus = try any(tags, .bus_taxi, .bus, deadline) orelse psv orelse motor;
+        const taxi = try any(tags, .bus_taxi, .taxi, deadline) orelse psv orelse motor;
+        const moped = try any(tags, .moped, .moped, deadline) orelse try any(tags, .moped, .mofa, deadline) orelse motor;
+        const motorcycle = try any(tags, .motor_vehicle, .motorcycle, deadline) orelse motor;
         explicit = .{
             .auto = auto != null,
             .truck = (truck orelse motor) != null,
             .pedestrian = foot != null,
             .bicycle = bike != null or (is_ferry_access and tags.id(.sac_scale) == .hiking),
+            .hov = true,
+            .bus = bus != null or access == .psv,
+            .taxi = taxi != null or access == .psv,
+            .moped = moped != null,
+            .motorcycle = motorcycle != null,
         };
         forward.auto = inherited(auto, forward.auto);
         forward.truck = if (is_ferry_access and truck == null)
             Flag.raw(tags, .truck_forward).ifUnset(inherited(motor, forward.truck))
         else
             inherited(truck orelse motor, forward.truck);
-        forward.bus = inherited(try any(tags, .bus_taxi, .bus, deadline) orelse psv orelse motor, forward.bus);
-        forward.taxi = inherited(try any(tags, .bus_taxi, .taxi, deadline) orelse psv orelse motor, forward.taxi);
+        forward.bus = inherited(bus, forward.bus);
+        forward.taxi = inherited(taxi, forward.taxi);
         forward.pedestrian = inherited(foot, forward.pedestrian);
         forward.bicycle = inherited(bike, forward.bicycle);
         if (bike == null and is_ferry_access and tags.get(.sac_scale) != null)
             forward.bicycle = Flag.fromBool(tags.id(.sac_scale) == .hiking);
-        forward.moped = inherited(try any(tags, .moped, .moped, deadline) orelse
-            try any(tags, .moped, .mofa, deadline) orelse motor, forward.moped);
-        forward.motorcycle = inherited(try any(tags, .motor_vehicle, .motorcycle, deadline) orelse motor, forward.motorcycle);
+        forward.moped = inherited(moped, forward.moped);
+        forward.motorcycle = inherited(motorcycle, forward.motorcycle);
         if (access == .psv) {
             forward.bus = .allow;
             forward.taxi = .allow;
@@ -387,5 +390,6 @@ pub fn select(tags: *const Scratch, deadline: io.Deadline) !?Selection {
         .other_modes_denied = forward.otherModesDenied() and backward.otherModesDenied(),
         .forward_pedestrian_denied = forward.pedestrian == .deny,
         .explicit = explicit,
+        .motorroad = tags.id(.motorroad) == .yes and (known != null or ferry or rail),
     };
 }

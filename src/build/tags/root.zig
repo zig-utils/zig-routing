@@ -28,6 +28,7 @@ pub fn transformWay(scratch: *Scratch, tags: anytype, deadline: io.Deadline) !?W
         .road_class = selected.road_class,
         .forward_access = selected.forward,
         .backward_access = selected.backward,
+        .access_tags = selected.explicit,
         .bicycle = try bike_foot.readMountainBike(scratch, deadline),
         .flags = .{
             .oneway = selected.oneway,
@@ -37,6 +38,7 @@ pub fn transformWay(scratch: *Scratch, tags: anytype, deadline: io.Deadline) !?W
             .rail = selected.rail,
             .pedestrian_area = selected.pedestrian_area,
             .toll = isToll(scratch.text(.toll) orelse ""),
+            .motorroad = selected.motorroad,
         },
         .layer = @truncate(if (scratch.text(.layer)) |layer| std.fmt.parseInt(i32, layer, 10) catch 0 else @as(i32, 0)),
         .level = scratch.text(.level),

@@ -56,6 +56,7 @@ pub const WayAttrs = struct {
     surface: attr.Surface = .paved,
     forward_access: attr.AccessMask = .{},
     backward_access: attr.AccessMask = .{},
+    access_tags: attr.AccessMask = .{},
     speed: u8 = 0,
     speed_limit: u8 = 0,
     forward_speed: u8 = 0,
@@ -132,7 +133,7 @@ pub const WayAttrs = struct {
         toll: bool = false,
         truck_route: bool = false,
         hov3: bool = false,
-        reserved: u1 = 0,
+        motorroad: bool = false,
     };
 };
 

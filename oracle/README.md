@@ -178,6 +178,48 @@ Utrecht's state relation has a missing member in the pinned extract. The Gurka
 fixture exercises a complete state, a separate island, an enclave occupying a
 country's hole, and an unclosed boundary.
 
+### Country access parity
+
+Build the Valhalla reference through `enhance`, then run its `validate` stage on
+those local tiles to set border flags. Keeping the local graph makes it possible
+to compare trunks, cycleways and their opposing directions together.
+
+```bash
+valhalla_build_tiles -c valhalla.json --end enhance input.osm.pbf
+valhalla_build_tiles -c valhalla.json --start validate --end validate input.osm.pbf
+zig-out/bin/zr import-valhalla --output reference-bundle valhalla-tile-dir/2
+python3 oracle/compare-access.py native-bundle reference-bundle
+```
+
+Generate the two-country input with `zig build gurka-pbf -- input.osm.pbf country-access`.
+Use the same input for both builders. For the original Amsterdam test, Valhalla's
+configuration points to the `netherlands_admin.sqlite` from the pinned checkout.
+Generate the equivalent OSM boundary input from that test database and pass it
+alongside `test/data/amsterdam.osm.pbf` to the native builder.
+
+```bash
+python3 oracle/dutch-admin-fixture.py valhalla-3.9.3/test/data/netherlands_admin.sqlite netherlands.osm.pbf
+zig-out/bin/zr build --output native-bundle valhalla-3.9.3/test/data/amsterdam.osm.pbf netherlands.osm.pbf
+```
+
+The comparator pairs edges by OSM way ID and ordered shape. It accepts a unique
+shape match within one E6 unit per axis. It compares the forward and reverse
+masks, country-crossing flag and source node's driving side exactly.
+
+| Input | Matching directed edges | Paired with E6 tolerance | Differences |
+| --- | ---: | ---: | ---: |
+| Netherlands-Belgium Gurka fixture | 10 | 0 | 0 |
+| Pinned Amsterdam fixture | 178 | 42 | 0 |
+| Liechtenstein | 15,760 | 4,546 | 0 |
+
+The pinned Utrecht extract has 85,336 paired edges and no assigned admins.
+The native builder uses the configured driving side for unassigned nodes.
+Valhalla 3.9.3 with its admin database enabled uses left for those nodes.
+On this extract, 85,266 pairs agree on both access masks. The other 70 are
+motorroads that Valhalla downgrades below primary during link reclassification
+before it applies country rules. All 85,336 pairs agree on access when both
+builders disable country overrides. Link reclassification is tracked in #118.
+
 The fixtures derive from OpenStreetMap data © OpenStreetMap contributors, under the
 [Open Database License](https://www.openstreetmap.org/copyright).
 

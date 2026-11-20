@@ -828,6 +828,48 @@ fn directedBetween(view: *const graph.reader.View, fixture: *const gurka.Map, fi
     return error.TestEdgeNotFound;
 }
 
+test "country defaults apply within borders and preserve explicitly tagged modes" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const fixture = try @import("examples.zig").countryAccess(arena.allocator());
+    var built = try Built.assembleWithOptions(fixture.osm, .{ .scratch_dir = "", .workers = 2, .drive_side = .left });
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const qr = try directedBetween(view, &fixture, "Q", "R");
+    const uv = try directedBetween(view, &fixture, "U", "V");
+    const st = try directedBetween(view, &fixture, "S", "T");
+    const rs = try directedBetween(view, &fixture, "R", "S");
+    const wx = try directedBetween(view, &fixture, "W", "X");
+    const cycleway = try view.class((try view.edge(qr)).cls.class_id);
+    try testing.expectEqual(774, cycleway.access.forward);
+    try testing.expectEqual(774, cycleway.access.reverse);
+    const oneway = try view.class((try view.edge(uv)).cls.class_id);
+    try testing.expectEqual(774, oneway.access.forward);
+    try testing.expectEqual(258, oneway.access.reverse);
+
+    const trunk = try view.class((try view.edge(st)).cls.class_id);
+    const trunk_access: graph.constants.AccessMask = @bitCast(trunk.access.forward);
+    try testing.expect(trunk_access.pedestrian and trunk_access.wheelchair and !trunk_access.bicycle and !trunk_access.moped);
+    try testing.expect(!trunk.flags.country_crossing);
+    const crossing = try view.class((try view.edge(rs)).cls.class_id);
+    const opposing = try view.class((try view.edge(try view.oppEdge(rs))).cls.class_id);
+    const crossing_access: graph.constants.AccessMask = @bitCast(crossing.access.forward);
+    try testing.expect(crossing.flags.country_crossing and opposing.flags.country_crossing and crossing_access.bicycle);
+    const motorroad = try view.class((try view.edge(wx)).cls.class_id);
+    const motorroad_access: graph.constants.AccessMask = @bitCast(motorroad.access.forward);
+    try testing.expect(!motorroad_access.pedestrian and !motorroad_access.bicycle and !motorroad_access.moped);
+    const q = try at(view, fixture.findNode("Q").?.location.toFixed());
+    try testing.expect(!(try view.node(q)).attr.drive_on_left);
+
+    var disabled = try Built.assembleWithOptions(fixture.osm, .{ .scratch_dir = "", .apply_country_overrides = false });
+    defer disabled.deinit();
+    const other = &disabled.bundle.view;
+    const other_cycleway = try other.class((try other.edge(try directedBetween(other, &fixture, "Q", "R"))).cls.class_id);
+    try testing.expectEqual(516, other_cycleway.access.forward);
+    const other_border = try other.class((try other.edge(try directedBetween(other, &fixture, "R", "S"))).cls.class_id);
+    try testing.expect(other_border.flags.country_crossing);
+}
+
 test "assembled admin assignments follow stitched boundaries, holes and islands" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();

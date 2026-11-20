@@ -21,6 +21,7 @@ const components = @import("components.zig");
 const checkpoint = @import("checkpoint.zig");
 const node_order = @import("order.zig");
 const admin_index = @import("admin_index.zig");
+const country_access = @import("country_access.zig");
 
 const Allocator = std.mem.Allocator;
 const max_degree = turns.max_degree;
@@ -47,6 +48,7 @@ pub const Options = struct {
     admin_drive_side: ?enhance.AdminDriveSide = null,
     admin_speed_region: ?AdminSpeedRegion = null,
     admin_index: ?graph.admin.View = null,
+    apply_country_overrides: bool = true,
     exit_signs: ?ExitSigns = null,
     speed_rules: ?*const speeds.Config = null,
     infer_turn_channels: bool = true,
@@ -111,12 +113,16 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     defer topology.deinit(gpa);
     var admin_ids = try assignAdmins(topology.coordinates, options);
     defer if (admin_ids) |*ids| ids.deinit();
+    const country_table = try country_access.compile(gpa, options.admin_index, options.deadline);
+    defer gpa.free(country_table);
     const shared: Shared = .{
         .topology = &topology,
         .segments = segments,
         .shape_points = shape_points,
         .ways = &metadata.ways,
         .admin_ids = if (admin_ids) |ids| ids.data else null,
+        .countries = country_table,
+        .apply_country_overrides = options.apply_country_overrides,
         .deadline = options.deadline,
     };
     var table = blk: {
@@ -136,7 +142,7 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     const turn_sides = try buildTurns(&shared, table.classes, metadata.name_ids.items, &turn_pool, gpa);
     defer gpa.free(turn_sides);
 
-    try writeTopology(writer, options.scratch_dir, topology, table.classes, turn_pool.bytes.items, if (terrain) |present| present.slopes.data else null);
+    try writeTopology(writer, options.scratch_dir, &topology, table.classes, turn_pool.bytes.items, if (terrain) |present| present.slopes.data else null);
     try writer.write(.turn_sides, turn_sides);
     try writeAdmins(writer, options.admin_index, shared.admin_ids);
     const topology_ns = timer.read();
@@ -212,17 +218,21 @@ pub fn buildStaged(
         try Topology.load(gpa, session, options);
     defer topology.deinit(gpa);
     if (topology.placements.data.len != 2 * segments.len) return error.InvalidCheckpoint;
-    var admin_ids = if (session.runs(.enhance) or session.runs(.cold))
+    var admin_ids = if (session.runs(.assemble) or session.runs(.enhance) or session.runs(.cold))
         try assignAdmins(topology.coordinates, options)
     else
         null;
     defer if (admin_ids) |*ids| ids.deinit();
+    const country_table = if (session.runs(.assemble)) try country_access.compile(gpa, options.admin_index, options.deadline) else &.{};
+    defer gpa.free(country_table);
     const shared: Shared = .{
         .topology = &topology,
         .segments = segments,
         .shape_points = points,
         .ways = &metadata.ways,
         .admin_ids = if (admin_ids) |ids| ids.data else null,
+        .countries = country_table,
+        .apply_country_overrides = options.apply_country_overrides,
         .deadline = options.deadline,
     };
     var edge_classes: ?[]const classes.EdgeClass = null;
@@ -235,7 +245,7 @@ pub fn buildStaged(
         edge_classes = table.classes;
         try validate(topology.first_edge, topology.output.data, topology.coordinates, table.classes, options.deadline);
         try topology.savePlacement(&tx);
-        try saveAttributes(topology, table.classes, &tx);
+        try saveAttributes(&topology, table.classes, &tx);
         try session.commit(&tx, topology.output.data.len, assembly_start);
     }
     if (session.endsAt(.assemble)) return;
@@ -255,7 +265,7 @@ pub fn buildStaged(
         gpa.free(enhanced.remap);
         gpa.free(edge_classes.?);
         edge_classes = enhanced.classes;
-        try saveAttributes(topology, enhanced.classes, &tx);
+        try saveAttributes(&topology, enhanced.classes, &tx);
         try session.commit(&tx, topology.output.data.len, start);
     }
     if (session.endsAt(.enhance)) return;
@@ -294,42 +304,7 @@ pub fn buildStaged(
     }
     if (session.endsAt(.turns)) return;
 
-    if (session.runs(.cold)) {
-        const start = io.Timer.start();
-        var tx = try session.begin(.cold);
-        defer tx.deinit();
-        var writer = try stageWriter(session.*, tx);
-        defer writer.deinit();
-        const saved_turns = try session.open(.turns);
-        defer saved_turns.close();
-        const turn_data = try saved_turns.map(.turn_pool, options.deadline);
-        defer turn_data.unmap();
-        const saved_terrain = try session.open(.elevation);
-        defer saved_terrain.close();
-        const coverage = try saved_terrain.readJson(elevation.Coverage, gpa, .terrain_stats, options.deadline);
-        defer coverage.deinit();
-        const means_map = if (coverage.value.dem_configured) try saved_terrain.map(.means, options.deadline) else null;
-        defer if (means_map) |mapped| mapped.unmap();
-        const slopes_map = if (coverage.value.dem_configured) try saved_terrain.map(.slopes, options.deadline) else null;
-        defer if (slopes_map) |mapped| mapped.unmap();
-        const means = if (means_map) |mapped| try checkpoint.array(i16, mapped) else &.{};
-        if (means.len != 0 and means.len != segments.len) return error.InvalidCheckpoint;
-        try writeTopology(&writer, options.scratch_dir, topology, edge_classes.?, turn_data.bytes, if (slopes_map) |mapped| try checkpoint.array(u16, mapped) else null);
-        try writeAdmins(&writer, options.admin_index, shared.admin_ids);
-        if (saved_turns.manifest.files.get(.turn_sides) != null) {
-            const side_data = try saved_turns.map(.turn_sides, options.deadline);
-            defer side_data.unmap();
-            try writer.write(.turn_sides, try checkpoint.array(u32, side_data));
-        }
-        const cold_bytes = try buildCold(gpa, &shared, metadata, &writer, options.scratch_dir, means);
-        try tx.writeJson(gpa, cold_bytes, .source_stats);
-        try writer.write(.metadata, &.{.{
-            .ordering_kind = @backingInt(options.ordering.kind),
-            .order_hash = plan.order_hash,
-        }});
-        try tx.saveSections(&writer);
-        try session.commit(&tx, topology.output.data.len / 2, start);
-    }
+    if (session.runs(.cold)) try saveColdStage(session, &shared, metadata, edge_classes.?, &options, plan.order_hash);
     if (session.endsAt(.cold)) return;
 
     if (session.runs(.spatial)) {
@@ -345,13 +320,53 @@ pub fn buildStaged(
     }
 }
 
-fn saveAttributes(topology: Topology, edge_classes: []const classes.EdgeClass, tx: *checkpoint.Transaction) !void {
+// Each section is copied into the stage's own transaction before publishing it.
+noinline fn saveColdStage(session: *checkpoint.Session, shared: *const Shared, metadata: *const Metadata, edge_classes: []const classes.EdgeClass, options: *const Options, order_hash: u64) !void {
+    const gpa = session.gpa;
+    const start = io.Timer.start();
+    var tx = try session.begin(.cold);
+    defer tx.deinit();
+    var writer = try stageWriter(session.*, tx);
+    defer writer.deinit();
+    const saved_turns = try session.open(.turns);
+    defer saved_turns.close();
+    const turn_data = try saved_turns.map(.turn_pool, options.deadline);
+    defer turn_data.unmap();
+    const saved_terrain = try session.open(.elevation);
+    defer saved_terrain.close();
+    const coverage = try saved_terrain.readJson(elevation.Coverage, gpa, .terrain_stats, options.deadline);
+    defer coverage.deinit();
+    const means_map = if (coverage.value.dem_configured) try saved_terrain.map(.means, options.deadline) else null;
+    defer if (means_map) |mapped| mapped.unmap();
+    const slopes_map = if (coverage.value.dem_configured) try saved_terrain.map(.slopes, options.deadline) else null;
+    defer if (slopes_map) |mapped| mapped.unmap();
+    const means = if (means_map) |mapped| try checkpoint.array(i16, mapped) else &.{};
+    if (means.len != 0 and means.len != shared.segments.len) return error.InvalidCheckpoint;
+    const slopes = if (slopes_map) |mapped| try checkpoint.array(u16, mapped) else null;
+    try writeTopology(&writer, options.scratch_dir, shared.topology, edge_classes, turn_data.bytes, slopes);
+    try writeAdmins(&writer, options.admin_index, shared.admin_ids);
+    if (saved_turns.manifest.files.get(.turn_sides) != null) {
+        const side_data = try saved_turns.map(.turn_sides, options.deadline);
+        defer side_data.unmap();
+        try writer.write(.turn_sides, try checkpoint.array(u32, side_data));
+    }
+    const cold_bytes = try buildCold(gpa, shared, metadata, &writer, options.scratch_dir, means);
+    try tx.writeJson(gpa, cold_bytes, .source_stats);
+    try writer.write(.metadata, &.{.{
+        .ordering_kind = @backingInt(options.ordering.kind),
+        .order_hash = order_hash,
+    }});
+    try tx.saveSections(&writer);
+    try session.commit(&tx, shared.topology.output.data.len / 2, start);
+}
+
+noinline fn saveAttributes(topology: *const Topology, edge_classes: []const classes.EdgeClass, tx: *checkpoint.Transaction) !void {
     try tx.writeArray(topology.nodes, .nodes);
     try tx.writeArray(topology.output.data, .directed_edges);
     try tx.writeArray(edge_classes, .classes);
 }
 
-fn writeTopology(writer: *format.BundleWriter, scratch_dir: []const u8, topology: Topology, edge_classes: []const classes.EdgeClass, turn_data: []const u8, slopes: ?[]const u16) !void {
+fn writeTopology(writer: *format.BundleWriter, scratch_dir: []const u8, topology: *const Topology, edge_classes: []const classes.EdgeClass, turn_data: []const u8, slopes: ?[]const u16) !void {
     try writer.write(.nodes, topology.nodes);
     try writer.write(.edges, topology.output.data);
     try writer.write(.first_edge, topology.first_edge);
@@ -390,7 +405,10 @@ const Way = extern struct {
         has_names: bool,
         layer: i8,
         ferry_duration: bool = false,
-        reserved: u18 = 0,
+        access_tags: u11 = 0,
+        motorroad: bool = false,
+        access_tags_known: bool = false,
+        reserved: u5 = 0,
     },
     level_start: u32,
     level_count: u32,
@@ -680,6 +698,9 @@ pub const Metadata = struct {
             .attr = .{
                 .oneway = attrs.flags.oneway,
                 .ferry_duration = attrs.ferry_speed != null,
+                .access_tags = @truncate(@as(u16, @bitCast(attrs.access_tags))),
+                .motorroad = attrs.flags.motorroad,
+                .access_tags_known = true,
                 .importance = @intCast(@backingInt(attrs.road_class)),
                 .has_names = name_start != name_end,
                 .layer = attrs.layer,
@@ -1057,7 +1078,13 @@ const Shared = struct {
     shape_points: []const geo.FixedLL,
     ways: *const Ways,
     admin_ids: ?[]const graph.admin.Id = null,
+    countries: []const country_access.Country = &.{},
+    apply_country_overrides: bool = true,
     deadline: io.Deadline,
+
+    fn country(self: *const Shared, node: u32) country_access.Country {
+        return if (self.admin_ids) |ids| self.countries[ids[node]] else .{};
+    }
 };
 
 const AdminJob = struct {
@@ -1131,6 +1158,7 @@ const Job = struct {
             try checkDeadline(shared.deadline, node - self.start);
             const first = topo.first_edge[node];
             const group = topo.groups[node];
+            const from_country = shared.country(@intCast(node));
             for (0..group.real_degree) |local| {
                 const slot = first + local;
                 const ref = topo.slot_refs.data[slot];
@@ -1140,6 +1168,16 @@ const Job = struct {
                 const direction = ref & 1;
                 var class = way.by_direction[direction];
                 edge_class.applySegmentControls(&class, segment.flags, direction == 0, way.attr.oneway);
+                const to_country = shared.country(opposite.node);
+                class.flags.country_crossing = from_country.iso != 0 and to_country.iso != 0 and from_country.iso != to_country.iso;
+                if (shared.apply_country_overrides and way.attr.access_tags_known and from_country.iso == to_country.iso and
+                    (from_country.rules != .none or way.attr.motorroad))
+                {
+                    const access_tags: graph.constants.AccessMask = @bitCast(@as(u16, way.attr.access_tags));
+                    const is_ferry = class.category.use == @backingInt(graph.constants.Use.ferry);
+                    const motorroad = way.attr.motorroad and (!is_ferry or way.attr.ferry_duration);
+                    country_access.apply(&class, from_country.rules, access_tags, motorroad);
+                }
                 const encoded_len = try encodeLength(segment.length_m);
                 const curvature = try computeCurvature(try segmentShape(shared.shape_points, segment), shared.deadline);
                 topo.output.data[slot] = .{

@@ -24,6 +24,7 @@ pub const Options = struct {
     default_speeds_config: ?[]const u8 = null,
     infer_turn_channels: ?bool = null,
     infer_internal_intersections: ?bool = null,
+    apply_country_overrides: ?bool = null,
     drive_side: ?@import("edge_class.zig").DriveSide = null,
     order: ?graph.format.OrderingKind = null,
     workers: usize = 0,
@@ -60,6 +61,7 @@ const Inputs = struct {
     speed_digest: ?[32]u8 = null,
     infer_turn_channels: bool = true,
     infer_internal_intersections: bool = true,
+    apply_country_overrides: bool = true,
     drive_side: @import("edge_class.zig").DriveSide,
     order: graph.format.OrderingKind,
 
@@ -83,6 +85,7 @@ const Inputs = struct {
         }
         if (!self.infer_turn_channels) hash.update("turn-channels-off");
         if (!self.infer_internal_intersections) hash.update("internal-intersections-off");
+        if (!self.apply_country_overrides) hash.update("country-overrides-off");
         for (self.sources) |source| {
             hash.update(std.mem.asBytes(&source.digest.bytes));
             hash.update(std.mem.asBytes(&source.digest.xxh3));
@@ -120,6 +123,7 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
         .dem_dir = options.dem_dir,
         .infer_turn_channels = options.infer_turn_channels orelse true,
         .infer_internal_intersections = options.infer_internal_intersections orelse true,
+        .apply_country_overrides = options.apply_country_overrides orelse true,
         .drive_side = options.drive_side orelse .right,
         .order = options.order orelse .hilbert,
     };
@@ -185,6 +189,7 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
         .speed_rules = if (speed_input) |*input| &input.rules else null,
         .infer_turn_channels = inputs.infer_turn_channels,
         .infer_internal_intersections = inputs.infer_internal_intersections,
+        .apply_country_overrides = inputs.apply_country_overrides,
     };
     if (session.runs(.read)) {
         var tx = try session.begin(.read);
@@ -286,6 +291,7 @@ fn checkOptions(a: Allocator, inputs: *Inputs, options: Options, diagnostic: *Di
     if (options.order) |order| if (order != inputs.order) return error.CheckpointInputMismatch;
     if (options.infer_turn_channels) |infer| if (infer != inputs.infer_turn_channels) return error.CheckpointInputMismatch;
     if (options.infer_internal_intersections) |infer| if (infer != inputs.infer_internal_intersections) return error.CheckpointInputMismatch;
+    if (options.apply_country_overrides) |apply| if (apply != inputs.apply_country_overrides) return error.CheckpointInputMismatch;
     if (options.dem_dir) |dir| {
         const saved = inputs.dem_dir orelse return error.CheckpointInputMismatch;
         if (inputs.dem_digest == null and !std.mem.eql(u8, dir, saved)) return error.CheckpointInputMismatch;
