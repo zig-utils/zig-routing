@@ -135,14 +135,22 @@ pub fn compileInto(comptime Model: type, options: Model.Canonical, classes: []co
     hash.update(std.mem.asBytes(&abi_version));
     const class_count: u32 = @intCast(classes.len);
     hash.update(std.mem.asBytes(&class_count));
-    for (classes, factors, 0..) |class, *out, i| {
-        if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
-        const value = canonicalFloat(try Model.classFactor(options, class));
-        if (std.math.isNan(value) or value < 0) return error.InvalidClassFactor;
-        out.* = value;
-        if (i % 1024 == 1023) hash.update(std.mem.sliceAsBytes(factors[i - 1023 .. i + 1]));
+    // Supply several complete subtrees per update, allowing Blake3 to
+    // compress chunks in parallel even after the eight-byte metric header.
+    const batch_size = 16 * 1024;
+    var start: usize = 0;
+    while (start < classes.len) {
+        const end = @min(start + batch_size, classes.len);
+        const output = factors[start..end];
+        for (classes[start..end], output, 0..) |class, *out, i| {
+            if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
+            const value = try Model.classFactor(options, class);
+            if (!(value >= 0)) return error.InvalidClassFactor;
+            out.* = canonicalFloat(value);
+        }
+        hash.update(std.mem.sliceAsBytes(output));
+        start = end;
     }
-    hash.update(std.mem.sliceAsBytes(factors[factors.len - factors.len % 1024 ..]));
     hash.update(std.mem.asBytes(&rules.seconds_per_metre));
     hash.update(std.mem.asBytes(&rules.turn));
     hash.update(std.mem.asBytes(&rules.floors.edge_factor));
@@ -455,4 +463,7 @@ test "compile cache canonicalizes options, keys equivalent tables and allocates 
     try testing.expectEqual(allocations, backing.allocations);
     try testing.expectEqual(resizes, backing.resize_index);
     try testing.expectError(error.DeadlineExceeded, cache.acquire(.{}, .{ .at_ns = 0 }));
+    for ([_]f32{ -1, std.math.nan(f32) }) |invalid| {
+        try testing.expectError(error.InvalidClassFactor, cache.acquire(.{ .value = .{ .class_scale = invalid } }, .none));
+    }
 }

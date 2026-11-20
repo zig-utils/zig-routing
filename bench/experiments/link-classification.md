@@ -52,3 +52,15 @@ The Linux x86_64 baseline release measured 19,454,328 bytes against the
 under the cap. In the local Utrecht height benchmark, serialization
 measured 38.7 ns per point, compared with 39.3 ns per point before the
 change and a 75 ns budget.
+
+The Ubuntu CI costing benchmark measured a 111,121 ns compile median
+against its 100,000 ns budget on the 5,844-class Utrecht bundle.
+Batching class factors preserves the metric byte stream and lets the
+existing BLAKE3 implementation compress more chunks in parallel.
+
+On the same emulated x86_64 Linux host and Utrecht bundle, three
+alternating runs per build gave medians of 395,536 ns before batching
+and 356,619 ns after batching. The 1,024-option benchmark reported
+the same metric-key checksum, `17068550211459947595`, on every run.
+The emulated timings measure relative performance. Ubuntu CI applies
+the production budget on its native runner.
