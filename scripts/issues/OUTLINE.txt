@@ -210,7 +210,8 @@ P9.01 | GTFS reader: zip and CSV into a feed model | build | new | M | P0.01
 P9.02 | Transit graph sections: stops, stations, lines, departures, schedules, transfers | graph | port | L | P3.12
 P9.03 | Transit build: connect stops to the street graph, schedule validity, timezones | build | port | L | P9.01 P9.02 P5.06
 P9.04 | Transit and multimodal costing with their options | costing | port | M | P3.26 P9.02
-P9.05 | Multimodal search: port of multimodal_astar and multimodal_transit | search | port | L | P9.03 P9.04 P5.15
+P9.05 | Multimodal search: port of multimodal_astar and multimodal_transit | search | port | L | P9.03 P9.04 P5.15 P9.05a
+P9.05a | Import Valhalla transit tiles for same-graph itinerary parity | cli | test | L | P3.34a P9.03 P9.04
 P9.06 | Transit narrative and transit info in serializers | narrative | port | M | P9.05 P6.12
 P9.07 | Bike share: stations, costing and the bike-share matrix | costing | port | M | P3.28 P7.03
 P9.08 | /transit_available | api | port | S | P9.03
