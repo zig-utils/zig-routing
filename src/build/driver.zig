@@ -25,6 +25,7 @@ pub const Options = struct {
     default_speeds_config: ?[]const u8 = null,
     timezone_geojson: ?[]const u8 = null,
     timezone_rules: ?[]const u8 = null,
+    reclassify_links: ?bool = null,
     infer_turn_channels: ?bool = null,
     infer_internal_intersections: ?bool = null,
     apply_country_overrides: ?bool = null,
@@ -69,6 +70,7 @@ const Inputs = struct {
     dem_digest: ?[32]u8 = null,
     speed_digest: ?[32]u8 = null,
     timezones: ?TimezoneInputs = null,
+    reclassify_links: bool = true,
     infer_turn_channels: bool = true,
     infer_internal_intersections: bool = true,
     apply_country_overrides: bool = true,
@@ -77,7 +79,8 @@ const Inputs = struct {
 
     fn identity(self: Inputs) graph.format.DatasetUuid {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update("zr-build-v1");
+        // Link classification changes the way attributes and classes saved in checkpoints.
+        hash.update("zr-build-v2");
         hash.update(&.{ @intFromBool(self.dem_dir != null), @backingInt(self.drive_side) });
         hash.update(@tagName(self.order));
         if (self.dem_digest) |digest| {
@@ -98,6 +101,7 @@ const Inputs = struct {
             hash.update(std.mem.asBytes(&input.boundaries.digest));
             hash.update(std.mem.asBytes(&input.rules.digest));
         }
+        if (!self.reclassify_links) hash.update("link-reclassification-off");
         if (!self.infer_turn_channels) hash.update("turn-channels-off");
         if (!self.infer_internal_intersections) hash.update("internal-intersections-off");
         if (!self.apply_country_overrides) hash.update("country-overrides-off");
@@ -137,6 +141,7 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
         .sources = try fingerprintInputs(a, options, diagnostic),
         .dem_dir = options.dem_dir,
         .timezones = try timezoneInputs(options, diagnostic),
+        .reclassify_links = options.reclassify_links orelse true,
         .infer_turn_channels = options.infer_turn_channels orelse true,
         .infer_internal_intersections = options.infer_internal_intersections orelse true,
         .apply_country_overrides = options.apply_country_overrides orelse true,
@@ -208,6 +213,7 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
         .ordering = .{ .kind = inputs.order },
         .dem_source = if (tiles) |*catalog| .{ .catalog = catalog } else null,
         .speed_rules = if (speed_input) |*input| &input.rules else null,
+        .reclassify_links = inputs.reclassify_links,
         .infer_turn_channels = inputs.infer_turn_channels,
         .infer_internal_intersections = inputs.infer_internal_intersections,
         .apply_country_overrides = inputs.apply_country_overrides,
@@ -407,6 +413,7 @@ const TimezoneMappings = struct {
 fn checkOptions(a: Allocator, inputs: *Inputs, options: Options, diagnostic: *Diagnostic) !void {
     if (options.drive_side) |side| if (side != inputs.drive_side) return error.CheckpointInputMismatch;
     if (options.order) |order| if (order != inputs.order) return error.CheckpointInputMismatch;
+    if (options.reclassify_links) |reclassify| if (reclassify != inputs.reclassify_links) return error.CheckpointInputMismatch;
     if (options.infer_turn_channels) |infer| if (infer != inputs.infer_turn_channels) return error.CheckpointInputMismatch;
     if (options.infer_internal_intersections) |infer| if (infer != inputs.infer_internal_intersections) return error.CheckpointInputMismatch;
     if (options.apply_country_overrides) |apply| if (apply != inputs.apply_country_overrides) return error.CheckpointInputMismatch;

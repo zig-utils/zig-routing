@@ -193,6 +193,7 @@ test "configured link speeds use directed signs and the destination admin" {
         .scratch_dir = "",
         .workers = 4,
         .speed_rules = &rules,
+        .reclassify_links = false,
     });
     defer result.deinit();
     const view = &result.bundle.view;
@@ -2761,5 +2762,123 @@ test "stop impact follows crossings and way changes" {
             const stop: u3 = @truncate(row[outgoing.cls.local] >> 3);
             try testing.expectEqual(movement.stopped, stop != 0);
         }
+    }
+}
+
+// Ported from test/gurka/test_ramps_tc.cc (Valhalla 3.9.3).
+test "link classes follow references, branches, and merging paths" {
+    const Class = graph.constants.RoadClass;
+    const Expected = struct { nodes: []const u8, class: Class };
+    const refs: []const Expected = &.{
+        .{ .nodes = "BJ", .class = .trunk }, .{ .nodes = "JF", .class = .trunk },
+        .{ .nodes = "FK", .class = .trunk }, .{ .nodes = "KC", .class = .trunk },
+    };
+    const cases: []const struct { fixture: @import("examples.zig").LinkCase, expected: []const Expected } = &.{
+        .{ .fixture = .refs, .expected = refs },
+        .{ .fixture = .destination_refs, .expected = refs },
+        .{ .fixture = .branches, .expected = &.{
+            .{ .nodes = "BG", .class = .trunk }, .{ .nodes = "GJ", .class = .secondary },
+            .{ .nodes = "GH", .class = .trunk }, .{ .nodes = "HM", .class = .tertiary },
+            .{ .nodes = "HE", .class = .trunk },
+        } },
+        .{ .fixture = .merge, .expected = &.{
+            .{ .nodes = "BJ", .class = .primary },   .{ .nodes = "JK", .class = .primary },
+            .{ .nodes = "KL", .class = .primary },   .{ .nodes = "KM", .class = .primary },
+            .{ .nodes = "ML", .class = .primary },   .{ .nodes = "LN", .class = .primary },
+            .{ .nodes = "NH", .class = .primary },   .{ .nodes = "NP", .class = .tertiary },
+            .{ .nodes = "EJ", .class = .secondary },
+        } },
+    };
+    for (cases) |case| {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        const fixture = try @import("examples.zig").links(arena.allocator(), case.fixture);
+        var result = try Built.assemble(fixture.osm, 4);
+        defer result.deinit();
+        const view = &result.bundle.view;
+        for (case.expected) |expected| {
+            const id = try directedBetween(view, &fixture, expected.nodes[0..1], expected.nodes[1..2]);
+            const edge = try view.edge(id);
+            const reverse = try view.edge(try view.oppEdge(id));
+            try testing.expectEqual(@backingInt(expected.class), (try view.class(edge.cls.class_id)).category.road_class);
+            try testing.expectEqual(@backingInt(expected.class), (try view.class(reverse.cls.class_id)).category.road_class);
+        }
+    }
+}
+
+test "turn channels are inferred independently of link reclassification" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const fixture = try @import("examples.zig").links(arena.allocator(), .inferred_channels);
+    for ([_]bool{ false, true }) |reclassify| {
+        var result = try Built.assembleWithOptions(fixture.osm, .{ .scratch_dir = "", .reclassify_links = reclassify });
+        defer result.deinit();
+        const view = &result.bundle.view;
+        for ([_][]const u8{ "BE", "EG", "EH", "GK", "KN", "LN", "NC" }) |labels| {
+            const id = try directedBetween(view, &fixture, labels[0..1], labels[1..2]);
+            const class = try view.class((try view.edge(id)).cls.class_id);
+            if (!reclassify) try testing.expectEqual(@backingInt(graph.constants.RoadClass.motorway), class.category.road_class);
+            if (std.mem.eql(u8, labels, "GK")) {
+                try testing.expectEqual(@backingInt(graph.constants.Use.turn_channel), class.category.use);
+            } else if (std.mem.eql(u8, labels, "BE") or std.mem.eql(u8, labels, "EG")) {
+                try testing.expectEqual(@backingInt(graph.constants.Use.ramp), class.category.use);
+            }
+        }
+    }
+}
+
+test "manual turn channel tags follow upstream use when inference is disabled" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const fixture = try @import("examples.zig").links(arena.allocator(), .tagged_channels);
+    var result = try Built.assembleWithOptions(fixture.osm, .{
+        .scratch_dir = "",
+        .reclassify_links = false,
+        .infer_turn_channels = false,
+    });
+    defer result.deinit();
+    const view = &result.bundle.view;
+    for ([_][]const u8{ "MN", "OP", "QR", "MB" }, [_]graph.constants.Use{ .ramp, .turn_channel, .ramp, .road }) |labels, expected| {
+        const id = try directedBetween(view, &fixture, labels[0..1], labels[1..2]);
+        const class = try view.class((try view.edge(id)).cls.class_id);
+        try testing.expectEqual(@backingInt(expected), class.category.use);
+    }
+}
+
+test "long slip lanes become turn channels when inference is enabled" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const fixture = try @import("examples.zig").links(arena.allocator(), .slip_lane);
+    for ([_]bool{ false, true }) |infer| {
+        var result = try Built.assembleWithOptions(fixture.osm, .{ .scratch_dir = "", .infer_turn_channels = infer });
+        defer result.deinit();
+        const view = &result.bundle.view;
+        for ([_][]const u8{ "AE", "XM" }) |labels| {
+            const id = try directedBetween(view, &fixture, labels[0..1], labels[1..2]);
+            const edge = try view.edge(id);
+            try testing.expect(edge.geom.len_m >= 200);
+            const class = try view.class(edge.cls.class_id);
+            const expected: graph.constants.Use = if (infer) .turn_channel else .ramp;
+            try testing.expectEqual(@backingInt(expected), class.category.use);
+        }
+    }
+}
+
+test "turn name consistency uses the admin country at the shared node" {
+    for ([_]bool{ true, false }) |us| {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        const fixture = try @import("examples.zig").turnNames(arena.allocator(), us);
+        var result = try Built.assemble(fixture.osm, 4);
+        defer result.deinit();
+        const view = &result.bundle.view;
+        const from = try view.edge(try directedBetween(view, &fixture, "A", "B"));
+        const to = try view.edge(try directedBetween(view, &fixture, "B", "C"));
+        const crossing = try view.edge(try directedBetween(view, &fixture, "B", "D"));
+        const via: format.NodeId = @fromBackingInt(from.head);
+        try testing.expectEqualStrings(if (us) "US" else "CA", (try view.nodeAdmin(via)).country_iso);
+        const row = try view.turnRow(via, from.cls.opp_local);
+        try testing.expectEqual(us, row[to.cls.local] & 0x40 != 0);
+        try testing.expect(row[crossing.cls.local] & 0x40 == 0);
     }
 }

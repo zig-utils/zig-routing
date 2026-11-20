@@ -589,3 +589,232 @@ pub fn signs(arena: Allocator) !gurka.Map {
         },
     }});
 }
+
+// Ported from test/gurka/test_ramps_tc.cc (Valhalla 3.9.3).
+pub const LinkCase = enum { refs, destination_refs, branches, merge, slip_lane, inferred_channels, tagged_channels };
+
+pub fn links(arena: Allocator, scenario: LinkCase) !gurka.Map {
+    const motorway: gurka.Tags = &.{.{ .key = "highway", .value = "motorway" }};
+    const trunk: gurka.Tags = &.{.{ .key = "highway", .value = "trunk" }};
+    const primary: gurka.Tags = &.{.{ .key = "highway", .value = "primary" }};
+    const secondary: gurka.Tags = &.{.{ .key = "highway", .value = "secondary" }};
+    const tertiary: gurka.Tags = &.{.{ .key = "highway", .value = "tertiary" }};
+    const one_way: gurka.Tag = .{ .key = "oneway", .value = "yes" };
+    const primary_one_way: gurka.Tags = &.{ primary[0], one_way };
+    const primary_link: gurka.Tag = .{ .key = "highway", .value = "primary_link" };
+    const motorway_link: gurka.Tag = .{ .key = "highway", .value = "motorway_link" };
+    const link: gurka.Tags = &.{ motorway_link, one_way };
+    const ascii = switch (scenario) {
+        .refs, .destination_refs =>
+        \\A------------B-------------C-----------D
+        \\              \     G     /
+        \\               \    |    K----------L
+        \\   I------------J   |   /
+        \\                 \  |  /
+        \\                  \ | /
+        \\                   \|/
+        \\                    F
+        \\                    |
+        \\                    |
+        \\                    E
+        ,
+        .branches =>
+        \\A--------B-------------------------------------C
+        \\          \                             D
+        \\           \                            |
+        \\            G-------------H-------------E
+        \\            |             |             |
+        \\        I---J---K         |             F
+        \\                      L---M---N
+        ,
+        .merge =>
+        \\                      A------B-----C
+        \\                             |         D
+        \\G                M           |         |
+        \\|               / \          J---------E
+        \\|              /   \        /          |
+        \\H-----N-------L-----K-------           F
+        \\|     |
+        \\|   O-P-R
+        \\I
+        ,
+        .slip_lane =>
+        \\              Z
+        \\              |
+        \\K__M_____W____C____D___E____N
+        \\    \         |        /
+        \\      \__Y    |      ^
+        \\          \   B     /
+        \\          |   |   F
+        \\          |   | /
+        \\           \  A
+        \\            \ |
+        \\              X
+        ,
+        .inferred_channels =>
+        \\A---B-------------------------------C------D
+        \\     \                             /
+        \\      \            F J            /
+        \\       \           | |           /
+        \\        \          | |          /
+        \\         \         | |         /
+        \\          \        | |        /
+        \\           --E-----G-K-----N--
+        \\              \    | |    /
+        \\               \   | |   /
+        \\                \  | |  /
+        \\                 \ | | /
+        \\                   H L
+        \\                   | |
+        \\                   | |
+        \\                   | |
+        \\                   I M
+        ,
+        .tagged_channels =>
+        \\      E D
+        \\      | |
+        \\      Q P
+        \\     /| |\
+        \\    / | | \
+        \\L--R--F-C--O--K
+        \\      | |
+        \\I-----G-B--N--J
+        \\      | | /
+        \\      | |/
+        \\      | M
+        \\      | |
+        \\      H A
+        ,
+    };
+    const start: @import("routing").geo.PointLL = if (scenario == .branches) .{ .lng = -0.001, .lat = 0.001 } else .{ .lng = 0, .lat = 0 };
+    const layout = try gurka.mapToCoordinatesAt(ascii, switch (scenario) {
+        .slip_lane, .tagged_channels => 100,
+        else => 10,
+    }, start);
+    const ways: []const gurka.Way = switch (scenario) {
+        .refs => &.{
+            .{ .label = "ABCD", .tags = &.{ motorway[0], .{ .key = "ref", .value = "M1" } } },
+            .{ .label = "EFG", .tags = &.{ trunk[0], .{ .key = "ref", .value = "M2" } } },
+            .{ .label = "BJF", .tags = &.{ motorway_link, one_way, .{ .key = "ref", .value = "M2" } } },
+            .{ .label = "IJ", .tags = tertiary },
+            .{ .label = "FKC", .tags = &.{ motorway_link, one_way, .{ .key = "ref", .value = "M2" } } },
+            .{ .label = "KL", .tags = tertiary },
+        },
+        .destination_refs => &.{
+            .{ .label = "ABCD", .tags = &.{ motorway[0], .{ .key = "ref", .value = "M1" } } },
+            .{ .label = "EFG", .tags = &.{ trunk[0], .{ .key = "ref", .value = "M2" } } },
+            .{ .label = "BJF", .tags = &.{ motorway_link, one_way, .{ .key = "destination:ref", .value = "M2" } } },
+            .{ .label = "IJ", .tags = tertiary },
+            .{ .label = "FKC", .tags = &.{ motorway_link, one_way, .{ .key = "destination:ref", .value = "M1" } } },
+            .{ .label = "KL", .tags = tertiary },
+        },
+        .branches => &.{
+            .{ .label = "ABC", .tags = motorway },
+            .{ .label = "DEF", .tags = trunk },
+            .{ .label = "BGHE", .tags = link },
+            .{ .label = "GJ", .tags = link },
+            .{ .label = "HM", .tags = link },
+            .{ .label = "IJK", .tags = secondary },
+            .{ .label = "LMN", .tags = tertiary },
+        },
+        .merge => &.{
+            .{ .label = "GHI", .tags = motorway },
+            .{ .label = "ABC", .tags = primary },
+            .{ .label = "DEF", .tags = secondary },
+            .{ .label = "OPR", .tags = tertiary },
+            .{ .label = "BJ", .tags = link },
+            .{ .label = "EJ", .tags = link },
+            .{ .label = "JK", .tags = link },
+            .{ .label = "KL", .tags = link },
+            .{ .label = "KM", .tags = link },
+            .{ .label = "ML", .tags = link },
+            .{ .label = "LN", .tags = link },
+            .{ .label = "NH", .tags = link },
+            .{ .label = "NP", .tags = link },
+        },
+        .slip_lane => &.{
+            .{ .label = "XABCZ", .tags = &.{ primary[0], .{ .key = "name", .value = "M1" } } },
+            .{ .label = "KMWCDEN", .tags = &.{ primary[0], .{ .key = "name", .value = "M2" } } },
+            .{ .label = "AFE", .tags = &.{ primary_link, one_way } },
+            .{ .label = "XYM", .tags = &.{ primary_link, one_way } },
+        },
+        .inferred_channels => &.{
+            .{ .label = "AB", .tags = &.{ motorway[0], one_way } },
+            .{ .label = "BC", .tags = &.{ motorway[0], one_way } },
+            .{ .label = "CD", .tags = &.{ motorway[0], one_way } },
+            .{ .label = "BE", .tags = link },
+            .{ .label = "EG", .tags = link },
+            .{ .label = "EH", .tags = link },
+            .{ .label = "GK", .tags = link },
+            .{ .label = "FG", .tags = primary_one_way },
+            .{ .label = "GH", .tags = primary_one_way },
+            .{ .label = "HI", .tags = primary_one_way },
+            .{ .label = "ML", .tags = primary_one_way },
+            .{ .label = "LK", .tags = primary_one_way },
+            .{ .label = "KJ", .tags = primary_one_way },
+            .{ .label = "KN", .tags = link },
+            .{ .label = "LN", .tags = link },
+            .{ .label = "NC", .tags = link },
+        },
+        .tagged_channels => &.{
+            .{ .label = "AM", .tags = primary_one_way },
+            .{ .label = "MB", .tags = primary_one_way },
+            .{ .label = "MN", .tags = &.{ primary_link, one_way, .{ .key = "turn_channel", .value = "true" } } },
+            .{ .label = "OP", .tags = &.{ primary[0], one_way, .{ .key = "turn_channel", .value = "true" } } },
+            .{ .label = "QR", .tags = &.{ primary_link, one_way, .{ .key = "turn_channel", .value = "false" } } },
+            .{ .label = "EQ", .tags = primary_one_way },
+            .{ .label = "QF", .tags = primary_one_way },
+            .{ .label = "BC", .tags = primary_one_way },
+            .{ .label = "CP", .tags = primary_one_way },
+            .{ .label = "PD", .tags = primary_one_way },
+            .{ .label = "FG", .tags = primary_one_way },
+            .{ .label = "GH", .tags = primary_one_way },
+            .{ .label = "IG", .tags = primary_one_way },
+            .{ .label = "GB", .tags = primary_one_way },
+            .{ .label = "BN", .tags = primary_one_way },
+            .{ .label = "NJ", .tags = primary_one_way },
+            .{ .label = "KO", .tags = primary_one_way },
+            .{ .label = "OC", .tags = primary_one_way },
+            .{ .label = "CF", .tags = primary_one_way },
+            .{ .label = "FR", .tags = primary_one_way },
+            .{ .label = "RL", .tags = primary_one_way },
+        },
+    };
+    return gurka.Map.init(arena, layout, ways, if (scenario == .inferred_channels) &.{.{ .label = "B", .tags = &.{
+        .{ .key = "highway", .value = "motorway_junction" },
+        .{ .key = "ref", .value = "4" },
+    } }} else &.{}, &.{});
+}
+
+pub fn turnNames(arena: Allocator, us: bool) !gurka.Map {
+    const residential: gurka.Tag = .{ .key = "highway", .value = "residential" };
+    const layout = try gurka.mapToCoordinatesAt(
+        \\P---------------------Q
+        \\
+        \\    A-------B-----C
+        \\            |
+        \\            D
+        \\
+        \\S---------------------R
+    , 30, .{ .lng = -76.6, .lat = 40.4 });
+    const boundary = [_]gurka.Tag{
+        .{ .key = "type", .value = "boundary" },
+        .{ .key = "boundary", .value = "administrative" },
+        .{ .key = "admin_level", .value = "2" },
+    };
+    return gurka.Map.init(arena, layout, &.{
+        .{ .label = "AB", .tags = &.{ residential, .{ .key = "name", .value = "North Main Street" } } },
+        .{ .label = "BC", .tags = &.{ residential, .{ .key = "name", .value = "Main Street South" } } },
+        .{ .label = "BD", .tags = &.{ residential, .{ .key = "name", .value = "Market Street" } } },
+        .{ .label = "PQRSP" },
+    }, &.{}, &.{.{
+        .members = &.{.{ .kind = .way, .ref = "PQRSP", .role = "outer" }},
+        .tags = if (us) &(boundary ++ [_]gurka.Tag{
+            .{ .key = "name", .value = "United States" },
+            .{ .key = "ISO3166-1:alpha2", .value = "US" },
+        }) else &(boundary ++ [_]gurka.Tag{
+            .{ .key = "name", .value = "Canada" },
+            .{ .key = "ISO3166-1:alpha2", .value = "CA" },
+        }),
+    }});
+}

@@ -377,3 +377,43 @@ fn directed(out: *std.ArrayList(u8), gpa: std.mem.Allocator, refs: []const u8, d
     }
     return out.items;
 }
+
+// Ported from src/baldr/streetname_us.cc (Valhalla 3.9.3).
+pub fn usBaseName(value: []const u8) []const u8 {
+    const directions = [_][]const u8{ "North", "East", "South", "West", "Northeast", "Southeast", "Southwest", "Northwest" };
+    var first: usize = 0;
+    var last = value.len;
+    inline for (directions) |word| {
+        if (std.mem.startsWith(u8, value, word ++ " ")) first = word.len + 1;
+        if (std.mem.endsWith(u8, value, " " ++ word)) last = value.len - word.len - 1;
+    }
+    // Overlapping delimiters make the unsigned length passed to C++ substr
+    // extend through the end of the remaining string.
+    return value[first..if (last < first) value.len else last];
+}
+
+// Ported from test/streetname_us.cc.
+test "US base names preserve spelling while removing full compass directions" {
+    const cases = [_][2][]const u8{
+        .{ "North Main Street", "Main Street" },
+        .{ "East Chestnut Avenue", "Chestnut Avenue" },
+        .{ "South Main Street", "Main Street" },
+        .{ "West 26th Street", "26th Street" },
+        .{ "US 220 North", "US 220" },
+        .{ "US 22 East", "US 22" },
+        .{ "I 81 South", "I 81" },
+        .{ "PA 283 West", "PA 283" },
+        .{ "Constitution Avenue Northeast", "Constitution Avenue" },
+        .{ "Constitution Avenue Northwest", "Constitution Avenue" },
+        .{ "Independence Avenue Southeast", "Independence Avenue" },
+        .{ "Independence Avenue Southwest", "Independence Avenue" },
+        .{ "North South Street Northwest", "South Street" },
+        .{ "East North Avenue Southwest", "North Avenue" },
+        .{ "North East", "East" },
+        .{ "Main Street", "Main Street" },
+        .{ "Broadway", "Broadway" },
+        .{ "Main St NW", "Main St NW" },
+        .{ "", "" },
+    };
+    for (cases) |case| try std.testing.expectEqualStrings(case[1], usBaseName(case[0]));
+}

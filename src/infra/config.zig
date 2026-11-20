@@ -18,6 +18,7 @@ pub const Config = struct {
     zig_routing: ZigRouting = .{},
 
     pub const Mjolnir = struct {
+        reclassify_links: ?bool = null,
         default_speeds_config: ?[]const u8 = null,
         data_processing: struct {
             infer_turn_channels: ?bool = null,

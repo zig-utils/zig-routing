@@ -457,6 +457,7 @@ fn buildGraph(ctx: *Context) !u8 {
         .timezone_geojson = ctx.getOption("timezones") orelse settings.timezone_geojson,
         .timezone_rules = ctx.getOption("timezone-rules") orelse settings.timezone_rules,
         .default_speeds_config = loaded.config.mjolnir.default_speeds_config,
+        .reclassify_links = loaded.config.mjolnir.reclassify_links,
         .infer_turn_channels = loaded.config.mjolnir.data_processing.infer_turn_channels,
         .infer_internal_intersections = loaded.config.mjolnir.data_processing.infer_internal_intersections,
         .apply_country_overrides = loaded.config.mjolnir.data_processing.apply_country_overrides,

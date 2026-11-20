@@ -29,6 +29,7 @@ const automaton = @import("../graph/restriction_automaton.zig");
 const automaton_builder = @import("restriction_automaton.zig");
 const conditional_access = @import("conditional_access.zig");
 const sign_build = @import("signs.zig");
+const link_classification = @import("link_classification.zig");
 const grid = @import("../geo/grid.zig");
 const radix = @import("../infra/radix.zig");
 
@@ -48,6 +49,7 @@ pub const Options = struct {
     apply_country_overrides: bool = true,
     timezone_source: ?timezones.Source = null,
     speed_rules: ?*const speeds.Config = null,
+    reclassify_links: bool = true,
     infer_turn_channels: bool = true,
     infer_internal_intersections: bool = true,
     ordering: node_order.Ordering = .{},
@@ -130,7 +132,7 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     var restriction_program: automaton_builder.Program = .{};
     defer restriction_program.deinit(gpa);
     var table = blk: {
-        var base = try populate(gpa, &shared, options.workers);
+        var base = try populate(gpa, &shared, &plan, options);
         defer base.deinit();
         try validate(topology.first_edge, topology.output.data, topology.coordinates, base.classes, options.deadline);
         break :blk try enhanceGraph(gpa, &shared, &plan, base.classes, options, restrictions.source(), &restriction_program);
@@ -143,9 +145,9 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     defer if (terrain) |*present| present.deinit();
     var turn_pool = turns.Pool.init(gpa);
     defer turn_pool.deinit();
-    var resolved = try resolveTurns(gpa, &shared, &plan, restrictions.source(), null);
+    var resolved = try resolveTurns(gpa, &shared, &plan, table.classes, restrictions.source(), null);
     defer resolved.deinit(gpa);
-    const turn_sides = try buildTurns(&shared, table.classes, metadata.name_ids.items, resolved.hard.items, &turn_pool, gpa);
+    const turn_sides = try buildTurns(&shared, table.classes, &metadata, resolved.hard.items, &turn_pool, gpa);
     defer gpa.free(turn_sides);
 
     try writeTopology(writer, options.scratch_dir, &topology, table.classes, turn_pool.bytes.items, if (terrain) |present| present.slopes.data else null);
@@ -230,12 +232,12 @@ pub fn buildStaged(
         try Topology.load(gpa, session, options);
     defer topology.deinit(gpa);
     if (topology.placements.data.len != 2 * segments.len) return error.InvalidCheckpoint;
-    var admin_ids = if (session.runs(.assemble) or session.runs(.enhance) or session.runs(.cold))
+    var admin_ids = if (session.runs(.assemble) or session.runs(.enhance) or session.runs(.turns) or session.runs(.cold))
         try assignAdmins(topology.coordinates, options)
     else
         null;
     defer if (admin_ids) |*ids| ids.deinit();
-    const country_table = if (session.runs(.assemble)) try country_access.compile(gpa, options.admin_index, options.deadline) else &.{};
+    const country_table = if (session.runs(.assemble) or session.runs(.turns)) try country_access.compile(gpa, options.admin_index, options.deadline) else &.{};
     defer gpa.free(country_table);
     const shared: Shared = .{
         .topology = &topology,
@@ -254,7 +256,7 @@ pub fn buildStaged(
     if (session.runs(.assemble)) {
         var tx = try session.begin(.assemble);
         defer tx.deinit();
-        const table = try populate(gpa, &shared, options.workers);
+        const table = try populate(gpa, &shared, &plan, options);
         gpa.free(table.remap);
         edge_classes = table.classes;
         try validate(topology.first_edge, topology.output.data, topology.coordinates, table.classes, options.deadline);
@@ -312,9 +314,9 @@ pub fn buildStaged(
         const start = io.Timer.start();
         var tx = try session.begin(.turns);
         defer tx.deinit();
-        var resolved = try resolveTurns(gpa, &shared, &plan, restrictions, null);
+        var resolved = try resolveTurns(gpa, &shared, &plan, edge_classes.?, restrictions, null);
         defer resolved.deinit(gpa);
-        const turn_sides = try buildTurns(&shared, edge_classes.?, metadata.name_ids.items, resolved.hard.items, &turn_pool, gpa);
+        const turn_sides = try buildTurns(&shared, edge_classes.?, metadata, resolved.hard.items, &turn_pool, gpa);
         defer gpa.free(turn_sides);
         try tx.writeArray(topology.nodes, .nodes);
         try tx.writeArray(turn_pool.bytes.items, .turn_pool);
@@ -448,7 +450,8 @@ const Way = extern struct {
         access_tags: u11 = 0,
         motorroad: bool = false,
         access_tags_known: bool = false,
-        reserved: u5 = 0,
+        primary_name: bool = false,
+        reserved: u4 = 0,
     },
     level_start: u32,
     level_count: u32,
@@ -497,6 +500,7 @@ pub const Metadata = struct {
     access_limits: std.AutoHashMapUnmanaged(i64, std.ArrayList(access_restriction.Entry)) = .empty,
     access_scratch: std.ArrayList(access_restriction.Entry) = .empty,
     conditional: conditional_access.Parser,
+    infer_turn_channels: bool,
     signs: sign_build.Catalog,
 
     pub fn init(gpa: Allocator, options: Options) Metadata {
@@ -506,6 +510,7 @@ pub const Metadata = struct {
             .deadline = options.deadline,
             .strings = .init(gpa),
             .conditional = .init(gpa, options.deadline),
+            .infer_turn_channels = options.infer_turn_channels,
             .signs = .{ .arena = .init(gpa) },
         };
     }
@@ -644,8 +649,10 @@ pub const Metadata = struct {
         for (try checkpoint.array(WayEntry, ways), 0..) |entry, i| {
             try checkDeadline(self.deadline, i);
             const attrs = entry.way;
+            const first_name = if (attrs.name_start == attrs.ref_start) attrs.ref_end else attrs.name_start;
             if (attrs.name_start > attrs.ref_start or attrs.ref_start > attrs.ref_end or attrs.name_start > attrs.name_end or
                 attrs.name_end - attrs.name_start > graph.cold.max_names or attrs.name_end > self.name_ids.items.len or
+                attrs.ref_end > self.name_ids.items.len or (attrs.attr.primary_name and first_name >= self.name_ids.items.len) or
                 attrs.level_start > self.levels.items.len or attrs.level_count > self.levels.items.len - attrs.level_start)
                 return error.InvalidCheckpoint;
             try self.ways.put(self.gpa, entry.id, attrs);
@@ -716,7 +723,7 @@ pub const Metadata = struct {
 
     pub fn way(self: *Metadata, id: i64, attrs: tags.WayAttrs, raw_tags: pbf.block.TagIterator) !void {
         const use = attrs.edgeUse();
-        const directed_use = if (attrs.flags.turn_channel and attrs.use != .construction)
+        const directed_use = if (!self.infer_turn_channels and attrs.flags.turn_channel and !attrs.flags.link and attrs.use != .construction)
             .turn_channel
         else if (attrs.flags.link and attrs.use != .service_area and attrs.use != .rest_area and attrs.use != .construction)
             .ramp
@@ -744,6 +751,7 @@ pub const Metadata = struct {
         try self.appendNames(indexed.ref.text);
         const ref_end = try self.nameOffset();
         if (ref_first) try self.appendNames(indexed.name.text);
+        const primary_name = self.name_ids.items.len - name_start > ref_end - ref_start;
         if (indexed.alt_name.text != indexed.name.text) try self.appendNames(indexed.alt_name.text);
         if (indexed.official_name.text != indexed.name.text and indexed.official_name.text != indexed.alt_name.text)
             try self.appendNames(indexed.official_name.text);
@@ -766,6 +774,7 @@ pub const Metadata = struct {
                 .access_tags_known = true,
                 .importance = @intCast(@backingInt(attrs.road_class)),
                 .has_names = name_start != name_end,
+                .primary_name = primary_name,
                 .layer = attrs.layer,
             },
             .level_start = level_start,
@@ -1241,11 +1250,95 @@ noinline fn writeTimezones(gpa: Allocator, writer: *format.BundleWriter, source:
     try writer.write(.timezone_rules, source.rules);
 }
 
+const LinkSource = struct {
+    shared: *const Shared,
+    plan: *const Layout,
+
+    pub fn nodeCount(self: LinkSource) usize {
+        return self.plan.nodes.items.len;
+    }
+
+    pub fn nodeOrder(self: LinkSource, id: u32) struct { osm: u64, geography: u64 } {
+        const node = self.plan.nodes.items[id];
+        const tile = enhance.tileId(node.point);
+        const bounds = enhance.tileBounds(tile);
+        const point = node.point.toOsmPoint();
+        const x: u32 = @intFromFloat(std.math.clamp((point.lng - bounds.minx) * 262144.0, 0, 65535));
+        const y: u32 = @intFromFloat(std.math.clamp((point.lat - bounds.miny) * 262144.0, 0, 65535));
+        return .{ .osm = @bitCast(node.osm_id), .geography = (@as(u64, tile) << 32) | grid.hilbertIndex(16, x, y) };
+    }
+
+    pub fn hasExit(self: LinkSource, id: u32) bool {
+        const node = self.plan.nodes.items[id];
+        const tags_at_node = self.shared.metadata.signs.nodes.get(node.osm_id) orelse return false;
+        return tags_at_node.ref.len != 0 or tags_at_node.exit_to.len != 0;
+    }
+
+    pub fn appendArcs(self: LinkSource, id: u32, out: *std.ArrayList(link_classification.Arc), a: Allocator) !void {
+        const topo = self.shared.topology;
+        const node = self.plan.nodes.items[id];
+        try out.ensureUnusedCapacity(a, node.degree);
+        for (node.first_alias..node.first_alias + aliasCount(node.degree)) |alias| {
+            try checkDeadline(self.shared.deadline, alias);
+            const first_edge = topo.first_edge[alias];
+            const degree = topo.groups[alias].real_degree;
+            for (topo.slot_refs.data[first_edge..][0..degree]) |ref|
+                out.appendAssumeCapacity(try self.arc(ref));
+        }
+    }
+
+    pub fn arc(self: LinkSource, ref: u32) !link_classification.Arc {
+        const segment = self.shared.segments[ref / 2];
+        const way = self.shared.ways.get(segment.way_id) orelse return error.MissingWayAttributes;
+        const class = way.by_direction[ref & 1];
+        const end = if (ref & 1 == 0) segment.to else segment.from;
+        return .{
+            .ref = ref,
+            .head = self.plan.by_id.get(end) orelse return error.MissingLinkNode,
+            .road_class = @fromBackingInt(way.attr.importance),
+            .link = class.flags.link,
+            .named = way.attr.has_names,
+            .outbound = class.forwardAccess().auto,
+            .inbound = class.reverseAccess().auto,
+        };
+    }
+
+    pub fn road(self: LinkSource, ref: u32) !link_classification.Road {
+        const id = self.shared.segments[ref / 2].way_id;
+        const way = self.shared.ways.get(id) orelse return error.MissingWayAttributes;
+        const metadata = self.shared.metadata;
+        const destination = if (metadata.signs.ways.get(id)) |fields| fields.branch_ref else .empty;
+        const main_name = if (way.attr.primary_name) name: {
+            const first_name = if (way.name_start == way.ref_start) way.ref_end else way.name_start;
+            break :name metadata.name_ids.items[first_name];
+        } else .empty;
+        const main_ref = if (way.ref_start < way.ref_end) metadata.name_ids.items[way.ref_start] else .empty;
+        return .{
+            .way = id,
+            .name = metadata.strings.get(main_name).?,
+            .ref = metadata.strings.get(main_ref).?,
+            .destination_refs = metadata.strings.get(destination).?,
+        };
+    }
+
+    pub fn length(self: LinkSource, ref: u32) f64 {
+        return self.shared.segments[ref / 2].length_m;
+    }
+
+    pub fn heading(self: LinkSource, ref: u32) !f64 {
+        const shape = try segmentShape(self.shared.shape_points, self.shared.segments[ref / 2]);
+        const first = if (ref & 1 == 0) shape[0] else shape[shape.len - 1];
+        const next = if (ref & 1 == 0) shape[1] else shape[shape.len - 2];
+        return first.toOsmPoint().headingWith(next.toOsmPoint(), math);
+    }
+};
+
 const Job = struct {
     shared: *const Shared,
     start: usize,
     end: usize,
     interner: classes.Interner,
+    link_results: []const link_classification.Result,
     result: anyerror!void = {},
 
     fn run(self: *Job) void {
@@ -1268,6 +1361,16 @@ const Job = struct {
                 const way = shared.ways.get(segment.way_id) orelse return error.MissingWayAttributes;
                 const direction = ref & 1;
                 var class = way.by_direction[direction];
+                if (self.link_results.len != 0) {
+                    const link = self.link_results[ref / 2];
+                    if (link.processed) {
+                        class.category.road_class = link.road_class;
+                        if (link.turn_channel and class.category.use != @backingInt(graph.constants.Use.construction)) {
+                            class.category.use = @backingInt(graph.constants.Use.turn_channel);
+                            class.flags.internal = false;
+                        }
+                    }
+                }
                 if (shared.metadata.signs.ways.count() != 0 or shared.metadata.signs.nodes.count() != 0)
                     class.flags.sign = (try selectEdgeSigns(shared, @intCast(node), segment, ref, class)) != null;
                 edge_class.applySegmentControls(&class, segment.flags, direction == 0, way.attr.oneway);
@@ -1332,7 +1435,16 @@ fn connectorEdge(head: usize, local: u32, opp_local: u32, class: classes.Handle)
     };
 }
 
-fn populate(gpa: Allocator, shared: *const Shared, requested: usize) !classes.Table {
+fn populate(gpa: Allocator, shared: *const Shared, plan: *const Layout, options: Options) !classes.Table {
+    const run_links = options.reclassify_links or options.infer_turn_channels;
+    const classified = try Scratch(link_classification.Result).init(if (run_links) shared.segments.len else 0, options.scratch_dir);
+    defer classified.deinit();
+    try link_classification.classify(gpa, LinkSource{ .shared = shared, .plan = plan }, classified.data, .{
+        .reclassify = options.reclassify_links,
+        .infer_turn_channels = options.infer_turn_channels,
+        .deadline = options.deadline,
+    });
+    const requested = options.workers;
     const workers = if (requested == 0) std.Thread.getCpuCount() catch 1 else requested;
     const nodes = shared.topology.nodes.len;
     const count = @max(1, @min(workers, max_workers, (nodes + 255) / 256));
@@ -1341,7 +1453,7 @@ fn populate(gpa: Allocator, shared: *const Shared, requested: usize) !classes.Ta
     for (active, 0..) |*job, i| {
         const start = (nodes * i) / count;
         const end = (nodes * (i + 1)) / count;
-        job.* = .{ .shared = shared, .start = start, .end = end, .interner = .init(gpa) };
+        job.* = .{ .shared = shared, .start = start, .end = end, .interner = .init(gpa), .link_results = classified.data };
     }
     defer for (active) |*job| job.interner.deinit();
 
@@ -1631,7 +1743,7 @@ noinline fn enhanceGraph(gpa: Allocator, shared: *const Shared, plan: *const Lay
     return final;
 }
 
-/// Valhalla visits outbound arcs by auto driveability, raw way class, names
+/// Valhalla visits outbound arcs by auto driveability, effective class, names
 /// and then segment encounter order. The expansion cap depends on that order,
 /// so keep a separate ordering for the walk and preserve CSR local indices.
 fn orderWalks(shared: *const Shared, plan: *const Layout, base: []const classes.EdgeClass, order: []u32, ranks: []u16) !void {
@@ -1650,7 +1762,7 @@ fn orderWalks(shared: *const Shared, plan: *const Layout, base: []const classes.
             } else {
                 const segment = shared.segments[topo.slot_refs.data[slot] / 2];
                 const way = shared.ways.get(segment.way_id) orelse return error.MissingWayAttributes;
-                rank.* = graph.constants.incidentEdgeRank(class.forwardAccess().auto, way.attr.importance, way.attr.has_names);
+                rank.* = graph.constants.incidentEdgeRank(class.forwardAccess().auto, class.category.road_class, way.attr.has_names);
             }
             positions[rank.*] += 1;
         }
@@ -1966,7 +2078,7 @@ noinline fn compileComplexTurns(gpa: Allocator, shared: *const Shared, layout: *
     defer builder.deinit();
     const sink: RestrictionSink = .{ .builder = &builder, .starts = starts };
     if (source.simple_domains.len != 0) {
-        var timed = try resolveTurns(gpa, shared, layout, source, sink);
+        var timed = try resolveTurns(gpa, shared, layout, base, source, sink);
         timed.deinit(gpa);
     }
     if (source.complex.len != 0) try addComplexTurns(shared, layout, base, order, source, sink);
@@ -2018,7 +2130,7 @@ noinline fn addComplexTurns(shared: *const Shared, layout: *const Layout, base: 
     }
 }
 
-fn turnIncidents(a: Allocator, shared: *const Shared, node: Node, incident: *std.ArrayList(IncidentTurnEdge)) !void {
+fn turnIncidents(a: Allocator, shared: *const Shared, edge_classes: []const classes.EdgeClass, node: Node, incident: *std.ArrayList(IncidentTurnEdge)) !void {
     incident.clearRetainingCapacity();
     try incident.ensureTotalCapacity(a, node.degree);
     const topo = shared.topology;
@@ -2030,11 +2142,12 @@ fn turnIncidents(a: Allocator, shared: *const Shared, node: Node, incident: *std
             const segment = shared.segments[ref / 2];
             const way = shared.ways.get(segment.way_id) orelse return error.MissingWayAttributes;
             const access = way.by_direction[ref & 1].forwardAccess();
+            const class = edge_classes[topo.output.data[slot].cls.class_id];
             incident.appendAssumeCapacity(.{
                 .way = segment.way_id,
                 .node = @intCast(alias),
                 .slot = @intCast(slot),
-                .rank = graph.constants.incidentEdgeRank(access.auto, way.attr.importance, way.attr.has_names),
+                .rank = graph.constants.incidentEdgeRank(access.auto, class.category.road_class, way.attr.has_names),
             });
         }
     }
@@ -2047,7 +2160,7 @@ fn restrictionEntryBefore(_: void, a: mode_turns.Entry, b: mode_turns.Entry) boo
 
 // The pinned tile stores eight outgoing bits in Valhalla's incident-edge order.
 // Find those arcs without changing native CSR indices.
-noinline fn resolveTurns(a: Allocator, shared: *const Shared, plan: *const Layout, source: turn_restrictions.Source, sink: ?RestrictionSink) !ResolvedTurns {
+noinline fn resolveTurns(a: Allocator, shared: *const Shared, plan: *const Layout, edge_classes: []const classes.EdgeClass, source: turn_restrictions.Source, sink: ?RestrictionSink) !ResolvedTurns {
     const topo = shared.topology;
     const valhalla_mask_width = 8;
     var result: ResolvedTurns = .{ .stats = source.stats };
@@ -2070,7 +2183,7 @@ noinline fn resolveTurns(a: Allocator, shared: *const Shared, plan: *const Layou
         };
         const via = plan.nodes.items[logical];
         if (preceding_via != restriction.via) {
-            try turnIncidents(a, shared, via, &incident);
+            try turnIncidents(a, shared, edge_classes, via, &incident);
             preceding_via = restriction.via;
         }
         var has_from = false;
@@ -2147,11 +2260,13 @@ noinline fn resolveTurns(a: Allocator, shared: *const Shared, plan: *const Layou
     return result;
 }
 
-fn buildTurns(shared: *const Shared, edge_classes: []const classes.EdgeClass, name_ids: []const tags.names.Id, restrictions: []const TurnMask, pool: *turns.Pool, gpa: Allocator) ![]u32 {
+fn buildTurns(shared: *const Shared, edge_classes: []const classes.EdgeClass, metadata: *Metadata, restrictions: []const TurnMask, pool: *turns.Pool, gpa: Allocator) ![]u32 {
     const topo = shared.topology;
     var side_pool = try turns.SidePool.init(gpa, topo.nodes.len);
     defer side_pool.deinit();
+    const name_ids = metadata.name_ids.items;
     var approaches: [max_degree]turns.Approach = undefined;
+    var us_names: [max_degree][graph.cold.max_names]tags.names.Id = undefined;
     var entries: [turns.max_matrix_size]u8 = undefined;
     var sides: [turns.max_matrix_size]u2 = undefined;
     var restriction_index: usize = 0;
@@ -2159,6 +2274,7 @@ fn buildTurns(shared: *const Shared, edge_classes: []const classes.EdgeClass, na
         try checkDeadline(shared.deadline, i);
         const first = topo.first_edge[i];
         const degree = topo.first_edge[i + 1] - first;
+        const use_us_names = shared.country(@intCast(i)).iso == std.mem.readInt(u16, "US", .little);
         for (approaches[0..degree], topo.output.data[first..][0..degree], 0..) |*approach, edge, local| {
             const class = &edge_classes[edge.cls.class_id];
             approach.* = .{ .bearing = 0, .length = edge.geom.len_m, .class = class, .names = &.{} };
@@ -2167,7 +2283,17 @@ fn buildTurns(shared: *const Shared, edge_classes: []const classes.EdgeClass, na
             const segment = shared.segments[ref / 2];
             const way = shared.ways.get(segment.way_id) orelse return error.MissingWayAttributes;
             approach.bearing = try turns.heading(try segmentShape(shared.shape_points, segment), ref & 1 == 0, class, shared.deadline);
-            approach.names = name_ids[way.name_start..way.name_end];
+            const names = name_ids[way.name_start..way.name_end];
+            approach.names = names;
+            if (use_us_names) {
+                const canonical = us_names[local][0..names.len];
+                for (names, canonical) |id, *out| {
+                    const text = metadata.strings.get(id).?;
+                    const base = tags.names.usBaseName(text);
+                    out.* = if (base.len == text.len) id else try metadata.strings.intern(base);
+                }
+                approach.names = canonical;
+            }
         }
         const matrix = entries[0 .. degree * degree];
         const side: edge_class.DriveSide = if (node.attr.drive_on_left) .left else .right;
@@ -2339,7 +2465,9 @@ noinline fn writeSigns(gpa: Allocator, shared: *const Shared, metadata: *Metadat
             const ref = topo.slot_refs.data[slot];
             const seg = shared.segments[ref / 2];
             const way = shared.ways.get(seg.way_id) orelse return error.MissingWayAttributes;
-            const selection = (try selectEdgeSigns(shared, @intCast(node), seg, ref, way.by_direction[ref & 1])) orelse return error.MissingSignTags;
+            var source_class = way.by_direction[ref & 1];
+            source_class.category.use = edge_classes[edge.cls.class_id].category.use;
+            const selection = (try selectEdgeSigns(shared, @intCast(node), seg, ref, source_class)) orelse return error.MissingSignTags;
             sink.cell = grid.snapCell(topo.coordinates[node].toPoint());
             sink.owner = @intCast(slot);
             try selection.write(&sink, shared.deadline);

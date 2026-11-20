@@ -155,33 +155,63 @@ pub const Writer = struct {
     }
 
     /// A key known at compile time (all of upstream's are) and its value.
-    /// The quoted, escaped key is built at compile time.
+    /// Share the scalar writing code across the compile-time key spellings.
     pub fn field(self: *Writer, comptime name: []const u8, v: anytype) Allocator.Error!void {
+        try self.scalarField(comptime quotedKey(name), scalar(v));
+    }
+
+    noinline fn scalarField(self: *Writer, quoted: []const u8, v: Scalar) Allocator.Error!void {
         std.debug.assert(!self.after_key);
         try self.prefix();
-        try self.out.appendSlice(self.gpa, comptime quotedKey(name));
+        try self.out.appendSlice(self.gpa, quoted);
         self.after_key = true;
-        try self.value(v);
+        try self.writeScalar(v);
     }
 
     /// Writes a value chosen by type, like the wrapper's operator().
     pub fn value(self: *Writer, v: anytype) Allocator.Error!void {
-        const T = @TypeOf(v);
-        switch (@typeInfo(T)) {
-            .int, .comptime_int => if (@typeInfo(@TypeOf(v)) == .comptime_int or @typeInfo(T).int.signedness == .signed) try self.int(@intCast(v)) else try self.uint(@intCast(v)),
-            .float, .comptime_float => try self.float(@floatCast(v)),
-            .bool => try self.boolean(v),
-            .null => try self.null_(),
-            .optional => if (v) |inner| try self.value(inner) else try self.null_(),
-            .pointer => |p| {
-                if (p.size == .slice and p.child == u8) return self.string(v);
-                if (p.size == .one and @typeInfo(p.child) == .array and @typeInfo(p.child).array.child == u8) return self.string(v);
-                @compileError("unsupported JSON value type " ++ @typeName(T));
-            },
-            else => @compileError("unsupported JSON value type " ++ @typeName(T)),
+        try self.writeScalar(scalar(v));
+    }
+
+    fn writeScalar(self: *Writer, v: Scalar) Allocator.Error!void {
+        switch (v) {
+            .signed => |n| try self.int(n),
+            .unsigned => |n| try self.uint(n),
+            .floating => |n| try self.float(n),
+            .boolean => |b| try self.boolean(b),
+            .text => |t| try self.string(t),
+            .missing => try self.null_(),
         }
     }
 };
+
+const Scalar = union(enum) {
+    signed: i64,
+    unsigned: u64,
+    floating: f64,
+    boolean: bool,
+    text: []const u8,
+    missing,
+};
+
+fn scalar(v: anytype) Scalar {
+    const T = @TypeOf(v);
+    return switch (@typeInfo(T)) {
+        .int => |n| if (n.signedness == .signed) .{ .signed = @intCast(v) } else .{ .unsigned = @intCast(v) },
+        .comptime_int => .{ .signed = @intCast(v) },
+        .float, .comptime_float => .{ .floating = @floatCast(v) },
+        .bool => .{ .boolean = v },
+        .null => .missing,
+        .optional => if (v) |inner| scalar(inner) else .missing,
+        .pointer => |p| text: {
+            if (p.size == .slice and p.child == u8) break :text .{ .text = v };
+            if (p.size == .one and @typeInfo(p.child) == .array and @typeInfo(p.child).array.child == u8)
+                break :text .{ .text = v };
+            @compileError("unsupported JSON value type " ++ @typeName(T));
+        },
+        else => @compileError("unsupported JSON value type " ++ @typeName(T)),
+    };
+}
 
 const escape_table = blk: {
     var t: [256]u8 = @splat(0);
