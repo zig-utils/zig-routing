@@ -362,18 +362,18 @@
     "upstream": ["test/narrativebuilder.cc", "test/maneuversbuilder.cc", "test/"],
     "scope": [
       "Write a converter (Zig tool under `scripts/` or test helper) that turns upstream's hand-built maneuver fixtures into Zig test tables.",
-      "Port every case of test/narrativebuilder.cc (about 498 KB) as snapshot tests using zig-test-framework snapshots.",
+      "Port every road-narrative case of test/narrativebuilder.cc as snapshot tests using zig-test-framework snapshots. Preserve explicit coverage counts for the full pinned file and the transit cases assigned to P9.06.",
       "Port every case of test/maneuversbuilder.cc.",
       "Port the smaller odin tests that exist alongside them (signs, markup formatter, verbal text formatters, narrative dictionary) if not already ported by their issues.",
       "Document how to refresh snapshots when upstream is re-pinned."
     ],
-    "out_of_scope": ["Fixing failures in the builders themselves: reopen or file against P6.07 to P6.12."],
+    "out_of_scope": ["Fixing failures in the builders themselves: reopen or file against P6.07 to P6.12.", "Transit instruction goldens already assigned to P9.06."],
     "notes": [
       "Snapshots are the expected strings from upstream, not our output; never regenerate them from our code.",
       "Risk called out in docs/PLAN.md: narrative parity is mostly rules and strings."
     ],
     "accept": [
-      "100% of upstream cases are present; a count check in the test compares against the number of upstream TEST cases at the pinned commit.",
+      "100% of in-scope upstream cases are present; a count check accounts for every TEST case at the pinned commit and the transit cases assigned to P9.06.",
       "All ported cases pass.",
       "`zig build test` green and the suite runs in under 30 seconds."
     ]
