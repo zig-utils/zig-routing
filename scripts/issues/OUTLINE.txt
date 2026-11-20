@@ -162,10 +162,11 @@ P6.06 | Enhanced trip leg helpers (enhancedtrippath.cc) | narrative | port | M |
 P6.07 | Maneuvers builder I: creation, turn types and combine rules | narrative | port | L | P6.06
 P6.08 | Maneuvers builder II: ramps, exits, merges, roundabouts, forks, u-turns, internal intersections | narrative | port | L | P6.07
 P6.09 | Maneuvers builder III: ferries, stairs, elevators, indoor, guidance views, lane guidance | narrative | port | L | P6.08
+P6.09a | Preserve OSM dataset IDs in graph bundles and trip legs | graph | port | M | P6.05
 P6.10 | Locale dictionaries compiled at comptime from the 36 locale files | narrative | port | M | P0.01
 P6.11 | Narrative builder I: text instructions for every maneuver type | narrative | port | L | P6.08 P6.10
 P6.12 | Narrative builder II: verbal instructions, multi-cue, markup and per-locale formatters | narrative | port | L | P6.11
-P6.13 | Valhalla route serializer with maneuvers, lanes, signs and summaries | api | port | M | P6.11 P3.33
+P6.13 | Valhalla route serializer with maneuvers, lanes, signs and summaries | api | port | M | P6.11 P3.33 P6.09a
 P6.14 | OSRM serializer: routes, legs, steps, intersections, banner and voice instructions | api | port | L | P6.11
 P6.15 | GPX and pbf output for the route family | api | port | M | P6.05 P1.08
 P6.16 | Port the narrativebuilder and maneuversbuilder upstream tests as snapshot goldens | narrative | test | L | P6.09 P6.12
@@ -184,7 +185,7 @@ P7.09 | /expansion endpoint | api | port | S | P7.01
 P7.10 | /centroid | search | port | M | P7.01
 P7.11 | /optimized_route: port of the optimizer on top of the matrix | search | port | M | P7.03 P6.13
 P7.12 | /locate with verbose edge and node info | api | port | M | P3.23 P3.17
-P7.13 | /status with verbose output | api | port | S | P1.13 P3.13 P5.06
+P7.13 | /status with verbose output | api | port | S | P1.13 P3.13 P5.06 P6.09a
 P7.14 | /tile: graph MVT with an MVT encoder | tiles | port | M | P1.07 P3.20
 P7.15 | Scheduling classes: light and heavy request pools with bounded intra-request parallelism | server | new | M | P7.02 P1.16
 P7.16 | Response cache keyed by snapped edges, metric key and traffic epoch | server | perf | M | P4.08 P3.33
@@ -197,7 +198,7 @@ P8.02 | Emission and transition cost models with bounded routing between candida
 P8.03 | Viterbi search and top-k | match | port | L | P8.02
 P8.04 | Match results to a path: match_route, discontinuities, edge walking | match | port | M | P8.03
 P8.05 | /trace_route API with shape_match modes and trace options | api | port | M | P8.04 P6.13
-P8.06 | /trace_attributes API with attribute filters | api | port | M | P8.04 P6.05
+P8.06 | /trace_attributes API with attribute filters | api | port | M | P8.04 P6.05 P6.09a
 P8.07 | Port the mapmatch tests, throughput target and byte-bounded memory | match | test | M | P8.05 P8.06
 P8.08 | Phase 8 gate: parity gate G on the trace corpus | match | gate | S | P8.07
 

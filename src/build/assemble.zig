@@ -547,6 +547,7 @@ pub const Metadata = struct {
     access_scratch: std.ArrayList(access_restriction.Entry) = .empty,
     conditional: conditional_access.Parser,
     infer_turn_channels: bool,
+    infer_internal_intersections: bool,
     signs: sign_build.Catalog,
     lanes: lane_build.Catalog,
     name_tags: name_details.Catalog,
@@ -561,6 +562,7 @@ pub const Metadata = struct {
             .strings = .init(gpa),
             .conditional = .init(gpa, options.deadline),
             .infer_turn_channels = options.infer_turn_channels,
+            .infer_internal_intersections = options.infer_internal_intersections,
             .signs = .{ .arena = .init(gpa) },
             .lanes = .{ .a = gpa, .deadline = options.deadline },
             .name_tags = .{ .a = gpa, .deadline = options.deadline },
@@ -799,10 +801,11 @@ pub const Metadata = struct {
             try edge_class.fromWay(attrs, true, .right),
             try edge_class.fromWay(attrs, false, .right),
         };
-        const drive_on_left = if (self.use_admin_db) false else try wayDriveOnLeft(raw_tags, (self.drive_side orelse .right) == .left);
+        const raw_flags = try self.rawWayFlags(raw_tags);
         for (&pair) |*class| {
             class.category.use = @intCast(@backingInt(directed_use));
-            if (directed_use == .ramp or directed_use == .turn_channel) class.flags.internal = false;
+            class.flags.internal = directed_use != .ramp and directed_use != .turn_channel and
+                (class.flags.internal or raw_flags.internal);
         }
         const entry = try self.ways.getOrPut(self.gpa, id);
         if (entry.found_existing) return error.DuplicateWay;
@@ -847,7 +850,7 @@ pub const Metadata = struct {
                 .importance = @intCast(@backingInt(attrs.road_class)),
                 .has_names = name_start != name_end,
                 .primary_name = primary_name and (!ref_first or ref_count < name_count),
-                .drive_on_left = drive_on_left,
+                .drive_on_left = raw_flags.drive_on_left,
                 .layer = attrs.layer,
             },
             .level_start = level_start,
@@ -858,14 +861,24 @@ pub const Metadata = struct {
         };
     }
 
-    fn wayDriveOnLeft(raw_tags: pbf.block.TagIterator, fallback: bool) !bool {
-        var left = fallback;
+    const RawWayFlags = struct { drive_on_left: bool = false, internal: bool = false };
+
+    // Ported from ParseWays' driving_side and internal_intersection handlers.
+    noinline fn rawWayFlags(self: *const Metadata, raw_tags: pbf.block.TagIterator) !RawWayFlags {
+        if (self.use_admin_db and self.infer_internal_intersections) return .{};
+        var flags: RawWayFlags = .{
+            .drive_on_left = !self.use_admin_db and self.drive_side == .left,
+        };
         var tags_at_way = raw_tags;
         while (try tags_at_way.next()) |tag| {
-            if (std.mem.eql(u8, tag.key, "driving_side"))
-                left = !std.mem.eql(u8, tag.value, "right");
+            if (self.deadline.expired()) return error.DeadlineExceeded;
+            if (!self.use_admin_db and std.mem.eql(u8, tag.key, "driving_side")) {
+                flags.drive_on_left = !std.mem.eql(u8, tag.value, "right");
+            } else if (!self.infer_internal_intersections and std.mem.eql(u8, tag.key, "internal_intersection")) {
+                flags.internal = std.mem.eql(u8, tag.value, "true");
+            }
         }
-        return left;
+        return flags;
     }
 
     noinline fn wayAccess(self: *Metadata, id: i64, unconditional: *const access_restriction.Set, raw_tags: pbf.block.TagIterator) ![2]u16 {

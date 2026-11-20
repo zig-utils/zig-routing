@@ -253,6 +253,32 @@ def compare_maneuvers(comparison, ours, donor, directions, result, types, highwa
                 counts[f"legs_with_{types[number]}"] += 1
 
 
+def compare_narrative_fixture(comparison, ours, donor, directions, result, types):
+    native_edges = [node["edge"] for node in ours["node"] if "edge" in node]
+    donor_edges = [edge for node in nested(donor, 6) for edge in nested(node, 1)]
+    same_path = [(edge["way_id"], edge["forward"]) for edge in native_edges] == [
+        (get(edge, 27), bool(get(edge, 59))) for edge in donor_edges
+    ]
+    comparison.check("path", same_path)
+    if not same_path:
+        return
+    comparison.counts["matched_legs"] += 1
+    records = nested(directions, 6)
+    steps = result.get("steps", [])
+    comparison.check("maneuver.types", bool(records) and
+                     [step["type"] for step in steps] == [types[get(record, 1)] for record in records])
+    comparison.check("maneuver.names", [[name["value"].encode() for name in step["street_names"]] for step in steps] == [
+        [get(name, 1, b"") for name in nested(record, 3)] for record in records
+    ])
+    for edge, reference in zip(native_edges, donor_edges):
+        states = {0: "kInvalid", 1: "kValid", 2: "kActive"}
+        received = nested(reference, 42)
+        comparison.counts["turn_lanes"] += len(received)
+        comparison.check("edge.turn_lane_states", [
+            (lane["directions_mask"], lane["state"], lane["active_direction"]) for lane in edge["turn_lanes"]
+        ] == [(get(lane, 1), states[get(lane, 2)], get(lane, 3)) for lane in received])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("native", type=Path)
@@ -266,10 +292,12 @@ def main():
                          help="score simple maneuver sequences on matching paths for Gate D")
     options.add_argument("--highway-maneuvers", action="store_true",
                          help="score maneuver sequences including highway junctions within the Gate D cost tolerance")
+    options.add_argument("--narrative-fixtures", action="store_true",
+                         help="compare every fixture path, maneuver sequence and turn lane state")
     args = parser.parse_args()
     comparison = Comparison(args.schema)
     score_maneuvers = args.maneuvers or args.highway_maneuvers
-    types = maneuver_types(args.schema) if score_maneuvers else {}
+    types = maneuver_types(args.schema) if score_maneuvers or args.narrative_fixtures else {}
     with args.native.open() as rows:
         for line in rows:
             row = json.loads(line)
@@ -280,11 +308,14 @@ def main():
             blob = path.read_bytes()
             reference = list(leg_records(blob))
             comparison.check("leg.count", len(row["legs"]) == len(reference))
-            if score_maneuvers:
+            if score_maneuvers or args.narrative_fixtures:
                 directions = list(direction_legs(blob))
                 comparison.check("directions.leg_count", len(row["legs"]) == len(directions))
                 for ours, donor, direction, result in zip(row["legs"], reference, directions, row["maneuvers"]):
-                    compare_maneuvers(comparison, ours, donor, direction, result, types, args.highway_maneuvers)
+                    if args.narrative_fixtures:
+                        compare_narrative_fixture(comparison, ours, donor, direction, result, types)
+                    else:
+                        compare_maneuvers(comparison, ours, donor, direction, result, types, args.highway_maneuvers)
             else:
                 for ours, donor in zip(row["legs"], reference):
                     comparison.leg(ours, donor, args.metadata_only)

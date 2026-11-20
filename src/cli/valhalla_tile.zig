@@ -273,9 +273,7 @@ pub const Tile = struct {
 
     pub fn signText(self: *const Tile, offset: u32) ![]const u8 {
         if (offset >= self.text.len) return error.InvalidSignOffset;
-        const text = self.text[offset..];
-        const end = std.mem.indexOfScalar(u8, text, 0) orelse return error.UnterminatedSign;
-        return text[0..end];
+        return terminatedText(self.text[offset..]) orelse error.UnterminatedSign;
     }
 
     pub fn parse(bytes: []const u8) !Tile {
@@ -362,9 +360,8 @@ pub const EdgeInfo = struct {
         const info = self.names[index].data;
         if (info.offset >= self.text.len) return error.InvalidNameOffset;
         if (info.tagged) return null;
-        const remaining = self.text[info.offset..];
-        const end = std.mem.indexOfScalar(u8, remaining, 0) orelse return error.UnterminatedEdgeName;
-        return .{ .text = remaining[0..end], .route = info.route };
+        const text = terminatedText(self.text[info.offset..]) orelse return error.UnterminatedEdgeName;
+        return .{ .text = text, .route = info.route };
     }
 
     pub fn decodeShape(self: EdgeInfo, a: std.mem.Allocator, points: *std.ArrayList(geo.FixedLL), deadline: io.Deadline) !void {
@@ -402,6 +399,11 @@ pub const EdgeInfo = struct {
         return .{ .layer = layer, .levels = levels.items };
     }
 };
+
+noinline fn terminatedText(bytes: []const u8) ?[]const u8 {
+    const end = std.mem.indexOfScalar(u8, bytes, 0) orelse return null;
+    return bytes[0..end];
+}
 
 fn decodeLevels(a: std.mem.Allocator, levels: *std.ArrayList(graph.cold.LevelRange), bytes: []const u8, deadline: io.Deadline) !void {
     const Decoder = geo.polyline.IntDecoder(i32);

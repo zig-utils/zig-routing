@@ -198,6 +198,50 @@ test "a turn channel ending at a side-of-street destination preserves arrival" {
     try testing.expectEqual(@as(u32, 2), result[2].begin_shape_index);
 }
 
+test "moving a straight internal edge carries turn lanes to the new maneuver boundary" {
+    const graph_lanes = @import("../graph/lanes.zig");
+    var approach = [_]trip.TurnLane{.{ .directions_mask = graph_lanes.left }};
+    const nodes = [_]trip.Node{
+        .{ .edge = .{ .name = &.{.{ .value = "Approach" }}, .length_km = 0.3, .road_class = .kPrimary, .end_shape_index = 1, .turn_lanes = &approach } },
+        .{ .edge = .{ .internal_intersection = true, .length_km = 0.012, .road_class = .kPrimary, .begin_shape_index = 1, .end_shape_index = 2 } },
+        .{ .edge = .{ .name = &.{.{ .value = "Exit road" }}, .length_km = 0.3, .road_class = .kPrimary, .begin_heading = 270, .begin_shape_index = 2, .end_shape_index = 3 } },
+        .{},
+    };
+    const path: trip.TripLeg = .{ .node = &nodes, .location = &.{ .{}, .{} } };
+    var storage = std.heap.ArenaAllocator.init(testing.allocator);
+    defer storage.deinit();
+    const built = try builder.buildAnnotated(storage.allocator(), &path, .{}, .none);
+    try testing.expectEqual(@as(usize, 3), built.maneuvers.len);
+    try testing.expectEqual(.kLeft, built.maneuvers[1].type);
+    try testing.expectEqual(@as(u32, 2), built.maneuvers[0].end_node_index);
+    try testing.expectEqual(@as(u32, 2), built.maneuvers[1].begin_node_index);
+    try testing.expectEqual(@as(usize, 0), path.node[1].edge.?.turn_lanes.len);
+    const transferred = built.trip_leg.node[1].edge.?.turn_lanes;
+    try testing.expectEqual(@as(usize, 1), transferred.len);
+    try testing.expectEqual(.kActive, transferred[0].state);
+    try testing.expectEqual(graph_lanes.left, transferred[0].active_direction);
+}
+
+test "ferry and rail ferry edges produce enter and exit maneuvers" {
+    var storage = std.heap.ArenaAllocator.init(testing.allocator);
+    defer storage.deinit();
+    for ([_]trip.Use{ .kFerryUse, .kRailFerryUse }) |use| {
+        const nodes = [_]trip.Node{
+            .{ .edge = .{ .name = &.{.{ .value = "West Pier" }}, .length_km = 0.2, .road_class = .kPrimary, .end_shape_index = 1 } },
+            .{ .edge = .{ .name = &.{.{ .value = "Harbor crossing" }}, .length_km = 2.5, .road_class = .kPrimary, .use = use, .begin_shape_index = 1, .end_shape_index = 2 } },
+            .{ .edge = .{ .name = &.{.{ .value = "East Pier" }}, .length_km = 0.3, .road_class = .kPrimary, .begin_shape_index = 2, .end_shape_index = 3 } },
+            .{},
+        };
+        const path: trip.TripLeg = .{ .node = &nodes, .location = &.{ .{}, .{} } };
+        const values = try builder.build(storage.allocator(), &path, .none);
+        try testing.expectEqual(@as(usize, 4), values.len);
+        try testing.expectEqual(.kFerryEnter, values[1].type);
+        try testing.expectEqual(.kFerryExit, values[2].type);
+        try testing.expectEqual(use == .kFerryUse, values[1].ferry);
+        try testing.expectEqual(use == .kRailFerryUse, values[1].rail_ferry);
+    }
+}
+
 test "upstream intersecting forward edges separate maneuvers sharing a road name" {
     const cases = [_]struct { from: u32, to: u32, crossing: u32 }{
         .{ .from = 291, .to = 20, .crossing = 289 },

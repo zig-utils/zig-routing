@@ -1,11 +1,15 @@
 // Ported from src/odin/maneuversbuilder.cc (Valhalla 3.9.3).
+// Transit routing supplies scheduled transit maneuvers in P9.06. Bike-share actions remain kNoneAction until P9.07 supplies station data.
 const trip = @import("../api/trip.zig");
 const directions = @import("../api/directions.zig");
 const turn = @import("../graph/turn.zig");
 const enhanced = @import("enhanced.zig");
+const guidance_views = @import("guidance_views.zig");
 const junctions = @import("junctions.zig");
 const maneuver = @import("maneuver.zig");
+const postprocess = @import("postprocess.zig");
 const signs = @import("signs.zig");
+const turn_lanes = @import("turn_lanes.zig");
 
 // Ported from ManeuversBuilder::DetermineCardinalDirection.
 pub fn cardinalDirection(heading: u32) directions.CardinalDirection {
@@ -139,9 +143,22 @@ pub const Options = struct {
     roundabout_exits: bool = true,
 };
 
+pub const setVerbalMultiCueFlags = postprocess.setVerbalMultiCueFlags;
+
 pub fn buildWithOptions(arena: std.mem.Allocator, path: *const trip.TripLeg, options: Options, deadline: io.Deadline) ![]const Maneuver {
+    return (try buildAnnotated(arena, path, options, deadline)).maneuvers;
+}
+
+pub const BuildResult = struct {
+    trip_leg: trip.TripLeg,
+    maneuvers: []const Maneuver,
+};
+
+/// The returned leg carries lane states and any lanes inherited by moved internal edges.
+pub fn buildAnnotated(arena: std.mem.Allocator, path: *const trip.TripLeg, options: Options, deadline: io.Deadline) !BuildResult {
     const leg: enhanced.Leg = .{ .value = path, .deadline = deadline };
-    const builder: Builder = .{ .leg = leg, .arena = arena };
+    var copied_nodes: ?[]trip.Node = null;
+    const builder: Builder = .{ .leg = leg, .arena = arena, .copied_nodes = &copied_nodes };
     var result = try builder.combine(try builder.produce());
     try signs.countAndSort(arena, result, deadline);
     for (result) |*value| {
@@ -152,14 +169,22 @@ pub fn buildWithOptions(arena: std.mem.Allocator, path: *const trip.TripLeg, opt
     result = try builder.processRoundabouts(result, options.roundabout_exits);
     try builder.setToStayOnAttribute(result);
     try builder.enhanceSignlessInterchanges(result);
+    try guidance_views.process(arena, leg, result);
     try builder.updateManeuverPlacementForInternalIntersectionTurns(result);
     result = try builder.collapseSmallEndRampFork(result);
-    return builder.collapseMergeManeuvers(result);
+    result = try builder.collapseMergeManeuvers(result);
+    var annotated = path.*;
+    if (copied_nodes) |nodes| annotated.node = nodes;
+    try turn_lanes.process(.{ .value = &annotated, .deadline = deadline }, result);
+    try postprocess.attachLandmarks(arena, leg, result);
+    try postprocess.markLongStreetNames(result, deadline);
+    return .{ .trip_leg = annotated, .maneuvers = result };
 }
 
 const Builder = struct {
     leg: enhanced.Leg,
     arena: std.mem.Allocator,
+    copied_nodes: ?*?[]trip.Node = null,
 
     fn check(self: Builder) error{DeadlineExceeded}!void {
         if (self.leg.deadline.expired()) return error.DeadlineExceeded;
@@ -235,6 +260,8 @@ const Builder = struct {
             .kRight => .kStartRight,
             else => .kStart,
         };
+        const first = self.leg.currEdge(0) orelse return error.InvalidTripLeg;
+        if (first.isStepsUse() or first.isEscalatorUse() or first.traversesLevels()) value.type = .kNone;
         try self.finalizeManeuver(value, 0);
     }
 
@@ -249,11 +276,29 @@ const Builder = struct {
             .drive_on_right = !previous.value.drive_on_left,
             .turn_channel = previous.isTurnChannelUse(),
             .ramp = previous.isRampUse(),
+            .ferry = previous.isFerryUse(),
+            .rail_ferry = previous.isRailFerryUse(),
+            .elevator = previous.isElevatorUse(),
+            .indoor_steps = previous.isStepsUse() and previous.value.indoor,
+            .steps = previous.isStepsUse() and (previous.traversesLevels() or previous.value.length_km >= 0.003 or previous.value.pedestrian_type == .kBlind),
+            .escalator = previous.isEscalatorUse(),
+            .has_level_changes = previous.traversesLevels(),
             .roundabout = roundabout,
             .roundabout_exit_count = @intFromBool(roundabout),
             .internal_intersection = previous.value.internal_intersection and index != 1 and !self.leg.isLastNodeIndex(index),
             .trail_type = trailType(previous),
         };
+        const next_edge = self.leg.currEdge(index);
+        if (next_edge) |edge| value.end_level_ref = try self.endLevelRef(edge);
+        if (previous.isTransitConnection()) {
+            value.transit_connection = true;
+            value.type = if (previous.isPlatformConnectionUse() and next_edge != null and next_edge.?.value.travel_mode == .kTransit)
+                .kTransitConnectionStart
+            else
+                .kTransitConnectionDestination;
+            const node = self.leg.node(index) orelse return error.InvalidTripLeg;
+            value.transit_connection_platform_info = node.value.transit_platform_info orelse .{};
+        }
         copyTravel(&value, previous);
         if (value.pedestrian_type == .kBlind) {
             value.bridge = previous.value.bridge;
@@ -306,10 +351,21 @@ const Builder = struct {
         value.begin_node_index = @intCast(index);
         value.begin_shape_index = current.value.begin_shape_index;
         value.time = end.elapsedTime() - node.elapsedTime();
+        if (node.isElevator()) {
+            value.elevator = true;
+            value.node_type = node.value.type;
+            const refs = try current.levelRefs(self.arena);
+            if (refs.len != 0) value.end_level_ref = if (refs.len == 1) refs[0] else "";
+        }
         if (self.leg.prevEdge(index, 1)) |previous| {
+            if (node.isBuildingEntrance()) {
+                value.building_enter = current.value.indoor and !previous.value.indoor;
+                value.building_exit = !current.value.indoor and previous.value.indoor;
+            }
             value.turn_degree = turn.degree(previous.value.end_heading, value.begin_heading);
             value.begin_relative_direction = try directionAt(value, node, previous, current);
             value.pedestrian_crossing = current.isPedestrianCrossingUse() and previous.isFootwayUse();
+            if (value.type == .kTransitConnectionStart and previous.value.travel_mode == .kTransit) value.type = .kTransitConnectionTransfer;
         }
         value.begin_intersecting_edge_name_consistency = try node.hasIntersectingEdgeNameConsistency();
         if (!current.isHighway() and !current.value.internal_intersection and current.nameList().len > 1) {
@@ -327,6 +383,10 @@ const Builder = struct {
     // Ported from ManeuversBuilder::SetManeuverType.
     fn setManeuverType(self: Builder, value: *Maneuver, none_type_allowed: bool) !void {
         if (value.type != .kNone) return;
+        if (value.begin_node_index == 0) {
+            value.type = facilityType(value, null) orelse try simpleDirectionalType(value, null);
+            return;
+        }
         const at = try self.context(value.begin_node_index);
         if (value.roundabout) {
             value.type = .kRoundaboutEnter;
@@ -349,8 +409,13 @@ const Builder = struct {
                 else => .kMerge,
             };
         } else {
-            value.type = try simpleDirectionalType(value, at);
+            value.type = facilityType(value, at.previous) orelse try simpleDirectionalType(value, at);
         }
+    }
+
+    fn endLevelRef(self: Builder, edge: enhanced.Edge) ![]const u8 {
+        const refs = try edge.levelRefs(self.arena);
+        return if (refs.len == 1) refs[0] else "";
     }
 
     // Ported from ManeuversBuilder::RampLeadsToHighway.
@@ -409,7 +474,18 @@ const Builder = struct {
         const current = at.current.value;
         if (current.pedestrian_type == .kBlind and value.node_type != null) return false;
         if (at.node.isParking() or at.node.isBikeShare()) return false;
-        if (value.drive_on_right == previous.drive_on_left or value.travel_mode != previous.travel_mode or
+        if (value.transit_connection or at.previous.isTransitConnection()) {
+            return value.transit_connection and at.previous.isTransitConnection() and transitConnectionsJoin(at.previous, at.current);
+        }
+        if (value.drive_on_right == previous.drive_on_left) return false;
+        if (value.elevator or at.previous.isElevatorUse()) return value.elevator and at.previous.isElevatorUse();
+        if (at.node.isElevator()) return false;
+        const previous_indoor_steps = at.previous.isStepsUse() and previous.indoor;
+        if (value.indoor_steps or previous_indoor_steps) return value.indoor_steps and previous_indoor_steps;
+        if (value.steps or at.previous.isStepsUse()) return value.steps and at.previous.isStepsUse();
+        if (value.escalator or at.previous.isEscalatorUse()) return value.escalator and at.previous.isEscalatorUse();
+        if (at.node.isBuildingEntrance() or value.has_level_changes != at.previous.traversesLevels()) return false;
+        if (value.travel_mode != previous.travel_mode or
             value.isUnnamedWalkway() != at.previous.isUnnamedWalkway() or
             value.isUnnamedCycleway() != at.previous.isUnnamedCycleway() or
             value.isUnnamedMountainBikeTrail() != at.previous.isUnnamedMountainBikeTrail()) return false;
@@ -427,6 +503,8 @@ const Builder = struct {
         if (at.previous.isRampUse() != value.ramp) return false;
         const degree = turn.degree(previous.end_heading, current.begin_heading);
         if (value.ramp) return at.current.isForward(degree);
+        if (value.ferry or at.previous.isFerryUse()) return value.ferry and at.previous.isFerryUse();
+        if (value.rail_ferry or at.previous.isRailFerryUse()) return value.rail_ferry and at.previous.isRailFerryUse();
         if (degree == 180) {
             value.type = if (previous.drive_on_left) .kUturnRight else .kUturnLeft;
             return false;
@@ -487,6 +565,10 @@ const Builder = struct {
     }
 
     fn combinePair(self: Builder, previous: *const Maneuver, current: *Maneuver, next: *const Maneuver, following: ?directions.ManeuverType, start: bool) !bool {
+        if (current.elevator or next.elevator or current.indoor_steps or next.indoor_steps or current.escalator or next.escalator or
+            current.has_level_changes != next.has_level_changes or current.building_enter or current.building_exit or next.building_enter or next.building_exit or
+            current.transit_connection or next.transit_connection)
+            return false;
         if (current.drive_on_right != next.drive_on_right or current.travel_mode != next.travel_mode or
             next.type == .kDestination) return false;
         const possible_internal = possibleUnspecifiedInternalManeuver(previous, current, next);
@@ -499,7 +581,7 @@ const Builder = struct {
             combineUnspecifiedInternalManeuver(previous, current, next, if (direction == .left) .kUturnLeft else .kUturnRight);
             return true;
         }
-        if (next.tee or next.fork) return false;
+        if (next.tee or next.fork or current.ferry or next.ferry) return false;
         if (current.internal_intersection and !next.isDestinationType()) {
             try self.combineInternalManeuver(previous, current, next, start);
             return true;
@@ -510,7 +592,7 @@ const Builder = struct {
         }
         if (next.intersecting_forward_edge or current.trail_type != next.trail_type) return false;
         if (current.pedestrian_type == .kBlind and next.pedestrian_type == .kBlind and
-            (current.node_type != null or next.node_type != null or current.bridge or next.bridge or current.tunnel or next.tunnel)) return false;
+            (current.node_type != null or next.node_type != null or current.steps or next.steps or current.bridge or next.bridge or current.tunnel or next.tunnel)) return false;
 
         const next_edge = self.leg.currEdge(next.begin_node_index);
         if (next.begin_relative_direction == .keep_straight and next_edge != null and !next_edge.?.isTurnChannelUse() and
@@ -754,6 +836,7 @@ const Builder = struct {
 
     // Ported from ManeuversBuilder::MoveInternalEdgeToPreviousManeuver.
     fn moveInternalEdgeToPreviousManeuver(self: Builder, previous: *Maneuver, current: *Maneuver, edge: *const trip.Edge) !void {
+        try self.inheritTurnLanes(current.begin_node_index);
         const next_begin = current.begin_node_index + 1;
         const boundary = self.leg.node(next_begin) orelse return error.InvalidTripLeg;
         const start = self.leg.node(previous.begin_node_index) orelse return error.InvalidTripLeg;
@@ -769,6 +852,17 @@ const Builder = struct {
         current.begin_node_index = next_begin;
         current.begin_shape_index = edge.end_shape_index;
         current.time = end.elapsedTime() - boundary.elapsedTime();
+    }
+
+    fn inheritTurnLanes(self: Builder, index: u32) !void {
+        const copied = self.copied_nodes orelse return;
+        const nodes: []const trip.Node = if (copied.*) |prior| prior else self.leg.value.node;
+        const edge = nodes[index].edge orelse return error.InvalidTripLeg;
+        if (edge.turn_lanes.len != 0) return;
+        const previous = nodes[index - 1].edge orelse return error.InvalidTripLeg;
+        if (previous.turn_lanes.len == 0) return;
+        if (copied.* == null) copied.* = try self.arena.dupe(trip.Node, nodes);
+        copied.*.?[index].edge.?.turn_lanes = try self.arena.dupe(trip.TurnLane, previous.turn_lanes);
     }
 
     // Ported from ManeuversBuilder::CollapseSmallEndRampFork.
@@ -903,8 +997,31 @@ fn forkThenTurnSameDirection(fork: directions.ManeuverType, following: direction
 fn requireSupportedEdge(edge: enhanced.Edge) !void {
     const raw = edge.value;
     if (!(raw.length_km >= 0 and std.math.isFinite(raw.length_km))) return error.InvalidTripLeg;
-    if (raw.travel_mode == .kTransit or edge.isTransitConnection() or raw.indoor or edge.traversesLevels() or edge.isStepsUse() or
-        edge.isEscalatorUse() or edge.isElevatorUse() or edge.isFerryUse() or edge.isRailFerryUse()) return error.UnsupportedManeuver;
+    if (raw.travel_mode == .kTransit) return error.UnsupportedManeuver;
+}
+
+// Ported from the station entrance and exit cases of CanManeuverIncludePrevEdge.
+fn transitConnectionsJoin(previous: enhanced.Edge, current: enhanced.Edge) bool {
+    return switch (previous.value.use) {
+        .kEgressConnectionUse => current.isPlatformConnectionUse() or current.isTransitConnectionUse(),
+        .kPlatformConnectionUse => current.isPlatformConnectionUse() or current.isEgressConnectionUse(),
+        .kTransitConnectionUse => current.isEgressConnectionUse(),
+        else => false,
+    };
+}
+
+// Ported from the facility and travel-mode branches of ManeuversBuilder::SetManeuverType.
+fn facilityType(value: *const Maneuver, previous: ?enhanced.Edge) ?directions.ManeuverType {
+    if (value.ferry or value.rail_ferry) return .kFerryEnter;
+    if (previous) |edge| if (edge.isFerryUse() or edge.isRailFerryUse()) return .kFerryExit;
+    if (value.elevator) return .kElevatorEnter;
+    if (value.indoor_steps or value.steps) return .kStepsEnter;
+    if (value.escalator) return .kEscalatorEnter;
+    if (value.building_enter) return .kBuildingEnter;
+    if (value.building_exit) return .kBuildingExit;
+    if (value.has_level_changes and value.end_level_ref.len != 0) return .kLevelChange;
+    if (previous) |edge| if (value.travel_mode == .kPedestrian and edge.value.travel_mode == .kDrive) return .kParkVehicle;
+    return null;
 }
 
 // Ported from ManeuversBuilder::AreRoundaboutsProcessable.
@@ -935,6 +1052,14 @@ fn combineManeuvers(current: *Maneuver, next: *const Maneuver) void {
     current.end_heading = next.end_heading;
     current.end_node_index = next.end_node_index;
     current.end_shape_index = next.end_shape_index;
+    current.end_level_ref = next.end_level_ref;
+    current.elevator = current.elevator or next.elevator;
+    current.steps = current.steps or next.steps;
+    current.indoor_steps = current.indoor_steps or next.indoor_steps;
+    current.escalator = current.escalator or next.escalator;
+    current.has_level_changes = current.has_level_changes or next.has_level_changes;
+    current.ferry = current.ferry or next.ferry;
+    current.rail_ferry = current.rail_ferry or next.rail_ferry;
     current.ramp = current.ramp or next.ramp;
     current.roundabout = current.roundabout or next.roundabout;
     current.portions_toll = current.portions_toll or next.portions_toll;

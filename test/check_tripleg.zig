@@ -6,8 +6,9 @@ const io = routing.infra.io;
 const search = routing.search;
 const trip = routing.api.trip;
 const auto = routing.costing.auto;
+const pedestrian = routing.costing.pedestrian;
 const Auto = @import("auto_search_kernel.zig").Auto;
-const Engine = search.search.Search(Auto, search.queue.Heap);
+const Foot = @import("pedestrian_search_kernel.zig").Foot;
 const Snap = routing.snap.candidates;
 
 pub fn main(init: std.process.Init) !void {
@@ -16,12 +17,23 @@ pub fn main(init: std.process.Init) !void {
     const bundle_path = args.next() orelse return error.MissingBundle;
     const corpus_path = args.next() orelse return error.MissingCorpus;
     const count = if (args.next()) |value| try std.fmt.parseInt(usize, value, 10) else std.math.maxInt(usize);
-    const with_maneuvers = if (args.next()) |option|
-        if (std.mem.eql(u8, option, "--maneuvers")) true else return error.InvalidOption
-    else
-        false;
-    if (args.next() != null) return error.TooManyArguments;
+    var with_maneuvers = false;
+    var on_foot = false;
+    while (args.next()) |option| {
+        if (std.mem.eql(u8, option, "--maneuvers") and !with_maneuvers) {
+            with_maneuvers = true;
+        } else if (std.mem.eql(u8, option, "--pedestrian") and !on_foot) {
+            on_foot = true;
+        } else return error.InvalidOption;
+    }
+    if (on_foot) return run(.pedestrian, init, bundle_path, corpus_path, count, with_maneuvers);
+    return run(.auto, init, bundle_path, corpus_path, count, with_maneuvers);
+}
 
+fn run(comptime mode: request.Costing, init: std.process.Init, bundle_path: []const u8, corpus_path: []const u8, count: usize, with_maneuvers: bool) !void {
+    const Kernel = if (mode == .pedestrian) Foot else Auto;
+    const Engine = search.search.Search(Kernel, search.queue.Heap);
+    const Cache = if (mode == .pedestrian) pedestrian.Cache else auto.Cache;
     var bundle = try routing.graph.reader.Bundle.open(bundle_path);
     defer bundle.close();
     const view = &bundle.view;
@@ -31,7 +43,7 @@ pub fn main(init: std.process.Init) !void {
     defer arena.deinit();
     var engine = try Engine.init(init.gpa, view);
     defer engine.deinit();
-    var cache = try auto.Cache.init(init.gpa, view.classes orelse return error.MissingClasses, 1);
+    var cache = try Cache.init(init.gpa, view.classes orelse return error.MissingClasses, 1);
     defer cache.deinit();
     var buffer: [16 * 1024]u8 = undefined;
     var stdout = io.stdoutWriter(init.io, &buffer);
@@ -43,7 +55,7 @@ pub fn main(init: std.process.Init) !void {
         const tab = std.mem.indexOfScalar(u8, line, '\t') orelse return error.InvalidCorpusRow;
         if (!std.mem.eql(u8, line[0..tab], "/route")) return error.InvalidCorpusRow;
         arena.reset();
-        const checked = check(&engine, view, &arena, &cache, line[tab + 1 ..]) catch |err| {
+        const checked = check(mode, &engine, view, &arena, &cache, line[tab + 1 ..]) catch |err| {
             try std.json.Stringify.value(.{ .index = index, .failure = @errorName(err) }, .{}, writer);
             try writer.writeByte('\n');
             continue;
@@ -53,8 +65,12 @@ pub fn main(init: std.process.Init) !void {
             const a = arena.allocator();
             const values = try a.alloc(ManeuverResult, legs.len);
             for (legs, values) |*leg, *result| {
-                const maneuvers = routing.narrative.maneuvers.buildWithOptions(a, leg, checked.narrative, io.Deadline.fromNowMs(10_000));
-                result.* = if (maneuvers) |steps| .{ .steps = steps } else |err| .{ .failure = @errorName(err) };
+                if (routing.narrative.maneuvers.buildAnnotated(a, leg, checked.narrative, io.Deadline.fromNowMs(10_000))) |built| {
+                    leg.* = built.trip_leg;
+                    result.* = .{ .steps = built.maneuvers };
+                } else |err| {
+                    result.* = .{ .failure = @errorName(err) };
+                }
             }
             try std.json.Stringify.value(.{ .index = index, .legs = legs, .maneuvers = values }, .{ .emit_null_optional_fields = false }, writer);
         } else {
@@ -71,11 +87,11 @@ const ManeuverResult = struct {
 };
 
 const Checked = struct {
-    legs: []const trip.TripLeg,
+    legs: []trip.TripLeg,
     narrative: routing.narrative.maneuvers.Options,
 };
 
-fn check(engine: *Engine, view: *const routing.graph.reader.View, arena: *routing.infra.arena.Arena, cache: *auto.Cache, request_json: []const u8) !Checked {
+fn check(comptime mode: request.Costing, engine: anytype, view: *const routing.graph.reader.View, arena: *routing.infra.arena.Arena, cache: anytype, request_json: []const u8) !Checked {
     const a = arena.allocator();
     const deadline = io.Deadline.fromNowMs(10_000);
     const control: search.search.Control = .{ .deadline = deadline };
@@ -84,20 +100,27 @@ fn check(engine: *Engine, view: *const routing.graph.reader.View, arena: *routin
         .ok => |options| options,
         .failure => return error.InvalidRequest,
     };
-    if (opts.costing != .auto or opts.date_time_type != .no_time) return error.UnsupportedProfile;
-    const auto_options = if (opts.costing_options) |root| routing.api.json.pointer(root, "/auto") orelse .null else .null;
+    if (opts.costing != mode or opts.date_time_type != .no_time) return error.UnsupportedProfile;
+    const options_key = if (mode == .pedestrian) "/pedestrian" else "/auto";
+    const model_options = if (opts.costing_options) |root| routing.api.json.pointer(root, options_key) orelse .null else .null;
     var warnings: std.ArrayList(routing.costing.base.Warning) = .empty;
-    const options = try auto.parse(a, .auto, auto_options, &warnings, deadline);
+    const options = if (mode == .pedestrian)
+        try pedestrian.parse(a, model_options, &warnings, deadline)
+    else
+        try auto.parse(a, .auto, model_options, &warnings, deadline);
     var lease = try cache.acquire(options, deadline);
     defer lease.release();
-    const kernel: Auto = .{ .profile = lease.profile(), .tables = lease.tables(), .arena = a };
+    const kernel = if (mode == .pedestrian)
+        Foot{ .profile = lease.profile(), .tables = lease.tables() }
+    else
+        Auto{ .profile = lease.profile(), .tables = lease.tables(), .arena = a };
     const correlated = try a.alloc(Snap.PathLocation, opts.locations.len);
     const access: Snap.Access = .{ .mask = lease.profile().permission.access_mask };
     for (opts.locations, correlated) |location, *out| {
         try control.check();
         out.* = try Snap.search(view, a, location, .{}, access, deadline);
     }
-    const path = try search.multi.route(engine, arena, kernel, opts.locations, correlated, .{ .search = .{ .costing = .auto } }, control);
+    const path = try search.multi.route(engine, arena, kernel, opts.locations, correlated, .{ .search = .{ .costing = mode } }, control);
     const geometry = try search.legs.build(a, view, kernel, path, correlated, control);
     const attrs = try opts.tripAttributes(true, deadline);
     const output = try a.alloc(trip.TripLeg, path.legs.len);

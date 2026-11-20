@@ -15,39 +15,7 @@ const Node = graph.format.NodeId;
 const View = graph.reader.View;
 const Hot = graph.format.EdgeHot;
 
-const Foot = struct {
-    profile: *const pedestrian.Profile,
-    tables: *const routing.costing.compiled.Compiled,
-
-    pub fn restrictionModes(self: Foot) u16 {
-        const permission = self.profile.permission;
-        if (permission.flags.contains(.ignore_restrictions) or permission.flags.contains(.ignore_non_vehicular_restrictions)) return 0;
-        return @bitCast(permission.access_mask);
-    }
-
-    pub fn edgeCost(self: Foot, view: *const View, _: Edge, edge: *const Hot, _: search.Direction) !Cost {
-        const class = try view.class(edge.cls.class_id);
-        return pedestrian.Kernel.edgeCost(self.profile, self.tables, class, edge.*, self.profile.untimedFerrySpeed(edge.*), .{});
-    }
-
-    pub fn allowedTurn(self: Foot, view: *const View, movement: search.Transition, previous: search.Label, _: search.Direction) !bool {
-        if (!self.profile.allowedNode(try view.node(movement.node))) return false;
-        const from = try view.class(movement.incoming_edge.cls.class_id);
-        const to = try view.class(movement.outgoing_edge.cls.class_id);
-        return pedestrian.Kernel.allowed(self.profile, from, to, movement.outgoing_edge.*, .{
-            .previous_distance = previous.dist_m,
-            .previous_dead_end = from.flags.dead_end or (try view.outEdgeRange(movement.node)).count() == 1,
-            .backtrack = movement.incoming_edge.cls.opp_local == movement.outgoing_edge.cls.local,
-        });
-    }
-
-    pub fn turnCost(self: Foot, view: *const View, movement: search.Transition, _: search.Label, _: search.Direction) !Cost {
-        const from = try view.class(movement.incoming_edge.cls.class_id);
-        const to = try view.class(movement.outgoing_edge.cls.class_id);
-        const turn = try pedestrian.Turn.read(view, movement.node, movement.incoming, movement.outgoing);
-        return pedestrian.Kernel.turnCost(self.profile, try view.node(movement.node), from, to, turn);
-    }
-};
+const Foot = @import("pedestrian_search_kernel.zig").Foot;
 
 const Motor = struct {
     pub fn edgeCost(_: Motor, view: *const View, _: Edge, edge: *const Hot, _: search.Direction) !Cost {

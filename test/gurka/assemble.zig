@@ -79,6 +79,22 @@ fn checkOpposites(view: *const graph.reader.View, directed_edges: usize) !void {
     }
 }
 
+test "explicit internal-intersection tags survive builds with inference disabled" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates("A---B", 20), &.{
+        .{ .label = "AB", .tags = &.{ .{ .key = "highway", .value = "primary" }, .{ .key = "internal_intersection", .value = "true" } } },
+    }, &.{}, &.{});
+    for ([_]bool{ false, true }) |infer| {
+        var built = try Built.assembleWithOptions(fixture.osm, .{ .scratch_dir = "", .workers = 1, .infer_internal_intersections = infer });
+        defer built.deinit();
+        const view = &built.bundle.view;
+        const edge = try view.edge(try directedBetween(view, &fixture, "A", "B"));
+        try testing.expectEqual(!infer, (try view.class(edge.cls.class_id)).flags.internal);
+    }
+}
+
 test "valhalla loop fixtures retain edge counts and opposing involution" {
     const motorway: gurka.Tags = &.{.{ .key = "highway", .value = "motorway" }};
     const cases = [_]struct { map: []const u8, way: []const u8, directed: usize }{

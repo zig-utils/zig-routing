@@ -4,6 +4,8 @@ const std = @import("std");
 const routing = @import("routing");
 const examples = @import("examples.zig");
 const gurka = @import("gurka.zig");
+const lane_examples = @import("lane_examples.zig");
+const narrative = @import("narrative_examples.zig");
 
 pub fn main(init: std.process.Init) !void {
     var args = std.process.Args.Iterator.init(init.minimal.args);
@@ -14,7 +16,8 @@ pub fn main(init: std.process.Init) !void {
     };
     const arena = init.arena.allocator();
     const scenario = args.next();
-    const fixture = if (scenario) |name| blk: {
+    const lane_example = if (scenario) |name| try lane_examples.find(arena, name) else null;
+    const fixture = if (lane_example) |example| example.map else if (scenario) |name| blk: {
         if (std.mem.eql(u8, name, "motor-vehicle")) break :blk try examples.motorVehicle(arena);
         if (std.mem.eql(u8, name, "admin-boundaries")) break :blk try examples.adminBoundaries(arena);
         if (std.mem.eql(u8, name, "country-access")) break :blk try examples.countryAccess(arena);
@@ -25,6 +28,10 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, name, "access-regions")) break :blk try examples.accessRegions(arena);
         if (std.mem.eql(u8, name, "signs")) break :blk try examples.signs(arena);
         if (std.mem.eql(u8, name, "turn-lanes")) break :blk try examples.turnLanes(arena);
+        if (std.mem.eql(u8, name, "split-lanes")) break :blk try narrative.splitLanes(arena);
+        if (std.mem.eql(u8, name, "indoor")) break :blk try narrative.indoor(arena);
+        if (std.mem.eql(u8, name, "level-change")) break :blk try narrative.levelChange(arena);
+        if (std.mem.eql(u8, name, "ferry")) break :blk try narrative.ferry(arena);
         if (std.mem.eql(u8, name, "street-linguistics")) break :blk try examples.streetLinguistics(arena);
         if (std.mem.eql(u8, name, "turn-names-us")) break :blk try examples.turnNames(arena, true);
         if (std.mem.eql(u8, name, "turn-names-ca")) break :blk try examples.turnNames(arena, false);
@@ -33,8 +40,24 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, name, "timed-turns")) break :blk try examples.timedTurns(arena, false);
         return error.UnknownFixture;
     } else try examples.intersection(arena);
-    if (scenario != null and std.mem.eql(u8, scenario.?, "access-regions")) {
-        if (args.next()) |profiles| try accessProfiles(arena, fixture, profiles);
+    if (scenario) |name| {
+        if (args.next()) |requests| {
+            if (lane_example) |example| {
+                try narrative.corpus(arena, fixture, requests, "auto", example.routes);
+            } else if (std.mem.eql(u8, name, "access-regions")) {
+                try accessProfiles(arena, fixture, requests);
+            } else if (std.mem.eql(u8, name, "indoor")) {
+                try narrative.corpus(arena, fixture, requests, "pedestrian", narrative.indoor_routes);
+            } else if (std.mem.eql(u8, name, "turn-lanes")) {
+                try narrative.corpus(arena, fixture, requests, "auto", narrative.lane_routes);
+            } else if (std.mem.eql(u8, name, "split-lanes")) {
+                try narrative.corpus(arena, fixture, requests, "auto", narrative.split_routes);
+            } else if (std.mem.eql(u8, name, "level-change")) {
+                try narrative.corpus(arena, fixture, requests, "pedestrian", narrative.level_change_routes);
+            } else if (std.mem.eql(u8, name, "ferry")) {
+                try narrative.corpus(arena, fixture, requests, "auto", narrative.ferry_routes);
+            } else return error.ExtraArguments;
+        }
     }
     if (args.next() != null) return error.ExtraArguments;
     try fixture.osm.writePbf(init.gpa, path);

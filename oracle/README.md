@@ -797,6 +797,24 @@ For the highway and junction rules, use the first 200 full-length Utrecht
 signs. The report includes motorway and per-maneuver coverage alongside the
 Gate D score.
 
+For pedestrian facilities and active lanes, generate fixtures with their
+request corpora. Use the same PBF and right-hand traffic on both builders,
+with admin lookup disabled.
+
+```bash
+zig build gurka-pbf -- fixture.osm.pbf indoor routes.tsv
+zig build check-tripleg -Doptimize=ReleaseFast -- BUNDLE routes.tsv 8 --maneuvers --pedestrian > native.jsonl
+python3 oracle/compare-triplegs.py native.jsonl REFERENCE_DIR DESCRIPTORS --minimum-legs 8 --narrative-fixtures
+```
+
+The fixture comparison checks each directed path, maneuver type and name,
+lane mask, lane state, and active direction. Use `--pedestrian` for `indoor`
+and `level-change`. The driving fixtures are `ferry`, `turn-lanes`,
+`split-lanes`, `shared-lanes`, `short-arrival-lanes`, `uturn-lanes`,
+`internal-lanes`, `restricted-lanes`, `fork-lanes`, and `short-fork-lanes`.
+For `internal-lanes`, run both with and without internal intersection
+inference. Set `--minimum-legs` to the number of rows in the request corpus.
+
 ### HTTP and route checks
 
 `compare-height.ts` sends the same random `/height` requests (shapes, encoded polylines at

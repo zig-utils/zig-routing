@@ -193,13 +193,30 @@
     "out_of_scope": ["Transit maneuvers (P9.06).", "Instruction text (P6.11)."],
     "notes": [
       "After this issue the whole of maneuversbuilder.cc is ported; record any deliberate deviation in the file header.",
-      "Lane guidance reads only cold data from the trip leg."
+      "Lane guidance reads only cold data from the trip leg.",
+      "Guidance views use the trip leg's OSM dataset ID. P6.09a carries the ID through graph construction and trip-leg projection."
     ],
     "accept": [
       "All of test/maneuversbuilder.cc is ported and green.",
       "Pedestrian gurka-style maps with steps, elevators and indoor levels match the oracle's maneuver list.",
       "Active lanes match the oracle on the lane test maps.",
       "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P6.09a",
+    "goal": "Carry Valhalla's OSM dataset ID from source data through a native bundle and trip leg so guidance views, status, and trace attributes report the same data identifier.",
+    "upstream": ["src/mjolnir/pbfgraphparser.cc", "src/mjolnir/graphbuilder.cc", "src/thor/triplegbuilder.cc"],
+    "scope": [
+      "Retain the maximum source changeset ID when decoding OSM entity metadata. Apply the pinned maximum OSM ID fallback for extracts without changeset IDs and honor the `mjolnir.dataset_id` setting.",
+      "Store the effective value in the native bundle, carry it across resumed builds, and preserve the dataset ID from Valhalla tile headers in the same-graph importer.",
+      "Populate `TripLeg.osm_changeset` when the attributes controller requests it. Preserve the existing default for older bundles without source metadata."
+    ],
+    "accept": [
+      "Pinned PBF cases with sparse and dense entity metadata, a metadata-free extract, and a configured dataset ID match the oracle identifier.",
+      "Native full and resumed builds expose the same ID through the graph reader and trip leg.",
+      "The identical guidance-view fixture has the same data ID through both engines.",
+      "The request and tile parsers remain green under fuzzing, and `zig build test` and the binary budget pass."
     ]
   },
   {
