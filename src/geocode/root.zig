@@ -8,6 +8,8 @@ pub const house_number = @import("house_number.zig");
 pub const interpolation = @import("interpolation.zig");
 pub const postcode = @import("postcode.zig");
 pub const address_format = @import("address_format.zig");
+pub const unicode = @import("unicode.zig");
+pub const analyze = @import("analyze.zig");
 
 test {
     std.testing.refAllDecls(@This());

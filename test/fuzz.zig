@@ -21,7 +21,7 @@
 //! `motor-tags` (motor vehicle access and unit normalization), `admin-index`
 //! (stored administrative boundaries), `timezone-geojson`, `timezone-rules`,
 //! `datetime`, `time-domain`, `lane-tags`, `name-tags`, `geocode-bundle` and
-//! `geocode-address`.
+//! `geocode-address` and `geocode-analysis`.
 //!
 //! The contract for every parser: malformed input returns an error, never
 //! panics, overflows or reads out of bounds. The fuzz step builds ReleaseSafe
@@ -496,6 +496,45 @@ test "fuzz geocode-address" {
     defer arena.deinit();
     const inputs = &.{ "", "12a–16", "7 2/4", "25½", "17 #B", "012b\x00Flat 3", "4294967296", "3 1/0", "L-1240\x00LU", "sw1a 1aa", "12345-1234" };
     try std.testing.fuzz({}, fuzzGeocodeAddress, .{ .corpus = try seeds(arena.allocator(), inputs) });
+}
+
+fn fuzzGeocodeAnalysis(_: void, s: *Smith) !void {
+    const analyzer = routing.geocode.analyze;
+    var input: [max_input]u8 = undefined;
+    const bytes = draw(s, &input, 0x616e616c);
+    if (bytes.len < 2) return;
+    const options: analyzer.Options = .{
+        .language = std.enums.values(analyzer.Language)[bytes[0] % std.enums.values(analyzer.Language).len],
+        .country = std.enums.values(analyzer.Country)[bytes[1] % std.enums.values(analyzer.Country).len],
+    };
+    const a = std.testing.allocator;
+    var scratch: analyzer.Scratch = .{};
+    defer scratch.deinit(a);
+    const result = scratch.analyze(a, bytes[2..], options, .none) catch |err| switch (err) {
+        error.InvalidUtf8 => return,
+        else => return err,
+    };
+    for (result.tokens) |token| {
+        const text = try token.text.get(result.bytes);
+        const latin = try token.latin.get(result.bytes);
+        try std.testing.expect(text.len != 0 and std.unicode.utf8ValidateSlice(text));
+        for (latin) |byte| try std.testing.expect(std.ascii.isAscii(byte));
+        try std.testing.expectEqual(0, token.attr.reserved);
+    }
+}
+
+test "fuzz geocode-analysis" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const inputs = &.{
+        "",
+        "\x01\x01" ++ "12½ St. John’s Rd, NW 84101-1234",
+        "\x02\x05" ++ "42A Buchenstraße 10115",
+        "\x00\x00" ++ "Αθήνα Москва 東京タワー 한글",
+        "\x00\x00\xf0\x80",
+        "\x01\x03" ++ "London SW1A 2AA",
+    };
+    try std.testing.fuzz({}, fuzzGeocodeAnalysis, .{ .corpus = try seeds(arena.allocator(), inputs) });
 }
 
 fn fuzzLaneTags(_: void, s: *Smith) !void {

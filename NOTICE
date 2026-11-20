@@ -20,3 +20,7 @@ are derived from OpenStreetMap and distributed under the ODbL.
 
 The generated UTC offset tables use the public-domain IANA Time Zone Database
 (https://www.iana.org/time-zones).
+
+The geocoder's generated Unicode tables use the Unicode Character Database
+18.0.0. Copyright (c) 1991-2026 Unicode, Inc. The Unicode License v3 is in
+src/geocode/unicode-LICENSE.txt.

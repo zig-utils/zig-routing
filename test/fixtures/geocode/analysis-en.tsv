@@ -1,0 +1,200 @@
+0012½ Oak Street Northwest, 84101-1234 Salt Lake City	12 2/4 oak St. NW 84101-1234 SALT LAKE CITY	house_number:12 1/2|word:oak|street_type:street|direction:northwest|postcode:84101-1234|word:salt|word:lake|word:city
+Oak Road	oak Rd.	word:oak|street_type:road
+Oak Avenue	oak Av	word:oak|street_type:avenue
+Oak Boulevard	oak Boul.	word:oak|street_type:boulevard
+Oak Drive Northwest	oak Drv NW	word:oak|street_type:drive|direction:northwest
+007B Oak Lane	7b oak Ln.	house_number:7b|word:oak|street_type:lane
+0012½ Oak Court	12 2/4 oak Ct	house_number:12 1/2|word:oak|street_type:court
+Oak Square	oak Sq.	word:oak|street_type:square
+Café Street Northwest	Café St. NW	word:cafe|street_type:street|direction:northwest
+Café Road	Café Rd.	word:cafe|street_type:road
+007B Café Avenue	7b Café Av	house_number:7b|word:cafe|street_type:avenue
+Café Boulevard, 84101-1234 Salt Lake City	Café Boul. 84101-1234 SALT LAKE CITY	word:cafe|street_type:boulevard|postcode:84101-1234|word:salt|word:lake|word:city
+0012½ Café Drive Northwest	12 2/4 Café Drv NW	house_number:12 1/2|word:cafe|street_type:drive|direction:northwest
+Café Lane	Café Ln.	word:cafe|street_type:lane
+Café Court	Café Ct	word:cafe|street_type:court
+007B Café Square	7b Café Sq.	house_number:7b|word:cafe|street_type:square
+St. John’s Street Northwest	Saint Johns St. NW	word:saint|word:johns|street_type:street|direction:northwest
+St. John’s Road	Saint Johns Rd.	word:saint|word:johns|street_type:road
+0012½ St. John’s Avenue	12 2/4 Saint Johns Av	house_number:12 1/2|word:saint|word:johns|street_type:avenue
+St. John’s Boulevard	Saint Johns Boul.	word:saint|word:johns|street_type:boulevard
+007B St. John’s Drive Northwest	7b Saint Johns Drv NW	house_number:7b|word:saint|word:johns|street_type:drive|direction:northwest
+St. John’s Lane	Saint Johns Ln.	word:saint|word:johns|street_type:lane
+St. John’s Court, 84101-1234 Salt Lake City	Saint Johns Ct 84101-1234 SALT LAKE CITY	word:saint|word:johns|street_type:court|postcode:84101-1234|word:salt|word:lake|word:city
+St. John’s Square	Saint Johns Sq.	word:saint|word:johns|street_type:square
+0012½ Old Mill Street Northwest	12 2/4 old mill St. NW	house_number:12 1/2|word:old|word:mill|street_type:street|direction:northwest
+007B Old Mill Road	7b old mill Rd.	house_number:7b|word:old|word:mill|street_type:road
+Old Mill Avenue	old mill Av	word:old|word:mill|street_type:avenue
+Old Mill Boulevard	old mill Boul.	word:old|word:mill|street_type:boulevard
+Old Mill Drive Northwest	old mill Drv NW	word:old|word:mill|street_type:drive|direction:northwest
+Old Mill Lane	old mill Ln.	word:old|word:mill|street_type:lane
+0012½ Old Mill Court	12 2/4 old mill Ct	house_number:12 1/2|word:old|word:mill|street_type:court
+Old Mill Square	old mill Sq.	word:old|word:mill|street_type:square
+Kings’ Cross Street Northwest	Kings Cross St. NW	word:kings|word:cross|street_type:street|direction:northwest
+Kings’ Cross Road, 84101-1234 Salt Lake City	Kings Cross Rd. 84101-1234 SALT LAKE CITY	word:kings|word:cross|street_type:road|postcode:84101-1234|word:salt|word:lake|word:city
+Kings’ Cross Avenue	Kings Cross Av	word:kings|word:cross|street_type:avenue
+007B Kings’ Cross Boulevard	7b Kings Cross Boul.	house_number:7b|word:kings|word:cross|street_type:boulevard
+0012½ Kings’ Cross Drive Northwest	12 2/4 Kings Cross Drv NW	house_number:12 1/2|word:kings|word:cross|street_type:drive|direction:northwest
+Kings’ Cross Lane	Kings Cross Ln.	word:kings|word:cross|street_type:lane
+Kings’ Cross Court	Kings Cross Ct	word:kings|word:cross|street_type:court
+Kings’ Cross Square	Kings Cross Sq.	word:kings|word:cross|street_type:square
+007B Birch Street Northwest	7b BIRCH St. NW	house_number:7b|word:birch|street_type:street|direction:northwest
+Birch Road	BIRCH Rd.	word:birch|street_type:road
+0012½ Birch Avenue	12 2/4 BIRCH Av	house_number:12 1/2|word:birch|street_type:avenue
+Birch Boulevard	BIRCH Boul.	word:birch|street_type:boulevard
+Birch Drive Northwest, 84101-1234 Salt Lake City	BIRCH Drv NW 84101-1234 SALT LAKE CITY	word:birch|street_type:drive|direction:northwest|postcode:84101-1234|word:salt|word:lake|word:city
+007B Birch Lane	7b BIRCH Ln.	house_number:7b|word:birch|street_type:lane
+Birch Court	BIRCH Ct	word:birch|street_type:court
+Birch Square	BIRCH Sq.	word:birch|street_type:square
+0012½ Église Street Northwest	12 2/4 Eglise St. NW	house_number:12 1/2|word:eglise|street_type:street|direction:northwest
+Église Road	Eglise Rd.	word:eglise|street_type:road
+007B Église Avenue	7b Eglise Av	house_number:7b|word:eglise|street_type:avenue
+Église Boulevard	Eglise Boul.	word:eglise|street_type:boulevard
+Église Drive Northwest	Eglise Drv NW	word:eglise|street_type:drive|direction:northwest
+Église Lane	Eglise Ln.	word:eglise|street_type:lane
+0012½ Église Court	12 2/4 Eglise Ct	house_number:12 1/2|word:eglise|street_type:court
+007B Église Square, 84101-1234 Salt Lake City	7b Eglise Sq. 84101-1234 SALT LAKE CITY	house_number:7b|word:eglise|street_type:square|postcode:84101-1234|word:salt|word:lake|word:city
+Willow Street Northwest	willow St. NW	word:willow|street_type:street|direction:northwest
+Willow Road	willow Rd.	word:willow|street_type:road
+Willow Avenue	willow Av	word:willow|street_type:avenue
+Willow Boulevard	willow Boul.	word:willow|street_type:boulevard
+0012½ Willow Drive Northwest	12 2/4 willow Drv NW	house_number:12 1/2|word:willow|street_type:drive|direction:northwest
+Willow Lane	willow Ln.	word:willow|street_type:lane
+Willow Court	willow Ct	word:willow|street_type:court
+Willow Square	willow Sq.	word:willow|street_type:square
+Mount Pleasant Street Northwest	Mt Pleasant St. NW	word:mount|word:pleasant|street_type:street|direction:northwest
+007B Mount Pleasant Road	7b Mt Pleasant Rd.	house_number:7b|word:mount|word:pleasant|street_type:road
+0012½ Mount Pleasant Avenue, 84101-1234 Salt Lake City	12 2/4 Mt Pleasant Av 84101-1234 SALT LAKE CITY	house_number:12 1/2|word:mount|word:pleasant|street_type:avenue|postcode:84101-1234|word:salt|word:lake|word:city
+Mount Pleasant Boulevard	Mt Pleasant Boul.	word:mount|word:pleasant|street_type:boulevard
+Mount Pleasant Drive Northwest	Mt Pleasant Drv NW	word:mount|word:pleasant|street_type:drive|direction:northwest
+Mount Pleasant Lane	Mt Pleasant Ln.	word:mount|word:pleasant|street_type:lane
+007B Mount Pleasant Court	7b Mt Pleasant Ct	house_number:7b|word:mount|word:pleasant|street_type:court
+Mount Pleasant Square	Mt Pleasant Sq.	word:mount|word:pleasant|street_type:square
+0012½ River of Lights Street Northwest	12 2/4 River Of Lights St. NW	house_number:12 1/2|word:river|stop_word:of|word:lights|street_type:street|direction:northwest
+River of Lights Road	River Of Lights Rd.	word:river|stop_word:of|word:lights|street_type:road
+River of Lights Avenue	River Of Lights Av	word:river|stop_word:of|word:lights|street_type:avenue
+007B River of Lights Boulevard	7b River Of Lights Boul.	house_number:7b|word:river|stop_word:of|word:lights|street_type:boulevard
+River of Lights Drive Northwest	River Of Lights Drv NW	word:river|stop_word:of|word:lights|street_type:drive|direction:northwest
+River of Lights Lane, 84101-1234 Salt Lake City	River Of Lights Ln. 84101-1234 SALT LAKE CITY	word:river|stop_word:of|word:lights|street_type:lane|postcode:84101-1234|word:salt|word:lake|word:city
+0012½ River of Lights Court	12 2/4 River Of Lights Ct	house_number:12 1/2|word:river|stop_word:of|word:lights|street_type:court
+River of Lights Square	River Of Lights Sq.	word:river|stop_word:of|word:lights|street_type:square
+007B Bénédict Street Northwest	7b Benedict St. NW	house_number:7b|word:benedict|street_type:street|direction:northwest
+Bénédict Road	Benedict Rd.	word:benedict|street_type:road
+Bénédict Avenue	Benedict Av	word:benedict|street_type:avenue
+Bénédict Boulevard	Benedict Boul.	word:benedict|street_type:boulevard
+0012½ Bénédict Drive Northwest	12 2/4 Benedict Drv NW	house_number:12 1/2|word:benedict|street_type:drive|direction:northwest
+007B Bénédict Lane	7b Benedict Ln.	house_number:7b|word:benedict|street_type:lane
+Bénédict Court	Benedict Ct	word:benedict|street_type:court
+Bénédict Square	Benedict Sq.	word:benedict|street_type:square
+5th Street Northwest, 84101-1234 Salt Lake City	5TH St. NW 84101-1234 SALT LAKE CITY	word:5th|street_type:street|direction:northwest|postcode:84101-1234|word:salt|word:lake|word:city
+5th Road	5TH Rd.	word:5th|street_type:road
+0012½ 5th Avenue	12 2/4 5TH Av	house_number:12 1/2|word:5th|street_type:avenue
+5th Boulevard	5TH Boul.	word:5th|street_type:boulevard
+5th Drive Northwest	5TH Drv NW	word:5th|street_type:drive|direction:northwest
+5th Lane	5TH Ln.	word:5th|street_type:lane
+5th Court	5TH Ct	word:5th|street_type:court
+007B 5th Square	7b 5TH Sq.	house_number:7b|word:5th|street_type:square
+0012½ García Street Northwest	12 2/4 Garcia St. NW	house_number:12 1/2|word:garcia|street_type:street|direction:northwest
+García Road	Garcia Rd.	word:garcia|street_type:road
+García Avenue	Garcia Av	word:garcia|street_type:avenue
+García Boulevard, 84101-1234 Salt Lake City	Garcia Boul. 84101-1234 SALT LAKE CITY	word:garcia|street_type:boulevard|postcode:84101-1234|word:salt|word:lake|word:city
+007B García Drive Northwest	7b Garcia Drv NW	house_number:7b|word:garcia|street_type:drive|direction:northwest
+García Lane	Garcia Ln.	word:garcia|street_type:lane
+0012½ García Court	12 2/4 Garcia Ct	house_number:12 1/2|word:garcia|street_type:court
+García Square	Garcia Sq.	word:garcia|street_type:square
+Fort Adams Street Northwest	Ft. Adams St. NW	word:fort|word:adams|street_type:street|direction:northwest
+007B Fort Adams Road	7b Ft. Adams Rd.	house_number:7b|word:fort|word:adams|street_type:road
+Fort Adams Avenue	Ft. Adams Av	word:fort|word:adams|street_type:avenue
+Fort Adams Boulevard	Ft. Adams Boul.	word:fort|word:adams|street_type:boulevard
+0012½ Fort Adams Drive Northwest	12 2/4 Ft. Adams Drv NW	house_number:12 1/2|word:fort|word:adams|street_type:drive|direction:northwest
+Fort Adams Lane	Ft. Adams Ln.	word:fort|word:adams|street_type:lane
+007B Fort Adams Court, 84101-1234 Salt Lake City	7b Ft. Adams Ct 84101-1234 SALT LAKE CITY	house_number:7b|word:fort|word:adams|street_type:court|postcode:84101-1234|word:salt|word:lake|word:city
+Fort Adams Square	Ft. Adams Sq.	word:fort|word:adams|street_type:square
+O’Rourke Street Northwest	Orourke St. NW	word:orourke|street_type:street|direction:northwest
+O’Rourke Road	Orourke Rd.	word:orourke|street_type:road
+0012½ O’Rourke Avenue	12 2/4 Orourke Av	house_number:12 1/2|word:orourke|street_type:avenue
+007B O’Rourke Boulevard	7b Orourke Boul.	house_number:7b|word:orourke|street_type:boulevard
+O’Rourke Drive Northwest	Orourke Drv NW	word:orourke|street_type:drive|direction:northwest
+O’Rourke Lane	Orourke Ln.	word:orourke|street_type:lane
+O’Rourke Court	Orourke Ct	word:orourke|street_type:court
+O’Rourke Square	Orourke Sq.	word:orourke|street_type:square
+0012½ Hawthorn Street Northwest	12 2/4 hawthorn St. NW	house_number:12 1/2|word:hawthorn|street_type:street|direction:northwest
+Hawthorn Road, 84101-1234 Salt Lake City	hawthorn Rd. 84101-1234 SALT LAKE CITY	word:hawthorn|street_type:road|postcode:84101-1234|word:salt|word:lake|word:city
+Hawthorn Avenue	hawthorn Av	word:hawthorn|street_type:avenue
+Hawthorn Boulevard	hawthorn Boul.	word:hawthorn|street_type:boulevard
+Hawthorn Drive Northwest	hawthorn Drv NW	word:hawthorn|street_type:drive|direction:northwest
+007B Hawthorn Lane	7b hawthorn Ln.	house_number:7b|word:hawthorn|street_type:lane
+0012½ Hawthorn Court	12 2/4 hawthorn Ct	house_number:12 1/2|word:hawthorn|street_type:court
+Hawthorn Square	hawthorn Sq.	word:hawthorn|street_type:square
+Chestnut Street Northwest	chestnut St. NW	word:chestnut|street_type:street|direction:northwest
+Chestnut Road	chestnut Rd.	word:chestnut|street_type:road
+007B Chestnut Avenue	7b chestnut Av	house_number:7b|word:chestnut|street_type:avenue
+Chestnut Boulevard	chestnut Boul.	word:chestnut|street_type:boulevard
+0012½ Chestnut Drive Northwest, 84101-1234 Salt Lake City	12 2/4 chestnut Drv NW 84101-1234 SALT LAKE CITY	house_number:12 1/2|word:chestnut|street_type:drive|direction:northwest|postcode:84101-1234|word:salt|word:lake|word:city
+Chestnut Lane	chestnut Ln.	word:chestnut|street_type:lane
+Chestnut Court	chestnut Ct	word:chestnut|street_type:court
+007B Chestnut Square	7b chestnut Sq.	house_number:7b|word:chestnut|street_type:square
+Juniper Street Northwest	juniper St. NW	word:juniper|street_type:street|direction:northwest
+Juniper Road	juniper Rd.	word:juniper|street_type:road
+0012½ Juniper Avenue	12 2/4 juniper Av	house_number:12 1/2|word:juniper|street_type:avenue
+Juniper Boulevard	juniper Boul.	word:juniper|street_type:boulevard
+007B Juniper Drive Northwest	7b juniper Drv NW	house_number:7b|word:juniper|street_type:drive|direction:northwest
+Juniper Lane	juniper Ln.	word:juniper|street_type:lane
+Juniper Court	juniper Ct	word:juniper|street_type:court
+Juniper Square, 84101-1234 Salt Lake City	juniper Sq. 84101-1234 SALT LAKE CITY	word:juniper|street_type:square|postcode:84101-1234|word:salt|word:lake|word:city
+0012½ Lakeside Street Northwest	12 2/4 LAKESIDE St. NW	house_number:12 1/2|word:lakeside|street_type:street|direction:northwest
+007B Lakeside Road	7b LAKESIDE Rd.	house_number:7b|word:lakeside|street_type:road
+Lakeside Avenue	LAKESIDE Av	word:lakeside|street_type:avenue
+Lakeside Boulevard	LAKESIDE Boul.	word:lakeside|street_type:boulevard
+Lakeside Drive Northwest	LAKESIDE Drv NW	word:lakeside|street_type:drive|direction:northwest
+Lakeside Lane	LAKESIDE Ln.	word:lakeside|street_type:lane
+0012½ Lakeside Court	12 2/4 LAKESIDE Ct	house_number:12 1/2|word:lakeside|street_type:court
+Lakeside Square	LAKESIDE Sq.	word:lakeside|street_type:square
+Maße Street Northwest	MASSE St. NW	word:masse|street_type:street|direction:northwest
+Maße Road	MASSE Rd.	word:masse|street_type:road
+Maße Avenue, 84101-1234 Salt Lake City	MASSE Av 84101-1234 SALT LAKE CITY	word:masse|street_type:avenue|postcode:84101-1234|word:salt|word:lake|word:city
+007B Maße Boulevard	7b MASSE Boul.	house_number:7b|word:masse|street_type:boulevard
+0012½ Maße Drive Northwest	12 2/4 MASSE Drv NW	house_number:12 1/2|word:masse|street_type:drive|direction:northwest
+Maße Lane	MASSE Ln.	word:masse|street_type:lane
+Maße Court	MASSE Ct	word:masse|street_type:court
+Maße Square	MASSE Sq.	word:masse|street_type:square
+007B Poplar Street Northwest	7b poplar St. NW	house_number:7b|word:poplar|street_type:street|direction:northwest
+Poplar Road	poplar Rd.	word:poplar|street_type:road
+0012½ Poplar Avenue	12 2/4 poplar Av	house_number:12 1/2|word:poplar|street_type:avenue
+Poplar Boulevard	poplar Boul.	word:poplar|street_type:boulevard
+Poplar Drive Northwest	poplar Drv NW	word:poplar|street_type:drive|direction:northwest
+007B Poplar Lane, 84101-1234 Salt Lake City	7b poplar Ln. 84101-1234 SALT LAKE CITY	house_number:7b|word:poplar|street_type:lane|postcode:84101-1234|word:salt|word:lake|word:city
+Poplar Court	poplar Ct	word:poplar|street_type:court
+Poplar Square	poplar Sq.	word:poplar|street_type:square
+0012½ Bank of the River Street Northwest	12 2/4 Bank Of The River St. NW	house_number:12 1/2|word:bank|stop_word:of|stop_word:the|word:river|street_type:street|direction:northwest
+Bank of the River Road	Bank Of The River Rd.	word:bank|stop_word:of|stop_word:the|word:river|street_type:road
+007B Bank of the River Avenue	7b Bank Of The River Av	house_number:7b|word:bank|stop_word:of|stop_word:the|word:river|street_type:avenue
+Bank of the River Boulevard	Bank Of The River Boul.	word:bank|stop_word:of|stop_word:the|word:river|street_type:boulevard
+Bank of the River Drive Northwest	Bank Of The River Drv NW	word:bank|stop_word:of|stop_word:the|word:river|street_type:drive|direction:northwest
+Bank of the River Lane	Bank Of The River Ln.	word:bank|stop_word:of|stop_word:the|word:river|street_type:lane
+0012½ Bank of the River Court	12 2/4 Bank Of The River Ct	house_number:12 1/2|word:bank|stop_word:of|stop_word:the|word:river|street_type:court
+007B Bank of the River Square	7b Bank Of The River Sq.	house_number:7b|word:bank|stop_word:of|stop_word:the|word:river|street_type:square
+Magnolia Street Northwest, 84101-1234 Salt Lake City	magnolia St. NW 84101-1234 SALT LAKE CITY	word:magnolia|street_type:street|direction:northwest|postcode:84101-1234|word:salt|word:lake|word:city
+Magnolia Road	magnolia Rd.	word:magnolia|street_type:road
+Magnolia Avenue	magnolia Av	word:magnolia|street_type:avenue
+Magnolia Boulevard	magnolia Boul.	word:magnolia|street_type:boulevard
+0012½ Magnolia Drive Northwest	12 2/4 magnolia Drv NW	house_number:12 1/2|word:magnolia|street_type:drive|direction:northwest
+Magnolia Lane	magnolia Ln.	word:magnolia|street_type:lane
+Magnolia Court	magnolia Ct	word:magnolia|street_type:court
+Magnolia Square	magnolia Sq.	word:magnolia|street_type:square
+Núñez Street Northwest	Nunez St. NW	word:nunez|street_type:street|direction:northwest
+007B Núñez Road	7b Nunez Rd.	house_number:7b|word:nunez|street_type:road
+0012½ Núñez Avenue	12 2/4 Nunez Av	house_number:12 1/2|word:nunez|street_type:avenue
+Núñez Boulevard, 84101-1234 Salt Lake City	Nunez Boul. 84101-1234 SALT LAKE CITY	word:nunez|street_type:boulevard|postcode:84101-1234|word:salt|word:lake|word:city
+Núñez Drive Northwest	Nunez Drv NW	word:nunez|street_type:drive|direction:northwest
+Núñez Lane	Nunez Ln.	word:nunez|street_type:lane
+007B Núñez Court	7b Nunez Ct	house_number:7b|word:nunez|street_type:court
+Núñez Square	Nunez Sq.	word:nunez|street_type:square
+0012½ Hôtel du Parc Street Northwest	12 2/4 Hotel du Parc St. NW	house_number:12 1/2|word:hotel|word:du|word:parc|street_type:street|direction:northwest
+Hôtel du Parc Road	Hotel du Parc Rd.	word:hotel|word:du|word:parc|street_type:road
+Hôtel du Parc Avenue	Hotel du Parc Av	word:hotel|word:du|word:parc|street_type:avenue
+007B Hôtel du Parc Boulevard	7b Hotel du Parc Boul.	house_number:7b|word:hotel|word:du|word:parc|street_type:boulevard
+Hôtel du Parc Drive Northwest	Hotel du Parc Drv NW	word:hotel|word:du|word:parc|street_type:drive|direction:northwest
+Hôtel du Parc Lane	Hotel du Parc Ln.	word:hotel|word:du|word:parc|street_type:lane
+0012½ Hôtel du Parc Court, 84101-1234 Salt Lake City	12 2/4 Hotel du Parc Ct 84101-1234 SALT LAKE CITY	house_number:12 1/2|word:hotel|word:du|word:parc|street_type:court|postcode:84101-1234|word:salt|word:lake|word:city
+Hôtel du Parc Square	Hotel du Parc Sq.	word:hotel|word:du|word:parc|street_type:square
