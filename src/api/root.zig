@@ -10,6 +10,8 @@ pub const request = @import("request.zig");
 pub const service = @import("service.zig");
 pub const height_action = @import("height_action.zig");
 pub const proto = @import("proto/root.zig");
+pub const trip = @import("trip.zig");
+pub const directions = @import("directions.zig");
 
 test {
     std.testing.refAllDecls(@This());
