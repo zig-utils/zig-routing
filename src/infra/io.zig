@@ -646,6 +646,62 @@ pub fn stderrWriter(system: std.Io, buffer: []u8) std.Io.File.Writer {
     return std.Io.File.stderr().writerStreaming(system, buffer);
 }
 
+/// A seekable ZIP reader borrowing a shim file and caller-owned buffer.
+pub const Zip = struct {
+    pub const Iterator = std.zip.Iterator;
+    pub const Entry = Iterator.Entry;
+    reader: std.Io.File.Reader,
+
+    pub fn init(file: File, buffer: []u8) Zip {
+        const borrowed: std.Io.File = .{ .handle = file.fd, .flags = .{ .nonblocking = false } };
+        return .{ .reader = borrowed.reader(std.Io.Threaded.global_single_threaded.io(), buffer) };
+    }
+
+    pub fn entries(self: *Zip) !Iterator {
+        return .init(&self.reader);
+    }
+
+    pub fn filename(self: *Zip, entry: Entry, storage: []u8) ![]const u8 {
+        return entry.getFilename(&self.reader, storage, .{});
+    }
+
+    /// Streams a stored or deflated member directly into caller memory.
+    pub fn read(self: *Zip, entry: Entry, storage: []u8, deadline: Deadline) !void {
+        if (deadline.expired()) return error.DeadlineExceeded;
+        if (storage.len != entry.uncompressed_size) return error.ZipOutputSizeMismatch;
+        var output: ZipOutput = .{ .storage = storage, .deadline = deadline };
+        entry.extractTo(&self.reader, &output.writer) catch |err| {
+            if (output.deadline.expired()) return error.DeadlineExceeded;
+            return err;
+        };
+        if (output.position != storage.len) return error.ZipOutputSizeMismatch;
+        if (output.crc.final() != entry.crc32) return error.ZipCrcMismatch;
+    }
+};
+
+const ZipOutput = struct {
+    storage: []u8,
+    deadline: Deadline,
+    position: usize = 0,
+    crc: std.hash.Crc32 = .init(),
+    writer: std.Io.Writer = .{ .buffer = &.{}, .vtable = &.{ .drain = drain } },
+
+    fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *ZipOutput = @fieldParentPtr("writer", writer);
+        const previous = self.position;
+        for (data[0 .. data.len - 1]) |part| try self.write(part);
+        for (0..splat) |_| try self.write(data[data.len - 1]);
+        return self.position - previous;
+    }
+
+    fn write(self: *ZipOutput, bytes: []const u8) std.Io.Writer.Error!void {
+        if (self.deadline.expired() or bytes.len > self.storage.len - self.position) return error.WriteFailed;
+        @memcpy(self.storage[self.position..][0..bytes.len], bytes);
+        self.crc.update(bytes);
+        self.position += bytes.len;
+    }
+};
+
 pub const Mutex = struct {
     inner: std.Io.Mutex = .init,
 

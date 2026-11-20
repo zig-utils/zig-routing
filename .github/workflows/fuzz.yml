@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        target: ${{ fromJSON(inputs.targets == 'graph-parsers' && '["osm-pbf","osm-primitives","osm-dense","graph-bundle","time-domain","lane-tags","name-tags"]' || '["request","http","polyline","lz4","dem","protobuf","config","osm-pbf","osm-primitives","osm-dense","node-store","graph-bundle","build-checkpoint","valhalla-tile","costing-reference","motor-costing","range-manifest","http-range","usage-directory","speed-config","motor-tags","admin-index","timezone-geojson","timezone-rules","datetime","time-domain","lane-tags","name-tags"]') }}
+        target: ${{ fromJSON(inputs.targets == 'graph-parsers' && '["osm-pbf","osm-primitives","osm-dense","graph-bundle","time-domain","lane-tags","name-tags"]' || '["request","http","polyline","lz4","dem","protobuf","config","osm-pbf","osm-primitives","osm-dense","node-store","graph-bundle","build-checkpoint","valhalla-tile","costing-reference","motor-costing","range-manifest","http-range","usage-directory","speed-config","motor-tags","admin-index","timezone-geojson","timezone-rules","datetime","time-domain","lane-tags","name-tags","gtfs-csv"]') }}
       fail-fast: false
     steps:
       - uses: actions/checkout@v6

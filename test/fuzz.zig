@@ -38,6 +38,44 @@ const polyline = routing.geo.polyline;
 const dem = routing.elevation.@"packed";
 const Smith = std.testing.Smith;
 
+pub fn fuzzGtfsCsv(_: void, smith: *Smith) !void {
+    var input: [max_input]u8 = undefined;
+    const bytes = draw(smith, &input, 0x67746673);
+    const csv = routing.build.gtfs.csv;
+    const a = std.testing.allocator;
+    var fields: std.ArrayList(csv.Field) = .empty;
+    defer fields.deinit(a);
+    var storage: std.ArrayList(u8) = .empty;
+    defer storage.deinit(a);
+    var diagnostic: csv.Diagnostic = .{};
+    var reader = csv.Reader.init(bytes, "stops.txt");
+    while (reader.next(a, &fields, &diagnostic, .none) catch |err| switch (err) {
+        error.InvalidQuote => {
+            try std.testing.expect(diagnostic.row > 0 and diagnostic.column > 0);
+            return;
+        },
+        else => return err,
+    }) |record| {
+        for (record) |field| {
+            const decoded = try field.text(a, &storage, .none);
+            try std.testing.expect(decoded.len <= field.raw.len);
+        }
+    }
+}
+
+test "fuzz gtfs-csv" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const inputs = &.{
+        "stop_id,stop_name\n1,East Street\n2,",
+        "\xef\xbb\xbfstop_id,stop_name\r\n1,\"North, West\"\r\n2,\"line1\r\nline2\"",
+        "a,b\nx,\"closed\"unquoted",
+        "a,b\nx,\"unterminated",
+        "\"\"\"double\"\"\nquote\",\",\r\n\",\r\n",
+    };
+    try std.testing.fuzz({}, fuzzGtfsCsv, .{ .corpus = try seeds(arena_state.allocator(), inputs) });
+}
+
 /// Largest input a target draws.
 const max_input = 64 * 1024;
 

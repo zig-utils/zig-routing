@@ -26,6 +26,7 @@ pub const lanes = @import("lanes.zig");
 pub const name_details = @import("name_details.zig");
 pub const restriction_automaton = @import("restriction_automaton.zig");
 pub const time_parsing = @import("time_parsing.zig");
+pub const gtfs = @import("gtfs/root.zig");
 
 test {
     std.testing.refAllDecls(@This());

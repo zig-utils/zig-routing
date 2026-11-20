@@ -369,6 +369,16 @@ pub fn build(b: *std.Build) void {
     run_bench_candidates.addPassthruArgs();
     b.step("bench-candidates", "Measure Meili candidate search and write correlations").dependOn(&run_bench_candidates.step);
 
+    const bench_gtfs = b.addExecutable(.{ .name = "bench-gtfs", .root_module = b.createModule(.{
+        .root_source_file = b.path("test/bench_gtfs.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{.{ .name = "routing", .module = lib_mod }},
+    }) });
+    const run_bench_gtfs = b.addRunArtifact(bench_gtfs);
+    run_bench_gtfs.addPassthruArgs();
+    b.step("bench-gtfs", "Count feed rows and measure parallel GTFS stop-time parsing").dependOn(&run_bench_gtfs.step);
+
     const bench_exclusions = b.addExecutable(.{ .name = "bench-exclusions", .root_module = b.createModule(.{
         .root_source_file = b.path("test/bench_exclusions.zig"),
         .target = target,
