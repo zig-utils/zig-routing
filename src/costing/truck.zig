@@ -163,6 +163,10 @@ pub const Profile = struct {
         return motor.untimedSpeed(self.permission.flow, edge, self.fixed_speed, true);
     }
 
+    pub fn resolvedSpeed(self: *const Profile, edge: EdgeHot, id: EdgeId, time: ?graph.speed.Time, overlays: anytype) Speed {
+        return motor.resolvedSpeed(self, edge, id, true, time, overlays);
+    }
+
     pub fn astarCostFactor(self: *const Profile) f32 {
         return motor.speed_factors[self.top_speed] * self.min_linear_factor;
     }
@@ -483,4 +487,45 @@ test "truck entry charges low class, destination-only and HGV access penalties o
     turn.movement.base_turn.previous_destination_only = true;
     try std.testing.expectEqual(@as(f32, 45), Kernel.turnCost(&profile, &node, &primary, &local, turn).cost);
     try std.testing.expectEqual(@as(f32, 0), Kernel.turnCost(&profile, &node, &local, &local, turn).cost);
+}
+
+test "truck live speed uses the ordinary noncurrent source for the speed penalty" {
+    const Overlay = struct {
+        encoded_speed: u7,
+
+        pub fn live(self: @This(), _: EdgeId) ?graph.speed.Live {
+            return .{ .overall = self.encoded_speed, .segments = .{ self.encoded_speed, 127, 127 }, .breakpoints = .{ 255, 0 } };
+        }
+
+        pub fn predicted(_: @This(), _: EdgeId, _: graph.speed.Bucket) ?f32 {
+            return null;
+        }
+    };
+    var scratch: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    var warnings: std.ArrayList(base.Warning) = .empty;
+    const input = try json.parse(arena, "{\"top_speed\":70,\"speed_types\":[\"current\"]}");
+    var options = try parse(arena, input, &warnings, .none);
+    const profile = try Profile.init(options);
+    const edge: EdgeHot = .{
+        .head = 0,
+        .geom = .{ .len_m = 650, .grade = 6, .curvature = 0 },
+        .cls = .{ .class_id = 0, .local = 0, .opp_local = 0, .cold_checks = 0, .pred_speed = 0 },
+        .speed = .{ 100, 90, 80, 65 },
+    };
+    const live = profile.resolvedSpeed(edge, @fromBackingInt(0), .{ .seconds_of_week = 0 }, Overlay{ .encoded_speed = 60 });
+    try std.testing.expectEqual(Speed{ .kph = 120, .non_current_kph = 100, .sources = .{ .current = true } }, live);
+    try std.testing.expectEqual(@as(f32, 1.5), motor.speedPenalty(profile.top_speed, profile.shared.speed_penalty_factor, live.kph, live));
+    const class: EdgeClass = .{ .access = .{ .forward = @bitCast(@as(graph.constants.AccessMask, .{ .truck = true })) } };
+    var factors: [1]f32 = undefined;
+    const tables = try compiled.compileInto(Model, profile, &.{class}, &factors, .none);
+    const actual = Kernel.edgeCost(&profile, &tables, &class, edge, live, .{});
+    try std.testing.expectApproxEqAbs(@as(f32, 36), actual.secs, 0.0001);
+    try std.testing.expect(compiled.costUnits(Kernel.edgeLowerBound(&profile, &tables, edge, graph.speed.upperBound(edge))) <= actual.cost);
+
+    options.shared.fixed_speed = 90;
+    const fixed = try Profile.init(options);
+    const closed = fixed.resolvedSpeed(edge, @fromBackingInt(0), null, Overlay{ .encoded_speed = 0 });
+    try std.testing.expectEqual(Speed{ .kph = 90, .non_current_kph = 90, .closed = true }, closed);
 }

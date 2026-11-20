@@ -11,7 +11,7 @@ const Use = graph.constants.Use;
 
 pub const max_penalty: f32 = 43_200;
 pub const max_ferry_penalty: f32 = 21_600;
-pub const fixed_speed_max: u32 = 252;
+pub const fixed_speed_max: u32 = graph.speed.max_traffic_kph;
 pub const unlimited_transitions = std.math.maxInt(u32);
 pub const unlimited_distance = std.math.floatMax(f32);
 
@@ -129,15 +129,7 @@ pub const Config = struct {
     }
 };
 
-pub const Flow = packed struct(u8) {
-    freeflow: bool = false,
-    constrained: bool = false,
-    predicted: bool = false,
-    current: bool = false,
-    reserved: u4 = 0,
-
-    pub const all: Flow = .{ .freeflow = true, .constrained = true, .predicted = true, .current = true };
-};
+pub const Flow = graph.speed.Flow;
 
 pub const HierarchyLimit = struct {
     max_up_transitions: u32 = unlimited_transitions,

@@ -415,6 +415,7 @@ pub fn run(gpa: Allocator, inputs: []const []const u8, output: []const u8, deadl
     try writer.write(.nodes, layout.nodes);
     try writer.write(.first_edge, layout.first);
     try writer.write(.edges, layout.edges);
+    try graph.speed.writeBounds(&writer, layout.edges);
     try writer.write(.classes, classes.classes);
     try writer.write(.coordinates, layout.coords);
     try writer.write(.slopes, layout.slopes);

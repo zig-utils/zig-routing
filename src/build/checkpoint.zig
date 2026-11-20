@@ -134,8 +134,9 @@ pub const Artifact = enum {
     bundle_signs,
     headings,
     bundle_headings,
+    bundle_lb_speeds,
 
-    fn filename(self: Artifact) [:0]const u8 {
+    noinline fn filename(self: Artifact) [:0]const u8 {
         return switch (self) {
             inline else => |key| @tagName(key) ++ ".bin",
         };

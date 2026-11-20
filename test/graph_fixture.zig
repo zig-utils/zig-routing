@@ -32,6 +32,8 @@ const classes = [_]routing.graph.class_table.EdgeClass{
 const coordinates = [_]format.Coordinate{ .{ .lng = 0, .lat = 0 }, .{ .lng = 100000, .lat = 0 } };
 const cold_idx = [_]u32{ 0, 0x8000_0000 };
 const slopes = [_]u16{ 0, 0x024f };
+const headings = [_]u8{ routing.graph.headings.encode(90), routing.graph.headings.encode(270) };
+const lb_speeds = [_]u8{ routing.graph.speed.upperBound(edges[0]), routing.graph.speed.upperBound(edges[1]) };
 const spatial = "\x01\x00\x00\x00\x00\x00\x00\x00\x00\xb4\x90\x7e\x00\x00\x00\x00\x00";
 const metadata = [_]format.Metadata{.{ .ordering_kind = 1, .order_hash = 0x1234_5678_9abc_def0 }};
 const empty_admins: routing.graph.admin.Header = .{
@@ -66,7 +68,8 @@ pub fn records(comptime kind: format.SectionKind) []const kind.Record() {
         .metadata => &metadata,
         .components => &.{ 0, 0 },
         .turn_sides => &.{ 3, 0, 0 },
-        .headings => &.{ routing.graph.headings.encode(90), routing.graph.headings.encode(270) },
+        .headings => &headings,
+        .lb_speeds => &lb_speeds,
         .coverage => &.{.{ .west = 0, .south = 0, .east = 100000, .north = 0 }},
         .admins => std.mem.asBytes(&empty_admins),
         .node_admins => &.{ 0, 0 },

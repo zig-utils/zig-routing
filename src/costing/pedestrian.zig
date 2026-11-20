@@ -175,9 +175,7 @@ pub const Profile = struct {
 
     /// The upstream choice with no departure time or traffic data.
     pub fn untimedFerrySpeed(self: *const Profile, edge: EdgeHot) u8 {
-        if (self.permission.flow.constrained and edge.speed[2] != 0) return edge.speed[2];
-        if (self.permission.flow.freeflow and edge.speed[1] != 0) return edge.speed[1];
-        return edge.speed[0];
+        return graph.speed.untimed(edge, self.permission.flow, false).kph;
     }
 };
 

@@ -99,6 +99,7 @@ fn fuzzGraphBundle(baseline: *const graph.reader.Files, s: *Smith) !void {
         _ = view.component(@fromBackingInt(id)) catch null;
         _ = view.coordinate(@fromBackingInt(id)) catch null;
         _ = view.edge(@fromBackingInt(@intCast(id))) catch null;
+        _ = view.lbSpeed(@fromBackingInt(id)) catch null;
         if (view.outEdges(@fromBackingInt(id))) |edges| {
             try expectBorrowed(std.mem.sliceAsBytes(view.edges), std.mem.sliceAsBytes(edges));
         } else |_| {}

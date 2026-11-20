@@ -117,17 +117,18 @@ pub const SectionKind = enum(u32) {
     restriction_conditions = 21,
     signs = 22,
     headings = 23,
+    lb_speeds = 24,
 
     pub fn placement(kind: SectionKind) Placement {
         return switch (kind) {
             .nodes, .edges, .first_edge, .turns, .classes, .turn_sides, .headings => .hot,
-            .coordinates, .spatial, .components, .metadata, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules => .warm,
+            .coordinates, .spatial, .components, .metadata, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules, .lb_speeds => .warm,
             .turn_restrictions, .restriction_automaton, .restriction_conditions => .warm,
             .cold_idx, .cold, .slopes, .signs => .cold,
         };
     }
 
-    pub fn filename(self: SectionKind) [:0]const u8 {
+    pub noinline fn filename(self: SectionKind) [:0]const u8 {
         return switch (self) {
             .nodes => "nodes.bin",
             .edges => "edges.bin",
@@ -152,6 +153,7 @@ pub const SectionKind = enum(u32) {
             .restriction_conditions => "restr_domains.bin",
             .signs => "signs.bin",
             .headings => "headings.bin",
+            .lb_speeds => "lb_speeds.bin",
         };
     }
 
@@ -176,7 +178,7 @@ pub const SectionKind = enum(u32) {
             .restriction_automaton => restriction_automaton.State,
             .restriction_conditions => restriction_automaton.Condition,
             .signs => @import("signs.zig").Entry,
-            .headings => u8,
+            .headings, .lb_speeds => u8,
         };
     }
 

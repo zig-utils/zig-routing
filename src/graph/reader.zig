@@ -167,6 +167,7 @@ pub const View = struct {
     restriction_conditions: ?[]const automaton.Condition = null,
     signs: ?[]const format.SectionKind.signs.Record() = null,
     headings: ?[]const u8 = null,
+    lb_speeds: ?[]const u8 = null,
 
     pub fn parse(files: Files, diagnostic: ?*Diagnostic) !View {
         return parseWithDeadline(files, diagnostic, .none);
@@ -290,6 +291,10 @@ pub const View = struct {
         if (graph.first_edge[0] != 0 or graph.first_edge[graph.first_edge.len - 1] != edge_count) {
             note(diagnostic, .first_edge);
             return error.InvalidCsrEndpoints;
+        }
+        if (graph.lb_speeds) |bounds| {
+            note(diagnostic, .lb_speeds);
+            try @import("speed.zig").verifyBounds(graph.edges, bounds, deadline);
         }
         if (graph.cold) |bytes| {
             note(diagnostic, .cold);
@@ -492,6 +497,12 @@ pub const View = struct {
         return .{ .code = value };
     }
 
+    pub fn lbSpeed(self: *const View, id: format.EdgeId) !u8 {
+        const hot = try self.edge(id);
+        if (self.lb_speeds) |bounds| return bounds[@backingInt(id)];
+        return @import("speed.zig").upperBound(hot.*);
+    }
+
     pub fn wayId(self: *const View, id: format.EdgeId) !u64 {
         return (try self.coldRecord(id)).wayId();
     }
@@ -514,7 +525,7 @@ pub const View = struct {
             note(diagnostic, kind);
             if (deadline.expired()) return error.DeadlineExceeded;
             const bytes: []const u8 = switch (kind) {
-                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata, .components, .turn_sides, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules, .turn_restrictions, .restriction_automaton, .restriction_conditions, .signs, .headings => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
+                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata, .components, .turn_sides, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules, .turn_restrictions, .restriction_automaton, .restriction_conditions, .signs, .headings, .lb_speeds => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
                 inline else => |section| std.mem.sliceAsBytes(@field(self, @tagName(section))),
             };
             var hash = std.hash.XxHash3.init(0);

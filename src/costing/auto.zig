@@ -103,6 +103,10 @@ pub const Profile = struct {
         return motor.untimedSpeed(self.permission.flow, edge, self.fixed_speed, false);
     }
 
+    pub fn resolvedSpeed(self: *const Profile, edge: EdgeHot, id: graph.format.EdgeId, time: ?graph.speed.Time, overlays: anytype) Speed {
+        return motor.resolvedSpeed(self, edge, id, false, time, overlays);
+    }
+
     fn hovAllowed(self: *const Profile, class: *const EdgeClass) bool {
         const flags = self.permission.flags;
         return !class.isHovOnly() or flags.contains(.include_hov3) or

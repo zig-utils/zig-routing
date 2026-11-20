@@ -425,6 +425,7 @@ noinline fn saveAttributes(topology: *const Topology, edge_classes: []const clas
 fn writeTopology(writer: *format.BundleWriter, scratch_dir: []const u8, topology: *const Topology, edge_classes: []const classes.EdgeClass, turn_data: []const u8, slopes: ?[]const u16) !void {
     try writer.write(.nodes, topology.nodes);
     try writer.write(.edges, topology.output.data);
+    try graph.speed.writeBounds(writer, topology.output.data);
     try writer.write(.first_edge, topology.first_edge);
     try writer.write(.classes, edge_classes);
     try writer.write(.coordinates, topology.coordinates);

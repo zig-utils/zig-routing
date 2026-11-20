@@ -82,7 +82,7 @@ const Inputs = struct {
     fn identity(self: Inputs) graph.format.DatasetUuid {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         // The turns checkpoint and bundle carry directed headings.
-        hash.update("zr-build-v4");
+        hash.update("zr-build-v5");
         hash.update(&.{ @intFromBool(self.dem_dir != null), if (self.drive_side) |side| @as(u8, @backingInt(side)) else 2 });
         hash.update(@tagName(self.order));
         if (self.dem_digest) |digest| {

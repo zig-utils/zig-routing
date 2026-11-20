@@ -109,6 +109,10 @@ pub const Profile = struct {
         return motor.untimedSpeed(self.permission.flow, edge, self.fixed_speed, false);
     }
 
+    pub fn resolvedSpeed(self: *const Profile, edge: EdgeHot, id: graph.format.EdgeId, time: ?graph.speed.Time, overlays: anytype) Speed {
+        return motor.resolvedSpeed(self, edge, id, false, time, overlays);
+    }
+
     fn pathClassAllowed(self: *const Profile, class: *const EdgeClass) bool {
         return class.category.surface <= @backingInt(self.mode.maximumSurface()) and self.permission.accessibleClass(class);
     }
@@ -296,7 +300,7 @@ pub const Kernel = struct {
         const weight = tables.factor(edge.cls.class_id);
         if (weight == std.math.inf(f32)) return compiled.forbidden_tick;
         const length: f64 = @floatFromInt(edge.geom.len_m);
-        const maximum: u8 = if (profile.fixed_speed != 0) profile.fixed_speed else if (upper_kph == 0) base.fixed_speed_max else upper_kph;
+        const maximum = if (profile.fixed_speed != 0) profile.fixed_speed else if (upper_kph == 0) graph.speed.upperBound(edge) else upper_kph;
         const secs = length * profile.secondsPerMetre(class, edge, maximum);
         if (class.category.use == ferry and (profile.mode == .motor_scooter or !profile.shared.shortest)) return compiled.floorTicks(secs * weight);
         if (profile.shared.shortest) return compiled.floorTicks(length);

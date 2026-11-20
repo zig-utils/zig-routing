@@ -165,6 +165,18 @@ The scooter oracle profiles keep the grade-adjusted speed within the pinned
 Valhalla speed table. Native tests cover the full fixed-speed range and its
 downhill maximum of 315 km/h using the same seconds-per-metre formula.
 
+### Speed resolution
+
+Synthetic overlays exercise live coverage and the one-hour fade, predicted
+five-minute buckets, and the strict 07:00 to 19:00 interval for constrained
+flow. Tests check the selected source bits, closure state, and the truck cap
+on the final traversal speed. The resolver uses an empty provider by default.
+
+Native builds and imports write one upper-speed byte per directed edge in
+`lb_speeds.bin`. This accounts for the edge's stored speeds and future
+overlays up to 252 km/h. The reader derives the same bound for older bundles
+and checks stored bounds when opening new ones.
+
 ### OSM tag parity
 
 CI compares the normal build tag transform against compressed NDJSON goldens for the

@@ -115,6 +115,31 @@ test "timezone sections are optional together" {
     try testing.expectEqual(@as(routing.graph.timezone.Id, 0), try bundle.view.nodeTimezone(@fromBackingInt(0)));
 }
 
+test "speed bounds reject invalid values and support bundles built before the section" {
+    const fixture = try Fixture.create();
+    defer fixture.deinit();
+    var buf: [80]u8 = undefined;
+    const path = fixture.path(&buf);
+    const first: format.EdgeId = @fromBackingInt(0);
+    const overlay_limit = routing.graph.speed.max_traffic_kph;
+    {
+        var bundle = try reader.Bundle.open(path);
+        defer bundle.close();
+        try testing.expectEqual(overlay_limit, try bundle.view.lbSpeed(first));
+        try testing.expectError(error.InvalidEdgeId, bundle.view.lbSpeed(@fromBackingInt(2)));
+    }
+    const file = try fixture.section(.lb_speeds);
+    defer file.close();
+    try file.pwriteAll(&.{overlay_limit - 1}, format.payload_offset);
+    try testing.expectError(error.InvalidSpeedBound, reader.Bundle.open(path));
+    const dir = try fixture.root.child("bundle");
+    defer dir.close();
+    try dir.deleteFile(format.SectionKind.lb_speeds.filename());
+    var older = try reader.Bundle.open(path);
+    defer older.close();
+    try testing.expectEqual(overlay_limit, try older.view.lbSpeed(first));
+}
+
 test "cold sections are optional as a pair and reject unsafe indexes and offsets" {
     const fixture = try Fixture.create();
     defer fixture.deinit();

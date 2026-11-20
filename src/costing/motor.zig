@@ -53,12 +53,24 @@ pub fn compileSpeeds(top_speed: u8, fixed_speed: u8) [256]f32 {
 
 pub fn untimedSpeed(flow: base.Flow, edge: EdgeHot, fixed_speed: u8, comptime truck: bool) Speed {
     if (fixed_speed != 0) return .{ .kph = fixed_speed, .non_current_kph = fixed_speed };
-    if (flow.constrained and edge.speed[2] != 0)
-        return .{ .kph = edge.speed[2], .non_current_kph = edge.speed[2], .sources = .{ .constrained = true } };
-    if (flow.freeflow and edge.speed[1] != 0)
-        return .{ .kph = edge.speed[1], .non_current_kph = edge.speed[1], .sources = .{ .freeflow = true } };
-    const kph = if (truck and edge.speed[3] != 0) @min(edge.speed[0], edge.speed[3]) else edge.speed[0];
-    return .{ .kph = kph, .non_current_kph = kph };
+    const speed = graph.speed.untimed(edge, flow, truck);
+    return .{ .kph = speed.kph, .non_current_kph = speed.kph, .sources = speed.sources };
+}
+
+pub fn resolvedSpeed(profile: anytype, edge: EdgeHot, id: graph.format.EdgeId, comptime truck: bool, time: ?graph.speed.Time, overlays: anytype) Speed {
+    const flow = profile.permission.flow;
+    if (profile.fixed_speed != 0) {
+        const closed = if (flow.current) if (overlays.live(id)) |live| live.closed() else false else false;
+        return .{ .kph = profile.fixed_speed, .non_current_kph = profile.fixed_speed, .closed = closed };
+    }
+    const speed = graph.speed.resolve(edge, id, .{ .flow = flow, .time = time, .truck = truck }, overlays);
+    var non_current = speed.kph;
+    if (speed.sources.current and profile.top_speed != assumed_speed) {
+        var static_flow = flow;
+        static_flow.current = false;
+        non_current = graph.speed.resolve(edge, id, .{ .flow = static_flow, .time = time }, overlays).kph;
+    }
+    return .{ .kph = speed.kph, .non_current_kph = non_current, .sources = speed.sources, .closed = speed.closed };
 }
 
 /// Resolved speed and its source bits. The non-current value is used for
