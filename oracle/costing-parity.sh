@@ -3,12 +3,12 @@
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 motor=
-if [ "${1:-}" = "--motor" ]; then
-  motor=--motor
+if [ "${1:-}" = "--motor" ] || [ "${1:-}" = "--truck" ]; then
+  motor="$1"
   shift
 fi
 [ "$#" -ge 2 ] && [ "$#" -le 3 ] ||
-  die "usage: $0 [--motor] DATASET REPORT.json [CASES_PER_PROFILE]"
+  die "usage: $0 [--motor|--truck] DATASET REPORT.json [CASES_PER_PROFILE]"
 dataset="$1"
 report="$2"
 cases="${3:-50000}"
@@ -72,7 +72,7 @@ docker run --rm --platform "$ORACLE_PLATFORM" \
 if [ -n "$motor" ]; then
   (
     cd "$repo"
-    "${ZIG:-zig}" build motor-costing-parity -Doptimize=ReleaseFast -- "$work/bundle" "$work/costs.bin"
+    "${ZIG:-zig}" build motor-costing-parity -Doptimize=ReleaseFast -- "$work/bundle" "$work/costs.bin" "$motor"
   ) > "$report" 2> "$work/failures.log" ||
     die "costing gate failed. See $report and $work/failures.log"
 else

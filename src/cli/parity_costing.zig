@@ -15,7 +15,7 @@ pub const call_limit = 1e-5;
 pub const path_limit = 1e-4;
 pub const minimum_calls = 10_000_000;
 const magic = "ZRCOST01";
-pub const Mode = enum(u32) { pedestrian, bicycle, auto, bus, taxi };
+pub const Mode = enum(u32) { pedestrian, bicycle, auto, bus, taxi, truck };
 
 const Case = extern struct {
     incoming: u32,

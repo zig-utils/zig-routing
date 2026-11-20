@@ -117,6 +117,38 @@ tiles preserve Valhalla's stored bearings for exact turn duration. Native
 builds use the same bearings for maneuver type and turn duration. Older
 bundles can recover bearings from their directed shapes.
 
+Run the truck gate with:
+
+```bash
+oracle/costing-parity.sh --truck utrecht bench/results/costing-truck-utrecht.json
+oracle/costing-parity.sh --truck liechtenstein bench/results/costing-truck-liechtenstein.json
+```
+
+Each extract supplied 69 profiles and 3.45 million samples of each call type.
+The gate used compiled tables for 67 profiles per extract and the raw
+formula for the two profiles with signed weights.
+All 13.8 million forward and reverse transitions and 15 fixed-path recosts
+matched exactly. The maximum relative error across 6.9 million edge costs
+was `3.35e-7`.
+
+The samples include the upstream minimum `low_class_factor` of `0.1`. With
+`use_tolls: 1`, 24,533 of 50,000 Utrecht samples had negative weights.
+The raw truck evaluator preserves these values for parity. Exact metric
+compilation requires nonnegative class factors under I3. See
+[#128](https://github.com/zig-utils/zig-routing/issues/128).
+
+To measure the auto relaxation loop with the production cost functions:
+
+```bash
+zig build bench-search -Doptimize=ReleaseFast -- "$bundle" 32 100000 82 --auto
+```
+
+On an Apple M3 Pro, 12 alternating baseline and candidate pairs on the
+imported Utrecht bundle settled 866,133 labels per run, with identical settle
+and pop counts per source. Median elapsed time was 167.70 ns per settled label
+at `3a1e0b2` and 167.48 ns with truck costing present. The median paired change
+was +0.36%.
+
 ### OSM tag parity
 
 CI compares the normal build tag transform against compressed NDJSON goldens for the

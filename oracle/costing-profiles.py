@@ -70,15 +70,25 @@ MOTOR = {
     "top_speed": (10, 252),
 }
 
+TRUCK = {
+    **dict.fromkeys(("use_highways", "use_tolls", "use_truck_route"), PREFERENCE),
+    "top_speed": (10, 252),
+    "axle_load": (0, 40),
+    "axle_count": (2, 20),
+    "low_class_penalty": PENALTY,
+    "low_class_factor": FACTOR,
+    "hgv_no_access_penalty": PENALTY,
+}
+
 INTEGERS = {
     "fixed_speed", "max_distance", "max_grade", "max_hiking_difficulty",
     "transit_start_end_max_distance", "transit_transfer_max_distance",
-    "multimodal_start_end_max_distance", "restriction_probability", "top_speed",
+    "multimodal_start_end_max_distance", "restriction_probability", "top_speed", "axle_count",
 }
 
 
 def sampled(mode, rng):
-    ranges = SHARED | {"pedestrian": PEDESTRIAN, "bicycle": BICYCLE}.get(mode, MOTOR)
+    ranges = SHARED | {"pedestrian": PEDESTRIAN, "bicycle": BICYCLE, "truck": TRUCK}.get(mode, MOTOR)
     settings = [{} for _ in range(PROFILES_PER_MODE)]
     for option, (low, high) in ranges.items():
         # Stratify each option independently and always include both bounds.
@@ -98,6 +108,13 @@ def sampled(mode, rng):
             row["type"] = ("foot", "wheelchair", "blind")[index % 3]
         elif mode == "bicycle":
             row["bicycle_type"] = ("road", "cross", "hybrid", "mountain")[index % 4]
+        elif mode == "truck":
+            row["hazmat"] = index % 2 == 0
+            row["ignore_restrictions"] = index % 7 == 0
+            row["ignore_oneways"] = index % 13 == 0
+            row["ignore_access"] = index % 19 == 0
+            row["ignore_closures"] = index % 23 == 0
+            row["exclude_tolls"] = index % 29 == 0
         else:
             row["include_hov2"] = index % 3 == 0
             row["include_hov3"] = index % 3 == 1
@@ -121,10 +138,10 @@ def production(corpus, rng, path_count, modes):
             continue
         request = json.loads(body)
         mode = request["costing"]
-        if mode not in modes:
+        if mode not in modes and not (mode == "auto" and "truck" in modes):
             continue
         options = request.get("costing_options", {}).get(mode, {})
-        for variant in MOTOR_MODES if mode == "auto" else (mode,):
+        for variant in modes if mode == "auto" else (mode,):
             key = (variant, json.dumps(options, sort_keys=True))
             paths = profiles[key]
             if len(request["locations"]) == 2 and "date_time" not in request:
@@ -144,10 +161,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("corpus", type=argparse.FileType())
     parser.add_argument("--paths-per-profile", type=int, default=8)
-    parser.add_argument("--motor", action="store_true", help="sample auto, bus, taxi and HOV options")
+    family = parser.add_mutually_exclusive_group()
+    family.add_argument("--motor", action="store_true", help="sample auto, bus, taxi and HOV options")
+    family.add_argument("--truck", action="store_true", help="sample truck costing options and dimensions")
     args = parser.parse_args()
     rng = random.Random(0x7A52C057)
-    modes = MOTOR_MODES if args.motor else MODES
+    modes = ("truck",) if args.truck else MOTOR_MODES if args.motor else MODES
     profiles = list(production(args.corpus, rng, args.paths_per_profile, modes))
     if {p["mode"] for p in profiles} != set(modes):
         parser.error(f"corpus must provide production profiles for {', '.join(modes)}")
@@ -156,6 +175,14 @@ def main():
     for mode in modes:
         if args.motor:
             for options in ({}, {"include_hov2": True}, {"include_hov3": True, "include_hot": True}):
+                print(json.dumps({"mode": mode, "options": options, "paths": []}, separators=(",", ":")))
+        if args.truck:
+            for options in (
+                {},
+                {"low_class_factor": 0.1, "use_tolls": 1},
+                {"hazmat": True, "use_truck_route": 1},
+                {"hgv_no_access_penalty": 30, "top_speed": 70},
+            ):
                 print(json.dumps({"mode": mode, "options": options, "paths": []}, separators=(",", ":")))
         for profile in sampled(mode, rng):
             print(json.dumps(profile, separators=(",", ":")))

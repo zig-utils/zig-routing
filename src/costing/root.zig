@@ -5,6 +5,7 @@ pub const base = @import("base.zig");
 pub const bicycle = @import("bicycle.zig");
 pub const compiled = @import("compiled.zig");
 pub const pedestrian = @import("pedestrian.zig");
+pub const truck = @import("truck.zig");
 
 const std = @import("std");
 

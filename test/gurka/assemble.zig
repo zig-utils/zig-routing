@@ -1685,6 +1685,165 @@ test "assembled motor vehicle limits follow the original way direction" {
     try testing.expect(booth.attr.cash_only_toll);
 }
 
+const TruckTestCost = struct {
+    const truck = routing.costing.truck;
+    const compiled = routing.costing.compiled;
+    profile: *const truck.Profile,
+    tables: *const compiled.Compiled,
+
+    pub fn edgeCost(self: TruckTestCost, view: *const graph.reader.View, _: format.EdgeId, edge: *const format.EdgeHot, _: search.Direction) !Cost {
+        const class = try view.class(edge.cls.class_id);
+        return truck.Kernel.edgeCost(self.profile, self.tables, class, edge.*, self.profile.untimedSpeed(edge.*), .{});
+    }
+
+    pub fn allowedTurn(self: TruckTestCost, view: *const graph.reader.View, movement: search.Transition, _: search.Label, direction: search.Direction) !bool {
+        const from = try view.class(movement.incoming_edge.cls.class_id);
+        const to = try view.class(movement.outgoing_edge.cls.class_id);
+        const previous = if (direction == .forward) from else to;
+        const check: truck.PathCheck = .{
+            .backtrack = movement.incoming_edge.cls.opp_local == movement.outgoing_edge.cls.local,
+            .previous_dead_end = previous.flags.dead_end or (try view.outEdgeRange(movement.node)).count() == 1,
+            .previous_access = .{ .destination_only = previous.flags.destination_only_hgv },
+        };
+        const turn: routing.costing.base.Turn = .{ .row = movement.row };
+        const admission = switch (direction) {
+            .forward => try truck.Kernel.allowed(self.profile, view, movement.outgoing, from, to, turn, check, .none),
+            .reverse => try truck.Kernel.allowedReverse(self.profile, view, movement.incoming, from, to, turn, check, .none),
+        };
+        return admission.allowed;
+    }
+
+    pub fn turnCost(self: TruckTestCost, view: *const graph.reader.View, movement: search.Transition, _: search.Label, _: search.Direction) !Cost {
+        const from = try view.class(movement.incoming_edge.cls.class_id);
+        const to = try view.class(movement.outgoing_edge.cls.class_id);
+        var turn = try truck.Turn.read(view, movement.node, movement.incoming, movement.outgoing, testing.allocator, .none);
+        turn.movement.base_turn.previous_destination_only = from.flags.destination_only_hgv;
+        turn.measured_speed = @as(u8, @bitCast(self.profile.untimedSpeed(movement.incoming_edge.*).sources)) != 0;
+        return truck.Kernel.turnCost(self.profile, try view.node(movement.node), from, to, turn);
+    }
+};
+
+fn checkTruckTrip(a: std.mem.Allocator, view: *const graph.reader.View, fixture: *const gurka.Map, origin: []const u8, destination: []const u8, settings: []const u8, expected: ?[]const []const u8) !void {
+    const truck = TruckTestCost.truck;
+    var warnings: std.ArrayList(routing.costing.base.Warning) = .empty;
+    const options = try truck.parse(a, try routing.api.json.parse(a, settings), &warnings, .none);
+    try testing.expectEqual(0, warnings.items.len);
+    const profile = try truck.Profile.init(options);
+    const classes = view.classes orelse return error.MissingClasses;
+    const tables = try TruckTestCost.compiled.compileInto(truck.Model, profile, classes, try a.alloc(f32, classes.len), .none);
+    const cost: TruckTestCost = .{ .profile = &profile, .tables = &tables };
+    const from = try at(view, fixture.findNode(origin).?.location.toFixed());
+    const to = try at(view, fixture.findNode(destination).?.location.toFixed());
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    var engine = try search.Search(TruckTestCost, routing.search.queue.Heap).init(testing.allocator, view);
+    defer engine.deinit();
+    for ([_]search.Direction{ .forward, .reverse }) |direction| {
+        const result = engine.run(&arena, cost, .{ .origin = from, .destination = to, .direction = direction }, search.Zero{}, .{});
+        if (expected) |ways| {
+            try expectWayPath(view, fixture, try result, direction, ways);
+        } else {
+            try testing.expectError(error.NoPath, result);
+        }
+        arena.reset();
+    }
+}
+
+// Ported from test/gurka/test_truck.cc.
+test "Gurka truck dimension and hazmat limits in both search directions" {
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const road = gurka.Tag{ .key = "highway", .value = "residential" };
+    const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates("A---B---C---D", 10), &.{
+        .{ .label = "AB", .tags = &.{road} },
+        .{ .label = "BC", .tags = &.{
+            road,
+            .{ .key = "maxheight:forward", .value = "5" },
+            .{ .key = "maxwidth", .value = "3" },
+            .{ .key = "maxlength", .value = "25" },
+            .{ .key = "maxweight", .value = "35" },
+            .{ .key = "maxaxleload", .value = "10" },
+            .{ .key = "maxaxles", .value = "8" },
+            .{ .key = "hazmat", .value = "destination" },
+        } },
+        .{ .label = "CD", .tags = &.{road} },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 2);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    try checkTruckTrip(a, view, &fixture, "A", "D", "{}", &.{ "AB", "BC", "CD" });
+    for ([_][]const u8{
+        "{\"height\":6}",    "{\"width\":4}",      "{\"length\":30}",     "{\"weight\":36}",
+        "{\"hazmat\":true}", "{\"axle_load\":11}", "{\"axle_count\":10}",
+    }) |options| {
+        try checkTruckTrip(a, view, &fixture, "A", "D", options, null);
+    }
+    try checkTruckTrip(a, view, &fixture, "D", "A", "{\"height\":6}", &.{ "CD", "BC", "AB" });
+    try checkTruckTrip(a, view, &fixture, "A", "D", "{\"height\":6,\"ignore_restrictions\":true}", &.{ "AB", "BC", "CD" });
+    try checkTruckTrip(a, view, &fixture, "A", "D", "{\"height\":5,\"width\":3,\"length\":25,\"weight\":35,\"axle_load\":10,\"axle_count\":8}", &.{ "AB", "BC", "CD" });
+}
+
+// Ported from test/gurka/test_truck.cc.
+test "Gurka truck route preference selects the designated detour" {
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const road = gurka.Tag{ .key = "highway", .value = "residential" };
+    const layout = try gurka.mapToCoordinates(
+        \\A------B
+        \\|      |
+        \\|      |
+        \\|      |
+        \\|      |
+        \\|      C
+        \\|      |
+        \\E------D
+    , 500);
+    const fixture = try gurka.Map.init(a, layout, &.{
+        .{ .label = "AB", .tags = &.{road} },
+        .{ .label = "AE", .tags = &.{ road, .{ .key = "hgv", .value = "designated" } } },
+        .{ .label = "BC", .tags = &.{road} },
+        .{ .label = "CD", .tags = &.{road} },
+        .{ .label = "ED", .tags = &.{road} },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 2);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    try checkTruckTrip(a, view, &fixture, "A", "C", "{}", &.{ "AB", "BC" });
+    try checkTruckTrip(a, view, &fixture, "A", "C", "{\"use_truck_route\":1}", &.{ "AE", "ED", "CD" });
+}
+
+// Ported from the low-road-class detours in test/gurka/test_truck.cc.
+test "Gurka truck low class entry penalty selects the higher class detour" {
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const speed = gurka.Tag{ .key = "maxspeed", .value = "30" };
+    const primary: gurka.Tags = &.{ .{ .key = "highway", .value = "primary" }, speed };
+    const local: gurka.Tags = &.{ .{ .key = "highway", .value = "residential" }, speed };
+    const detour: gurka.Tags = &.{ .{ .key = "highway", .value = "unclassified" }, speed };
+    const layout = try gurka.mapToCoordinates(
+        \\    D---E
+        \\    |   |
+        \\S---A-B-C---T
+    , 10);
+    const fixture = try gurka.Map.init(a, layout, &.{
+        .{ .label = "SA", .tags = primary },
+        .{ .label = "AB", .tags = local },
+        .{ .label = "BC", .tags = local },
+        .{ .label = "CT", .tags = primary },
+        .{ .label = "AD", .tags = detour },
+        .{ .label = "DE", .tags = detour },
+        .{ .label = "EC", .tags = detour },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 2);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    try checkTruckTrip(a, view, &fixture, "S", "T", "{\"low_class_factor\":1,\"low_class_penalty\":0}", &.{ "SA", "AB", "BC", "CT" });
+    try checkTruckTrip(a, view, &fixture, "S", "T", "{\"low_class_factor\":1,\"low_class_penalty\":120}", &.{ "SA", "AD", "DE", "EC", "CT" });
+}
+
 test "assembled gates and tolls retain shared costing attributes" {
     const base = routing.costing.base;
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);

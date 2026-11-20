@@ -4,6 +4,7 @@
 #include <valhalla/sif/autocost.h>
 #include <valhalla/sif/bicyclecost.h>
 #include <valhalla/sif/pedestriancost.h>
+#include <valhalla/sif/truckcost.h>
 #include <valhalla/tyr/actor.h>
 
 #include <boost/property_tree/json_parser.hpp>
@@ -192,12 +193,13 @@ void record(std::ostream& output,
     decltype(&ParseAutoCostOptions) parse;
     decltype(&CreateAutoCost) create;
   };
-  static constexpr std::array<Model, 5> models{{
+  static constexpr std::array<Model, 6> models{{
       {"pedestrian", ParsePedestrianCostOptions, CreatePedestrianCost},
       {"bicycle", ParseBicycleCostOptions, CreateBicycleCost},
       {"auto", ParseAutoCostOptions, CreateAutoCost},
       {"bus", ParseBusCostOptions, CreateBusCost},
       {"taxi", ParseTaxiCostOptions, CreateTaxiCost},
+      {"truck", ParseTruckCostOptions, CreateTruckCost},
   }};
   const auto model = std::find_if(models.begin(), models.end(),
                                   [&](const Model& candidate) { return candidate.name == mode; });
@@ -211,6 +213,13 @@ void record(std::ostream& output,
     throw std::runtime_error("out-of-range oracle costing options: " + json(option["options"]));
   }
   const auto cost = model->create(config);
+  const bool truck = model->name == "truck";
+  const auto predecessor = [&](const EdgeRef& ref) {
+    return EdgeLabel(kInvalidLabel, ref.id, ref.edge, {}, 0, cost->travel_mode(), 0,
+                     kInvalidRestriction, false, false, InternalTurn::kNoTurn, 0,
+                     truck && ref.edge->destonly_hgv(),
+                     truck && (ref.edge->forwardaccess() & kTruckAccess));
+  };
   std::vector<bool> allowed;
   allowed.reserve(graph.edges.size());
   for (const auto& ref : graph.edges) {
@@ -224,8 +233,7 @@ void record(std::ostream& output,
     const auto& incoming = graph.edges[from];
     const auto& outgoing = graph.edges[to];
     const auto* node = outgoing.tile->node(incoming.edge->endnode());
-    EdgeLabel previous(kInvalidLabel, incoming.id, incoming.edge, {}, 0, cost->travel_mode(),
-                       0, kInvalidRestriction, false, false, InternalTurn::kNoTurn);
+    auto previous = predecessor(incoming);
     previous.set_deadend(node->edge_count() == 1);
     uint8_t restriction = kInvalidRestriction;
     uint8_t destination_mask = 0;
@@ -249,14 +257,13 @@ void record(std::ostream& output,
     const auto& incoming = graph.edges[from];
     const auto& outgoing = graph.edges[to];
     const auto* node = outgoing.tile->node(incoming.edge->endnode());
-    const EdgeLabel previous(kInvalidLabel, incoming.id, incoming.edge, {}, 0, cost->travel_mode(),
-                             0, kInvalidRestriction, false, false, InternalTurn::kNoTurn);
+    const auto previous = predecessor(incoming);
     graph_tile_ptr reverse_tile;
     const DirectedEdge* reverse_edge = nullptr;
     const auto reverse_id = reader.GetOpposingEdgeId(outgoing.id, reverse_edge, reverse_tile);
     const EdgeLabel reverse(kInvalidLabel, reverse_id, reverse_edge, {}, 0, cost->travel_mode(), 0,
                             kInvalidRestriction, false, false, InternalTurn::kNoTurn, 0,
-                            outgoing.edge->destonly());
+                            truck ? outgoing.edge->destonly_hgv() : outgoing.edge->destonly());
     uint8_t sources = 0;
     const auto traversal = cost->EdgeCost(outgoing.edge, outgoing.id, outgoing.tile,
                                           TimeInfo::invalid(), sources);
@@ -265,7 +272,8 @@ void record(std::ostream& output,
     const auto backwards =
         cost->TransitionCostReverse(incoming.edge->opp_local_idx(), node, incoming.edge,
                                     outgoing.edge, reverse, incoming.tile, limited_reader,
-                                    false, InternalTurn::kNoTurn, incoming.edge->destonly());
+                                    false, InternalTurn::kNoTurn,
+                                    truck ? incoming.edge->destonly_hgv() : incoming.edge->destonly());
     write(output, Case{from, to, traversal, forward, backwards});
   }
   for (const auto& route : routes) {

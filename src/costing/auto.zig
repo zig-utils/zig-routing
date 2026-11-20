@@ -2,6 +2,7 @@
 const std = @import("std");
 const base = @import("base.zig");
 const compiled = @import("compiled.zig");
+const motor = @import("motor.zig");
 const graph = @import("../graph/root.zig");
 const json = @import("../api/json.zig");
 const Deadline = @import("../infra/io.zig").Deadline;
@@ -64,17 +65,6 @@ pub fn parse(arena: std.mem.Allocator, mode: Mode, input: json.Value, warnings: 
     };
 }
 
-const speed_factors: [highest_speed + 1]f32 = blk: {
-    var factors: [highest_speed + 1]f32 = undefined;
-    factors[0] = 3600;
-    for (factors[1..], 1..) |*factor, speed| {
-        factor.* = (3600.0 * @as(f32, 0.001)) / @as(f32, @floatFromInt(speed));
-    }
-    break :blk factors;
-};
-
-const highway_class = [8]f32{ 1, 0.5, 0, 0, 0, 0, 0, 0 };
-const surface_weight = [8]f32{ 0, 0, 0, 0.1, 0.2, 0.5, 1, 0 };
 const taxi_factor: f32 = 0.85;
 const turn_channel_factor: f32 = 0.6;
 
@@ -105,17 +95,12 @@ pub const Profile = struct {
     }
 
     pub fn astarCostFactor(self: *const Profile) f32 {
-        return speed_factors[self.top_speed] * self.min_linear_factor;
+        return motor.speed_factors[self.top_speed] * self.min_linear_factor;
     }
 
     /// Valhalla's speed selection without a time of week or live speed.
     pub fn untimedSpeed(self: *const Profile, edge: EdgeHot) Speed {
-        if (self.fixed_speed != 0) return .{ .kph = self.fixed_speed, .non_current_kph = self.fixed_speed };
-        if (self.permission.flow.constrained and edge.speed[2] != 0)
-            return .{ .kph = edge.speed[2], .non_current_kph = edge.speed[2], .sources = .{ .constrained = true } };
-        if (self.permission.flow.freeflow and edge.speed[1] != 0)
-            return .{ .kph = edge.speed[1], .non_current_kph = edge.speed[1], .sources = .{ .freeflow = true } };
-        return .{ .kph = edge.speed[0], .non_current_kph = edge.speed[0] };
+        return motor.untimedSpeed(self.permission.flow, edge, self.fixed_speed, false);
     }
 
     fn hovAllowed(self: *const Profile, class: *const EdgeClass) bool {
@@ -150,7 +135,7 @@ pub const Profile = struct {
             return (weight + speed_penalty) * (if (access.taxi and !access.auto) taxi_factor else @as(f32, 1));
         }
         const starting = if (use == @backingInt(Use.rail_ferry)) self.shared.rail_ferry_factor else weight;
-        const surface = 0.5 * surface_weight[class.category.surface];
+        const surface = 0.5 * motor.surface_weight[class.category.surface];
         const toll = if (class.flags.toll) self.toll_bias else 0;
         return starting + (self.highway_bias[class.category.road_class] + surface + speed_penalty + toll);
     }
@@ -190,24 +175,12 @@ pub const Model = struct {
         if (!(alley_range.min <= options.alley_factor and options.alley_factor <= alley_range.max) or
             options.top_speed < 10 or options.top_speed > highest_speed or options.shared.fixed_speed > highest_speed or
             options.restriction_probability > 100) return error.InvalidAutoOptions;
-        const highways = options.use_highways;
-        const highway_bias = if (highways >= 0.5) bias: {
-            const f: f32 = 0.5 - highways;
-            break :bias f * f * f;
-        } else bias: {
-            const f: f32 = 1 - highways * 2;
-            break :bias 8 * (f * f);
-        };
-        const tolls = options.use_tolls;
-        const toll_bias = if (tolls < 0.5) 4 - 8 * tolls else (0.5 - tolls) * 0.03;
-        var highway: [8]f32 = undefined;
-        for (&highway, highway_class) |*adjustment, class| adjustment.* = highway_bias * class;
         return .{
             .mode = options.mode,
             .shared = .init(options.shared),
             .permission = .init(options.shared, options.mode.access(), options.filter_closures),
-            .highway_bias = highway,
-            .toll_bias = toll_bias,
+            .highway_bias = motor.highwayBias(options.use_highways),
+            .toll_bias = motor.tollBias(options.use_tolls, 4),
             .alley_factor = options.alley_factor,
             .top_speed = if (options.shared.fixed_speed != 0) @intCast(options.shared.fixed_speed) else options.top_speed,
             .fixed_speed = @intCast(options.shared.fixed_speed),
@@ -236,14 +209,8 @@ pub const Model = struct {
         var key: compiled.MetricKey = undefined;
         hash.final(&key);
         const minimum_use = @min(1, profile.alley_factor, profile.shared.tracks.factor, profile.shared.living_streets.factor, profile.shared.service_factor, if (profile.mode == .taxi) 1 else turn_channel_factor);
-        var speeds: [256]f32 = undefined;
-        speeds[0] = std.math.inf(f32);
-        for (speeds[1..], 1..) |*factor, speed| {
-            const effective = if (profile.fixed_speed != 0) profile.fixed_speed else @min(speed, profile.top_speed);
-            factor.* = speed_factors[effective];
-        }
         return .{
-            .seconds_per_metre = speeds,
+            .seconds_per_metre = motor.compileSpeeds(profile.top_speed, profile.fixed_speed),
             .floors = .{ .edge_factor = if (profile.shared.shortest) 0 else minimum_use * profile.shared.time_weight * profile.min_linear_factor, .turn_factor = 0 },
             .node_access_mask = if (profile.permission.flags.contains(.ignore_access)) 0 else @bitCast(profile.permission.access_mask),
             .model_metric_key = key,
@@ -273,60 +240,12 @@ pub const PathCheck = struct {
     time: ?graph.datetime.Local = null,
 };
 
-/// Resolved speed and its source bits. The non-current value is used for
-/// the optional top-speed penalty when live traffic supplied the speed.
-pub const Speed = struct {
-    kph: u8,
-    non_current_kph: u8,
-    sources: base.Flow = .{},
-    closed: bool = false,
-};
-
-pub const InternalTurn = enum { none, left, right };
-
-pub const Turn = struct {
-    movement: base.IntersectionTurn,
-    degrees: u16,
-    more_than_two_roads: bool,
-    measured_speed: bool = false,
-    internal_turn: InternalTurn = .none,
-
-    pub fn read(view: *const graph.reader.View, node: graph.format.NodeId, incoming: graph.format.EdgeId, outgoing: graph.format.EdgeId, arena: std.mem.Allocator, deadline: Deadline) !Turn {
-        const movement = try base.IntersectionTurn.read(view, node, incoming, outgoing);
-        const range = try view.outEdgeRange(node);
-        const opposing = try view.oppEdge(incoming);
-        const approach = (try heading(view, opposing, arena, deadline) + 180) % 360;
-        const departure = try heading(view, outgoing, arena, deadline);
-        const last = try view.edge(@fromBackingInt(range.end - 1));
-        return .{
-            .movement = movement,
-            .degrees = (departure + 360 - approach) % 360,
-            .more_than_two_roads = range.count() > 2 or (try view.class(last.cls.class_id)).flags.node_connector,
-        };
-    }
-
-    fn heading(view: *const graph.reader.View, id: graph.format.EdgeId, arena: std.mem.Allocator, deadline: Deadline) !u16 {
-        if (view.headings) |headings| return graph.headings.decode(headings[@backingInt(id)]);
-        const edge = try view.edge(id);
-        const class = try view.class(edge.cls.class_id);
-        if (class.flags.node_connector) return 0;
-        const points = try view.shapeWithDeadline(id, arena, deadline);
-        defer arena.free(points);
-        return graph.headings.decode(graph.headings.encode(try graph.headings.sample(points, true, class, deadline)));
-    }
-};
-
-const right_turn_cost = [8]f32{ 0.5, 0.75, 1, 1.5, 9.5, 3.5, 2.5, 0.75 };
-const left_turn_cost = [8]f32{ 0.5, 0.75, 2.5, 3.5, 9.5, 1.5, 1, 0.75 };
+pub const Speed = motor.Speed;
+pub const Turn = motor.Turn;
+pub const InternalTurn = motor.InternalTurn;
 
 pub const Kernel = struct {
-    /// Retain a turn onto a short internal edge for the next transition.
-    pub fn internalTurn(node: *const NodeHot, class: *const EdgeClass, edge: EdgeHot, turn: base.Turn) InternalTurn {
-        if (!class.flags.internal or edge.geom.len_m > 8) return .none;
-        const kind = turn.kind();
-        if (node.attr.drive_on_left) return if (kind == 2 or kind == 3) .right else .none;
-        return if (kind == 5 or kind == 6) .left else .none;
-    }
+    pub const internalTurn = motor.internalTurn;
 
     /// Edges are supplied in travel order for both search directions.
     pub fn allowed(profile: *const Profile, from: *const EdgeClass, to: *const EdgeClass, turn: base.Turn, check: PathCheck, deadline: Deadline) !base.AccessEvaluation {
@@ -368,7 +287,7 @@ pub const Kernel = struct {
         if (effects.forbidden or static_weight == std.math.inf(f32)) return .forbidden;
         const kph = if (profile.fixed_speed == 0) speed.kph else profile.fixed_speed;
         const length: f32 = @floatFromInt(edge.geom.len_m);
-        const secs = length * (if (kph == 0) speed_factors[0] else tables.seconds_per_metre[kph]);
+        const secs = length * (if (kph == 0) motor.speed_factors[0] else tables.seconds_per_metre[kph]);
         if (profile.shared.shortest) return .{ .cost = length, .secs = secs };
         const expected = if (profile.top_speed != assumed_speed and speed.sources.current) speed.non_current_kph else kph;
         const excess: f32 = @floatFromInt(expected -| profile.top_speed);
@@ -409,38 +328,8 @@ pub const Kernel = struct {
         if (from.flags.node_connector or to.flags.node_connector) return .{};
         const entry = turn.movement.base_turn;
         var result = profile.shared.transition(node, from, to, entry);
-        result.secs += carTurnDuration(node, turn.degrees, turn.more_than_two_roads);
-        const impact: f32 = @floatFromInt(entry.stopImpact());
-        const kind = entry.kind();
-        const sides = turn.movement.sides;
-        const drive_left = node.attr.drive_on_left;
-        if (impact > 0 and !profile.shared.shortest) {
-            var seconds: f32 = if (sides.left and sides.right) 2 else if (drive_left) left_turn_cost[kind] else right_turn_cost[kind];
-            const ramp = @backingInt(Use.ramp);
-            if ((from.category.use == ramp) != (to.category.use == ramp)) {
-                seconds += 1.5;
-                if (to.flags.roundabout) seconds += 0.5;
-            }
-            const left = kind == 5 or kind == 6;
-            const right = kind == 2 or kind == 3;
-            const reverse = kind == 4;
-            const is_turn = left or right or reverse;
-            if (is_turn) seconds *= impact;
-            if (reverse and !entry.nameConsistent()) {
-                seconds += 10;
-            } else if (reverse or (if (drive_left) turn.internal_turn == .right and right else turn.internal_turn == .left and left)) {
-                seconds += 600;
-            } else if (to.flags.named and entry.nameConsistent() and
-                (if (drive_left) kind == 3 and sides.left and !sides.right else kind == 5 and sides.right and !sides.left))
-            {
-                seconds *= 15;
-            }
-            if (!turn.measured_speed) {
-                if (!is_turn) seconds *= impact;
-                seconds *= base.transition_density_factor[node.attr.density];
-            }
-            result.cost += seconds;
-        }
+        result.secs += motor.carTurnDuration(node, turn.degrees, turn.more_than_two_roads);
+        if (!profile.shared.shortest) result.cost += motor.turnPenalty(node, from, to, turn);
         result.cost *= profile.shared.time_weight;
         return result;
     }
@@ -449,33 +338,6 @@ pub const Kernel = struct {
         return turnCost(profile, node, from, to, turn);
     }
 };
-
-// Ported from valhalla/sif/osrm_car_duration.h.
-const car_turn_duration = blk: {
-    @setEvalBranchQuota(5000);
-    var result: [2][360]f64 = undefined;
-    const bias: f64 = 1.075;
-    for (&result, 0..) |*table, side| {
-        for (table, 0..) |*duration, angle| {
-            const symmetric: i32 = @as(i32, @intCast(angle)) - if (angle > 180) @as(i32, 360) else 0;
-            const near_side = (symmetric >= 0) == (side == 1);
-            const multiplier = if (near_side) bias else 1 / bias;
-            const offset = if (near_side) 1 / bias else bias;
-            const degrees: f64 = @floatFromInt(@abs(symmetric));
-            duration.* = 7.5 / (1 + @exp(-((13 * multiplier) * degrees / 180 - 6.5 * offset)));
-        }
-    }
-    break :blk result;
-};
-
-fn carTurnDuration(node: *const NodeHot, degrees: u16, more_than_two_roads: bool) f32 {
-    std.debug.assert(degrees < 360);
-    const reverse = degrees >= 160 and degrees <= 200;
-    var duration: f64 = if (node.attr.signal != 0) 2 else 0;
-    if (more_than_two_roads or reverse) duration += car_turn_duration[@intFromBool(node.attr.drive_on_left)][degrees];
-    if (reverse) duration += 20;
-    return @floatCast(duration);
-}
 
 // Ported from the INLINE_TEST AutoCost parameter cases.
 test "auto parses default service and track preferences and bounds the new options" {
@@ -502,7 +364,7 @@ test "auto parses default service and track preferences and bounds the new optio
     const fixed = try parse(arena, .auto, try json.parse(arena, "{\"fixed_speed\":184,\"top_speed\":137}"), &warnings, .none);
     const profile = try Model.canonicalize(fixed);
     try std.testing.expectEqual(184, profile.top_speed);
-    try std.testing.expectEqual(speed_factors[184], profile.astarCostFactor());
+    try std.testing.expectEqual(motor.speed_factors[184], profile.astarCostFactor());
 }
 
 test "auto and bus favor measured turn channels while taxi favors taxi-only streets" {

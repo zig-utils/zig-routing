@@ -7,6 +7,7 @@ const graph = routing.graph;
 const search = routing.search.search;
 const queue = routing.search.queue;
 const pedestrian = routing.costing.pedestrian;
+const auto = routing.costing.auto;
 const Cost = routing.costing.compiled.Cost;
 const io = routing.infra.io;
 const Edge = graph.format.EdgeId;
@@ -62,6 +63,37 @@ const Motor = struct {
     }
 };
 
+const Auto = struct {
+    profile: *const auto.Profile,
+    tables: *const routing.costing.compiled.Compiled,
+    arena: std.mem.Allocator,
+
+    pub fn edgeCost(self: Auto, view: *const View, _: Edge, edge: *const Hot, _: search.Direction) !Cost {
+        const class = try view.class(edge.cls.class_id);
+        return auto.Kernel.edgeCost(self.profile, self.tables, class, edge.*, self.profile.untimedSpeed(edge.*), .{});
+    }
+
+    pub fn allowedTurn(self: Auto, view: *const View, movement: search.Transition, _: search.Label, _: search.Direction) !bool {
+        if (!self.profile.allowedNode(try view.node(movement.node))) return false;
+        const from = try view.class(movement.incoming_edge.cls.class_id);
+        const to = try view.class(movement.outgoing_edge.cls.class_id);
+        const result = try auto.Kernel.allowed(self.profile, from, to, .{ .row = movement.row }, .{
+            .previous_dead_end = from.flags.dead_end or (try view.outEdgeRange(movement.node)).count() == 1,
+            .backtrack = movement.incoming_edge.cls.opp_local == movement.outgoing_edge.cls.local,
+            .previous_access = movement.incoming_access,
+        }, .none);
+        return result.allowed;
+    }
+
+    pub fn turnCost(self: Auto, view: *const View, movement: search.Transition, _: search.Label, _: search.Direction) !Cost {
+        const from = try view.class(movement.incoming_edge.cls.class_id);
+        const to = try view.class(movement.outgoing_edge.cls.class_id);
+        var turn = try auto.Turn.read(view, movement.node, movement.incoming, movement.outgoing, self.arena, .none);
+        turn.measured_speed = @as(u8, @bitCast(self.profile.untimedSpeed(movement.incoming_edge.*).sources)) != 0;
+        return auto.Kernel.turnCost(self.profile, try view.node(movement.node), from, to, turn);
+    }
+};
+
 const Sample = struct {
     source: u32,
     settled: usize,
@@ -110,6 +142,10 @@ pub fn main(init: std.process.Init) !void {
     const samples = if (args.next()) |arg| try std.fmt.parseInt(usize, arg, 10) else 10;
     const limit = if (args.next()) |arg| try std.fmt.parseInt(usize, arg, 10) else 1_000_000;
     const seed = if (args.next()) |arg| try std.fmt.parseInt(u64, arg, 10) else 82;
+    const auto_only = if (args.next()) |arg| blk: {
+        if (!std.mem.eql(u8, arg, "--auto")) return error.InvalidSearchBenchmarkArguments;
+        break :blk true;
+    } else false;
     if (args.next() != null or samples == 0 or limit == 0) return error.InvalidSearchBenchmarkArguments;
     const a = init.arena.allocator();
     var bundle = try graph.reader.Bundle.open(path);
@@ -121,6 +157,26 @@ pub fn main(init: std.process.Init) !void {
     for (sources) |*source| source.* = @fromBackingInt(random.random().uintLessThan(u32, @intCast(view.nodes.len)));
 
     var warnings: std.ArrayList(routing.costing.base.Warning) = .empty;
+    var buffer: [4096]u8 = undefined;
+    var stdout = io.stdoutWriter(init.io, &buffer);
+    if (auto_only) {
+        const options = try auto.parse(a, .auto, .null, &warnings, .none);
+        var cache = try auto.Cache.init(a, view.classes orelse return error.MissingClasses, 1);
+        defer cache.deinit();
+        var lease = try cache.acquire(options, .none);
+        defer lease.release();
+        const results = try measure(Auto, .{ .profile = lease.profile(), .tables = lease.tables(), .arena = init.gpa }, a, view, sources, limit);
+        try std.json.Stringify.value(.{
+            .platform = @tagName(builtin.os.tag),
+            .architecture = @tagName(builtin.cpu.arch),
+            .dataset_uuid = std.fmt.bytesToHex(view.dataset_uuid, .lower),
+            .seed = seed,
+            .label_limit = limit,
+            .auto = results,
+        }, .{}, &stdout.interface);
+        try stdout.interface.writeByte('\n');
+        return stdout.interface.flush();
+    }
     var options = try pedestrian.parse(a, .null, &warnings, .none);
     // Use an unbounded sweep so the service's distance limit does not stop it.
     options.max_distance = std.math.maxInt(u32);
@@ -131,8 +187,6 @@ pub fn main(init: std.process.Init) !void {
     const foot = try measure(Foot, .{ .profile = lease.profile(), .tables = lease.tables() }, a, view, sources, limit);
     const motor = try measure(Motor, .{}, a, view, sources, limit);
 
-    var buffer: [4096]u8 = undefined;
-    var stdout = io.stdoutWriter(init.io, &buffer);
     try std.json.Stringify.value(.{
         .platform = @tagName(builtin.os.tag),
         .architecture = @tagName(builtin.cpu.arch),
