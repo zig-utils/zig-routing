@@ -1041,6 +1041,64 @@ const RestrictionMotor = struct {
 
 const RestrictionSearch = search.Search(RestrictionMotor, routing.search.queue.Heap);
 
+// Ported from the Dijkstra cases in test/gurka/test_expansion.cc.
+test "Gurka Dijkstra expansion settles the one-way branch only forward" {
+    const expansion = routing.search.expand;
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const road: gurka.Tag = .{ .key = "highway", .value = "primary" };
+    const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates(
+        \\   B  F--G
+        \\   |  |
+        \\E--A--C--H
+        \\   |
+        \\   D
+    , 10), &.{
+        .{ .label = "DAB", .tags = &.{road} },
+        .{ .label = "EACH", .tags = &.{road} },
+        .{ .label = "CFG", .tags = &.{ road, .{ .key = "oneway", .value = "yes" } } },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const start = try at(view, fixture.findNode("A").?.location.toFixed());
+    const one_way = try directedBetween(view, &fixture, "C", "G");
+    const opposing = try view.oppEdge(one_way);
+    const Observer = struct {
+        view: *const graph.reader.View,
+        edges: u16 = 0,
+        pairs: u16 = 0,
+        previous_cost: f32 = 0,
+
+        pub fn visit(self: *@This(), event: expansion.Visit) !expansion.Decision {
+            try testing.expect(event.label.cost >= self.previous_cost);
+            self.previous_cost = event.label.cost;
+            const edge = event.label.edgeId();
+            const reverse_edge = try self.view.oppEdge(edge);
+            const bit = @as(u16, 1) << @intCast(@backingInt(edge));
+            try testing.expect(self.edges & bit == 0);
+            self.edges |= bit;
+            self.pairs |= @as(u16, 1) << @intCast(@min(@backingInt(edge), @backingInt(reverse_edge)));
+            return .expand;
+        }
+    };
+    var engine = try expansion.Expansion(RestrictionMotor, routing.search.queue.BucketQueue).init(testing.allocator, view);
+    defer engine.deinit();
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    for ([_]search.Direction{ .forward, .reverse }) |direction| {
+        var seen: Observer = .{ .view = view };
+        const stats = try engine.run(&arena, .{}, .{ .origins = &.{start}, .direction = direction }, &seen, .{});
+        const forward = direction == .forward;
+        try testing.expectEqual(@as(usize, if (forward) 11 else 10), stats.settled);
+        try testing.expectEqual(@as(u16, if (forward) 6 else 5), @popCount(seen.pairs));
+        try testing.expectEqual(forward, seen.edges & (@as(u16, 1) << @intCast(@backingInt(one_way))) != 0);
+        try testing.expect(seen.edges & (@as(u16, 1) << @intCast(@backingInt(opposing))) == 0);
+        arena.reset();
+    }
+}
+
 // Ported from the polygon and location detours in test_avoids.cc.
 test "Gurka exclusions detour around polygon and snapped directed edges" {
     var storage: std.heap.ArenaAllocator = .init(testing.allocator);

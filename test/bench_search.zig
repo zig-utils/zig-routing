@@ -42,14 +42,24 @@ const Sample = struct {
     counters_per_label: ?perf.Counts.PerUnit,
 };
 
-fn measure(comptime K: type, kernel: K, gpa: std.mem.Allocator, view: *const View, sources: []const Node, limit: usize) ![]Sample {
-    var engine = try search.Search(K, queue.Heap).init(gpa, view);
+const QueueKind = enum { heap, bucket };
+
+fn measure(comptime K: type, kernel: K, gpa: std.mem.Allocator, view: *const View, sources: []const Node, limit: usize, kind: QueueKind, unit_size: u32) ![]Sample {
+    return switch (kind) {
+        .heap => measureWithQueue(K, .heap, kernel, gpa, view, sources, limit, unit_size),
+        .bucket => measureWithQueue(K, .bucket, kernel, gpa, view, sources, limit, unit_size),
+    };
+}
+
+fn measureWithQueue(comptime K: type, comptime kind: QueueKind, kernel: K, gpa: std.mem.Allocator, view: *const View, sources: []const Node, limit: usize, unit_size: u32) ![]Sample {
+    const Engine = if (kind == .heap) search.Search(K, queue.Heap) else routing.search.expand.Expansion(K, queue.BucketQueue);
+    var engine = try Engine.init(gpa, view);
     defer engine.deinit();
     var arena = routing.infra.arena.Arena.init(gpa, .{});
     defer arena.deinit();
     // Visit the identical sources for warm-up and measurement.
     for (sources) |source| {
-        _ = try engine.sweep(&arena, kernel, source, .forward, limit, .{});
+        _ = try sweep(kind, &engine, &arena, kernel, source, limit, unit_size);
         arena.reset();
     }
     const samples = try gpa.alloc(Sample, sources.len);
@@ -58,7 +68,7 @@ fn measure(comptime K: type, kernel: K, gpa: std.mem.Allocator, view: *const Vie
         var counters = perf.Counters.start();
         defer if (counters) |*counter| counter.deinit();
         const timer = io.Timer.start();
-        const stats = try engine.sweep(&arena, kernel, source, .forward, limit, .{});
+        const stats = try sweep(kind, &engine, &arena, kernel, source, limit, unit_size);
         const elapsed = timer.read();
         const counts = if (counters) |*counter| counter.finish() else null;
         sample.* = .{
@@ -74,6 +84,11 @@ fn measure(comptime K: type, kernel: K, gpa: std.mem.Allocator, view: *const Vie
     return samples;
 }
 
+fn sweep(comptime kind: QueueKind, engine: anytype, arena: *routing.infra.arena.Arena, kernel: anytype, source: Node, limit: usize, unit_size: u32) !search.SweepStats {
+    if (kind == .heap) return engine.sweep(arena, kernel, source, .forward, limit, .{});
+    return engine.run(arena, kernel, .{ .origins = &.{source}, .limit = limit, .unit_size = unit_size }, {}, .{});
+}
+
 pub fn main(init: std.process.Init) !void {
     var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.skip();
@@ -81,11 +96,16 @@ pub fn main(init: std.process.Init) !void {
     const samples = if (args.next()) |arg| try std.fmt.parseInt(usize, arg, 10) else 10;
     const limit = if (args.next()) |arg| try std.fmt.parseInt(usize, arg, 10) else 1_000_000;
     const seed = if (args.next()) |arg| try std.fmt.parseInt(u64, arg, 10) else 82;
-    const auto_only = if (args.next()) |arg| blk: {
-        if (!std.mem.eql(u8, arg, "--auto")) return error.InvalidSearchBenchmarkArguments;
-        break :blk true;
-    } else false;
-    if (args.next() != null or samples == 0 or limit == 0) return error.InvalidSearchBenchmarkArguments;
+    var auto_only = false;
+    var kind: QueueKind = .heap;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--auto") and !auto_only) {
+            auto_only = true;
+        } else if (std.mem.eql(u8, arg, "--bucket") and kind == .heap) {
+            kind = .bucket;
+        } else return error.InvalidSearchBenchmarkArguments;
+    }
+    if (samples == 0 or limit == 0) return error.InvalidSearchBenchmarkArguments;
     const a = init.arena.allocator();
     var bundle = try graph.reader.Bundle.open(path);
     defer bundle.close();
@@ -104,7 +124,7 @@ pub fn main(init: std.process.Init) !void {
         defer cache.deinit();
         var lease = try cache.acquire(options, .none);
         defer lease.release();
-        const results = try measure(Auto, .{ .profile = lease.profile(), .tables = lease.tables(), .arena = init.gpa }, a, view, sources, limit);
+        const results = try measure(Auto, .{ .profile = lease.profile(), .tables = lease.tables(), .arena = init.gpa }, a, view, sources, limit, kind, lease.tables().unit_size);
         try std.json.Stringify.value(.{
             .platform = @tagName(builtin.os.tag),
             .architecture = @tagName(builtin.cpu.arch),
@@ -123,8 +143,8 @@ pub fn main(init: std.process.Init) !void {
     defer cache.deinit();
     var lease = try cache.acquire(options, .none);
     defer lease.release();
-    const foot = try measure(Foot, .{ .profile = lease.profile(), .tables = lease.tables() }, a, view, sources, limit);
-    const motor = try measure(Motor, .{}, a, view, sources, limit);
+    const foot = try measure(Foot, .{ .profile = lease.profile(), .tables = lease.tables() }, a, view, sources, limit, kind, lease.tables().unit_size);
+    const motor = try measure(Motor, .{}, a, view, sources, limit, kind, 1);
 
     try std.json.Stringify.value(.{
         .platform = @tagName(builtin.os.tag),
