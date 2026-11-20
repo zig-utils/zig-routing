@@ -74,3 +74,10 @@ test "first locale selection borrows compiled tables without an allocator" {
     try std.testing.expectEqualStrings("stops", english.transit_subset.transit_stop_count_labels.get(.other).?);
     try std.testing.expect(english.start_subset.phrases.get(3) == null);
 }
+
+test "Valhalla English dictionary subset snapshots" {
+    const fixtures = @import("instruction_fixtures.zig");
+    const snapshot = @import("reference_snapshot.zig");
+    try std.testing.expectEqual(57, fixtures.pinned_dictionary_count);
+    try fixtures.compareDictionary(forLanguage("en-US"), snapshot);
+}

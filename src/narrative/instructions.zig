@@ -333,9 +333,11 @@ const Builder = struct {
 
 test "Valhalla visual instruction snapshots" {
     const fixtures = @import("instruction_fixtures.zig");
+    const snapshot = @import("reference_snapshot.zig");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     for (&fixtures.visual) |fixture| {
+        if (fixture.upstream_disabled) continue;
         _ = arena.reset(.retain_capacity);
         const builder: Builder = .{
             .locale = dictionary.forLanguage(fixture.language),
@@ -344,7 +346,7 @@ test "Valhalla visual instruction snapshots" {
         for (fixture.steps, 0..) |*step, index| {
             const previous = if (index == 0) null else &fixture.steps[index - 1].maneuver;
             const actual = try builder.instruction(arena.allocator(), &step.maneuver, previous);
-            std.testing.expectEqualStrings(step.text, actual) catch |err| {
+            snapshot.match(fixture.name, step.text, actual) catch |err| {
                 std.debug.print("{s}, step {d}\n", .{ fixture.name, index });
                 return err;
             };
@@ -354,6 +356,7 @@ test "Valhalla visual instruction snapshots" {
 
 test "Valhalla signed ramp and exit snapshots" {
     const fixtures = @import("instruction_fixtures.zig");
+    const snapshot = @import("reference_snapshot.zig");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const builder: Builder = .{ .locale = dictionary.forLanguage("en-US") };
@@ -361,7 +364,7 @@ test "Valhalla signed ramp and exit snapshots" {
         _ = arena.reset(.retain_capacity);
         for (fixture.steps, 0..) |*step, index| {
             const actual = try builder.instruction(arena.allocator(), &step.maneuver, null);
-            std.testing.expectEqualStrings(step.text, actual) catch |err| {
+            snapshot.match(fixture.name, step.text, actual) catch |err| {
                 std.debug.print("{s}, case {d}\n", .{ fixture.name, index });
                 return err;
             };

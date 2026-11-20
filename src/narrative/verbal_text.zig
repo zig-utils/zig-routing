@@ -353,6 +353,7 @@ const state_routes = [_]RouteRule{
 };
 
 test "Valhalla verbal text formatter snapshots" {
+    const snapshot = @import("reference_snapshot.zig");
     var formatter = Formatter.init(std.testing.allocator, .{}, .none);
     defer formatter.deinit();
     for (@import("verbal_text_fixtures.zig").cases) |fixture| {
@@ -369,7 +370,7 @@ test "Valhalla verbal text formatter snapshots" {
             .farm_to_market => try formatter.replace(fixture.input, .{ .route = farm_to_market }),
             .ranch_to_market => try formatter.replace(fixture.input, .{ .route = ranch_to_market }),
         };
-        std.testing.expectEqualStrings(fixture.expected, actual) catch |err| {
+        snapshot.match(@tagName(fixture.stage), fixture.expected, actual) catch |err| {
             std.debug.print("{s} {s}: {s}\n", .{ @tagName(fixture.style), @tagName(fixture.stage), fixture.input });
             return err;
         };

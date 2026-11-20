@@ -496,10 +496,12 @@ pub fn transitTimeCue(arena: std.mem.Allocator, language: []const u8, cue: Trans
 
 test "Valhalla route verbal instruction snapshots" {
     const fixtures = @import("instruction_fixtures.zig");
+    const snapshot = @import("reference_snapshot.zig");
     var allocator: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer allocator.deinit();
     const arena = allocator.allocator();
     for (&fixtures.visual) |fixture| {
+        if (fixture.upstream_disabled) continue;
         _ = allocator.reset(.retain_capacity);
         var speech = verbal_text.Formatter.init(arena, .{}, .none);
         defer speech.deinit();
@@ -519,7 +521,7 @@ test "Valhalla route verbal instruction snapshots" {
             };
             const goldens = [_][]const u8{ expected.speech.succinct, expected.speech.alert, expected.speech.pre, expected.speech.post };
             for (actual, goldens, [_][]const u8{ "succinct", "alert", "pre", "post" }) |output, golden, kind| {
-                std.testing.expectEqualStrings(golden, output) catch |err| {
+                snapshot.match(fixture.name, golden, output) catch |err| {
                     std.debug.print("{s}, step {d} ({s})\n", .{ fixture.name, index, kind });
                     return err;
                 };
@@ -530,6 +532,7 @@ test "Valhalla route verbal instruction snapshots" {
 
 test "Valhalla round distances for spoken post, approaching and multi-cue instructions" {
     const fixtures = @import("instruction_fixtures.zig");
+    const snapshot = @import("reference_snapshot.zig");
     var allocator: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer allocator.deinit();
     const arena = allocator.allocator();
@@ -537,14 +540,14 @@ test "Valhalla round distances for spoken post, approaching and multi-cue instru
     defer speech.deinit();
     for (&fixtures.post) |*fixture| {
         const builder = Builder.init(arena, "en-US", fixture.units, .{}, &speech, .none);
-        try std.testing.expectEqualStrings(fixture.expected, try builder.post(&fixture.maneuver, fixture.include_street_names));
+        try snapshot.match("TestFormVerbalPostTransitionInstruction", fixture.expected, try builder.post(&fixture.maneuver, fixture.include_street_names));
     }
     for (fixtures.approach) |fixture| {
-        try std.testing.expectEqualStrings(fixture.expected, try approachAlert(arena, .{ .units = fixture.units }, fixture.distance, fixture.cue, .none));
+        try snapshot.match("TestFormVerbalAlertApproachInstruction", fixture.expected, try approachAlert(arena, .{ .units = fixture.units }, fixture.distance, fixture.cue, .none));
     }
     for (&fixtures.multi_cue) |*fixture| {
         const builder = Builder.init(arena, "en-US", fixture.units, .{}, &speech, .none);
-        try std.testing.expectEqualStrings(fixture.expected, try builder.combineCues(&fixture.maneuver, fixture.first, fixture.next));
+        try snapshot.match("TestFormVerbalMultiCue", fixture.expected, try builder.combineCues(&fixture.maneuver, fixture.first, fixture.next));
     }
 }
 

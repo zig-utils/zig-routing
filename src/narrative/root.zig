@@ -15,4 +15,5 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("enhanced_test.zig");
     _ = @import("maneuvers_test.zig");
+    _ = @import("snapshot_coverage_test.zig");
 }

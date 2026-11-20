@@ -903,3 +903,25 @@ Germany and US+DACH builds are tracked in [#239](https://github.com/zig-utils/zi
 pinned Valhalla tile builder. It checks for graph tiles, three routable ways and one turn restriction.
 Use `ORACLE_PLATFORM=linux/arm64` to run the arm64 oracle. The generated PBF, tiles and build log
 are written under `bench/results/`.
+
+### Refresh narrative snapshots
+
+The fixtures come from the pinned Valhalla checkout at
+`5c7f918e61306521d79cc4496d40c19c5305fa4b`. Generate the Zig tables and check
+that a second read of the upstream sources produces the same bytes.
+
+```bash
+zig build narrative-fixtures -- VALHALLA_CHECKOUT src/narrative/instruction_fixtures.zig
+zig build narrative-fixtures -- VALHALLA_CHECKOUT src/narrative/instruction_fixtures.zig --check
+zig build test-narrative --summary all
+```
+
+On an upstream repin, review the inventory and fixture diff against the new
+C++ tests before updating the pinned counts in `snapshot_coverage_test.zig`.
+The inventory accounts for the explicitly disabled sharp-turn fixture and
+the 26 transit narrative tests tracked in #191. The maneuver builder inventory
+checks the 19 upstream test names against their typed fixtures. The generator
+also reads the pinned sign-list and English dictionary tests.
+
+The snapshot matcher compares the supplied reference strings byte for byte.
+It leaves them unchanged even when update mode is enabled.

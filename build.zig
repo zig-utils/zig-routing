@@ -129,8 +129,40 @@ pub fn build(b: *std.Build) void {
     height_test.expectStdOutMatch("\"height\":[null]");
     test_step.dependOn(&height_test.step);
 
+    lib_mod.addImport("zig_test_framework", b.dependency("zig_test_framework", dep_args).module("zig_test_framework"));
     const lib_tests = b.addTest(.{ .root_module = lib_mod });
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
+
+    const narrative_tests = b.addTest(.{
+        .name = "test-narrative",
+        .root_module = lib_mod,
+        .filters = &.{"narrative."},
+    });
+    b.step("test-narrative", "Run the narrative snapshot suite").dependOn(&b.addRunArtifact(narrative_tests).step);
+
+    const fixture_io = b.createModule(.{
+        .root_source_file = b.path("src/infra/io.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    });
+    const fixture_converter = b.addExecutable(.{
+        .name = "narrative-fixtures",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/narrative_fixtures.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "io", .module = fixture_io }},
+        }),
+    });
+    const refresh_narrative = b.addRunArtifact(fixture_converter);
+    refresh_narrative.addPassthruArgs();
+    b.step("narrative-fixtures", "Check or refresh the pinned narrative fixtures").dependOn(&refresh_narrative.step);
+    const fixture_scanner_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("scripts/narrative_cpp.zig"),
+        .target = b.graph.host,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(fixture_scanner_tests).step);
 
     const graph_imports: []const std.Build.Module.Import = &.{.{ .name = "routing", .module = lib_mod }};
     const graph_tests = b.addTest(.{ .root_module = b.createModule(.{

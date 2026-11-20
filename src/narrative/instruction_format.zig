@@ -299,3 +299,41 @@ pub fn rampDirectionOffset(step: *const Maneuver) u8 {
         else => 0,
     };
 }
+
+test "Valhalla sign list and sign text snapshots" {
+    const fixtures = @import("instruction_fixtures.zig");
+    const snapshot = @import("reference_snapshot.zig");
+    const testing = std.testing;
+    try testing.expectEqual(19, fixtures.sign_cases.len);
+    var output = io.Writer.Allocating.init(testing.allocator);
+    defer output.deinit();
+
+    for (fixtures.sign_cases) |fixture| {
+        errdefer std.debug.print("failed upstream fixture {s}\n", .{fixture.name});
+        for (fixture.trials) |trial| {
+            const limits: SignLimits = .{ .count = trial.limit, .consecutive = trial.consecutive };
+            const result: Value = switch (fixture.part) {
+                .guide => try limits.guide(fixture.sign),
+                .trim => .{ .signs = try limits.select(fixture.sign.exit_onto_streets) },
+                inline else => |part| try limits.signs(@field(fixture.sign, @tagName(part))),
+            };
+            switch (trial.expected) {
+                .text => |text| {
+                    output.clearRetainingCapacity();
+                    try result.write(&output.writer, .{ .deadline = .none });
+                    try snapshot.match(fixture.name, text, output.written());
+                },
+                .elements => |expected| switch (result) {
+                    .signs => |actual| try testing.expectEqualDeep(expected, actual),
+                    .guide => |guide| {
+                        try testing.expectEqual(expected.len, guide.branch.len + guide.toward.len);
+                        try testing.expectEqualDeep(expected[0..guide.branch.len], guide.branch);
+                        try testing.expectEqualDeep(expected[guide.branch.len..], guide.toward);
+                    },
+                    .empty => try testing.expectEqual(0, expected.len),
+                    else => return error.InvalidSignFixture,
+                },
+            }
+        }
+    }
+}
