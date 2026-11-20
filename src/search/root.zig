@@ -3,6 +3,7 @@
 pub const paged = @import("paged.zig");
 pub const expand = @import("expand.zig");
 pub const endpoints = @import("endpoints.zig");
+pub const isochrone = @import("isochrone.zig");
 pub const legs = @import("legs.zig");
 pub const multi = @import("multi.zig");
 pub const queue = @import("queue.zig");

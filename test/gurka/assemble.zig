@@ -1099,6 +1099,114 @@ test "Gurka Dijkstra expansion settles the one-way branch only forward" {
     }
 }
 
+// Ported from Isochrones.OriginEdge and Isochrones.LongEdge in test/isochrone.cc.
+test "Gurka isochrone paints clipped origins and reaches partway along a long edge" {
+    const iso = routing.search.isochrone;
+    const Candidate = routing.search.endpoints.Candidate;
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "primary" }};
+    var counting = routing.infra.arena.CountingAllocator.init(testing.allocator);
+    var arena = routing.infra.arena.Arena.init(counting.allocator(), .{});
+    defer arena.deinit();
+    {
+        const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates("A-B-C", 2000), &.{
+            .{ .label = "ABC", .tags = road },
+        }, &.{}, &.{});
+        var built = try Built.assemble(fixture.osm, 1);
+        defer built.deinit();
+        const view = &built.bundle.view;
+        const left = fixture.findNode("A").?.location;
+        const middle = fixture.findNode("B").?.location;
+        const right = fixture.findNode("C").?.location;
+        const east = try directedBetween(view, &fixture, "A", "C");
+        const west = try view.oppEdge(east);
+        const seeds = [_]Candidate{
+            .{ .edge = east, .fraction = 0.5, .score = 0, .begin_node = false, .end_node = false },
+            .{ .edge = west, .fraction = 0.5, .score = 0, .begin_node = false, .end_node = false },
+        };
+        var engine = try iso.Isochrone(RestrictionMotor).init(counting.allocator(), view);
+        defer engine.deinit();
+        const result = try engine.run(&arena, .{}, .{
+            .origins = &.{.{ .location = middle, .seed = .{ .edges = &seeds } }},
+            .contours = &.{.{ .metric = iso.time_metric, .value = 10 }},
+            .mode = .pedestrian,
+        }, .{});
+        const grid = result.grid;
+        try testing.expectEqual(@as(f32, 0), grid.dataAt(grid.tiles.tileIdOf(middle), iso.time_metric).?);
+        for ([_]routing.geo.PointLL{ left, right }) |end| {
+            const nearby = middle.pointAlongSegment(end, 0.1);
+            const value = grid.dataAt(grid.tiles.tileIdOf(nearby), iso.time_metric).?;
+            try testing.expect(value > 0 and value < 10);
+            try testing.expect((grid.dataAt(grid.tiles.tileIdOf(end), iso.time_metric) orelse iso.nodata) > 10);
+        }
+        arena.reset();
+    }
+    {
+        const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates(
+            \\   C----D
+            \\  /
+            \\A-B--------------F
+        , 100), &.{
+            .{ .label = "AB", .tags = road },
+            .{ .label = "BC", .tags = road },
+            .{ .label = "CD", .tags = road },
+            .{ .label = "BF", .tags = road },
+        }, &.{}, &.{});
+        var built = try Built.assemble(fixture.osm, 1);
+        defer built.deinit();
+        const view = &built.bundle.view;
+        const origin = fixture.findNode("A").?.location;
+        const start = try at(view, origin.toFixed());
+        const branch = fixture.findNode("B").?.location;
+        const far = fixture.findNode("F").?.location;
+        var engine = try iso.Isochrone(RestrictionMotor).init(counting.allocator(), view);
+        defer engine.deinit();
+        const result = try engine.run(&arena, .{}, .{
+            .origins = &.{.{ .location = origin, .seed = .{ .node = start } }},
+            .contours = &.{ .{ .metric = iso.time_metric, .value = 16 }, .{ .metric = iso.distance_metric, .value = 2 } },
+            .mode = .pedestrian,
+        }, .{});
+        const grid = result.grid;
+        const far_cell = grid.tiles.tileIdOf(far);
+        const partway = grid.tiles.tileIdOf(branch.pointAlongSegment(far, 0.4));
+        try testing.expect(grid.dataAt(partway, iso.time_metric).? < 16);
+        try testing.expect(grid.dataAt(far_cell, iso.time_metric).? > 16);
+        try testing.expect(grid.dataAt(far_cell, iso.distance_metric).? < 2);
+        arena.reset();
+
+        const other = fixture.findNode("D").?.location;
+        const target = try at(view, other.toFixed());
+        const origins: []const iso.Origin = &.{
+            .{ .location = origin, .seed = .{ .node = start } },
+            .{ .location = other, .seed = .{ .node = target } },
+        };
+        var reverse: iso.Request = .{
+            .origins = origins,
+            .contours = &.{.{ .metric = iso.distance_metric, .value = 1 }},
+            .direction = .reverse,
+            .mode = .pedestrian,
+        };
+        const return_grid = (try engine.run(&arena, .{}, reverse, .{})).grid;
+        for (origins) |entry| {
+            const cell = return_grid.tiles.tileIdOf(entry.location);
+            try testing.expectEqual(@as(f32, 0), return_grid.dataAt(cell, iso.distance_metric).?);
+            try testing.expectEqual(std.math.floatMin(f32), return_grid.dataAt(cell, iso.time_metric).?);
+        }
+        const branch_cell = return_grid.tiles.tileIdOf(branch);
+        try testing.expect(return_grid.dataAt(branch_cell, iso.distance_metric).? < 1);
+        arena.reset();
+        counting.resetCounts();
+        _ = try engine.run(&arena, .{}, reverse, .{});
+        try testing.expectEqual(0, counting.calls());
+        arena.reset();
+        try testing.expectError(error.Cancelled, engine.run(&arena, .{}, reverse, .{ .deadline = .{ .at_ns = 0 } }));
+        reverse.mode = .multimodal;
+        try testing.expectError(error.UnsupportedMultimodalIsochrone, engine.run(&arena, .{}, reverse, .{}));
+    }
+}
+
 // Ported from the polygon and location detours in test_avoids.cc.
 test "Gurka exclusions detour around polygon and snapped directed edges" {
     var storage: std.heap.ArenaAllocator = .init(testing.allocator);

@@ -151,6 +151,7 @@ pub const ExpansionVisit = struct {
     node: NodeId,
     index: u32,
     label: Label,
+    previous: ?Label,
     cut: Cut,
     time: graph.time_info.TimeInfo,
 };
@@ -671,7 +672,14 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     .{};
                 if (expanding) {
                     const decision: ExpansionDecision = if (visits)
-                        try query.visitor.visit(.{ .node = at, .index = top.label, .label = last, .cut = last.cut(cuts.items), .time = time })
+                        try query.visitor.visit(.{
+                            .node = at,
+                            .index = top.label,
+                            .label = last,
+                            .previous = if (last.pred == no_index) null else labels.items[last.pred],
+                            .cut = last.cut(cuts.items),
+                            .time = time,
+                        })
                     else
                         .expand;
                     if (settled == limit or decision == .stop) {

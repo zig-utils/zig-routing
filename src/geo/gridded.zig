@@ -75,9 +75,12 @@ pub fn Grid(comptime dimensions: usize) type {
             const tiles = Tiles.init(bounds, cell_size, 1, false);
             const data = try gpa.alloc(Value, @intFromFloat(rows * cols));
             errdefer gpa.free(data);
-            for (data, 0..) |*value, i| {
-                try checkAt(deadline, i);
-                value.* = initial;
+            var offset: usize = 0;
+            while (offset < data.len) {
+                if (deadline.expired()) return error.DeadlineExceeded;
+                const end = @min(offset + 1024, data.len);
+                @memset(data[offset..end], initial);
+                offset = end;
             }
             return .{ .tiles = tiles, .max_value = initial, .data = data, .allocator = gpa };
         }
@@ -97,6 +100,20 @@ pub fn Grid(comptime dimensions: usize) type {
             if (tile_id < 0 or tile_id >= self.data.len) return;
             const current = &self.data[@intCast(tile_id)];
             current.* = observedMin(dimensions, current.*, value);
+        }
+
+        /// Update scattered cells with the same observation. Repeated cells
+        /// are safe because all lanes compare against the same value.
+        pub fn setCellsIfLess(self: *Self, comptime count: usize, ids: [count]i32, value: Value) void {
+            var current: [count]Value = undefined;
+            inline for (ids, &current) |id, *cell| {
+                cell.* = if (id >= 0 and id < self.data.len) self.data[@intCast(id)] else self.max_value;
+            }
+            const values: [count]Value = @splat(value);
+            const result: [count]Value = @bitCast(observedMin(count * dimensions, @bitCast(current), @bitCast(values)));
+            inline for (ids, result) |id, cell| {
+                if (id >= 0 and id < self.data.len) self.data[@intCast(id)] = cell;
+            }
         }
 
         /// Apply minima to one contiguous run of cells, discarding the suffix
@@ -407,6 +424,10 @@ test "gridded minima support multiple metrics and SIMD runs without changing adj
     try data.setManyIfLess(11, &.{ .{ 6, 7 }, .{ 1, 2 } }, .none);
     try testing.expectEqual(6, data.dataAt(11, 0).?);
     try testing.expectEqual(null, data.dataAt(12, 0));
+    data.setCellsIfLess(4, .{ 2, 2, 9, -1 }, .{ 3, std.math.inf(f32) });
+    try testing.expectEqual([2]f32{ 3, 200 }, data.data[2]);
+    try testing.expectEqual([2]f32{ 3, 200 }, data.data[9]);
+    try testing.expectEqual([2]f32{ 25, 20 }, data.data[3]);
 }
 
 // Ported from test/gridded_data.cc, GriddedData.Basic.

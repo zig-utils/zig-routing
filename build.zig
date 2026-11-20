@@ -346,6 +346,16 @@ pub fn build(b: *std.Build) void {
     run_bench_search.addPassthruArgs();
     b.step("bench-search", "Measure edge-based Dijkstra throughput and counters on a graph bundle").dependOn(&run_bench_search.step);
 
+    const bench_isochrone = b.addExecutable(.{ .name = "bench-isochrone", .root_module = b.createModule(.{
+        .root_source_file = b.path("test/bench_isochrone.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{.{ .name = "routing", .module = lib_mod }},
+    }) });
+    const run_bench_isochrone = b.addRunArtifact(bench_isochrone);
+    run_bench_isochrone.addPassthruArgs();
+    b.step("bench-isochrone", "Measure isochrone expansion and write arrival grids").dependOn(&run_bench_isochrone.step);
+
     const bench_exclusions = b.addExecutable(.{ .name = "bench-exclusions", .root_module = b.createModule(.{
         .root_source_file = b.path("test/bench_exclusions.zig"),
         .target = target,

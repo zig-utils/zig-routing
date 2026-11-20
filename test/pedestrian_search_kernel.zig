@@ -23,15 +23,20 @@ pub const Foot = struct {
         return pedestrian.Kernel.edgeCost(self.profile, self.tables, class, edge.*, self.profile.untimedFerrySpeed(edge.*), .{});
     }
 
-    pub fn allowedTurn(self: Foot, view: *const View, movement: search.Transition, previous: search.Label, _: search.Direction) !bool {
+    pub fn allowedTurn(self: Foot, view: *const View, movement: search.Transition, previous: search.Label, direction: search.Direction) !bool {
         if (!self.profile.allowedNode(try view.node(movement.node))) return false;
         const from = try view.class(movement.incoming_edge.cls.class_id);
         const to = try view.class(movement.outgoing_edge.cls.class_id);
-        return pedestrian.Kernel.allowed(self.profile, from, to, movement.outgoing_edge.*, .{
+        const prior = if (direction == .forward) from else to;
+        const check: pedestrian.PathCheck = .{
             .previous_distance = previous.dist_m,
-            .previous_dead_end = from.flags.dead_end or (try view.outEdgeRange(movement.node)).count() == 1,
+            .previous_dead_end = prior.flags.dead_end or (try view.outEdgeRange(movement.node)).count() == 1,
             .backtrack = movement.incoming_edge.cls.opp_local == movement.outgoing_edge.cls.local,
-        });
+        };
+        return if (direction == .forward)
+            pedestrian.Kernel.allowed(self.profile, from, to, movement.outgoing_edge.*, check)
+        else
+            pedestrian.Kernel.allowedReverse(self.profile, from, to, check);
     }
 
     pub fn turnCost(self: Foot, view: *const View, movement: search.Transition, _: search.Label, _: search.Direction) !Cost {

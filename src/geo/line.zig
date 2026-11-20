@@ -267,13 +267,21 @@ pub fn uniformResampleSpherical(gpa: Allocator, polyline: []const PointLL, lengt
 /// in single precision, about `resolution` metres apart, ending at the last
 /// vertex.
 pub fn resamplePolyline(gpa: Allocator, polyline: []const PointLL, length_m: f32, resolution: f32, out: *std.ArrayList(PointLL)) Allocator.Error!void {
+    resamplePolylineWithDeadline(gpa, polyline, length_m, resolution, out, .none) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DeadlineExceeded => unreachable,
+    };
+}
+
+pub fn resamplePolylineWithDeadline(gpa: Allocator, polyline: []const PointLL, length_m: f32, resolution: f32, out: *std.ArrayList(PointLL), deadline: Deadline) (Allocator.Error || error{DeadlineExceeded})!void {
     if (polyline.len == 0) return;
     const base = out.items.len;
     try out.append(gpa, polyline[0]);
     const n: usize = @intFromFloat(@round(length_m / resolution));
     const sample_distance: f32 = length_m / @as(f32, @floatFromInt(n));
     var accumulated_d: f32 = 0;
-    for (polyline[0 .. polyline.len - 1], polyline[1..]) |p0, p1| {
+    for (polyline[0 .. polyline.len - 1], polyline[1..], 0..) |p0, p1, i| {
+        if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
         if (out.items.len - base == n) break;
         const d: f32 = @floatCast(p0.distance(p1));
         if (d + accumulated_d > sample_distance) {
@@ -283,6 +291,7 @@ pub fn resamplePolyline(gpa: Allocator, polyline: []const PointLL, length_m: f32
             try out.append(gpa, .{ .lng = p0.lng + p * dlon, .lat = p0.lat + p * dlat });
             const dp = sample_distance / d;
             while (p + dp < 1.0 and out.items.len - base < n) {
+                if ((out.items.len - base) % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
                 p += dp;
                 try out.append(gpa, .{ .lng = p0.lng + p * dlon, .lat = p0.lat + p * dlat });
             }
