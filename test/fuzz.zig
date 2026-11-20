@@ -14,7 +14,8 @@
 //! `osm-dense` (PrimitiveBlock and DenseNodes decoding), and
 //! `node-store` (the build-time coordinate index format) and `graph-bundle`
 //! (section headers, checksums and typed topology access), `live-traffic`
-//! (mutable traffic header, bitmap and records), and
+//! (mutable traffic header, bitmap and records), `traffic-feed` (CSV,
+//! JSON lines and the observation age sidecar), and
 //! `build-checkpoint` (restart manifests), `valhalla-tile` (offline tile import),
 //! `costing-reference` (gate A samples and paths), `speed-config` (default speed tables),
 //! `motor-tags` (motor vehicle access and unit normalization), `admin-index`
@@ -271,6 +272,47 @@ test "fuzz live-traffic" {
     defer state.deinit();
     const corpus = try seeds(state.allocator(), &.{ &.{}, std.mem.asBytes(&sample.header), std.mem.asBytes(&sample) });
     try std.testing.fuzz({}, fuzzLiveTraffic, .{ .corpus = corpus });
+}
+
+fn fuzzTrafficFeed(_: void, s: *Smith) !void {
+    const feed = routing.traffic.feed;
+    const expiry = routing.traffic.expiry;
+    var buf: [max_input]u8 align(8) = undefined;
+    const input = draw(s, &buf, 0x66656564);
+    if (input.len < 8) return;
+    if (input[0] % 3 == 2) {
+        expiry.Ages.validate(input[8..], traffic_uuid, 2) catch return;
+        return;
+    }
+    var records = feed.Input.init(std.testing.allocator, input[8..], if (input[0] % 3 == 0) .csv else .jsonl);
+    defer records.deinit();
+    var seen: usize = 0;
+    while (try records.next(.none)) |record| {
+        seen += 1;
+        try std.testing.expect(seen <= input.len);
+        if (record == .observation) {
+            try std.testing.expect(record.observation.key.valid());
+            try std.testing.expect(record.observation.record.validSpeed());
+            try std.testing.expect(record.observation.record.overallKph() <= 252);
+        }
+    }
+}
+
+test "fuzz traffic-feed" {
+    const expiry = routing.traffic.expiry;
+    const age_seed = extern struct { mode: u64 = 2, header: expiry.Header, times: [2]u64 }{
+        .header = .{ .dataset_uuid = traffic_uuid, .count = 2, .epoch = 3 },
+        .times = .{ 0, 546 },
+    };
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const corpus = try seeds(state.allocator(), &.{
+        &.{},
+        "\x00\x00\x00\x00\x00\x00\x00\x00edge_key,speed\r\n\"12,42,43,forward\",98",
+        "\x01\x00\x00\x00\x00\x00\x00\x00{\"edge_key\":\"12,43,42,reverse\",\"speed\":0}",
+        std.mem.asBytes(&age_seed),
+    });
+    try std.testing.fuzz({}, fuzzTrafficFeed, .{ .corpus = corpus });
 }
 
 fn fuzzLaneTags(_: void, s: *Smith) !void {

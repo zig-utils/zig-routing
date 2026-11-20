@@ -361,33 +361,82 @@ pub const Writer = struct {
     /// can recover it while readers fall back to the next available speed source.
     pub fn update(self: *Writer, updates: []const Update, timestamp: u64, deadline: io.Deadline) !Metadata {
         if (deadline.expired()) return error.DeadlineExceeded;
-        const header = @constCast(self.view.header);
-        const prev_time = @atomicLoad(u64, &header.last_update, .seq_cst);
-        if (timestamp == 0 or timestamp < prev_time) return error.InvalidLiveTrafficTime;
-        var ratio: f64 = @bitCast(@atomicLoad(u64, &header.live_to_bound_bits, .seq_cst));
-        if (!validRatio(ratio)) return error.InvalidLiveTrafficRatio;
+        var ratio = try self.checkedRatio(timestamp);
         for (updates, 0..) |entry, i| {
             if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
             if (self.view.slot(entry.edge) == null) return error.EdgeNotDrivable;
-            if (entry.record.reserved) return error.InvalidLiveTrafficRecord;
-            const bound = self.graph.bound(@backingInt(entry.edge));
-            if (bound == 0) return error.InvalidLiveTrafficBound;
-            const kph: f64 = @floatFromInt(entry.record.maxKph());
-            ratio = @max(ratio, kph / @as(f64, @floatFromInt(bound)));
+            ratio = @max(ratio, try self.ratioFor(entry.edge, entry.record));
         }
+        var batch = try self.startBatch(timestamp, ratio);
+        for (updates, 0..) |entry, i| {
+            if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
+            self.store(self.view.slot(entry.edge).?, entry.record);
+        }
+        return batch.finish();
+    }
+
+    /// Start a streaming publication. The writer's owner finishes the batch
+    /// after validating and applying its records. An interrupted publication
+    /// leaves an odd sequence and can be recovered by the next batch.
+    pub fn begin(self: *Writer, timestamp: u64) !Batch {
+        return self.startBatch(timestamp, try self.checkedRatio(timestamp));
+    }
+
+    fn checkedRatio(self: *Writer, timestamp: u64) !f64 {
+        const header = self.view.header;
+        const prev_time = @atomicLoad(u64, &header.last_update, .seq_cst);
+        if (timestamp == 0 or timestamp < prev_time) return error.InvalidLiveTrafficTime;
+        const ratio: f64 = @bitCast(@atomicLoad(u64, &header.live_to_bound_bits, .seq_cst));
+        if (!validRatio(ratio)) return error.InvalidLiveTrafficRatio;
+        return ratio;
+    }
+
+    fn ratioFor(self: *const Writer, edge: format.EdgeId, record: Record) !f64 {
+        if (record.reserved) return error.InvalidLiveTrafficRecord;
+        const bound = self.graph.bound(@backingInt(edge));
+        if (bound == 0) return error.InvalidLiveTrafficBound;
+        const kph: f64 = @floatFromInt(record.maxKph());
+        return kph / @as(f64, @floatFromInt(bound));
+    }
+
+    fn startBatch(self: *Writer, timestamp: u64, ratio: f64) !Batch {
+        const header = @constCast(self.view.header);
         const previous = @atomicLoad(u64, &header.sequence, .seq_cst) & ~@as(u64, 1);
         const next = std.math.add(u64, previous, 2) catch return error.LiveTrafficEpochExhausted;
         @atomicStore(u64, &header.sequence, previous + 1, .seq_cst);
         @atomicStore(u64, &header.live_to_bound_bits, @bitCast(ratio), .seq_cst);
+        return .{ .writer = self, .timestamp = timestamp, .next = next, .ratio = ratio };
+    }
+
+    fn store(self: *Writer, slot: Slot, record: Record) void {
         const records = @constCast(self.view.records);
-        for (updates, 0..) |entry, i| {
-            if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
-            const index = @backingInt(self.view.slot(entry.edge).?);
-            @atomicStore(u64, &records[index], @bitCast(entry.record), .monotonic);
+        @atomicStore(u64, &records[@backingInt(slot)], @bitCast(record), .monotonic);
+    }
+};
+
+pub const Batch = struct {
+    writer: *Writer,
+    timestamp: u64,
+    next: u64,
+    ratio: f64,
+
+    pub fn put(self: *Batch, edge: format.EdgeId, record: Record) !Slot {
+        const slot = self.writer.view.slot(edge) orelse return error.EdgeNotDrivable;
+        const new_ratio = try self.writer.ratioFor(edge, record);
+        if (new_ratio > self.ratio) {
+            self.ratio = new_ratio;
+            const header = @constCast(self.writer.view.header);
+            @atomicStore(u64, &header.live_to_bound_bits, @bitCast(new_ratio), .seq_cst);
         }
-        @atomicStore(u64, &header.last_update, timestamp, .seq_cst);
-        @atomicStore(u64, &header.sequence, next, .seq_cst);
-        return .{ .epoch = next >> 1, .last_update = timestamp, .live_to_bound = ratio };
+        self.writer.store(slot, record);
+        return slot;
+    }
+
+    pub fn finish(self: *Batch) Metadata {
+        const header = @constCast(self.writer.view.header);
+        @atomicStore(u64, &header.last_update, self.timestamp, .seq_cst);
+        @atomicStore(u64, &header.sequence, self.next, .seq_cst);
+        return .{ .epoch = self.next >> 1, .last_update = self.timestamp, .live_to_bound = self.ratio };
     }
 };
 

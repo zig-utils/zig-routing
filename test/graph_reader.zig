@@ -323,6 +323,72 @@ test "loading a graph rejects a traffic overlay for another dataset" {
     try testing.expectError(error.LiveTrafficDatasetUuidMismatch, reader.Bundle.open(path));
 }
 
+test "traffic feed applies keys and preserves individual expiry across reopen" {
+    const live = routing.traffic.live;
+    const feed = routing.traffic.feed;
+    const a = testing.allocator;
+    const fixture = try Fixture.create();
+    defer fixture.deinit();
+    var buf: [80]u8 = undefined;
+    const path = fixture.path(&buf);
+    const dir = try fixture.root.child("bundle");
+    defer dir.close();
+    defer dir.deleteFile(live.filename) catch {};
+    defer dir.deleteFile("traffic-expiry.bin") catch {};
+    var base = try reader.Bundle.open(path);
+    defer base.close();
+    const graph = try base.view.liveTrafficGraph();
+    const index = base.view.edge_key_index.?;
+    var writer = try feed.Feeder.open(a, dir, graph, index, 100, .none);
+    {
+        defer writer.close();
+        const report = try writer.apply(a,
+            \\edge_key,speed
+            \\"12,42,43,forward",98
+            \\"12,43,42,reverse",0
+            \\"999,42,43,forward",88
+            \\"999,42,43,forward",86
+            \\"12,43,42,reverse",253
+            \\incomplete
+        , .csv, 1000, .none);
+        defer report.deinit(a);
+        try testing.expectEqual(6, report.rows);
+        try testing.expectEqual(2, report.applied);
+        try testing.expectEqual(2, report.unknown);
+        try testing.expectEqual(1, report.unknown_keys.len);
+        try testing.expectEqual(999, report.unknown_keys[0].way_id);
+        try testing.expectEqual(1, report.out_of_range);
+        try testing.expectEqual(1, report.invalid_rows);
+        try testing.expectEqual(1, report.metadata.?.epoch);
+
+        var opened = try reader.Bundle.open(path);
+        defer opened.close();
+        const overlay = opened.view.live_traffic.?;
+        try testing.expectEqual(98, overlay.record(@fromBackingInt(0)).?.overallKph());
+        try testing.expect(overlay.record(@fromBackingInt(1)).?.closed());
+        const next = try writer.apply(a,
+            \\{"edge_key":"12,42,43,forward","speed":60,"speed1":44,"speed2":22,"speed3":38,"breakpoint1":128,"breakpoint2":220,"congestion3":8,"observed_at":1040}
+            \\{"edge_key":"12,43,42,reverse","speed":80,"observed_at":995}
+        , .jsonl, 1050, .none);
+        defer next.deinit(a);
+        try testing.expectEqual(1, next.applied);
+        try testing.expectEqual(1, next.older_observations);
+        try testing.expectEqual(2, next.metadata.?.epoch);
+        try testing.expectEqual(38, overlay.record(@fromBackingInt(0)).?.subsegmentKph(.third));
+        try testing.expectEqual(8, overlay.record(@fromBackingInt(0)).?.congestion3);
+        try testing.expect(overlay.record(@fromBackingInt(1)).?.closed());
+    }
+    var restarted = try feed.Feeder.open(a, dir, graph, index, 100, .none);
+    defer restarted.close();
+    try testing.expectEqual(0, try restarted.expire(1100, .none));
+    try testing.expectEqual(1, try restarted.expire(1101, .none));
+    try testing.expectEqual(live.Record.unknown, restarted.writer.view.record(@fromBackingInt(1)).?);
+    try testing.expectEqual(60, restarted.writer.view.record(@fromBackingInt(0)).?.overallKph());
+    try testing.expectEqual(1, try restarted.expire(1141, .none));
+    try testing.expectEqual(live.Record.unknown, restarted.writer.view.record(@fromBackingInt(0)).?);
+    try testing.expectEqual(4, restarted.writer.view.metadata().?.epoch);
+}
+
 test "timetable references can exceed Valhalla's twelve-bit indices" {
     const fixture = try Fixture.createWithTransit(true);
     defer fixture.deinit();

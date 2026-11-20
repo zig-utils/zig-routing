@@ -6,35 +6,11 @@ const reader = @import("../graph/reader.zig");
 const edge_keys = @import("../graph/edge_keys.zig");
 const kinds = std.enums.values(format.SectionKind);
 
-pub fn parseEdgeKey(text: []const u8) !edge_keys.Key {
-    var parts = std.mem.splitScalar(u8, text, ',');
-    var key: edge_keys.Key = .{
-        .way_id = try parseKeyPart(i64, parts.next()),
-        .begin_node = try parseKeyPart(i64, parts.next()),
-        .end_node = try parseKeyPart(i64, parts.next()),
-    };
-    const direction = parts.next() orelse return error.InvalidEdgeKey;
-    key.flags.reversed = if (std.mem.eql(u8, direction, "reverse"))
-        true
-    else if (std.mem.eql(u8, direction, "forward"))
-        false
-    else
-        return error.InvalidEdgeKey;
-    if (parts.next()) |occurrence| key.flags.occurrence = try parseKeyPart(u32, occurrence);
-    if (parts.next()) |kind| key.flags.kind = std.meta.stringToEnum(edge_keys.Kind, kind) orelse return error.InvalidEdgeKey;
-    if (!key.valid() or parts.next() != null) return error.InvalidEdgeKey;
-    return key;
-}
-
-fn parseKeyPart(comptime T: type, part: ?[]const u8) !T {
-    return std.fmt.parseInt(T, part orelse return error.InvalidEdgeKey, 10) catch error.InvalidEdgeKey;
-}
-
 const Key = struct {
     way_id: i64,
     begin_node: i64,
     end_node: i64,
-    direction: enum { forward, reverse },
+    direction: edge_keys.Direction,
     occurrence: u32,
     kind: edge_keys.Kind,
 
@@ -123,9 +99,9 @@ pub fn diffEdgeKeys(old: edge_keys.View, new: edge_keys.View, out: *io.Writer, j
 }
 
 test "edge key diff reports membership changes and dense edge moves" {
-    const first = try parseEdgeKey("1,10,20,forward");
-    const retained = try parseEdgeKey("2,10,20,reverse,1");
-    const added = try parseEdgeKey("3,10,20,forward,0,transit");
+    const first = try edge_keys.Key.parse("1,10,20,forward");
+    const retained = try edge_keys.Key.parse("2,10,20,reverse,1");
+    const added = try edge_keys.Key.parse("3,10,20,forward,0,transit");
     const old: edge_keys.View = .{ .records = &.{ .{ .key = first, .edge = 0 }, .{ .key = retained, .edge = 1 } }, .inverse = &.{ 0, 1 } };
     const new: edge_keys.View = .{ .records = &.{ .{ .key = retained, .edge = 0 }, .{ .key = added, .edge = 1 } }, .inverse = &.{ 0, 1 } };
     var buffer: [1024]u8 = undefined;
@@ -138,8 +114,8 @@ test "edge key diff reports membership changes and dense edge moves" {
             "1 added, 1 removed, 1 changed\n",
         writer.buffered(),
     );
-    try std.testing.expectError(error.InvalidEdgeKey, parseEdgeKey("1,10,20,left"));
-    try std.testing.expectError(error.InvalidEdgeKey, parseEdgeKey("1,10,20,reverse,0,transit,1"));
+    try std.testing.expectError(error.InvalidEdgeKey, edge_keys.Key.parse("1,10,20,left"));
+    try std.testing.expectError(error.InvalidEdgeKey, edge_keys.Key.parse("1,10,20,reverse,0,transit,1"));
 }
 
 const Section = struct {

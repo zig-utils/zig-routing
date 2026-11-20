@@ -12,6 +12,7 @@ const service = routing.api.service;
 const bench = routing.cli.bench;
 const diff = routing.cli.diff;
 const inspect = routing.cli.inspect;
+const traffic = routing.cli.traffic;
 const dem = routing.cli.dem;
 const Command = cli.BaseCommand;
 const Context = Command.ParseContext;
@@ -149,6 +150,15 @@ fn createCommands(a: Allocator) !*Command {
         option("node", "Print a node by ID", .int),
         option("edge-key", "Find WAY,BEGIN,END,forward|reverse[,OCCURRENCE[,KIND]]", .string),
         option("key-for-edge", "Print the stable key for a directed edge ID", .int),
+    }, &.{arg("BUNDLE", "Graph bundle directory")});
+    const traffic_cmd = try command(root, "traffic", "Write live speeds and closures", null, &.{}, &.{});
+    _ = try command(traffic_cmd, "set", "Apply a CSV or JSON lines file by stable edge key", setTraffic, &.{
+        option("format", "Input format (csv or jsonl)", .string),
+        option("max-age", "Maximum observation age in seconds (default 300)", .int),
+    }, &.{ arg("BUNDLE", "Graph bundle directory"), arg("FILE", "Traffic update file") });
+    _ = try command(traffic_cmd, "serve", "Run the loopback traffic update endpoint", serveTraffic, &.{
+        option("port", "Loopback TCP port (default 8003)", .int),
+        option("max-age", "Maximum observation age in seconds (default 300)", .int),
     }, &.{arg("BUNDLE", "Graph bundle directory")});
     _ = try command(root, "bundle-manifest", "Write range hashes for a graph bundle", bundleManifest, &.{
         option("output", "Range manifest output file", .string).withRequired(true),
@@ -571,7 +581,7 @@ fn inspectGraph(ctx: *Context) !u8 {
     const node_id = try unsigned(ctx, u32, "node");
     const key_edge = try unsigned(ctx, u32, "key-for-edge");
     const edge_key = if (ctx.getOption("edge-key")) |text|
-        inspect.parseEdgeKey(text) catch return badOption(ctx, "--edge-key expects WAY,BEGIN,END,forward|reverse[,OCCURRENCE[,KIND]]")
+        routing.graph.edge_keys.Key.parse(text) catch return badOption(ctx, "--edge-key expects WAY,BEGIN,END,forward|reverse[,OCCURRENCE[,KIND]]")
     else
         null;
     if ((edge_key != null and key_edge != null) or ((edge_key != null or key_edge != null) and (edge_id != null or node_id != null)))
@@ -597,6 +607,66 @@ fn inspectGraph(ctx: *Context) !u8 {
 fn missingEdgeKeys(ctx: *Context) error{MissingEdgeKeys} {
     ctx.setDiagnostic("bundle needs stable edge-key sections");
     return error.MissingEdgeKeys;
+}
+
+fn setTraffic(ctx: *Context) !u8 {
+    const input = ctx.getArgument(1).?;
+    const FeedFormat = routing.traffic.feed.Format;
+    const kind: FeedFormat = if (ctx.getOption("format")) |name|
+        std.meta.stringToEnum(FeedFormat, name) orelse return badOption(ctx, "--format expects csv or jsonl")
+    else if (std.mem.endsWith(u8, input, ".jsonl") or std.mem.endsWith(u8, input, ".ndjson"))
+        .jsonl
+    else
+        .csv;
+    const max_age = (try unsigned(ctx, u64, "max-age")) orelse routing.traffic.live.default_max_age_seconds;
+    const map = try io.Mapping.mapFile(input, .read_only);
+    defer map.unmap();
+    const a = std.heap.c_allocator;
+    var owned = traffic.OwnedFeeder.open(a, ctx.getArgument(0).?, max_age, .none) catch |err| {
+        if (err == error.MissingEdgeKeys) return missingEdgeKeys(ctx);
+        return err;
+    };
+    defer owned.close();
+    const now = std.math.cast(u64, io.wallSeconds()) orelse return error.InvalidLiveTrafficTime;
+    const report = try owned.feeder.apply(a, map.bytes, kind, now, .none);
+    defer report.deinit(a);
+    try ctx.writeJson(report);
+    return 0;
+}
+
+fn serveTraffic(ctx: *Context) !u8 {
+    const app = App.from(ctx);
+    const token = app.env.get("ZR_TRAFFIC_TOKEN") orelse return badOption(ctx, "set ZR_TRAFFIC_TOKEN to serve traffic updates");
+    if (token.len == 0) return badOption(ctx, "ZR_TRAFFIC_TOKEN must be nonempty");
+    const max_age = (try unsigned(ctx, u64, "max-age")) orelse routing.traffic.live.default_max_age_seconds;
+    const port = (try unsigned(ctx, u16, "port")) orelse 8003;
+    const a = std.heap.c_allocator;
+    var owned = traffic.OwnedFeeder.open(a, ctx.getArgument(0).?, max_age, .none) catch |err| {
+        if (err == error.MissingEdgeKeys) return missingEdgeKeys(ctx);
+        return err;
+    };
+    defer owned.close();
+    var admin = traffic.Admin.init(&owned.feeder, token);
+    io.installTerminationHandler();
+    var server = http.Server.init(a, .{ .address = io.Address.loopback(port), .threads = 1 }, admin.handler());
+    try server.start();
+    defer server.stop();
+    if (ctx.wantsJson()) {
+        try ctx.writeJson(.{ .host = .{ 127, 0, 0, 1 }, .port = server.port });
+        try ctx.out.?.flush();
+    } else {
+        try ctx.out.?.print("Traffic update endpoint on loopback port {d}\n", .{server.port});
+        try ctx.out.?.flush();
+    }
+    while (!io.termination_requested.load(.acquire)) {
+        io.sleepMs(250);
+        const now = std.math.cast(u64, io.wallSeconds()) orelse return error.InvalidLiveTrafficTime;
+        admin.expire(now, io.Deadline.fromNowMs(120_000)) catch |err| switch (err) {
+            error.DeadlineExceeded => continue,
+            else => return err,
+        };
+    }
+    return 0;
 }
 
 fn bundleManifest(ctx: *Context) !u8 {

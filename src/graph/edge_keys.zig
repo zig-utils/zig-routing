@@ -4,6 +4,7 @@ const Deadline = @import("../infra/io.zig").Deadline;
 const EdgeId = @import("format.zig").EdgeId;
 
 pub const Kind = enum(u2) { osm, node_connector, transit, _ };
+pub const Direction = enum { forward, reverse };
 
 pub const Key = extern struct {
     way_id: i64,
@@ -15,6 +16,26 @@ pub const Key = extern struct {
         kind: Kind = .osm,
         reserved: u29 = 0,
     } = .{},
+
+    pub fn parse(text: []const u8) error{InvalidEdgeKey}!Key {
+        var parts = std.mem.splitScalar(u8, text, ',');
+        var key: Key = .{
+            .way_id = try parsePart(i64, parts.next()),
+            .begin_node = try parsePart(i64, parts.next()),
+            .end_node = try parsePart(i64, parts.next()),
+        };
+        const direction = std.meta.stringToEnum(Direction, parts.next() orelse return error.InvalidEdgeKey) orelse
+            return error.InvalidEdgeKey;
+        key.flags.reversed = direction == .reverse;
+        if (parts.next()) |occurrence| key.flags.occurrence = try parsePart(u32, occurrence);
+        if (parts.next()) |kind| key.flags.kind = std.meta.stringToEnum(Kind, kind) orelse return error.InvalidEdgeKey;
+        if (!key.valid() or parts.next() != null) return error.InvalidEdgeKey;
+        return key;
+    }
+
+    fn parsePart(comptime T: type, part: ?[]const u8) error{InvalidEdgeKey}!T {
+        return std.fmt.parseInt(T, part orelse return error.InvalidEdgeKey, 10) catch error.InvalidEdgeKey;
+    }
 
     pub fn order(left: Key, right: Key) std.math.Order {
         inline for (.{ "way_id", "begin_node", "end_node" }) |field| {

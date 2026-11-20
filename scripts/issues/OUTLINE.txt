@@ -220,7 +220,7 @@ P9.09 | Phase 9 gate: transit gurka suites green | search | gate | M | P9.05 P9.
 ## P10 | P10 Traffic | Live and historical speeds on the accelerated search.
 P10.01 | Stable edge keys: way id and node pair to edge id map emitted by the build | build | new | M | P3.22
 P10.02 | Live traffic overlay: record layout, lock-free reads, epoch, live-to-bound ratio | traffic | new | M | P10.01 P5.14
-P10.03 | Traffic feeder: write speeds and closures by edge key | traffic | new | M | P10.02
+P10.03 | Traffic feeder: write speeds and closures by edge key | traffic | new | M | P10.02 P10.05
 P10.04 | Predicted speeds: weekly profiles, SIMD DCT codec, deduplicated profile table | traffic | port | M | P10.01 P5.14
 P10.05 | Traffic in costing and the admissibility floors | costing | new | M | P10.02 P10.04 P4.07
 P10.06 | Time-dependent potentials for predicted and live traffic | accel | new | L | P10.05 P5.21

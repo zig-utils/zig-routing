@@ -243,6 +243,52 @@ incremental publisher can clear obsolete observations with the unknown word.
 zig build bench-live-traffic -Doptimize=ReleaseFast -- BUNDLE
 ```
 
+### Live traffic feeder
+
+`zr traffic set BUNDLE FILE` applies one CSV or JSON lines batch to the live
+overlay. A bundle can initialize its overlay before starting the router.
+Use `--format csv` or `--format jsonl` to override file extension detection.
+Both formats take the same comma-delimited edge key accepted by
+`zr inspect --edge-key`.
+
+CSV accepts an optional header in this order. Quote the key because it
+contains commas, and leave unused optional columns empty.
+
+```csv
+edge_key,speed,speed1,speed2,speed3,breakpoint1,breakpoint2,congestion1,congestion2,congestion3,observed_at
+"88293320,1025569552,1025568991,reverse",36
+```
+
+```json
+{"edge_key":"88293320,1025569552,1025568991,reverse","speed":36}
+```
+
+Speeds are integer kph from 0 to 252. The overlay stores 2 kph units. Positive
+values round down to an even speed with a 2 kph minimum. A zero overall speed
+marks a closure. Optional sub-segment breakpoints are fractions of 255 along
+the edge and congestion values range from 0 to 63. `observed_at` is an optional
+Unix timestamp in seconds. Without it, the observation time is the batch's
+publication time.
+
+The feeder keeps observation times in `traffic-expiry.bin`. Each entry expires
+independently according to `--max-age`, which defaults to 300 seconds. One-shot
+commands expire older entries before publishing their batch. A running feeder
+also expires entries while idle. Newer observations take precedence when
+sources deliver data out of order. The report counts applied rows, expired
+entries, unknown keys and invalid values. The unknown key list is deduplicated.
+The feeder validates and writes rows in a single pass, then advances the
+overlay epoch once for the batch.
+
+`zr traffic serve BUNDLE` binds a loopback-only listener. Set
+`ZR_TRAFFIC_TOKEN` in the feeder process's environment. Submit a
+`POST /traffic` with an `Authorization: Bearer` header and either
+`text/csv` or `application/x-ndjson` content. Each request uses the same
+validation and publication path as the one-shot command.
+
+```sh
+zig build bench-traffic-feed -Doptimize=ReleaseFast
+```
+
 ### Transit timetable sections
 
 A bundle with transit carries sections 27 through 38 together. They use the v1 section

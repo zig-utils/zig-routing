@@ -17,7 +17,7 @@ seconds=600
 if [ "${1:-}" = "-s" ]; then seconds="$2"; shift 2; fi
 [[ "$seconds" =~ ^[1-9][0-9]*$ ]] || { echo "fuzz: expected a positive duration in seconds" >&2; exit 2; }
 targets=("$@")
-[ ${#targets[@]} -eq 0 ] && targets=(request http polyline lz4 dem protobuf config osm-pbf osm-primitives osm-dense node-store graph-bundle live-traffic build-checkpoint valhalla-tile costing-reference motor-costing range-manifest http-range usage-directory speed-config motor-tags admin-index timezone-geojson timezone-rules datetime lane-tags name-tags gtfs-csv)
+[ ${#targets[@]} -eq 0 ] && targets=(request http polyline lz4 dem protobuf config osm-pbf osm-primitives osm-dense node-store graph-bundle live-traffic traffic-feed build-checkpoint valhalla-tile costing-reference motor-costing range-manifest http-range usage-directory speed-config motor-tags admin-index timezone-geojson timezone-rules datetime lane-tags name-tags gtfs-csv)
 
 ZIG="${ZIG:-zig}"
 if ! command -v "$ZIG" >/dev/null 2>&1 && [ -x "$HOME/.local/share/zig-0.17-master/zig" ]; then

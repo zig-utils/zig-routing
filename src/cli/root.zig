@@ -9,6 +9,7 @@ pub const tags = @import("tags.zig");
 pub const inspect = @import("inspect.zig");
 pub const import_valhalla = @import("import_valhalla.zig");
 pub const parity_costing = @import("parity_costing.zig");
+pub const traffic = @import("traffic.zig");
 
 test {
     std.testing.refAllDecls(@This());
