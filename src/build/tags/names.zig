@@ -5,6 +5,8 @@ const std = @import("std");
 const io = @import("../../infra/io.zig");
 const attrs = @import("attrs.zig");
 const input = @import("input.zig");
+const name_keys = @import("name_keys.zig");
+const Language = @import("../../graph/linguistics.zig").Language;
 
 pub const Id = enum(u32) { empty = 0, _ };
 
@@ -17,9 +19,15 @@ pub const Options = struct {
     allow_alt_name: bool = false,
     use_admin_db: bool = true,
     use_direction_on_ways: bool = false,
+    capture_details: bool = false,
 };
 
 pub const Indexed = struct {
+    // Borrowed until the next way is indexed. Preserve the normalized base
+    // strings before any language variants are joined.
+    base_name: []const u8,
+    base_ref: []const u8,
+    detail_tags: []const name_keys.Tag,
     name: LocalizedId,
     alt_name: LocalizedId,
     official_name: LocalizedId,
@@ -102,17 +110,6 @@ const localized_prefixes = std.StaticStringMap(Group).initComptime(.{
     .{ "junction:name", .junction_name },
 });
 
-// From stringLanguage in valhalla/baldr/graphconstants.h.
-const languages = std.StaticStringMap(void).initComptime(.{
-    .{"ab"},      .{"am"},  .{"ar"}, .{"az"}, .{"be"}, .{"bg"}, .{"bn"}, .{"bs"}, .{"ca"}, .{"ckb"}, .{"cs"}, .{"da"},
-    .{"de"},      .{"dv"},  .{"dz"}, .{"el"}, .{"en"}, .{"es"}, .{"et"}, .{"fa"}, .{"fi"}, .{"fr"},  .{"fy"}, .{"gl"},
-    .{"he"},      .{"hr"},  .{"hu"}, .{"hy"}, .{"id"}, .{"is"}, .{"it"}, .{"ja"}, .{"ka"}, .{"kl"},  .{"km"}, .{"ko"},
-    .{"lo"},      .{"lt"},  .{"lv"}, .{"mg"}, .{"mk"}, .{"mn"}, .{"mo"}, .{"mt"}, .{"my"}, .{"ne"},  .{"nl"}, .{"no"},
-    .{"oc"},      .{"pap"}, .{"pl"}, .{"ps"}, .{"pt"}, .{"rm"}, .{"ro"}, .{"ru"}, .{"sk"}, .{"sl"},  .{"sq"}, .{"sr"},
-    .{"sr-Latn"}, .{"sv"},  .{"tg"}, .{"th"}, .{"tk"}, .{"tr"}, .{"uk"}, .{"ur"}, .{"uz"}, .{"vi"},  .{"zh"}, .{"cy"},
-    .{"ta"},      .{"ms"},
-});
-
 const Localized = struct {
     key: []const u8,
     group: Group,
@@ -125,7 +122,7 @@ fn localeTag(key: []const u8, value: []const u8) ?Localized {
     const trimmed = std.mem.trimEnd(u8, key, ":");
     const colon = std.mem.lastIndexOfScalar(u8, trimmed, ':') orelse return null;
     const language = trimmed[colon + 1 ..];
-    if (!languages.has(language)) return null;
+    if (Language.fromTag(language) == .none) return null;
     var prefix = trimmed[0..colon];
     if (std.mem.endsWith(u8, prefix, ":lang")) prefix = prefix[0 .. prefix.len - ":lang".len];
     return .{
@@ -144,6 +141,7 @@ pub const StringTable = struct {
     ids: std.StringHashMapUnmanaged(Id) = .empty,
     strings: std.ArrayList([]const u8) = .empty,
     localized: std.ArrayList(Localized) = .empty,
+    detail_tags: std.ArrayList(name_keys.Tag) = .empty,
     directed_ref: std.ArrayList(u8) = .empty,
     directed_int_ref: std.ArrayList(u8) = .empty,
     merged: std.ArrayList(u8) = .empty,
@@ -159,6 +157,7 @@ pub const StringTable = struct {
         self.ids.deinit(self.gpa);
         self.strings.deinit(self.gpa);
         self.localized.deinit(self.gpa);
+        self.detail_tags.deinit(self.gpa);
         self.directed_ref.deinit(self.gpa);
         self.directed_int_ref.deinit(self.gpa);
         self.merged.deinit(self.gpa);
@@ -195,6 +194,9 @@ pub const StringTable = struct {
         const merged = try self.mergeRefs(ref, int_ref, deadline);
         const name = try self.withoutRefNames(names.name orelse "", merged, deadline);
         return .{
+            .base_name = name,
+            .base_ref = merged,
+            .detail_tags = self.detail_tags.items,
             .name = try self.compose(.name, name, options, deadline),
             .alt_name = if (options.allow_alt_name) try self.compose(.alt_name, names.alt_name orelse "", options, deadline) else .{},
             .official_name = try self.compose(.official_name, names.official_name orelse "", options, deadline),
@@ -220,10 +222,24 @@ pub const StringTable = struct {
 
     fn collect(self: *StringTable, tags: anytype, options: Options, deadline: io.Deadline) !void {
         self.localized.clearRetainingCapacity();
+        self.detail_tags.clearRetainingCapacity();
+        var has_details = false;
         var iter = input.Iterator.init(tags, deadline);
         var count: usize = 0;
         while (try iter.next()) |tag| : (count += 1) {
             if (count % 1024 == 0) try check(deadline);
+            if (options.capture_details and tag.value.len != 0) {
+                if (name_keys.parseKey(tag.key)) |key| {
+                    const detailed = key.needsDetails();
+                    // The base name and refs are captured after normalization.
+                    if ((detailed or key.group == .alt_name or key.group == .official_name) and
+                        (key.group != .alt_name or options.allow_alt_name))
+                    {
+                        try self.detail_tags.append(self.gpa, .{ .key = key, .text = tag.value });
+                        has_details = has_details or detailed;
+                    }
+                }
+            }
             const part = localeTag(tag.key, tag.value) orelse continue;
             if (part.group == .alt_name and !options.allow_alt_name) continue;
             for (self.localized.items) |*previous| {
@@ -235,6 +251,7 @@ pub const StringTable = struct {
                 try self.localized.append(self.gpa, part);
             }
         }
+        if (!has_details) self.detail_tags.clearRetainingCapacity();
     }
 
     fn mergeRefs(self: *StringTable, ref: []const u8, int_ref: []const u8, deadline: io.Deadline) ![]const u8 {

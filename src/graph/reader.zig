@@ -520,7 +520,11 @@ pub const View = struct {
     }
 
     pub fn names(self: *const View, id: format.EdgeId) !cold.Names {
-        return (try self.coldRecord(id)).names(self.cold_data.?);
+        return self.namesWithOptions(id, .{});
+    }
+
+    pub fn namesWithOptions(self: *const View, id: format.EdgeId, options: cold.Names.Options) !cold.Names {
+        return (try self.coldRecordWithDeadline(id, options.deadline)).names(self.cold_data.?, options);
     }
 
     pub fn shape(self: *const View, id: format.EdgeId, arena: std.mem.Allocator) ![]format.Coordinate {

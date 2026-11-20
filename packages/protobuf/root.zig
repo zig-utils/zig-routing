@@ -205,7 +205,7 @@ const Fields = struct {
         return self;
     }
 
-    fn next(self: *Fields, deadline: anytype) Error!?wire.FieldView {
+    noinline fn next(self: *Fields, deadline: anytype) Error!?wire.FieldView {
         while (true) : (self.visited += 1) {
             try wire.checkAt(deadline, self.visited);
             if (try self.readers[self.level].next(deadline)) |field| {
@@ -236,6 +236,16 @@ const Occurrence = struct {
 
     fn asChild(self: Occurrence, parent: Source, number: wire.FieldNumber) Error!Source {
         return parent.child(number, self.last.?.length_delimited, self.merged);
+    }
+
+    noinline fn find(source: *const Source, number: wire.FieldNumber, wire_type: wire.WireType, deadline: anytype) Error!Occurrence {
+        var cursor = Fields.init(source.*);
+        var seen: Occurrence = .{};
+        while (try cursor.next(deadline)) |item| {
+            if (item.number == number and item.wireType() == wire_type)
+                seen.remember(item.value);
+        }
+        return seen;
     }
 };
 
@@ -271,15 +281,17 @@ fn validatePacked(comptime field: Field, input: []const u8, deadline: anytype) E
     switch (comptime field.kind.wireType()) {
         .fixed32 => if (input.len % 4 != 0) return error.Truncated,
         .fixed64 => if (input.len % 8 != 0) return error.Truncated,
-        .varint => {
-            var reader = wire.Reader.init(input);
-            var count: usize = 0;
-            while (reader.remaining.len != 0) : (count += 1) {
-                try wire.checkAt(deadline, count);
-                _ = try reader.readVarint();
-            }
-        },
+        .varint => try validatePackedVarints(input, deadline),
         else => unreachable,
+    }
+}
+
+noinline fn validatePackedVarints(input: []const u8, deadline: anytype) Error!void {
+    var reader = wire.Reader.init(input);
+    var count: usize = 0;
+    while (reader.remaining.len != 0) : (count += 1) {
+        try wire.checkAt(deadline, count);
+        _ = try reader.readVarint();
     }
 }
 
@@ -423,12 +435,7 @@ pub fn Message(comptime description: []const Field) type {
                 const field = comptime fieldNamed(name);
                 if (comptime field.presence == .repeated) return .{ .fields = .init(self.source) };
 
-                var cursor = Fields.init(self.source);
-                var seen: Occurrence = .{};
-                while (try cursor.next(deadline)) |item| {
-                    if (item.number == field.number and item.wireType() == field.kind.wireType())
-                        seen.remember(item.value);
-                }
+                const seen = try Occurrence.find(&self.source, field.number, field.kind.wireType(), deadline);
                 if (seen.last) |value| {
                     if (comptime field.kind == .message) {
                         return .{ .source = try seen.asChild(self.source, field.number) };

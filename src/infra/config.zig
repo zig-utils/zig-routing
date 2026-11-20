@@ -25,6 +25,8 @@ pub const Config = struct {
             infer_internal_intersections: ?bool = null,
             apply_country_overrides: ?bool = null,
             use_admin_db: ?bool = null,
+            allow_alt_name: ?bool = null,
+            use_direction_on_ways: ?bool = null,
         } = .{},
     };
 

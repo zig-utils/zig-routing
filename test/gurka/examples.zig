@@ -630,6 +630,78 @@ pub fn signs(arena: Allocator) !gurka.Map {
     }});
 }
 
+// Ported from test/gurka/test_phonemes_w_langs.cc and test_tagged_values.cc (Valhalla 3.9.3).
+pub fn streetLinguistics(arena: Allocator) !gurka.Map {
+    const layout = try gurka.mapToCoordinatesAt(
+        \\P--------------Q
+        \\|
+        \\| A---B---C---E
+        \\|     |
+        \\|     D
+        \\S--------------R
+    , 40, .{ .lng = 4.3516970, .lat = 50.8465573 });
+    const road = gurka.Tag{ .key = "highway", .value = "primary" };
+    return gurka.Map.init(arena, layout, &.{
+        .{ .label = "AB", .tags = &.{
+            road,
+            .{ .key = "name", .value = "Rive droite - Rechteroever" },
+            .{ .key = "name:fr", .value = "Rive droite" },
+            .{ .key = "name:nl", .value = "Rechteroever" },
+            .{ .key = "name:en", .value = "Right Bank" },
+            .{ .key = "name:fr:pronunciation", .value = "riv dʁwat" },
+            .{ .key = "name:nl:pronunciation", .value = "rɛxtəruvər" },
+            .{ .key = "name:nl:pronunciation:nt-sampa", .value = "rExt@ruv@r" },
+        } },
+        .{ .label = "BC", .tags = &.{
+            road,
+            .{ .key = "name", .value = "Rue de la Gare" },
+            .{ .key = "name:right", .value = "Place Est" },
+            .{ .key = "name:right:fr", .value = "Place Est" },
+            .{ .key = "name:right:fr:pronunciation", .value = "plas ɛst" },
+            .{ .key = "name:left", .value = "Westplein" },
+            .{ .key = "name:left:nl", .value = "Westplein" },
+            .{ .key = "name:left:nl:pronunciation", .value = "ʋɛstplɛin" },
+        } },
+        .{ .label = "BD", .tags = &.{
+            road,
+            .{ .key = "ref", .value = "N 1" },
+            .{ .key = "tunnel", .value = "yes" },
+            .{ .key = "tunnel:name", .value = "Tunnel du Pont - Brug Tunnel" },
+            .{ .key = "tunnel:name:fr", .value = "Tunnel du Pont" },
+            .{ .key = "tunnel:name:nl", .value = "Brug Tunnel" },
+            .{ .key = "tunnel:name:fr:pronunciation", .value = "tynɛl dy pɔ̃" },
+            .{ .key = "layer", .value = "-2" },
+            .{ .key = "level", .value = "0-2;3.5" },
+            .{ .key = "level:ref", .value = "B2;G" },
+        } },
+        .{ .label = "CE", .tags = &.{
+            road,
+            .{ .key = "name:forward", .value = "Rue Orient" },
+            .{ .key = "name:backward", .value = "Weststraat" },
+            .{ .key = "name:forward:fr", .value = "Rue Orient" },
+            .{ .key = "name:backward:nl", .value = "Weststraat" },
+            .{ .key = "name:forward:pronunciation", .value = "ʁy ɔʁjɑ̃" },
+            .{ .key = "name:backward:pronunciation", .value = "ʋɛststrat" },
+            .{ .key = "name:forward:fr:pronunciation", .value = "ʁy ɔʁjɑ̃" },
+            .{ .key = "name:backward:nl:pronunciation", .value = "ʋɛststrat" },
+            .{ .key = "ref:right", .value = "R 12" },
+            .{ .key = "ref:left", .value = "R 13" },
+            .{ .key = "ref:right:pronunciation", .value = "ɛʁ duz" },
+            .{ .key = "ref:left:pronunciation", .value = "ɛr dɛrtin" },
+        } },
+        .{ .label = "PQRSP" },
+    }, &.{}, &.{.{
+        .members = &.{.{ .kind = .way, .ref = "PQRSP", .role = "outer" }},
+        .tags = &.{
+            .{ .key = "type", .value = "boundary" },
+            .{ .key = "boundary", .value = "administrative" },
+            .{ .key = "admin_level", .value = "9" },
+            .{ .key = "name", .value = "Brussels language area" },
+            .{ .key = "default_language", .value = "fr - nl" },
+        },
+    }});
+}
+
 // Ported from test/gurka/test_turn_lanes.cc (Valhalla 3.9.3).
 pub fn turnLanes(arena: Allocator) !gurka.Map {
     const road = gurka.Tag{ .key = "highway", .value = "primary" };

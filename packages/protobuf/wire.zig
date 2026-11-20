@@ -67,6 +67,16 @@ pub const Reader = struct {
 
     pub fn readVarint(self: *Reader) Error!u64 {
         const input = self.remaining;
+        if (input.len == 0) return error.Truncated;
+        if (input[0] < 0x80) {
+            self.remaining = input[1..];
+            return input[0];
+        }
+        return self.readMultiByteVarint();
+    }
+
+    noinline fn readMultiByteVarint(self: *Reader) Error!u64 {
+        const input = self.remaining;
         var value: u64 = 0;
         for (input[0..@min(input.len, 10)], 0..) |byte, i| {
             if (i == 9 and byte > 1) return error.VarintOverflow;

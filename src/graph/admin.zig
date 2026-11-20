@@ -131,6 +131,50 @@ pub const View = struct {
         return if (result.state != unknown) result.state else result.country;
     }
 
+    /// Language policy combines every containing area, including language
+    /// boundaries that are excluded from political admin lookup.
+    pub fn languageAreas(self: View, point: PointLL, out: *std.ArrayList(Id), a: std.mem.Allocator, deadline: io.Deadline) !void {
+        out.clearRetainingCapacity();
+        if (!point.inRange()) return;
+        const cell = cellId(point);
+        const box = cellBox(cell);
+        const west = cell % columns != 0 and point.lng == box.minx;
+        const south = cell >= columns and point.lat == box.miny;
+        const geometry = self.gridView();
+        for ([_]?u32{
+            cell,
+            if (west) cell - 1 else null,
+            if (south) cell - columns else null,
+            if (west and south) cell - columns - 1 else null,
+        }) |maybe_cell| {
+            const candidate = maybe_cell orelse continue;
+            const pieces = geometry.cellPieces(candidate) catch return error.InvalidAdminIndex;
+            for (pieces, 0..) |piece, i| {
+                try checkAt(deadline, i);
+                const id = piece.attr.region;
+                const area = (try self.region(id)) orelse return error.InvalidAdminIndex;
+                if (area.default_language.count == 0 and !isPoliticalArea(area)) continue;
+                if (std.mem.indexOfScalar(Id, out.items, id) != null) continue;
+                if ((geometry.locate(piece, point, deadline) catch |err| return gridError(err)) == .outside) continue;
+                try out.append(a, id);
+            }
+        }
+        std.sort.heap(Id, out.items, self, languageAreaBefore);
+    }
+
+    fn languageAreaBefore(self: View, a: Id, b: Id) bool {
+        const left = self.regions[a - 1];
+        const right = self.regions[b - 1];
+        if (left.attr.level != right.attr.level) return left.attr.level > right.attr.level;
+        const left_name = self.text(left.name) catch "";
+        const right_name = self.text(right.name) catch "";
+        return switch (std.mem.order(u8, left_name, right_name)) {
+            .lt => true,
+            .gt => false,
+            .eq => a < b,
+        };
+    }
+
     /// Valhalla assigns a tile's sole admin to every node in that tile.
     pub fn singleArea(self: View, box: AABB, deadline: io.Deadline) !Id {
         if (!box.minpt().inRange() or !box.maxpt().inRange() or box.minx > box.maxx or box.miny > box.maxy)

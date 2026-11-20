@@ -4,6 +4,7 @@ const std = @import("std");
 const io = @import("../infra/io.zig");
 const point = @import("../geo/point.zig");
 const polyline = @import("../geo/polyline.zig");
+const linguistics = @import("linguistics.zig");
 pub const access_restriction = @import("access_restriction.zig");
 const Allocator = std.mem.Allocator;
 
@@ -48,9 +49,23 @@ const IndoorHeader = extern struct {
 const ReverseHeader = extern struct {
     attr: packed struct(u32) {
         name_count: u8,
-        reserved: u22 = 0,
+        reserved: u21 = 0,
+        name_details: bool = false,
         inherit_names: bool = false,
         restrictions: bool = false,
+    },
+};
+
+const NameDetailsHeader = extern struct {
+    linguistic: packed struct(u32) {
+        forward: u16,
+        reverse: u16,
+    },
+    tagged: packed struct(u32) {
+        forward: u8,
+        reverse: u8,
+        separate_reverse: bool,
+        reserved: u15 = 0,
     },
 };
 
@@ -83,6 +98,8 @@ comptime {
     std.debug.assert(@sizeOf(IndoorHeader) == 4);
     std.debug.assert(@offsetOf(IndoorHeader, "attributes") == 0);
     std.debug.assert(@sizeOf(ReverseHeader) == 4 and @offsetOf(ReverseHeader, "attr") == 0);
+    std.debug.assert(@sizeOf(NameDetailsHeader) == 8);
+    std.debug.assert(@offsetOf(NameDetailsHeader, "linguistic") == 0 and @offsetOf(NameDetailsHeader, "tagged") == 4);
     std.debug.assert(@sizeOf(LevelRange) == 8);
     std.debug.assert(@offsetOf(LevelRange, "bounds") == 0);
     std.debug.assert(@sizeOf(Header) == 16);
@@ -187,19 +204,83 @@ fn bounds(bytes: []const u8, start: u64, end: u64) ![]const u8 {
 pub const Name = struct {
     text: []const u8,
     route: bool,
+    language: linguistics.Language = .none,
+    pronunciation: ?linguistics.Pronunciation = null,
+    tagged: ?linguistics.Tag = null,
+};
+
+pub const NameDetails = struct {
+    linguistic: []align(1) const linguistics.Entry = &.{},
+    tagged: []align(1) const linguistics.Tagged = &.{},
+
+    fn empty(self: NameDetails) bool {
+        return self.linguistic.len == 0 and self.tagged.len == 0;
+    }
+
+    fn validate(self: NameDetails, names: usize, deadline: io.Deadline) !void {
+        if (self.tagged.len > max_names - names or self.linguistic.len > (names + self.tagged.len) * 5)
+            return error.InvalidColdNameDetails;
+        var previous: u8 = 0;
+        for (self.linguistic, 0..) |entry, i| {
+            if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+            if (!entry.valid(names + self.tagged.len) or entry.attr.name_index < previous) return error.InvalidColdNameDetails;
+            previous = entry.attr.name_index;
+        }
+        for (self.tagged) |tag| if (!tag.valid()) return error.InvalidColdNameDetails;
+    }
 };
 
 pub const Names = struct {
     table: View,
     references: []const u8,
+    details: NameDetails = .{},
+    options: Options = .{},
+
+    pub const Options = struct {
+        include_tagged: bool = false,
+        deadline: io.Deadline = .none,
+    };
 
     pub fn count(self: Names) usize {
-        return self.references.len / @sizeOf(u32);
+        return self.references.len / @sizeOf(u32) + (if (self.options.include_tagged) self.details.tagged.len else 0);
     }
 
     pub fn at(self: Names, i: usize) !Name {
         if (i >= self.count()) return error.InvalidNameIndex;
-        return self.table.name(readInt(u32, self.references, i * @sizeOf(u32)));
+        const ordinary = self.references.len / @sizeOf(u32);
+        var result: Name = if (i < ordinary)
+            try self.table.name(readInt(u32, self.references, i * @sizeOf(u32)))
+        else tagged: {
+            const tag = self.details.tagged[i - ordinary];
+            var name = try self.table.name(tag.text_ref);
+            name.tagged = tag.attr.kind;
+            break :tagged name;
+        };
+        if (try self.preferred(i)) |entry| {
+            result.language = entry.attr.language;
+            if (entry.attr.alphabet != .none) result.pronunciation = .{
+                .alphabet = entry.attr.alphabet,
+                .text = (try self.table.name(entry.text_ref)).text,
+            };
+        }
+        return result;
+    }
+
+    fn preferred(self: Names, i: usize) !?linguistics.Entry {
+        const rows = self.details.linguistic;
+        var low: usize = 0;
+        var high = rows.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            if (rows[mid].attr.name_index < i) low = mid + 1 else high = mid;
+        }
+        var best: ?linguistics.Entry = null;
+        for (rows[low..], 0..) |entry, step| {
+            if (entry.attr.name_index != i) break;
+            if (step % 256 == 0 and self.options.deadline.expired()) return error.DeadlineExceeded;
+            if (best == null or entry.replaces(best.?)) best = entry;
+        }
+        return best;
     }
 };
 
@@ -209,6 +290,7 @@ pub const Record = struct {
     encoded: []const u8,
     references: []const u8,
     reverse_references: ?[]const u8 = null,
+    name_details: []const u8 = &.{},
     indoor: Indoor,
     access_limits: []align(1) const access_restriction.Entry = &.{},
 
@@ -223,6 +305,7 @@ pub const Record = struct {
         const end = @as(usize, header.shape_bytes) + ref_bytes;
         const trailer = data[end..];
         var reverse_references: ?[]const u8 = null;
+        var name_details: []const u8 = &.{};
         var access_limits: []align(1) const access_restriction.Entry = &.{};
         const indoor: Indoor = if (trailer.len == 0) .{} else blk: {
             if (trailer.len < @sizeOf(IndoorHeader)) return error.InvalidColdIndoorData;
@@ -236,10 +319,18 @@ pub const Record = struct {
                 const rev = std.mem.bytesToValue(ReverseHeader, extra[0..@sizeOf(ReverseHeader)]).attr;
                 const refs_end = @sizeOf(ReverseHeader) + @as(usize, rev.name_count) * @sizeOf(u32);
                 if (rev.reserved != 0 or refs_end > extra.len or
-                    (rev.inherit_names and (!rev.restrictions or rev.name_count != 0)))
+                    (rev.inherit_names and ((!rev.restrictions and !rev.name_details) or rev.name_count != 0)))
                     return error.InvalidColdReverseNames;
                 if (!rev.inherit_names) reverse_references = extra[@sizeOf(ReverseHeader)..refs_end];
-                const limit_bytes = extra[refs_end..];
+                var limit_bytes = extra[refs_end..];
+                if (rev.name_details) {
+                    if (limit_bytes.len < @sizeOf(u32)) return error.InvalidColdNameDetails;
+                    const details_len = readInt(u32, limit_bytes, 0);
+                    limit_bytes = limit_bytes[@sizeOf(u32)..];
+                    if (details_len < @sizeOf(NameDetailsHeader) or details_len > limit_bytes.len) return error.InvalidColdNameDetails;
+                    name_details = limit_bytes[0..details_len];
+                    limit_bytes = limit_bytes[details_len..];
+                }
                 if (rev.restrictions) {
                     const size_of_entry = @sizeOf(access_restriction.Entry);
                     if (limit_bytes.len == 0 or limit_bytes.len % size_of_entry != 0) return error.InvalidColdAccessLimits;
@@ -258,6 +349,7 @@ pub const Record = struct {
             .encoded = data[0..header.shape_bytes],
             .references = data[header.shape_bytes..end],
             .reverse_references = reverse_references,
+            .name_details = name_details,
             .indoor = indoor,
             .access_limits = access_limits,
         };
@@ -275,8 +367,14 @@ pub const Record = struct {
         return self.header.attributes.mean_elevation;
     }
 
-    pub fn names(self: Record, table: View) Names {
-        return .{ .table = table, .references = if (self.reverse) self.reverse_references orelse self.references else self.references };
+    pub fn names(self: Record, table: View, options: Names.Options) !Names {
+        const references = if (self.reverse) self.reverse_references orelse self.references else self.references;
+        return .{
+            .table = table,
+            .references = references,
+            .details = try readNameDetails(self.name_details, references.len / @sizeOf(u32), self.reverse, options.deadline),
+            .options = options,
+        };
     }
 
     pub const Limits = struct {
@@ -334,9 +432,57 @@ pub fn appendDirectionalRecord(out: *std.ArrayList(u8), allocator: Allocator, wa
 
 pub const Trailer = struct {
     reverse_refs: ?[]const u32 = null,
+    name_details: NameDetails = .{},
+    reverse_name_details: ?NameDetails = null,
     indoor: Indoor = .{},
     access_limits: []const access_restriction.Entry = &.{},
 };
+
+fn readNameDetails(bytes: []const u8, names: usize, reverse: bool, deadline: io.Deadline) !NameDetails {
+    if (bytes.len == 0) return .{};
+    if (bytes.len < @sizeOf(NameDetailsHeader)) return error.InvalidColdNameDetails;
+    const header = std.mem.bytesToValue(NameDetailsHeader, bytes[0..@sizeOf(NameDetailsHeader)]);
+    if (header.tagged.reserved != 0 or (!header.tagged.separate_reverse and
+        (header.tagged.reverse != 0 or header.linguistic.reverse != 0))) return error.InvalidColdNameDetails;
+    var remaining = bytes[@sizeOf(NameDetailsHeader)..];
+    const forward: NameDetails = .{
+        .linguistic = try detailRecords(linguistics.Entry, header.linguistic.forward, &remaining),
+        .tagged = try detailRecords(linguistics.Tagged, header.tagged.forward, &remaining),
+    };
+    const backward: NameDetails = .{
+        .linguistic = try detailRecords(linguistics.Entry, header.linguistic.reverse, &remaining),
+        .tagged = try detailRecords(linguistics.Tagged, header.tagged.reverse, &remaining),
+    };
+    if (remaining.len != 0) return error.InvalidColdNameDetails;
+    const result = if (reverse and header.tagged.separate_reverse) backward else forward;
+    try result.validate(names, deadline);
+    return result;
+}
+
+fn detailRecords(comptime T: type, count: usize, remaining: *[]const u8) ![]align(1) const T {
+    const size = count * @sizeOf(T);
+    if (size > remaining.*.len) return error.InvalidColdNameDetails;
+    const records = std.mem.bytesAsSlice(T, remaining.*[0..size]);
+    remaining.* = remaining.*[size..];
+    return records;
+}
+
+noinline fn appendNameDetails(out: *std.ArrayList(u8), allocator: Allocator, forward: NameDetails, reverse: ?NameDetails) !void {
+    const backward = reverse orelse NameDetails{};
+    const header: NameDetailsHeader = .{
+        .linguistic = .{ .forward = @intCast(forward.linguistic.len), .reverse = @intCast(backward.linguistic.len) },
+        .tagged = .{ .forward = @intCast(forward.tagged.len), .reverse = @intCast(backward.tagged.len), .separate_reverse = reverse != null },
+    };
+    const size: u32 = @intCast(@sizeOf(NameDetailsHeader) +
+        (forward.linguistic.len + backward.linguistic.len) * @sizeOf(linguistics.Entry) +
+        (forward.tagged.len + backward.tagged.len) * @sizeOf(linguistics.Tagged));
+    try out.appendSlice(allocator, std.mem.asBytes(&size));
+    try out.appendSlice(allocator, std.mem.asBytes(&header));
+    for ([_]NameDetails{ forward, backward }) |details| {
+        try out.appendSlice(allocator, std.mem.sliceAsBytes(details.linguistic));
+        try out.appendSlice(allocator, std.mem.sliceAsBytes(details.tagged));
+    }
+}
 
 pub fn appendFullRecord(out: *std.ArrayList(u8), allocator: Allocator, way_id: u64, speed_limit: u8, mean_elevation: i16, vertices: []const point.FixedLL, refs: []const u32, trailer: Trailer, deadline: io.Deadline) !void {
     if (vertices.len < 2) return error.IncompleteShape;
@@ -346,6 +492,12 @@ pub fn appendFullRecord(out: *std.ArrayList(u8), allocator: Allocator, way_id: u
     }
     const point_count = std.math.cast(u32, vertices.len) orelse return error.ShapeTooLarge;
     const name_count = std.math.cast(u8, refs.len) orelse return error.TooManyEdgeNames;
+    const reverse_count = std.math.cast(u8, (trailer.reverse_refs orelse refs).len) orelse return error.TooManyEdgeNames;
+    const has_details = !trailer.name_details.empty() or trailer.reverse_name_details != null;
+    if (has_details) {
+        try trailer.name_details.validate(name_count, deadline);
+        try (trailer.reverse_name_details orelse trailer.name_details).validate(reverse_count, deadline);
+    }
     const start = out.items.len;
     errdefer out.shrinkRetainingCapacity(start);
     try out.appendNTimes(allocator, 0, @sizeOf(RecordHeader));
@@ -360,7 +512,7 @@ pub fn appendFullRecord(out: *std.ArrayList(u8), allocator: Allocator, way_id: u
     try out.appendSlice(allocator, std.mem.sliceAsBytes(refs));
     const indoor = trailer.indoor;
     const has_limits = trailer.access_limits.len != 0;
-    const has_reverse_header = trailer.reverse_refs != null or has_limits;
+    const has_reverse_header = trailer.reverse_refs != null or has_limits or has_details;
     if (indoor.layer != 0 or indoor.levels.len != 0 or has_reverse_header) {
         const count = std.math.cast(u24, indoor.levels.len) orelse return error.TooManyLevels;
         const indoor_header: IndoorHeader = .{ .attributes = .{ .layer = indoor.layer, .count = count } };
@@ -374,11 +526,13 @@ pub fn appendFullRecord(out: *std.ArrayList(u8), allocator: Allocator, way_id: u
         const names = trailer.reverse_refs orelse &.{};
         const reverse_header: ReverseHeader = .{ .attr = .{
             .name_count = std.math.cast(u8, names.len) orelse return error.TooManyEdgeNames,
+            .name_details = has_details,
             .inherit_names = trailer.reverse_refs == null,
             .restrictions = has_limits,
         } };
         try out.appendSlice(allocator, std.mem.asBytes(&reverse_header));
         try out.appendSlice(allocator, std.mem.sliceAsBytes(names));
+        if (has_details) try appendNameDetails(out, allocator, trailer.name_details, trailer.reverse_name_details);
         try out.appendSlice(allocator, std.mem.sliceAsBytes(trailer.access_limits));
     }
     const header: RecordHeader = .{
@@ -406,7 +560,10 @@ test "cold record preserves an E7 shape over 64 KiB and 255 name references" {
     const refs: [max_names]u32 = @splat(0);
     try testing.expectError(error.DeadlineExceeded, appendRecord(&bytes, arena, 0, 0, no_elevation, vertices, &.{}, .{}, .{ .at_ns = 0 }));
     try testing.expectEqual(0, bytes.items.len);
-    try appendRecord(&bytes, arena, 0x0123_4567_89ab_cdef, 255, no_elevation, vertices, &refs, .{}, .none);
+    const last: linguistics.Entry = .{ .attr = .{ .name_index = 254, .language = .fr } };
+    try appendFullRecord(&bytes, arena, 0x0123_4567_89ab_cdef, 255, no_elevation, vertices, &refs, .{
+        .name_details = .{ .linguistic = &.{last} },
+    }, .none);
     const forward = try Record.parse(bytes.items, false, .none);
     const backward = try Record.parse(bytes.items, true, .none);
     try testing.expect(forward.encoded.len > std.math.maxInt(u16));
@@ -414,6 +571,18 @@ test "cold record preserves an E7 shape over 64 KiB and 255 name references" {
     try testing.expectEqual(255, forward.speedLimit());
     try testing.expectEqual(no_elevation, forward.meanElevation());
     try testing.expectEqual(max_names, forward.header.attributes.name_count);
+    const table: View = .{
+        .bytes = "\x00\x00\x00\x00\x00\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00Road",
+        .header = .{ .record_count = 0, .name_count = 1, .names_offset = 0 },
+        .chunks_start = 0,
+        .names_start = 0,
+        .strings_start = 16,
+    };
+    const names = try forward.names(table, .{});
+    try testing.expectEqual(max_names, names.count());
+    try testing.expectEqual(linguistics.Language.none, (try names.at(0)).language);
+    try testing.expectEqual(linguistics.Language.fr, (try names.at(254)).language);
+    try testing.expectError(error.InvalidNameIndex, names.at(255));
     const decoded = try forward.shape(arena, .none);
     defer arena.free(decoded);
     try testing.expectEqualSlices(point.FixedLL, vertices, decoded);
@@ -451,6 +620,81 @@ test "motor limits share a cold record with independent reverse names" {
     try testing.expectError(error.InvalidColdAccessLimits, Record.parse(bytes.items[0 .. bytes.items.len - 1], false, .none));
     bytes.items[bytes.items.len - 1] = 0x80;
     try testing.expectError(error.InvalidColdAccessLimits, Record.parse(bytes.items, false, .none));
+}
+
+// Ported from the tagged and linguistic records in test/edgeinfo.cc.
+// Ported from test/edgeinfo.cc TaggedValueSize tests. Each native tagged
+// value borrows its exact byte range from the shared string table.
+test "directional cold names retain languages, phonemes and tagged values" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    const vertices: [2]point.FixedLL = .{ .{ .lat = 3, .lng = 4 }, .{ .lat = 5, .lng = 6 } };
+    const offsets = [_]u64{ 0, 5, 8, 11, 17, 21, 22, 28, 31, 32 };
+    const text = "NorthipaSAMTunnelZuid\x01Bridge1.5G";
+    var table_bytes: [@sizeOf(@TypeOf(offsets)) + text.len]u8 = undefined;
+    @memcpy(table_bytes[0..@sizeOf(@TypeOf(offsets))], std.mem.asBytes(&offsets));
+    @memcpy(table_bytes[@sizeOf(@TypeOf(offsets))..], text);
+    const table: View = .{
+        .bytes = &table_bytes,
+        .header = .{ .record_count = 0, .name_count = offsets.len - 1, .names_offset = 0 },
+        .chunks_start = 0,
+        .names_start = 0,
+        .strings_start = @sizeOf(@TypeOf(offsets)),
+    };
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    try appendFullRecord(&bytes, a, 7, 80, no_elevation, &vertices, &.{nameRef(0, true)}, .{
+        .reverse_refs = &.{nameRef(4, false)},
+        .indoor = .{ .layer = 1, .levels = &.{.init(2, 4)} },
+        .name_details = .{
+            .linguistic = &.{
+                .{ .text_ref = 1, .attr = .{ .name_index = 0, .language = .en, .alphabet = .ipa } },
+                .{ .text_ref = 2, .attr = .{ .name_index = 0, .language = .en, .alphabet = .nt_sampa } },
+                .{ .attr = .{ .name_index = 1, .language = .en } },
+            },
+            .tagged = &.{
+                .{ .text_ref = 3, .attr = .{ .kind = .tunnel } },
+                .{ .text_ref = 5, .attr = .{ .kind = .layer } },
+                .{ .text_ref = 6, .attr = .{ .kind = .bridge } },
+                .{ .text_ref = 7, .attr = .{ .kind = .level } },
+                .{ .text_ref = 8, .attr = .{ .kind = .level_ref } },
+            },
+        },
+        .reverse_name_details = .{ .linguistic = &.{.{ .attr = .{ .name_index = 0, .language = .nl } }} },
+        .access_limits = &.{.{ .value = 380, .attr = .{ .kind = .maxheight, .direction = .both } }},
+    }, .none);
+    const forward = try Record.parse(bytes.items, false, .none);
+    const ordinary = try forward.names(table, .{});
+    try testing.expectEqual(1, ordinary.count());
+    const name = try ordinary.at(0);
+    try testing.expectEqualStrings("North", name.text);
+    try testing.expect(name.route);
+    try testing.expectEqual(linguistics.Language.en, name.language);
+    try testing.expectEqual(linguistics.Alphabet.nt_sampa, name.pronunciation.?.alphabet);
+    try testing.expectEqualStrings("SAM", name.pronunciation.?.text);
+    const all = try forward.names(table, .{ .include_tagged = true });
+    try testing.expectEqual(6, all.count());
+    const tunnel = try all.at(1);
+    try testing.expectEqual(linguistics.Tag.tunnel, tunnel.tagged.?);
+    try testing.expectEqualStrings("Tunnel", tunnel.text);
+    try testing.expect(!tunnel.route);
+    try testing.expectEqual(linguistics.Language.en, tunnel.language);
+    try testing.expectEqualStrings("\x01", (try all.at(2)).text);
+    try testing.expectEqual(linguistics.Tag.bridge, (try all.at(3)).tagged.?);
+    try testing.expectEqualStrings("Bridge", (try all.at(3)).text);
+    try testing.expectEqual(linguistics.Tag.level, (try all.at(4)).tagged.?);
+    try testing.expectEqualStrings("1.5", (try all.at(4)).text);
+    try testing.expectEqual(linguistics.Tag.level_ref, (try all.at(5)).tagged.?);
+    try testing.expectEqualStrings("G", (try all.at(5)).text);
+    try testing.expect(try forward.indoor.includes(3, .none));
+    try testing.expectEqual(1, forward.access_limits.len);
+    const backward = try (try Record.parse(bytes.items, true, .none)).names(table, .{ .include_tagged = true });
+    try testing.expectEqual(1, backward.count());
+    const reversed = try backward.at(0);
+    try testing.expectEqualStrings("Zuid", reversed.text);
+    try testing.expectEqual(linguistics.Language.nl, reversed.language);
+    try testing.expectEqual(null, reversed.pronunciation);
+    try testing.expectError(error.InvalidColdNameDetails, readNameDetails(forward.name_details[0 .. forward.name_details.len - 1], 1, false, .none));
 }
 
 test "cold directory locates the last record in a full chunk and the following chunk" {

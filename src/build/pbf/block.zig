@@ -31,7 +31,7 @@ pub const Scratch = struct {
         self.* = .{};
     }
 
-    pub fn decode(self: *Scratch, gpa: std.mem.Allocator, bytes: []const u8, deadline: Deadline) (Error || std.mem.Allocator.Error)!Block {
+    pub noinline fn decode(self: *Scratch, gpa: std.mem.Allocator, bytes: []const u8, deadline: Deadline) (Error || std.mem.Allocator.Error)!Block {
         self.strings.clearRetainingCapacity();
         const view = try schema.PrimitiveBlock.decode(bytes, deadline);
         const table = try view.get("stringtable", deadline);
@@ -149,7 +149,7 @@ pub const TagIterator = struct {
         };
     }
 
-    pub fn next(self: *TagIterator) Error!?osm.Tag {
+    pub noinline fn next(self: *TagIterator) Error!?osm.Tag {
         try check(self.deadline);
         return switch (self.fields) {
             .separate => |*fields| blk: {
@@ -194,7 +194,7 @@ pub const MemberIterator = struct {
     deadline: Deadline,
     previous: i64 = 0,
 
-    pub fn next(self: *MemberIterator) Error!?osm.Member {
+    pub noinline fn next(self: *MemberIterator) Error!?osm.Member {
         try check(self.deadline);
         const delta = try self.deltas.next(self.deadline);
         const role = try self.roles.next(self.deadline);
@@ -300,7 +300,7 @@ fn PrimitiveIterator(comptime kind: osm.Kind) type {
             };
         }
 
-        pub fn next(self: *Self) Error!?Item {
+        pub noinline fn next(self: *Self) Error!?Item {
             const block = self.block;
             const deadline = block.deadline;
             while (true) {

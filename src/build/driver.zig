@@ -30,6 +30,8 @@ pub const Options = struct {
     infer_internal_intersections: ?bool = null,
     apply_country_overrides: ?bool = null,
     use_admin_db: ?bool = null,
+    allow_alt_name: ?bool = null,
+    use_direction_on_ways: ?bool = null,
     drive_side: ?@import("edge_class.zig").DriveSide = null,
     order: ?graph.format.OrderingKind = null,
     workers: usize = 0,
@@ -76,15 +78,27 @@ const Inputs = struct {
     infer_internal_intersections: bool = true,
     apply_country_overrides: bool = true,
     use_admin_db: bool = true,
+    allow_alt_name: bool = false,
+    use_direction_on_ways: bool = false,
     drive_side: ?@import("edge_class.zig").DriveSide = null,
     order: graph.format.OrderingKind,
 
-    fn identity(self: Inputs) graph.format.DatasetUuid {
+    noinline fn identity(self: *const Inputs) graph.format.DatasetUuid {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        // The build retains lane tags and connectivity across checkpoints.
-        hash.update("zr-build-v6");
-        hash.update(&.{ @intFromBool(self.dem_dir != null), if (self.drive_side) |side| @as(u8, @backingInt(side)) else 2 });
-        hash.update(@tagName(self.order));
+        // The build retains edge linguistics and tagged values across checkpoints.
+        hash.update("zr-build-v7");
+        hash.update(&.{
+            @intFromBool(self.dem_dir != null),
+            if (self.drive_side) |side| @as(u8, @backingInt(side)) else 2,
+            @intCast(@backingInt(self.order)),
+            @intFromBool(self.reclassify_links),
+            @intFromBool(self.infer_turn_channels),
+            @intFromBool(self.infer_internal_intersections),
+            @intFromBool(self.apply_country_overrides),
+            @intFromBool(self.use_admin_db),
+            @intFromBool(self.allow_alt_name),
+            @intFromBool(self.use_direction_on_ways),
+        });
         if (self.dem_digest) |digest| {
             hash.update("dem-bytes-v1");
             hash.update(&digest);
@@ -103,11 +117,6 @@ const Inputs = struct {
             hash.update(std.mem.asBytes(&input.boundaries.digest));
             hash.update(std.mem.asBytes(&input.rules.digest));
         }
-        if (!self.reclassify_links) hash.update("link-reclassification-off");
-        if (!self.infer_turn_channels) hash.update("turn-channels-off");
-        if (!self.infer_internal_intersections) hash.update("internal-intersections-off");
-        if (!self.apply_country_overrides) hash.update("country-overrides-off");
-        if (!self.use_admin_db) hash.update("admin-lookup-off");
         for (self.sources) |source| {
             hash.update(std.mem.asBytes(&source.digest.bytes));
             hash.update(std.mem.asBytes(&source.digest.xxh3));
@@ -149,6 +158,8 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
         .infer_internal_intersections = options.infer_internal_intersections orelse true,
         .apply_country_overrides = options.apply_country_overrides orelse true,
         .use_admin_db = options.use_admin_db orelse true,
+        .allow_alt_name = options.allow_alt_name orelse false,
+        .use_direction_on_ways = options.use_direction_on_ways orelse false,
         .drive_side = options.drive_side,
         .order = options.order orelse .hilbert,
     };
@@ -222,6 +233,8 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
         .infer_internal_intersections = inputs.infer_internal_intersections,
         .apply_country_overrides = inputs.apply_country_overrides,
         .use_admin_db = inputs.use_admin_db,
+        .allow_alt_name = inputs.allow_alt_name,
+        .use_direction_on_ways = inputs.use_direction_on_ways,
         .timezone_source = if (timezone_mappings) |mapped| .{ .boundaries = mapped.boundaries.bytes, .rules = mapped.rules.bytes } else null,
     };
     if (session.runs(.read)) {
@@ -263,13 +276,13 @@ noinline fn runAssembly(session: *checkpoint.Session, metadata: *assemble.Metada
     const source_stats = try prior.readJson(edges.Stats, gpa, .source_stats, deadline);
     defer source_stats.deinit();
     if (@backingInt(session.from) > @backingInt(Stage.edges)) {
-        try metadata.loadWays(prior);
+        try metadata.loadWays(&prior);
         const nodes = try session.open(.node_store);
         defer nodes.close();
         if (session.runs(.order)) {
-            try metadata.loadNodes(nodes);
+            try metadata.loadNodes(&nodes);
         } else {
-            try metadata.loadNodeSigns(nodes);
+            try metadata.loadNodeSigns(&nodes);
         }
     }
     const edge_file = try prior.read(.segments, deadline);
@@ -278,7 +291,7 @@ noinline fn runAssembly(session: *checkpoint.Session, metadata: *assemble.Metada
     defer shape_file.close();
     const tagged = try session.open(.tags);
     defer tagged.close();
-    if (session.runs(.enhance) and !session.runs(.tags)) try metadata.lanes.loadLinks(tagged);
+    if (session.runs(.enhance) and !session.runs(.tags)) try metadata.lanes.loadLinks(&tagged);
     var admin_mapping: ?io.Mapping = null;
     defer if (admin_mapping) |mapped| mapped.unmap();
     var assembly_options = graph_options;
@@ -424,6 +437,8 @@ fn checkOptions(a: Allocator, inputs: *Inputs, options: Options, diagnostic: *Di
     if (options.infer_internal_intersections) |infer| if (infer != inputs.infer_internal_intersections) return error.CheckpointInputMismatch;
     if (options.apply_country_overrides) |apply| if (apply != inputs.apply_country_overrides) return error.CheckpointInputMismatch;
     if (options.use_admin_db) |use_admin_db| if (use_admin_db != inputs.use_admin_db) return error.CheckpointInputMismatch;
+    if (options.allow_alt_name) |allow| if (allow != inputs.allow_alt_name) return error.CheckpointInputMismatch;
+    if (options.use_direction_on_ways) |use| if (use != inputs.use_direction_on_ways) return error.CheckpointInputMismatch;
     if (options.timezone_geojson) |path| {
         const expected = if (inputs.timezones) |input| input.boundaries else return error.CheckpointInputMismatch;
         const actual = try fingerprintFile(path, options.deadline, diagnostic);
@@ -510,10 +525,10 @@ fn buildSegments(session: *checkpoint.Session, metadata: *assemble.Metadata, inp
     } else {
         const tags = try session.open(.tags);
         defer tags.close();
-        try prep.loadTags(tags);
+        try prep.loadTags(&tags);
         if (session.runs(.node_store)) {
-            try prep.loadCuts(tags);
-            try edges.loadUsage(&referenced, tags, session.path, .usage_directory, .usage_leaves, deadline);
+            try prep.loadCuts(&tags);
+            try edges.loadUsage(&referenced, &tags, session.path, .usage_directory, .usage_leaves, deadline);
             have_referenced = true;
         }
     }
@@ -533,9 +548,9 @@ fn buildSegments(session: *checkpoint.Session, metadata: *assemble.Metadata, inp
     } else {
         const nodes = try session.open(.node_store);
         defer nodes.close();
-        try prep.loadCuts(nodes);
-        try prep.loadNodes(nodes);
-        try metadata.loadNodes(nodes);
+        try prep.loadCuts(&nodes);
+        try prep.loadNodes(&nodes);
+        try metadata.loadNodes(&nodes);
     }
     if (session.endsAt(.node_store)) return;
 
@@ -569,7 +584,7 @@ fn validate(session: *checkpoint.Session) !void {
     const start = io.Timer.start();
     var tx = try session.begin(.validate);
     defer tx.deinit();
-    var writer = try assemble.stageWriter(session.*, tx);
+    var writer = try assemble.stageWriter(session, &tx);
     defer writer.deinit();
     for ([_]Stage{ .enhance, .cold, .spatial }) |stage| {
         const saved = try session.open(stage);

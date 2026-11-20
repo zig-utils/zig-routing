@@ -4020,6 +4020,85 @@ test "regional registry snaps and routes in one bundle and rejects cross-bundle 
     try testing.expectError(error.DeadlineExceeded, registry.snap(&arena, &locations[0], defaults, cost, .{ .at_ns = 0 }));
 }
 
+test "Gurka multilingual direction names and phonemes share the cold string table" {
+    const linguistic = graph.linguistics;
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const fixture = try @import("examples.zig").streetLinguistics(storage.allocator());
+    var built = try Built.assemble(fixture.osm, 2);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    try view.verify(.none, null);
+    const ab = try directedBetween(view, &fixture, "A", "B");
+    const bc = try directedBetween(view, &fixture, "B", "C");
+    const bd = try directedBetween(view, &fixture, "B", "D");
+    for ([_]format.EdgeId{ ab, try view.oppEdge(ab) }) |edge| {
+        const bilingual = try view.names(edge);
+        try testing.expectEqual(2, bilingual.count());
+        const fr = try bilingual.at(0);
+        const nl = try bilingual.at(1);
+        try testing.expectEqualStrings("Rive droite", fr.text);
+        try testing.expectEqual(linguistic.Language.fr, fr.language);
+        try testing.expectEqualStrings("riv dʁwat", fr.pronunciation.?.text);
+        try testing.expectEqualStrings("Rechteroever", nl.text);
+        try testing.expectEqual(linguistic.Language.nl, nl.language);
+        try testing.expectEqual(linguistic.Alphabet.nt_sampa, nl.pronunciation.?.alphabet);
+        try testing.expectEqualStrings("rExt@ruv@r", nl.pronunciation.?.text);
+    }
+    const east = try (try view.names(bc)).at(0);
+    const west = try (try view.names(try view.oppEdge(bc))).at(0);
+    try testing.expectEqualStrings("Place Est", east.text);
+    try testing.expectEqual(linguistic.Language.fr, east.language);
+    try testing.expectEqualStrings("plas ɛst", east.pronunciation.?.text);
+    try testing.expectEqualStrings("Westplein", west.text);
+    try testing.expectEqual(linguistic.Language.nl, west.language);
+    try testing.expectEqualStrings("ʋɛstplɛin", west.pronunciation.?.text);
+
+    const ce = try directedBetween(view, &fixture, "C", "E");
+    for ([_]struct {
+        edge: format.EdgeId,
+        name: []const u8,
+        language: linguistic.Language,
+        ref: []const u8,
+        phoneme: []const u8,
+    }{
+        .{ .edge = ce, .name = "Rue Orient", .language = .fr, .ref = "R 12", .phoneme = "ɛʁ duz" },
+        .{ .edge = try view.oppEdge(ce), .name = "Weststraat", .language = .nl, .ref = "R 13", .phoneme = "ɛr dɛrtin" },
+    }) |expected| {
+        const names = try view.names(expected.edge);
+        try testing.expectEqual(2, names.count());
+        const name = try names.at(0);
+        try testing.expectEqualStrings(expected.name, name.text);
+        try testing.expectEqual(expected.language, name.language);
+        try testing.expectEqual(null, name.pronunciation);
+        const ref = try names.at(1);
+        try testing.expect(ref.route);
+        try testing.expectEqualStrings(expected.ref, ref.text);
+        try testing.expectEqual(linguistic.Alphabet.ipa, ref.pronunciation.?.alphabet);
+        try testing.expectEqualStrings(expected.phoneme, ref.pronunciation.?.text);
+    }
+
+    try testing.expectEqual(2, (try view.names(bd)).count());
+    const tags = try view.namesWithOptions(bd, .{ .include_tagged = true });
+    try testing.expectEqual(8, tags.count());
+    try testing.expectEqualStrings("BD", (try tags.at(0)).text);
+    const ref = try tags.at(1);
+    try testing.expect(ref.route);
+    try testing.expectEqualStrings("N 1", ref.text);
+    const first_tunnel = try tags.at(2);
+    try testing.expectEqual(linguistic.Tag.tunnel, first_tunnel.tagged.?);
+    try testing.expectEqualStrings("Tunnel du Pont", first_tunnel.text);
+    try testing.expectEqualStrings("tynɛl dy pɔ̃", first_tunnel.pronunciation.?.text);
+    try testing.expectEqualStrings("Brug Tunnel", (try tags.at(3)).text);
+    try testing.expectEqual(linguistic.Tag.layer, (try tags.at(4)).tagged.?);
+    try testing.expectEqualStrings("\xfe", (try tags.at(4)).text);
+    try testing.expectEqual(linguistic.Tag.levels, (try tags.at(5)).tagged.?);
+    try testing.expectEqualStrings("\x0e\x02\x00\x28\xfe\xff\x7f\x46", (try tags.at(5)).text);
+    try testing.expectEqual(linguistic.Tag.level_ref, (try tags.at(6)).tagged.?);
+    try testing.expectEqualStrings("B2", (try tags.at(6)).text);
+    try testing.expectEqualStrings("G", (try tags.at(7)).text);
+}
+
 test "Gurka lane masks follow directed tags and keep connectivity on each target edge" {
     const lanes = graph.lanes;
     var storage: std.heap.ArenaAllocator = .init(testing.allocator);

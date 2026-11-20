@@ -116,7 +116,7 @@ pub const Catalog = struct {
         try file.sync();
     }
 
-    pub fn loadWays(self: *Catalog, gpa: Allocator, saved: checkpoint.Existing, strings: *const tags.names.StringTable, deadline: io.Deadline) !void {
+    pub fn loadWays(self: *Catalog, gpa: Allocator, saved: *const checkpoint.Existing, strings: *const tags.names.StringTable, deadline: io.Deadline) !void {
         if (saved.manifest.files.get(.way_signs) == null) return;
         const mapping = try saved.map(.way_signs, deadline);
         defer mapping.unmap();
@@ -153,7 +153,7 @@ pub const Catalog = struct {
         try file.sync();
     }
 
-    pub fn loadNodes(self: *Catalog, gpa: Allocator, saved: checkpoint.Existing, deadline: io.Deadline) !void {
+    pub fn loadNodes(self: *Catalog, gpa: Allocator, saved: *const checkpoint.Existing, deadline: io.Deadline) !void {
         if (saved.manifest.files.get(.node_signs) == null) return;
         const mapping = try saved.map(.node_signs, deadline);
         defer mapping.unmap();

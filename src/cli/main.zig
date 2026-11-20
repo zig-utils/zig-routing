@@ -16,13 +16,30 @@ const Command = cli.BaseCommand;
 const Context = Command.ParseContext;
 const Allocator = std.mem.Allocator;
 
+const cpu_features = features: {
+    const arch_features = builtin.cpu.arch.allFeaturesList();
+    var names: [arch_features.len][]const u8 = undefined;
+    var count: usize = 0;
+    for (arch_features) |feature| {
+        if (!builtin.cpu.features.isEnabled(feature.index)) continue;
+        names[count] = feature.name;
+        count += 1;
+    }
+    break :features names[0..count].*;
+};
+const version_details = details: {
+    var features: []const u8 = "";
+    for (cpu_features, 0..) |name, i| features = features ++ (if (i == 0) "" else ", ") ++ name;
+    break :details std.fmt.comptimePrint("commit {s}\nzig {s}\ncpu {s}\nfeatures {s}\n", .{
+        build_options.commit, builtin.zig_version_string, @tagName(builtin.cpu.arch), features,
+    });
+};
+
 const App = struct {
     arena: Allocator,
     env: *const std.process.Environ.Map,
     stderr: *io.Writer,
     log_level: std.log.Level = .info,
-    features: []const []const u8,
-    version_details: []const u8,
 
     fn from(ctx: *Context) *App {
         return @ptrCast(@alignCast(ctx.user_data.?));
@@ -54,28 +71,17 @@ pub fn main(init: std.process.Init) !u8 {
     var err_buf: [4096]u8 = undefined;
     var stdout = io.stdoutWriter(init.io, &out_buf);
     var stderr = io.stderrWriter(init.io, &err_buf);
-    var features: std.ArrayList([]const u8) = .empty;
-    for (builtin.cpu.arch.allFeaturesList()) |feature| {
-        if (builtin.cpu.features.isEnabled(feature.index)) try features.append(a, feature.name);
-    }
     var app: App = .{
         .arena = a,
         .env = init.environ_map,
         .stderr = &stderr.interface,
-        .features = features.items,
-        .version_details = try std.fmt.allocPrint(a, "commit {s}\nzig {s}\ncpu {s}\nfeatures {s}\n", .{
-            build_options.commit,
-            builtin.zig_version_string,
-            @tagName(builtin.cpu.arch),
-            try std.mem.join(a, ", ", features.items),
-        }),
     };
     const root = try createCommands(a);
     return cli.run(a, root, if (args.items.len == 0) &.{"--help"} else args.items, .{
         .stdout = &stdout.interface,
         .stderr = &stderr.interface,
         .version = routing.version,
-        .version_details = app.version_details,
+        .version_details = version_details,
         .user_data = &app,
     });
 }
@@ -211,17 +217,16 @@ fn duration(ctx: *Context, comptime name: []const u8) !?u64 {
 }
 
 fn version(ctx: *Context) !u8 {
-    const app = App.from(ctx);
     if (ctx.wantsJson()) {
         try ctx.writeJson(.{
             .version = routing.version,
             .commit = build_options.commit,
             .zig = builtin.zig_version_string,
             .cpu = @tagName(builtin.cpu.arch),
-            .features = app.features,
+            .features = &cpu_features,
         });
     } else {
-        try ctx.out.?.print("zr {s}\n{s}", .{ routing.version, app.version_details });
+        try ctx.out.?.print("zr {s}\n{s}", .{ routing.version, version_details });
     }
     return 0;
 }
@@ -462,6 +467,8 @@ fn buildGraph(ctx: *Context) !u8 {
         .infer_internal_intersections = loaded.config.mjolnir.data_processing.infer_internal_intersections,
         .apply_country_overrides = loaded.config.mjolnir.data_processing.apply_country_overrides,
         .use_admin_db = loaded.config.mjolnir.data_processing.use_admin_db,
+        .allow_alt_name = loaded.config.mjolnir.data_processing.allow_alt_name,
+        .use_direction_on_ways = loaded.config.mjolnir.data_processing.use_direction_on_ways,
         .drive_side = side,
         .order = order,
         .workers = (try unsigned(ctx, usize, "threads")) orelse settings.threads orelse configured.threads,

@@ -170,7 +170,7 @@ pub const Catalog = struct {
         try tx.writeArray(rows, .way_lanes);
     }
 
-    pub fn loadWays(self: *Catalog, saved: checkpoint.Existing, strings: *const names.StringTable) !void {
+    pub fn loadWays(self: *Catalog, saved: *const checkpoint.Existing, strings: *const names.StringTable) !void {
         if (saved.manifest.files.get(.way_lanes) == null) return;
         const map = try saved.map(.way_lanes, self.deadline);
         defer map.unmap();
@@ -182,7 +182,7 @@ pub const Catalog = struct {
         }
     }
 
-    pub fn loadLinks(self: *Catalog, saved: checkpoint.Existing) !void {
+    pub fn loadLinks(self: *Catalog, saved: *const checkpoint.Existing) !void {
         if (saved.manifest.files.get(.lane_relations) == null) return;
         const map = try saved.map(.lane_relations, self.deadline);
         defer map.unmap();

@@ -100,7 +100,7 @@ pub const Reference = struct {
         segments: []align(1) const Segment,
     };
 
-    pub fn nextPath(self: *Reference) !Path {
+    pub noinline fn nextPath(self: *Reference) !Path {
         const count = try self.cursor.value(u32);
         if (count == 0) return error.InvalidReferencePath;
         const cost = try self.cursor.value(Cost);
@@ -114,7 +114,7 @@ pub const Score = struct {
     failures: u64 = 0,
     max_relative_error: f64 = 0,
 
-    pub fn compare(self: *Score, expected: Cost, actual: Cost, tolerance: f64) !bool {
+    pub noinline fn compare(self: *Score, expected: Cost, actual: Cost, tolerance: f64) !bool {
         if (!std.math.isFinite(expected.cost) or !std.math.isFinite(expected.secs)) return error.InvalidReferenceCost;
         const difference = @max(relative(expected.cost, actual.cost), relative(expected.secs, actual.secs));
         self.samples += 1;
@@ -244,24 +244,9 @@ fn checkProfile(comptime model: type, gpa: Allocator, view: *const View, referen
     var counts: Counts = .{};
     for (profile.calls, 0..) |sample, i| {
         if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
-        const from: EdgeId = @fromBackingInt(sample.incoming);
-        const to: EdgeId = @fromBackingInt(sample.outgoing);
-        const incoming = try view.edge(from);
-        const outgoing = try view.edge(to);
-        const node: graph.format.NodeId = @fromBackingInt(incoming.head);
-        const range = try view.outEdgeRange(node);
-        const row = try view.turnRow(node, incoming.cls.opp_local);
-        if (outgoing.cls.local >= row.len or range.first + outgoing.cls.local != sample.outgoing) return error.InvalidReferenceTurn;
-        const movement: search.Transition = .{
-            .node = node,
-            .incoming = from,
-            .incoming_edge = incoming,
-            .outgoing = to,
-            .outgoing_edge = outgoing,
-            .row = row[outgoing.cls.local],
-        };
+        const movement = try referenceTransition(view, sample);
         const previous: search.Label = .{ .edge = sample.incoming };
-        const traversal = try kernel.edgeCost(view, to, outgoing, .forward);
+        const traversal = try kernel.edgeCost(view, movement.outgoing, movement.outgoing_edge, .forward);
         const forward = try kernel.turnCost(view, movement, previous, .forward);
         const reverse = try kernel.turnCost(view, movement, previous, .reverse);
         if (!try counts.traversal.compare(sample.edge, traversal, call_limit)) try tupleDiagnostic(diagnostics, "edge", profile, reference.*, sample, sample.edge, traversal);
@@ -282,12 +267,35 @@ fn checkProfile(comptime model: type, gpa: Allocator, view: *const View, referen
             };
         }
         if (!try counts.recost.compare(path.expected, recost.elapsed, path_limit)) {
-            try diagnostics.print("recost {s}: expected {d}/{d}, got {d}/{d}, request {s}\n", .{
-                @tagName(profile.mode), path.expected.cost, path.expected.secs, recost.elapsed.cost, recost.elapsed.secs, path.request,
-            });
+            try recostDiagnostic(diagnostics, profile.mode, path, recost.elapsed);
         }
     }
     return counts;
+}
+
+noinline fn referenceTransition(view: *const View, sample: Case) !search.Transition {
+    const from: EdgeId = @fromBackingInt(sample.incoming);
+    const to: EdgeId = @fromBackingInt(sample.outgoing);
+    const incoming = try view.edge(from);
+    const outgoing = try view.edge(to);
+    const node: graph.format.NodeId = @fromBackingInt(incoming.head);
+    const range = try view.outEdgeRange(node);
+    const row = try view.turnRow(node, incoming.cls.opp_local);
+    if (outgoing.cls.local >= row.len or range.first + outgoing.cls.local != sample.outgoing) return error.InvalidReferenceTurn;
+    return .{
+        .node = node,
+        .incoming = from,
+        .incoming_edge = incoming,
+        .outgoing = to,
+        .outgoing_edge = outgoing,
+        .row = row[outgoing.cls.local],
+    };
+}
+
+noinline fn recostDiagnostic(out: *io.Writer, mode: Mode, path: Reference.Path, elapsed: Cost) !void {
+    try out.print("recost {s}: expected {d}/{d}, got {d}/{d}, request {s}\n", .{
+        @tagName(mode), path.expected.cost, path.expected.secs, elapsed.cost, elapsed.secs, path.request,
+    });
 }
 
 pub fn tupleDiagnostic(out: *io.Writer, name: []const u8, profile: Reference.Profile, ref: Reference, sample: Case, expected: Cost, actual: Cost) !void {

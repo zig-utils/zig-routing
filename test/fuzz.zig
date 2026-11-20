@@ -18,7 +18,7 @@
 //! `costing-reference` (gate A samples and paths), `speed-config` (default speed tables),
 //! `motor-tags` (motor vehicle access and unit normalization), `admin-index`
 //! (stored administrative boundaries), `timezone-geojson`, `timezone-rules`,
-//! `datetime`, `time-domain` and `lane-tags`.
+//! `datetime`, `time-domain`, `lane-tags` and `name-tags`.
 //!
 //! The contract for every parser: malformed input returns an error, never
 //! panics, overflows or reads out of bounds. The fuzz step builds ReleaseSafe
@@ -138,7 +138,7 @@ fn fuzzGraphBundle(baseline: *const graph.reader.Files, s: *Smith) !void {
         }
         _ = view.edgeSlopes(edge) catch null;
         if (view.shape(edge, gpa)) |shape| gpa.free(shape) else |_| {}
-        if (view.names(edge)) |names| {
+        if (view.namesWithOptions(edge, .{ .include_tagged = true })) |names| {
             for (0..names.count()) |i| _ = names.at(i) catch null;
         } else |_| {}
         if (view.oppEdge(@fromBackingInt(@intCast(id)))) |other| {
@@ -191,6 +191,24 @@ test "fuzz lane-tags" {
     defer storage.deinit();
     try std.testing.fuzz({}, fuzzLaneTags, .{ .corpus = try seeds(storage.allocator(), &.{
         "", "left|through;right|", "merge_to_left||reverse|merge_to_right", "none||none||none|", "1|2|3|4|4", "1|16", "||", "\xff",
+    }) });
+}
+
+fn fuzzNameTags(_: void, s: *Smith) !void {
+    var buf: [max_input]u8 = undefined;
+    const raw = draw(s, &buf, 0x6e616d65);
+    if (routing.build.name_details.parseKey(raw)) |key| {
+        try std.testing.expect(key.language.valid());
+        try std.testing.expect(@backingInt(key.group) <= @backingInt(routing.build.name_details.Group.level_ref));
+    }
+}
+
+test "fuzz name-tags" {
+    var storage: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer storage.deinit();
+    try std.testing.fuzz({}, fuzzNameTags, .{ .corpus = try seeds(storage.allocator(), &.{
+        "",                                       "name",             "name:nl:pronunciation:nt-sampa", "name:backward:fr", "tunnel:name:left:fr:pronunciation",
+        "name:forward:ja:pronunciation:katakana", "official_name:pt", "level:ref",                      "bridge:name",      "name:\xff",
     }) });
 }
 

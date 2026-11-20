@@ -23,6 +23,7 @@ pub const country_access = @import("country_access.zig");
 pub const timezones = @import("timezones.zig");
 pub const turn_restrictions = @import("turn_restrictions.zig");
 pub const lanes = @import("lanes.zig");
+pub const name_details = @import("name_details.zig");
 pub const restriction_automaton = @import("restriction_automaton.zig");
 pub const time_parsing = @import("time_parsing.zig");
 

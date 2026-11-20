@@ -30,6 +30,7 @@ const automaton_builder = @import("restriction_automaton.zig");
 const conditional_access = @import("conditional_access.zig");
 const sign_build = @import("signs.zig");
 const lane_build = @import("lanes.zig");
+const name_details = @import("name_details.zig");
 const link_classification = @import("link_classification.zig");
 const grid = @import("../geo/grid.zig");
 const radix = @import("../infra/radix.zig");
@@ -48,6 +49,8 @@ pub const Options = struct {
     admin_drive_side: ?enhance.AdminDriveSide = null,
     admin_index: ?graph.admin.View = null,
     use_admin_db: bool = true,
+    allow_alt_name: bool = false,
+    use_direction_on_ways: bool = false,
     apply_country_overrides: bool = true,
     timezone_source: ?timezones.Source = null,
     speed_rules: ?*const speeds.Config = null,
@@ -229,7 +232,7 @@ pub fn buildStaged(
         }
         const saved = try session.open(.order);
         defer saved.close();
-        break :blk try Layout.load(gpa, saved, options.deadline);
+        break :blk try Layout.load(gpa, &saved, options.deadline);
     };
     defer plan.deinit(gpa);
     if (session.endsAt(.order)) return;
@@ -280,7 +283,7 @@ pub fn buildStaged(
         const source: checkpoint.Stage = if (session.runs(.enhance)) .assemble else .enhance;
         const saved = try session.open(source);
         defer saved.close();
-        edge_classes = try loadArray(classes.EdgeClass, gpa, saved, .classes, options.deadline);
+        edge_classes = try loadArray(classes.EdgeClass, gpa, &saved, .classes, options.deadline);
         try validate(topology.first_edge, topology.output.data, topology.coordinates, edge_classes.?, options.deadline);
     }
     if (session.runs(.enhance)) {
@@ -299,7 +302,7 @@ pub fn buildStaged(
         if (restriction_program.states.len != 0) try tx.writeArray(restriction_program.states, .restriction_states);
         if (restriction_program.conditions.len != 0) try tx.writeArray(restriction_program.conditions, .restriction_conditions);
         if (lane_output.entries.items.len != 0 or lane_output.connections.items.len != 0) {
-            var writer = try stageWriter(session.*, tx);
+            var writer = try stageWriter(session, &tx);
             defer writer.deinit();
             try lane_output.write(&writer);
             try tx.saveSections(&writer);
@@ -356,7 +359,7 @@ pub fn buildStaged(
         const start = io.Timer.start();
         var tx = try session.begin(.spatial);
         defer tx.deinit();
-        var writer = try stageWriter(session.*, tx);
+        var writer = try stageWriter(session, &tx);
         defer writer.deinit();
         const spatial = try buildSpatial(gpa, &shared, &writer, options.scratch_dir, options.workers);
         try tx.writeJson(gpa, spatial, .spatial_stats);
@@ -371,7 +374,7 @@ noinline fn saveColdStage(session: *checkpoint.Session, shared: *const Shared, m
     const start = io.Timer.start();
     var tx = try session.begin(.cold);
     defer tx.deinit();
-    var writer = try stageWriter(session.*, tx);
+    var writer = try stageWriter(session, &tx);
     defer writer.deinit();
     const saved_turns = try session.open(.turns);
     defer saved_turns.close();
@@ -450,7 +453,7 @@ fn writeTopology(writer: *format.BundleWriter, scratch_dir: []const u8, topology
     try writer.write(.components, labels.data);
 }
 
-pub fn stageWriter(session: checkpoint.Session, tx: checkpoint.Transaction) !format.BundleWriter {
+pub noinline fn stageWriter(session: *const checkpoint.Session, tx: *const checkpoint.Transaction) !format.BundleWriter {
     const path = try std.fs.path.join(session.gpa, &.{ session.path, &tx.name, "bundle" });
     defer session.gpa.free(path);
     return format.BundleWriter.init(path, session.identity, session.deadline);
@@ -485,9 +488,21 @@ const Way = extern struct {
     level_start: u32,
     level_count: u32,
     name_start: u32,
-    ref_start: u32,
-    ref_end: u32,
-    name_end: u32,
+    names: packed struct(u32) {
+        count: u8,
+        ref_start: u8,
+        ref_count: u8,
+        reserved: u8 = 0,
+    },
+    name_tags: name_details.Range,
+
+    fn primaryNameOffset(self: Way) usize {
+        return self.name_start + @as(usize, if (self.names.ref_start == 0) self.names.ref_count else 0);
+    }
+
+    fn nameRange(self: Way, ids: []const tags.names.Id) []const tags.names.Id {
+        return ids[self.name_start..][0..self.names.count];
+    }
 };
 
 const WayEntry = extern struct {
@@ -509,7 +524,8 @@ const LimitEntry = extern struct {
 comptime {
     std.debug.assert(@sizeOf(Way) == 72);
     std.debug.assert(@offsetOf(Way, "by_direction") == 0 and @offsetOf(Way, "speeds") == 40 and @offsetOf(Way, "attr") == 44);
-    std.debug.assert(@offsetOf(Way, "level_start") == 48 and @offsetOf(Way, "name_end") == 68);
+    std.debug.assert(@offsetOf(Way, "level_start") == 48 and @offsetOf(Way, "name_start") == 56 and
+        @offsetOf(Way, "names") == 60 and @offsetOf(Way, "name_tags") == 64);
     std.debug.assert(@sizeOf(WayEntry) == 80 and @offsetOf(WayEntry, "way") == 8);
     std.debug.assert(@sizeOf(NodeEntry) == 16 and @offsetOf(NodeEntry, "hot") == 8);
     std.debug.assert(@sizeOf(LimitEntry) == 24 and @offsetOf(LimitEntry, "way_id") == 0 and @offsetOf(LimitEntry, "limit") == 8);
@@ -533,6 +549,8 @@ pub const Metadata = struct {
     infer_turn_channels: bool,
     signs: sign_build.Catalog,
     lanes: lane_build.Catalog,
+    name_tags: name_details.Catalog,
+    name_options: tags.names.Options,
 
     pub fn init(gpa: Allocator, options: Options) Metadata {
         return .{
@@ -545,6 +563,13 @@ pub const Metadata = struct {
             .infer_turn_channels = options.infer_turn_channels,
             .signs = .{ .arena = .init(gpa) },
             .lanes = .{ .a = gpa, .deadline = options.deadline },
+            .name_tags = .{ .a = gpa, .deadline = options.deadline },
+            .name_options = .{
+                .use_admin_db = options.use_admin_db,
+                .allow_alt_name = options.allow_alt_name,
+                .use_direction_on_ways = options.use_direction_on_ways,
+                .capture_details = true,
+            },
         };
     }
 
@@ -570,7 +595,7 @@ pub const Metadata = struct {
         try file.sync();
     }
 
-    pub fn loadNodes(self: *Metadata, saved: checkpoint.Existing) !void {
+    pub fn loadNodes(self: *Metadata, saved: *const checkpoint.Existing) !void {
         try self.loadNodeSigns(saved);
         const mapped = try saved.map(.node_attributes, self.deadline);
         defer mapped.unmap();
@@ -589,13 +614,14 @@ pub const Metadata = struct {
         }
     }
 
-    pub fn loadNodeSigns(self: *Metadata, saved: checkpoint.Existing) !void {
+    pub fn loadNodeSigns(self: *Metadata, saved: *const checkpoint.Existing) !void {
         try self.signs.loadNodes(self.gpa, saved, self.deadline);
     }
 
     pub fn saveWays(self: *const Metadata, tx: *checkpoint.Transaction) !void {
         try self.signs.saveWays(tx);
         try self.lanes.saveWays(tx);
+        try self.name_tags.save(tx);
         const file = try tx.create(.way_attributes);
         defer file.close();
         var rows: [512]WayEntry = undefined;
@@ -653,7 +679,7 @@ pub const Metadata = struct {
         try file.sync();
     }
 
-    pub fn loadWays(self: *Metadata, saved: checkpoint.Existing) !void {
+    pub fn loadWays(self: *Metadata, saved: *const checkpoint.Existing) !void {
         const names = try saved.map(.names, self.deadline);
         defer names.unmap();
         var remaining: []const u8 = names.bytes;
@@ -668,6 +694,7 @@ pub const Metadata = struct {
         }
         try self.signs.loadWays(self.gpa, saved, &self.strings, self.deadline);
         try self.lanes.loadWays(saved, &self.strings);
+        try self.name_tags.load(saved, &self.strings);
         const refs = try saved.map(.name_refs, self.deadline);
         defer refs.unmap();
         for (try checkpoint.array(tags.names.Id, refs), 0..) |id, i| {
@@ -684,10 +711,11 @@ pub const Metadata = struct {
         for (try checkpoint.array(WayEntry, ways), 0..) |entry, i| {
             try checkDeadline(self.deadline, i);
             const attrs = entry.way;
-            const first_name = if (attrs.name_start == attrs.ref_start) attrs.ref_end else attrs.name_start;
-            if (attrs.name_start > attrs.ref_start or attrs.ref_start > attrs.ref_end or attrs.name_start > attrs.name_end or
-                attrs.name_end - attrs.name_start > graph.cold.max_names or attrs.name_end > self.name_ids.items.len or
-                attrs.ref_end > self.name_ids.items.len or (attrs.attr.primary_name and first_name >= self.name_ids.items.len) or
+            const end = @as(usize, attrs.name_start) + attrs.names.count;
+            if (attrs.names.reserved != 0 or end > self.name_ids.items.len or
+                @as(u16, attrs.names.ref_start) + attrs.names.ref_count > attrs.names.count or
+                (attrs.attr.primary_name and attrs.primaryNameOffset() >= end) or
+                attrs.name_tags.first > attrs.name_tags.end or attrs.name_tags.end > self.name_tags.rows.items.len or
                 attrs.level_start > self.levels.items.len or attrs.level_count > self.levels.items.len - attrs.level_start)
                 return error.InvalidCheckpoint;
             try self.ways.put(self.gpa, entry.id, attrs);
@@ -725,6 +753,7 @@ pub const Metadata = struct {
         self.conditional.deinit();
         self.signs.deinit(self.gpa);
         self.lanes.deinit();
+        self.name_tags.deinit();
         self.name_ids.deinit(self.gpa);
         self.levels.deinit(self.gpa);
         self.strings.deinit();
@@ -779,9 +808,10 @@ pub const Metadata = struct {
         if (entry.found_existing) return error.DuplicateWay;
         const access_masks = try self.wayAccess(id, &attrs.motor_limits, raw_tags);
         for (&pair, access_masks) |*class, modes| class.detail.access_restriction = modes;
-        const indexed = try self.strings.indexWay(attrs, raw_tags, .{ .use_admin_db = self.use_admin_db }, self.deadline);
+        const indexed = try self.strings.indexWay(attrs, raw_tags, self.name_options, self.deadline);
         try self.signs.addWay(self.gpa, id, indexed);
         try self.lanes.addWay(id, indexed.turn_lanes_forward, indexed.turn_lanes_backward);
+        const name_tags = try self.name_tags.addWay(&self.strings, &indexed);
         const name_start = try self.nameOffset();
         const ref_first = attrs.road_class == .motorway or attrs.road_class == .trunk;
         if (!ref_first) try self.appendNames(indexed.name.text);
@@ -793,7 +823,11 @@ pub const Metadata = struct {
         if (indexed.alt_name.text != indexed.name.text) try self.appendNames(indexed.alt_name.text);
         if (indexed.official_name.text != indexed.name.text and indexed.official_name.text != indexed.alt_name.text)
             try self.appendNames(indexed.official_name.text);
-        const name_end = try self.nameOffset();
+        const name_end = @min(try self.nameOffset(), name_start +| graph.cold.max_names);
+        self.name_ids.shrinkRetainingCapacity(name_end);
+        const name_count: u8 = @intCast(name_end - name_start);
+        const ref_offset: u8 = @intCast(@min(name_end, ref_start) - name_start);
+        const ref_count: u8 = @intCast(@min(name_end, ref_end) - @min(name_end, ref_start));
         const level_start = std.math.cast(u32, self.levels.items.len) orelse return error.TooManyLevels;
         if (attrs.level) |level| try appendLevels(&self.levels, self.gpa, level, self.deadline);
         entry.value_ptr.* = .{
@@ -812,16 +846,15 @@ pub const Metadata = struct {
                 .access_tags_known = true,
                 .importance = @intCast(@backingInt(attrs.road_class)),
                 .has_names = name_start != name_end,
-                .primary_name = primary_name,
+                .primary_name = primary_name and (!ref_first or ref_count < name_count),
                 .drive_on_left = drive_on_left,
                 .layer = attrs.layer,
             },
             .level_start = level_start,
             .level_count = std.math.cast(u32, self.levels.items.len - level_start) orelse return error.TooManyLevels,
             .name_start = name_start,
-            .ref_start = ref_start,
-            .ref_end = ref_end,
-            .name_end = @min(name_end, name_start +| graph.cold.max_names),
+            .names = .{ .count = name_count, .ref_start = ref_offset, .ref_count = ref_count },
+            .name_tags = name_tags,
         };
     }
 
@@ -935,7 +968,7 @@ const Layout = struct {
         }, .layout_stats);
     }
 
-    fn load(gpa: Allocator, saved: checkpoint.Existing, deadline: io.Deadline) !Layout {
+    fn load(gpa: Allocator, saved: *const checkpoint.Existing, deadline: io.Deadline) !Layout {
         const stats = try saved.readJson(LayoutStats, gpa, .layout_stats, deadline);
         defer stats.deinit();
         const mapped = try saved.map(.logical_nodes, deadline);
@@ -1067,7 +1100,7 @@ fn Scratch(comptime T: type) type {
             return .{ .mapping = mapping, .data = try mapping.sliceMut(T, 0, count) };
         }
 
-        fn load(saved: checkpoint.Existing, key: checkpoint.Artifact, options: Options) !@This() {
+        fn load(saved: *const checkpoint.Existing, key: checkpoint.Artifact, options: Options) !@This() {
             const file = try saved.read(key, options.deadline);
             defer file.close();
             const bytes = try file.size();
@@ -1172,19 +1205,19 @@ const Topology = struct {
         const edges_source = try session.open(edges_stage);
         defer edges_source.close();
 
-        const nodes = try loadArray(format.NodeHot, gpa, nodes_source, .nodes, options.deadline);
+        const nodes = try loadArray(format.NodeHot, gpa, &nodes_source, .nodes, options.deadline);
         errdefer gpa.free(nodes);
-        const coordinates = try loadArray(format.Coordinate, gpa, base, .coordinates, options.deadline);
+        const coordinates = try loadArray(format.Coordinate, gpa, &base, .coordinates, options.deadline);
         errdefer gpa.free(coordinates);
-        const groups = try loadArray(Group, gpa, base, .groups, options.deadline);
+        const groups = try loadArray(Group, gpa, &base, .groups, options.deadline);
         errdefer gpa.free(groups);
-        const first_edge = try loadArray(u32, gpa, base, .first_edge, options.deadline);
+        const first_edge = try loadArray(u32, gpa, &base, .first_edge, options.deadline);
         errdefer gpa.free(first_edge);
-        const slot_refs = try Scratch(u32).load(base, .slot_refs, options);
+        const slot_refs = try Scratch(u32).load(&base, .slot_refs, options);
         errdefer slot_refs.deinit();
-        const placements = try Scratch(Placement).load(base, .placements, options);
+        const placements = try Scratch(Placement).load(&base, .placements, options);
         errdefer placements.deinit();
-        const output = try Scratch(format.EdgeHot).load(edges_source, .directed_edges, options);
+        const output = try Scratch(format.EdgeHot).load(&edges_source, .directed_edges, options);
         errdefer output.deinit();
         if (groups.len != nodes.len or coordinates.len != nodes.len or first_edge.len != nodes.len + 1 or
             first_edge[0] != 0 or first_edge[nodes.len] != output.data.len or slot_refs.data.len != output.data.len)
@@ -1211,7 +1244,7 @@ const Topology = struct {
     }
 };
 
-fn loadArray(comptime T: type, gpa: Allocator, saved: checkpoint.Existing, key: checkpoint.Artifact, deadline: io.Deadline) ![]T {
+fn loadArray(comptime T: type, gpa: Allocator, saved: *const checkpoint.Existing, key: checkpoint.Artifact, deadline: io.Deadline) ![]T {
     const mapping = try saved.map(key, deadline);
     defer mapping.unmap();
     return gpa.dupe(T, try checkpoint.array(T, mapping));
@@ -1368,11 +1401,8 @@ const LinkSource = struct {
         const way = self.shared.ways.get(id) orelse return error.MissingWayAttributes;
         const metadata = self.shared.metadata;
         const destination = if (metadata.signs.ways.get(id)) |fields| fields.branch_ref else .empty;
-        const main_name = if (way.attr.primary_name) name: {
-            const first_name = if (way.name_start == way.ref_start) way.ref_end else way.name_start;
-            break :name metadata.name_ids.items[first_name];
-        } else .empty;
-        const main_ref = if (way.ref_start < way.ref_end) metadata.name_ids.items[way.ref_start] else .empty;
+        const main_name = if (way.attr.primary_name) metadata.name_ids.items[way.primaryNameOffset()] else .empty;
+        const main_ref = if (way.names.ref_count != 0) way.nameRange(metadata.name_ids.items)[way.names.ref_start] else .empty;
         return .{
             .way = id,
             .name = metadata.strings.get(main_name).?,
@@ -2440,7 +2470,7 @@ fn buildTurns(shared: *const Shared, edge_classes: []const classes.EdgeClass, me
             const way = shared.ways.get(segment.way_id) orelse return error.MissingWayAttributes;
             code.* = graph.headings.encode(try turns.rawHeading(try segmentShape(shared.shape_points, segment), ref & 1 == 0, class, shared.deadline));
             approach.bearing = graph.headings.decode(code.*);
-            const names = name_ids[way.name_start..way.name_end];
+            const names = way.nameRange(name_ids);
             approach.names = names;
             if (use_us_names) {
                 const canonical = us_names[local][0..names.len];
@@ -2491,7 +2521,7 @@ fn appendLevels(out: *std.ArrayList(graph.cold.LevelRange), gpa: Allocator, sour
     }
 }
 
-fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *Metadata, plan: *const Layout, edge_classes: []const classes.EdgeClass, writer: *format.BundleWriter, scratch_dir: []const u8, means: []const i16) !u64 {
+noinline fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *Metadata, plan: *const Layout, edge_classes: []const classes.EdgeClass, writer: *format.BundleWriter, scratch_dir: []const u8, means: []const i16) !u64 {
     const topo = shared.topology;
     var coverage: graph.coverage.Builder = .{};
     try coverage.add(topo.coordinates, writer.deadline);
@@ -2499,6 +2529,8 @@ fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *Metadata, plan: *
     defer index.deinit();
     var builder = try ColdBuilder.init(gpa, &metadata.strings, scratch_dir, shared.deadline);
     defer builder.deinit();
+    var name_writer: name_details.Builder = .{ .selector = .{ .a = gpa, .deadline = shared.deadline } };
+    defer name_writer.deinit();
     var refs: [graph.cold.max_names]u32 = undefined;
     var access_scratch: std.ArrayList(access_restriction.Entry) = .empty;
     defer access_scratch.deinit(gpa);
@@ -2514,9 +2546,11 @@ fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *Metadata, plan: *
                 const ref = topo.slot_refs.data[slot];
                 const seg = shared.segments[ref / 2];
                 const way = shared.ways.get(seg.way_id) orelse return error.MissingWayAttributes;
-                const active = refs[0 .. way.name_end - way.name_start];
-                for (active, way.name_start..way.name_end) |*name, i| {
-                    name.* = try builder.nameRef(metadata.name_ids.items[i], i >= way.ref_start and i < way.ref_end);
+                const active = refs[0..way.names.count];
+                const ref_start = way.names.ref_start;
+                const ref_end = @as(usize, ref_start) + way.names.ref_count;
+                for (active, way.nameRange(metadata.name_ids.items), 0..) |*name, id, i| {
+                    name.* = try builder.nameRef(id, i >= ref_start and i < ref_end);
                 }
                 reverse = ref & 1 != 0;
                 const mean = if (means.len == 0) graph.cold.no_elevation else means[ref / 2];
@@ -2531,6 +2565,29 @@ fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *Metadata, plan: *
                     topo.output.data[if (reverse) opposite else slot].cls.cold_checks != 0,
                     topo.output.data[if (reverse) slot else opposite].cls.cold_checks != 0,
                 }, shared.deadline) else &.{};
+                const raw_names = metadata.name_tags.tags(way.name_tags);
+                if (raw_names.len != 0 or indoor.layer != 0 or (shared.admin_index != null and active.len != 0)) {
+                    const ref_first = way.attr.importance <= @backingInt(graph.constants.RoadClass.trunk);
+                    for ([_]bool{ true, false }) |forward| {
+                        try name_writer.resolve(&builder, &metadata.strings, if (shared.admin_index) |*admin| admin else null, &.{
+                            .rows = raw_names,
+                            .legacy = active,
+                            .indoor = indoor,
+                            .ref_first = ref_first,
+                            .forward = forward,
+                            .point = shape[if (forward) 0 else shape.len - 1].toPoint(),
+                        });
+                    }
+                    const fore = name_writer.sides[0];
+                    const aft = name_writer.sides[1];
+                    break :blk try builder.appendFull(@bitCast(seg.way_id), way.speeds.limit, mean, shape, fore.refs.items, .{
+                        .reverse_refs = if (std.mem.eql(u32, fore.refs.items, aft.refs.items)) null else aft.refs.items,
+                        .name_details = fore.details(),
+                        .reverse_name_details = if (fore.detailsEqual(aft)) null else aft.details(),
+                        .indoor = indoor,
+                        .access_limits = access_limits,
+                    });
+                }
                 break :blk try builder.appendFull(@bitCast(seg.way_id), way.speeds.limit, mean, shape, active, .{
                     .indoor = indoor,
                     .access_limits = access_limits,

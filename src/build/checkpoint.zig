@@ -44,7 +44,7 @@ pub const Fingerprint = struct {
     }
 };
 
-pub fn transfer(file: io.File, output: ?io.File, deadline: io.Deadline) !Fingerprint {
+pub noinline fn transfer(file: io.File, output: ?io.File, deadline: io.Deadline) !Fingerprint {
     var buffer: [128 * 1024]u8 = undefined;
     var digest = std.hash.XxHash3.init(0);
     const size = try file.size();
@@ -139,6 +139,7 @@ pub const Artifact = enum {
     lane_relations,
     bundle_turnlanes,
     bundle_lane_connectivity,
+    way_name_details,
 
     noinline fn filename(self: Artifact) [:0]const u8 {
         return switch (self) {
@@ -254,7 +255,7 @@ pub const Existing = struct {
         self.dir.close();
     }
 
-    pub fn read(self: *const Existing, key: Artifact, deadline: io.Deadline) !io.File {
+    pub noinline fn read(self: *const Existing, key: Artifact, deadline: io.Deadline) !io.File {
         const expected = self.manifest.files.get(key) orelse return error.MissingCheckpointArtifact;
         const file = try self.dir.readFile(key.filename());
         errdefer file.close();
@@ -321,15 +322,15 @@ pub const Session = struct {
     current: *?Stage,
     previous: ?u64 = null,
 
-    pub fn runs(self: Session, stage: Stage) bool {
+    pub fn runs(self: *const Session, stage: Stage) bool {
         return @backingInt(self.from) <= @backingInt(stage) and @backingInt(stage) <= @backingInt(self.to);
     }
 
-    pub fn endsAt(self: Session, stage: Stage) bool {
+    pub fn endsAt(self: *const Session, stage: Stage) bool {
         return self.to == stage;
     }
 
-    pub fn begin(self: Session, stage: Stage) !Transaction {
+    pub noinline fn begin(self: *const Session, stage: Stage) !Transaction {
         self.current.* = stage;
         if (self.progress) |writer| {
             try writer.print("building {s}\n", .{@tagName(stage)});
@@ -340,7 +341,7 @@ pub const Session = struct {
         return tx;
     }
 
-    pub fn open(self: Session, stage: Stage) !Existing {
+    pub noinline fn open(self: *const Session, stage: Stage) !Existing {
         return Existing.open(self.gpa, self.root, stage, self.identity);
     }
 
@@ -407,7 +408,7 @@ pub const Transaction = struct {
         try output.sync();
     }
 
-    pub fn write(self: *Transaction, key: Artifact, bytes: []const u8) !void {
+    pub noinline fn write(self: *Transaction, key: Artifact, bytes: []const u8) !void {
         const file = try self.create(key);
         defer file.close();
         var offset: usize = 0;
@@ -420,7 +421,7 @@ pub const Transaction = struct {
         try file.sync();
     }
 
-    pub fn saveSections(self: *Transaction, writer: *const format.BundleWriter) !void {
+    pub noinline fn saveSections(self: *Transaction, writer: *const format.BundleWriter) !void {
         var kinds = writer.written.iterator();
         while (kinds.next()) |kind| {
             const file = try writer.staging.readFile(kind.filename());

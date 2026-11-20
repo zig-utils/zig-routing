@@ -244,7 +244,7 @@ pub fn saveUsage(tx: *checkpoint.Transaction, store: *usage.Usage, directory: ch
     try tx.stash(leaves, frozen.leaves);
 }
 
-pub fn loadUsage(out: *usage.Usage, saved: checkpoint.Existing, scratch: []const u8, directory: checkpoint.Artifact, leaves: checkpoint.Artifact, deadline: io.Deadline) !void {
+pub fn loadUsage(out: *usage.Usage, saved: *const checkpoint.Existing, scratch: []const u8, directory: checkpoint.Artifact, leaves: checkpoint.Artifact, deadline: io.Deadline) !void {
     const leaf = try loadUsageFile(saved, scratch, leaves, null, deadline);
     errdefer leaf.close();
     const dir = try loadUsageFile(saved, scratch, directory, try usage.Usage.maxDirectoryBranches(leaf), deadline);
@@ -252,7 +252,7 @@ pub fn loadUsage(out: *usage.Usage, saved: checkpoint.Existing, scratch: []const
     try out.reopen(dir, leaf);
 }
 
-fn loadUsageFile(saved: checkpoint.Existing, scratch: []const u8, key: checkpoint.Artifact, max_branches: ?u64, deadline: io.Deadline) !io.File {
+fn loadUsageFile(saved: *const checkpoint.Existing, scratch: []const u8, key: checkpoint.Artifact, max_branches: ?u64, deadline: io.Deadline) !io.File {
     const source = try saved.read(key, deadline);
     defer source.close();
     const target = try io.File.temporary(scratch);
@@ -323,7 +323,7 @@ pub const Preparation = struct {
         }, .source_stats);
     }
 
-    pub fn loadTags(self: *Preparation, saved: checkpoint.Existing) !void {
+    pub fn loadTags(self: *Preparation, saved: *const checkpoint.Existing) !void {
         const loops = try saved.map(.loops, self.options.deadline);
         defer loops.unmap();
         const refs = try saved.map(.loop_refs, self.options.deadline);
@@ -355,7 +355,7 @@ pub const Preparation = struct {
         try file.sync();
     }
 
-    pub fn loadNodes(self: *Preparation, saved: checkpoint.Existing) !void {
+    pub fn loadNodes(self: *Preparation, saved: *const checkpoint.Existing) !void {
         const mapped = try saved.map(.controls, self.options.deadline);
         defer mapped.unmap();
         for (try checkpoint.array(ControlEntry, mapped), 0..) |entry, i| {
@@ -364,7 +364,7 @@ pub const Preparation = struct {
         }
     }
 
-    pub fn loadCuts(self: *Preparation, saved: checkpoint.Existing) !void {
+    pub fn loadCuts(self: *Preparation, saved: *const checkpoint.Existing) !void {
         const old_dir = self.cuts.dir;
         const old_leaves = self.cuts.leaves;
         try loadUsage(&self.cuts, saved, self.options.scratch_dir, .cuts_directory, .cuts_leaves, self.options.deadline);
