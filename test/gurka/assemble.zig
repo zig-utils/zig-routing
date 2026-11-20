@@ -285,6 +285,12 @@ test "assembled turn rows use opposing locals, shared names and class-based stop
     try testing.expectEqualSlices(u8, &.{0x44}, try view.turnRow(a, 0));
     const c = try at(view, fixture.findNode("C").?.location.toFixed());
     try testing.expectEqual((try view.node(a)).turn_off, (try view.node(c)).turn_off);
+    const bd = try directedBetween(view, &fixture, "B", "D");
+    const Turn = routing.costing.auto.Turn;
+    const stored = try Turn.read(view, b, ab, bd, testing.allocator, .none);
+    var old_bundle = view.*;
+    old_bundle.headings = null;
+    try testing.expectEqualDeep(stored, try Turn.read(&old_bundle, b, ab, bd, testing.allocator, .none));
 }
 
 test "cold records share names and round trip exact E7 shapes in either direction" {
@@ -1571,6 +1577,56 @@ test "driving side follows admin mode, tagged ways and the configured fallback" 
         const cycle_lane: graph.constants.CycleLane = if (case.forward_left) .separated else .dedicated;
         try testing.expectEqual(@backingInt(cycle_lane), forward.category.cycle_lane);
         try testing.expectEqual(!case.forward_left, forward.flags.shoulder);
+    }
+}
+
+// Ported from test/gurka/test_hov.cc (HOV2Test, HOV3Test and HOTTest).
+test "decoded motorway classes admit the requested HOV or toll variant" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    const motorway = [_]gurka.Tag{
+        .{ .key = "highway", .value = "motorway" },
+        .{ .key = "oneway", .value = "yes" },
+    };
+    const hov = motorway ++ [_]gurka.Tag{.{ .key = "hov", .value = "designated" }};
+    const fixture = try gurka.Map.init(arena, try gurka.mapToCoordinates(
+        \\A-------------------C
+        \\D-------------------F
+        \\G-------------------I
+        \\J-------------------L
+    , 10), &.{
+        .{ .label = "AC", .tags = &motorway },
+        .{ .label = "DF", .tags = &(hov ++ [_]gurka.Tag{.{ .key = "hov:minimum", .value = "2" }}) },
+        .{ .label = "GI", .tags = &(hov ++ [_]gurka.Tag{.{ .key = "hov:minimum", .value = "3" }}) },
+        .{ .label = "JL", .tags = &(hov ++ [_]gurka.Tag{
+            .{ .key = "hov:minimum", .value = "3" },
+            .{ .key = "toll", .value = "yes" },
+        }) },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 4);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const auto = routing.costing.auto;
+    const cases = [_]struct { body: []const u8, allowed: [4]bool }{
+        .{ .body = "{\"costing\":\"auto\"}", .allowed = .{ true, false, false, false } },
+        .{ .body = "{\"costing\":\"auto\",\"costing_options\":{\"auto\":{\"include_hov2\":true}}}", .allowed = .{ true, true, false, false } },
+        .{ .body = "{\"costing\":\"auto\",\"costing_options\":{\"auto\":{\"include_hov3\":true}}}", .allowed = .{ true, true, true, true } },
+        .{ .body = "{\"costing\":\"auto\",\"costing_options\":{\"auto\":{\"include_hot\":true}}}", .allowed = .{ true, false, false, true } },
+        .{ .body = "{\"costing\":\"hov\",\"costing_options\":{\"hov\":{\"include_hov2\":false}}}", .allowed = .{ true, true, false, false } },
+    };
+    for (cases) |case| {
+        const request = (try routing.api.request.parseHttp(arena, "/route", &.{}, case.body)).ok;
+        try testing.expectEqual(.auto, request.costing);
+        const config = if (request.costing_options) |settings| routing.api.json.pointer(settings, "/auto") orelse .null else .null;
+        var warnings: std.ArrayList(routing.costing.base.Warning) = .empty;
+        const profile = try auto.Model.canonicalize(try auto.parse(arena, .auto, config, &warnings, .none));
+        for ([_][]const u8{ "AC", "DF", "GI", "JL" }, case.allowed) |labels, allowed| {
+            const id = try directedBetween(view, &fixture, labels[0..1], labels[1..2]);
+            const edge = try view.edge(id);
+            const class = try view.class(edge.cls.class_id);
+            try testing.expectEqual(allowed, profile.allowedCandidate(class, .{}, .{}, false));
+        }
     }
 }
 

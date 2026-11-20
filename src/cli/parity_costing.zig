@@ -15,7 +15,7 @@ pub const call_limit = 1e-5;
 pub const path_limit = 1e-4;
 pub const minimum_calls = 10_000_000;
 const magic = "ZRCOST01";
-pub const Mode = enum(u32) { pedestrian, bicycle };
+pub const Mode = enum(u32) { pedestrian, bicycle, auto, bus, taxi };
 
 const Case = extern struct {
     incoming: u32,
@@ -114,7 +114,7 @@ pub const Score = struct {
     failures: u64 = 0,
     max_relative_error: f64 = 0,
 
-    fn compare(self: *Score, expected: Cost, actual: Cost, tolerance: f64) !bool {
+    pub fn compare(self: *Score, expected: Cost, actual: Cost, tolerance: f64) !bool {
         if (!std.math.isFinite(expected.cost) or !std.math.isFinite(expected.secs)) return error.InvalidReferenceCost;
         const difference = @max(relative(expected.cost, actual.cost), relative(expected.secs, actual.secs));
         self.samples += 1;
@@ -145,7 +145,7 @@ pub const Counts = struct {
         return self.traversal.failures + self.transition.failures + self.reverse_transition.failures + self.recost.failures;
     }
 
-    fn merge(self: *Counts, other: Counts) void {
+    pub fn merge(self: *Counts, other: Counts) void {
         inline for (.{ "traversal", "transition", "reverse_transition", "recost" }) |name| {
             const destination = &@field(self, name);
             const source = @field(other, name);
@@ -207,11 +207,13 @@ pub fn run(a: Allocator, bundle: *const View, bytes: []const u8, min_calls: u64,
         const scores = switch (profile.mode) {
             .pedestrian => try checkProfile(costing.pedestrian, a, bundle, &reference, profile, diagnostics, deadline),
             .bicycle => try checkProfile(costing.bicycle, a, bundle, &reference, profile, diagnostics, deadline),
+            else => return error.InvalidReferenceCosting,
         };
         try reports.append(a, .{ .mode = profile.mode, .options = profile.options, .scores = scores });
         switch (profile.mode) {
             .pedestrian => pedestrian.merge(scores),
             .bicycle => bicycle.merge(scores),
+            else => unreachable,
         }
     }
     return .{
@@ -288,7 +290,7 @@ fn checkProfile(comptime model: type, gpa: Allocator, view: *const View, referen
     return counts;
 }
 
-fn tupleDiagnostic(out: *io.Writer, name: []const u8, profile: Reference.Profile, ref: Reference, sample: Case, expected: Cost, actual: Cost) !void {
+pub fn tupleDiagnostic(out: *io.Writer, name: []const u8, profile: Reference.Profile, ref: Reference, sample: Case, expected: Cost, actual: Cost) !void {
     try out.print("{s} {s}: expected {d}/{d}, got {d}/{d}, native {d}->{d}, Valhalla {d}->{d}, options {s}\n", .{
         @tagName(profile.mode),     name,                       expected.cost,   expected.secs, actual.cost, actual.secs, sample.incoming, sample.outgoing,
         ref.edges[sample.incoming], ref.edges[sample.outgoing], profile.options,

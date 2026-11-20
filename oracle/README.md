@@ -98,6 +98,25 @@ Each failing call lists the options and both native and Valhalla edge IDs.
 zig-out/bin/zr parity costing BUNDLE costs.bin --out report.json
 ```
 
+For auto, bus and taxi, run the motor gate with the same pinned tile set.
+The profiles exercise HOV-2, HOV-3 and high-occupancy toll access through
+auto. They also vary fixed and top speeds, costs and preferences across
+their legal ranges.
+
+```bash
+oracle/costing-parity.sh --motor utrecht bench/results/costing-motor-utrecht.json
+```
+
+Utrecht and Liechtenstein each used 68 profiles and 3.4 million samples
+of each call type per mode. All 40.8 million forward and reverse
+transition samples and 48 path recosts matched exactly. The largest
+relative error across 20.4 million edge cost samples was `3.3e-7`.
+
+The graph retains one quantized heading byte per directed edge. Imported
+tiles preserve Valhalla's stored bearings for exact turn duration. Native
+builds use the same bearings for maneuver type and turn duration. Older
+bundles can recover bearings from their directed shapes.
+
 ### OSM tag parity
 
 CI compares the normal build tag transform against compressed NDJSON goldens for the

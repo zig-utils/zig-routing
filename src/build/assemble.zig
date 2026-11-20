@@ -149,11 +149,14 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     defer turn_pool.deinit();
     var resolved = try resolveTurns(gpa, &shared, &plan, table.classes, restrictions.source(), null);
     defer resolved.deinit(gpa);
-    const turn_sides = try buildTurns(&shared, table.classes, &metadata, resolved.hard.items, &turn_pool, gpa);
+    const headings = try Scratch(u8).init(topology.output.data.len, options.scratch_dir);
+    defer headings.deinit();
+    const turn_sides = try buildTurns(&shared, table.classes, &metadata, resolved.hard.items, &turn_pool, headings.data, gpa);
     defer gpa.free(turn_sides);
 
     try writeTopology(writer, options.scratch_dir, &topology, table.classes, turn_pool.bytes.items, if (terrain) |present| present.slopes.data else null);
     try writer.write(.turn_sides, turn_sides);
+    try writer.write(.headings, headings.data);
     if (resolved.modes.items.len != 0) try writer.write(.turn_restrictions, resolved.modes.items);
     if (restriction_program.states.len != 0) try writer.write(.restriction_automaton, restriction_program.states);
     if (restriction_program.conditions.len != 0) try writer.write(.restriction_conditions, restriction_program.conditions);
@@ -318,11 +321,14 @@ pub fn buildStaged(
         defer tx.deinit();
         var resolved = try resolveTurns(gpa, &shared, &plan, edge_classes.?, restrictions, null);
         defer resolved.deinit(gpa);
-        const turn_sides = try buildTurns(&shared, edge_classes.?, metadata, resolved.hard.items, &turn_pool, gpa);
+        const headings = try Scratch(u8).init(topology.output.data.len, options.scratch_dir);
+        defer headings.deinit();
+        const turn_sides = try buildTurns(&shared, edge_classes.?, metadata, resolved.hard.items, &turn_pool, headings.data, gpa);
         defer gpa.free(turn_sides);
         try tx.writeArray(topology.nodes, .nodes);
         try tx.writeArray(turn_pool.bytes.items, .turn_pool);
         try tx.writeArray(turn_sides, .turn_sides);
+        try tx.writeArray(headings.data, .headings);
         if (resolved.modes.items.len != 0) try tx.writeArray(resolved.modes.items, .mode_turns);
         if (resolved.stats.parsed != 0) try tx.writeJson(gpa, resolved.stats, .simple_turn_stats);
         try tx.writeJson(gpa, turn_pool.indices.count(), .turn_stats);
@@ -376,6 +382,12 @@ noinline fn saveColdStage(session: *checkpoint.Session, shared: *const Shared, m
         const side_data = try saved_turns.map(.turn_sides, options.deadline);
         defer side_data.unmap();
         try writer.write(.turn_sides, try checkpoint.array(u32, side_data));
+    }
+    if (saved_turns.manifest.files.get(.headings) != null) {
+        const headings = try saved_turns.map(.headings, options.deadline);
+        defer headings.unmap();
+        if (headings.bytes.len != shared.topology.output.data.len) return error.InvalidCheckpoint;
+        try writer.write(.headings, headings.bytes);
     }
     if (saved_turns.manifest.files.get(.mode_turns) != null) {
         const rows = try saved_turns.map(.mode_turns, options.deadline);
@@ -1391,6 +1403,7 @@ const Job = struct {
                 const way = shared.ways.get(segment.way_id) orelse return error.MissingWayAttributes;
                 const direction = ref & 1;
                 var class = way.by_direction[direction];
+                class.flags.named = way.attr.has_names;
                 if (admin_left orelse way.attr.drive_on_left) {
                     const opposing = way.by_direction[direction ^ 1];
                     class.flags.shoulder = opposing.flags.shoulder;
@@ -2310,7 +2323,7 @@ noinline fn resolveTurns(a: Allocator, shared: *const Shared, plan: *const Layou
     return result;
 }
 
-fn buildTurns(shared: *const Shared, edge_classes: []const classes.EdgeClass, metadata: *Metadata, restrictions: []const TurnMask, pool: *turns.Pool, gpa: Allocator) ![]u32 {
+fn buildTurns(shared: *const Shared, edge_classes: []const classes.EdgeClass, metadata: *Metadata, restrictions: []const TurnMask, pool: *turns.Pool, headings: []u8, gpa: Allocator) ![]u32 {
     const topo = shared.topology;
     var side_pool = try turns.SidePool.init(gpa, topo.nodes.len);
     defer side_pool.deinit();
@@ -2325,14 +2338,16 @@ fn buildTurns(shared: *const Shared, edge_classes: []const classes.EdgeClass, me
         const first = topo.first_edge[i];
         const degree = topo.first_edge[i + 1] - first;
         const use_us_names = shared.country(@intCast(i)).iso == std.mem.readInt(u16, "US", .little);
-        for (approaches[0..degree], topo.output.data[first..][0..degree], 0..) |*approach, edge, local| {
+        for (approaches[0..degree], topo.output.data[first..][0..degree], headings[first..][0..degree], 0..) |*approach, edge, *code, local| {
             const class = &edge_classes[edge.cls.class_id];
             approach.* = .{ .bearing = 0, .length = edge.geom.len_m, .class = class, .names = &.{} };
+            code.* = 0;
             if (class.flags.node_connector) continue;
             const ref = topo.slot_refs.data[first + local];
             const segment = shared.segments[ref / 2];
             const way = shared.ways.get(segment.way_id) orelse return error.MissingWayAttributes;
-            approach.bearing = try turns.heading(try segmentShape(shared.shape_points, segment), ref & 1 == 0, class, shared.deadline);
+            code.* = graph.headings.encode(try turns.rawHeading(try segmentShape(shared.shape_points, segment), ref & 1 == 0, class, shared.deadline));
+            approach.bearing = graph.headings.decode(code.*);
             const names = name_ids[way.name_start..way.name_end];
             approach.names = names;
             if (use_us_names) {

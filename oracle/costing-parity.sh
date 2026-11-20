@@ -2,14 +2,22 @@
 # Gate A on the local graph of one pinned oracle extract.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+motor=
+if [ "${1:-}" = "--motor" ]; then
+  motor=--motor
+  shift
+fi
 [ "$#" -ge 2 ] && [ "$#" -le 3 ] ||
-  die "usage: $0 DATASET REPORT.json [CASES_PER_PROFILE]"
+  die "usage: $0 [--motor] DATASET REPORT.json [CASES_PER_PROFILE]"
 dataset="$1"
 report="$2"
 cases="${3:-50000}"
 repo="$(cd "$ORACLE_DIR/.." && pwd)"
 zr="${ZR:-$repo/zig-out/bin/zr}"
 corpus="$repo/bench/corpora/route-foot-bike.$dataset.tsv"
+if [ -n "$motor" ]; then
+  corpus="$repo/bench/corpora/route-auto-10km.$dataset.tsv"
+fi
 [ -x "$zr" ] || die "build zr in ReleaseFast or set ZR"
 [ -f "$corpus" ] || die "generate the route corpora before running gate A"
 ensure_built "$dataset"
@@ -21,7 +29,7 @@ echo "costing parity artifacts in $work" >&2
 
 "$zr" import-valhalla "$data/tiles.tar" --output "$work/bundle"
 uuid=$("$zr" inspect "$work/bundle" --json | python3 -c 'import json, sys; print(json.load(sys.stdin)["dataset_uuid"])')
-python3 "$ORACLE_DIR/costing-profiles.py" "$corpus" > "$work/profiles.jsonl"
+python3 "$ORACLE_DIR/costing-profiles.py" "$corpus" ${motor:+"$motor"} > "$work/profiles.jsonl"
 python3 - "$data" "$work" <<'PY'
 import json
 from pathlib import Path, PurePosixPath
@@ -61,5 +69,13 @@ docker run --rm --platform "$ORACLE_PLATFORM" \
   ' costing-reference "$cases" "$uuid" > "$work/oracle.log" 2>&1 ||
   die "could not generate the oracle reference. See $work/oracle.log"
 
-"$zr" parity costing "$work/bundle" "$work/costs.bin" --out "$report" 2> "$work/failures.log" ||
-  die "costing gate failed. See $report and $work/failures.log"
+if [ -n "$motor" ]; then
+  (
+    cd "$repo"
+    "${ZIG:-zig}" build motor-costing-parity -Doptimize=ReleaseFast -- "$work/bundle" "$work/costs.bin"
+  ) > "$report" 2> "$work/failures.log" ||
+    die "costing gate failed. See $report and $work/failures.log"
+else
+  "$zr" parity costing "$work/bundle" "$work/costs.bin" --out "$report" 2> "$work/failures.log" ||
+    die "costing gate failed. See $report and $work/failures.log"
+fi

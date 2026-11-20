@@ -2,13 +2,13 @@
 // src/mjolnir/graphenhancer.cc (Valhalla 3.9.3).
 const std = @import("std");
 const geo = @import("../geo/point.zig");
-const math = @import("../geo/build_math.zig");
 const io = @import("../infra/io.zig");
 const constants = @import("../graph/constants.zig");
 const EdgeClass = @import("../graph/class_table.zig").EdgeClass;
 const names = @import("tags/names.zig");
 const DriveSide = @import("edge_class.zig").DriveSide;
 const turn_sides = @import("../graph/turn_sides.zig");
+const headings = @import("../graph/headings.zig");
 
 pub const Type = enum(u3) {
     straight,
@@ -39,44 +39,14 @@ pub fn encode(kind: Type, stop: u3, consistent: bool) u8 {
     return @as(u8, @backingInt(kind)) | (@as(u8, stop) << 3) | (@as(u8, @intFromBool(consistent)) << 6);
 }
 
-/// Turn headings are stored and recovered using Valhalla's NodeInfo byte
-/// quantization, even though the bundle only retains the resulting turn.
 pub fn heading(points: []const geo.FixedLL, forward: bool, class: *const EdgeClass, deadline: io.Deadline) !u16 {
     return storedHeading(try rawHeading(points, forward, class, deadline));
 }
 
-pub fn rawHeading(points: []const geo.FixedLL, forward: bool, class: *const EdgeClass, deadline: io.Deadline) !u16 {
-    if (points.len < 2) return error.InvalidSegmentShape;
-    const dist = constants.headingOffset(class.category.road_class, class.category.use);
-    // GraphEnhancer reads the edge-info shape after the E6 tile encoding.
-    const start = points[if (forward) 0 else points.len - 1].toTilePoint();
-    var target = points[if (forward) points.len - 1 else 0].toTilePoint();
-    var previous = start;
-    var travelled: f64 = 0;
-    for (1..points.len) |i| {
-        if (points.len == 2 or travelled >= dist) break;
-        if ((i - 1) % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
-        const next = points[if (forward) i else points.len - 1 - i].toTilePoint();
-        const length = previous.distanceWith(next, math);
-        if (travelled + length > dist) {
-            const fraction = (dist - travelled) / length;
-            target = .{
-                .lng = previous.lng + (next.lng - previous.lng) * fraction,
-                .lat = previous.lat + (next.lat - previous.lat) * fraction,
-            };
-            break;
-        }
-        travelled += length;
-        previous = next;
-    }
-    return @as(u16, @intFromFloat(@round(start.headingWith(target, math)))) % 360;
-}
+pub const rawHeading = headings.sample;
 
 pub fn storedHeading(rounded: u16) u16 {
-    const shrink: f32 = 255.0 / 359.0;
-    const expand: f32 = 359.0 / 255.0;
-    const stored: f32 = @round(@as(f32, @floatFromInt(rounded)) * shrink);
-    return @intFromFloat(@round(stored * expand));
+    return headings.decode(headings.encode(rounded));
 }
 
 pub const Approach = struct {

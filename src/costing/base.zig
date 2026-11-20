@@ -214,8 +214,12 @@ pub fn rangedFloat(arena: std.mem.Allocator, input: json.Value, comptime name: [
 }
 
 pub fn rangedUnsigned(arena: std.mem.Allocator, input: json.Value, comptime name: []const u8, default: u32, maximum: u32, warnings: *std.ArrayList(Warning)) !u32 {
+    return rangedUnsignedIn(arena, input, name, 0, default, maximum, warnings);
+}
+
+pub fn rangedUnsignedIn(arena: std.mem.Allocator, input: json.Value, comptime name: []const u8, minimum: u32, default: u32, maximum: u32, warnings: *std.ArrayList(Warning)) !u32 {
     const value = unsigned(input, "/" ++ name, default);
-    if (value <= maximum) return value;
+    if (minimum <= value and value <= maximum) return value;
     try warnings.append(arena, .{ .option = name, .reset_to = .{ .integer = default } });
     return default;
 }

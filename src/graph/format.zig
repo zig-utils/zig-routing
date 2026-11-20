@@ -116,10 +116,11 @@ pub const SectionKind = enum(u32) {
     restriction_automaton = 20,
     restriction_conditions = 21,
     signs = 22,
+    headings = 23,
 
     pub fn placement(kind: SectionKind) Placement {
         return switch (kind) {
-            .nodes, .edges, .first_edge, .turns, .classes, .turn_sides => .hot,
+            .nodes, .edges, .first_edge, .turns, .classes, .turn_sides, .headings => .hot,
             .coordinates, .spatial, .components, .metadata, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules => .warm,
             .turn_restrictions, .restriction_automaton, .restriction_conditions => .warm,
             .cold_idx, .cold, .slopes, .signs => .cold,
@@ -150,6 +151,7 @@ pub const SectionKind = enum(u32) {
             .restriction_automaton => "restr.bin",
             .restriction_conditions => "restr_domains.bin",
             .signs => "signs.bin",
+            .headings => "headings.bin",
         };
     }
 
@@ -174,6 +176,7 @@ pub const SectionKind = enum(u32) {
             .restriction_automaton => restriction_automaton.State,
             .restriction_conditions => restriction_automaton.Condition,
             .signs => @import("signs.zig").Entry,
+            .headings => u8,
         };
     }
 

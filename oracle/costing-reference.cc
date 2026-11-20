@@ -1,6 +1,7 @@
 // Calls the costing kernels in the pinned Valhalla library for gate A.
 #include <valhalla/baldr/graphreader.h>
 #include <valhalla/baldr/rapidjson_utils.h>
+#include <valhalla/sif/autocost.h>
 #include <valhalla/sif/bicyclecost.h>
 #include <valhalla/sif/pedestriancost.h>
 #include <valhalla/tyr/actor.h>
@@ -186,21 +187,30 @@ void record(std::ostream& output,
             uint32_t count,
             std::mt19937_64& random) {
   const char* mode = option["mode"].GetString();
-  const bool pedestrian = std::string_view(mode) == "pedestrian";
-  if (!pedestrian && std::string_view(mode) != "bicycle") {
+  struct Model {
+    std::string_view name;
+    decltype(&ParseAutoCostOptions) parse;
+    decltype(&CreateAutoCost) create;
+  };
+  static constexpr std::array<Model, 5> models{{
+      {"pedestrian", ParsePedestrianCostOptions, CreatePedestrianCost},
+      {"bicycle", ParseBicycleCostOptions, CreateBicycleCost},
+      {"auto", ParseAutoCostOptions, CreateAutoCost},
+      {"bus", ParseBusCostOptions, CreateBusCost},
+      {"taxi", ParseTaxiCostOptions, CreateTaxiCost},
+  }};
+  const auto model = std::find_if(models.begin(), models.end(),
+                                  [&](const Model& candidate) { return candidate.name == mode; });
+  if (model == models.end()) {
     throw std::runtime_error("unsupported costing in reference options");
   }
   Costing config;
   google::protobuf::RepeatedPtrField<CodedDescription> warnings;
-  if (pedestrian) {
-    ParsePedestrianCostOptions(option, "/options", &config, warnings);
-  } else {
-    ParseBicycleCostOptions(option, "/options", &config, warnings);
-  }
+  model->parse(option, "/options", &config, warnings);
   if (!warnings.empty()) {
     throw std::runtime_error("out-of-range oracle costing options: " + json(option["options"]));
   }
-  const auto cost = pedestrian ? CreatePedestrianCost(config) : CreateBicycleCost(config);
+  const auto cost = model->create(config);
   std::vector<bool> allowed;
   allowed.reserve(graph.edges.size());
   for (const auto& ref : graph.edges) {
@@ -229,7 +239,7 @@ void record(std::ostream& output,
   }
   const uint32_t calls = pairs.empty() ? 0 : count;
   const auto routes = paths(actor, graph, option["paths"], mode, option["options"]);
-  write(output, static_cast<uint32_t>(pedestrian ? 0 : 1));
+  write(output, static_cast<uint32_t>(model - models.begin()));
   write(output, calls);
   write(output, static_cast<uint32_t>(routes.size()));
   write_string(output, json(option["options"]));

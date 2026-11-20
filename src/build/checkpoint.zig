@@ -132,6 +132,8 @@ pub const Artifact = enum {
     way_signs,
     node_signs,
     bundle_signs,
+    headings,
+    bundle_headings,
 
     fn filename(self: Artifact) [:0]const u8 {
         return switch (self) {

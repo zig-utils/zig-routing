@@ -4,7 +4,8 @@
 //!   zig build fuzz -Dfuzz-target=lz4 --fuzz         fuzz one target until stopped
 //!   zig build fuzz -Dfuzz-target=lz4 --fuzz=50M     ... for a number of runs
 //!
-//! Targets: `request` (the API request parser), `http` (request head, query
+//! Targets: `motor-costing` (admissible edge and turn bounds),
+//! `request` (the API request parser), `http` (request head, query
 //! string, percent decoding), `polyline` (polyline 5/6/7 and varint
 //! decoders), `lz4` (block and frame decoders, plus a compress round trip),
 //! `dem` (the packed elevation block decoder), and `protobuf` (wire records
@@ -922,6 +923,7 @@ pub fn fuzzRequest(_: void, s: *Smith) !void {
             const settings = switch (fast.ok.costing) {
                 .pedestrian => (try routing.costing.pedestrian.parse(arena, input, &warnings, .none)).shared,
                 .bicycle => (try routing.costing.bicycle.parse(arena, input, &warnings, .none)).shared,
+                .auto, .bus, .taxi => |mode| (try routing.costing.auto.parse(arena, std.meta.stringToEnum(routing.costing.auto.Mode, @tagName(mode)).?, input, &warnings, .none)).shared,
                 else => try base.parse(arena, input, .{}, &warnings, .none),
             };
             try std.testing.expect(settings.fixed_speed <= base.fixed_speed_max);
@@ -934,6 +936,102 @@ pub fn fuzzRequest(_: void, s: *Smith) !void {
         try std.testing.expect(request.resultsEqual(fast, reference));
         try std.testing.expect(request.resultsEqual(try request.parseHttpForHeight(arena, path, query, body), reference));
     }
+}
+
+fn fraction(byte: u8) f32 {
+    return @as(f32, @floatFromInt(byte)) / 255;
+}
+
+fn fuzzMotorCosting(_: void, s: *Smith) !void {
+    const auto = routing.costing.auto;
+    const base = routing.costing.base;
+    const compiled = routing.costing.compiled;
+    var raw: [32]u8 = undefined;
+    const input = draw(s, &raw, 0x6d6f_746f);
+    var bytes: [32]u8 = @splat(0);
+    @memcpy(bytes[0..input.len], input);
+    var warnings: std.ArrayList(base.Warning) = .empty;
+    defer warnings.deinit(std.testing.allocator);
+    const mode: auto.Mode = @fromBackingInt(@intCast(bytes[0] % 3));
+    var options = try auto.parse(std.testing.allocator, mode, .null, &warnings, .none);
+    options.use_highways = fraction(bytes[1]);
+    options.use_tolls = fraction(bytes[2]);
+    options.min_linear_factor = fraction(bytes[3]);
+    options.top_speed = 10 + bytes[4] % 243;
+    options.alley_factor = 0.1 + fraction(bytes[5]) * 99_999.9;
+    options.shared.fixed_speed = if (bytes[6] & 1 == 0) 0 else bytes[7] % 253;
+    options.shared.flags.setPresent(.shortest, bytes[6] & 2 != 0);
+    options.shared.flags.setPresent(.ignore_closures, bytes[6] & 4 != 0);
+    options.shared.flow.current = bytes[6] & 8 == 0;
+    options.shared.floats.set(.use_distance, fraction(bytes[8]));
+    options.shared.floats.set(.use_ferry, fraction(bytes[9]));
+    options.shared.floats.set(.use_rail_ferry, fraction(bytes[10]));
+    options.shared.floats.set(.use_tracks, fraction(bytes[11]));
+    options.shared.floats.set(.use_living_streets, fraction(bytes[12]));
+    options.shared.floats.set(.service_factor, 0.1 + fraction(bytes[13]) * 99_999.9);
+    options.shared.floats.set(.speed_penalty_factor, fraction(bytes[14]));
+    options.shared.floats.set(.closure_factor, 1 + fraction(bytes[15]) * 9);
+    const uses = [_]graph.constants.Use{ .road, .ferry, .rail_ferry, .alley, .track, .living_street, .service_road, .turn_channel, .ramp };
+    const class: graph.class_table.EdgeClass = .{
+        .category = .{
+            .use = @intCast(@backingInt(uses[bytes[16] % uses.len])),
+            .road_class = @truncate(bytes[17]),
+            .surface = @truncate(bytes[18]),
+            .density = @truncate(bytes[19]),
+        },
+        .access = .{ .forward = @bitCast(@as(graph.constants.AccessMask, .{ .auto = bytes[20] & 1 == 0 or mode != .taxi, .taxi = true, .bus = true })) },
+        .flags = .{ .toll = bytes[20] & 2 != 0, .named = bytes[20] & 4 != 0, .roundabout = bytes[20] & 8 != 0 },
+    };
+    const edge: graph.format.EdgeHot = .{
+        .head = 0,
+        .geom = .{ .len_m = std.mem.readInt(u24, bytes[21..24], .little), .grade = 6, .curvature = 0 },
+        .cls = .{ .class_id = 0, .local = 0, .opp_local = 0, .cold_checks = 0, .pred_speed = 0 },
+        .speed = @splat(0),
+    };
+    const profile = try auto.Model.canonicalize(options);
+    var factors: [1]f32 = undefined;
+    const tables = try compiled.compileInto(auto.Model, profile, &.{class}, &factors, .none);
+    const speed: auto.Speed = .{
+        .kph = bytes[24] % 253,
+        .non_current_kph = bytes[25] % 253,
+        .sources = @bitCast(bytes[26] & 0xf),
+        .closed = bytes[26] & 16 != 0,
+    };
+    const effects: compiled.Effects = .{
+        .factor = profile.min_linear_factor + fraction(bytes[27]) * 15,
+        .penalty = .{ .cost = fraction(bytes[28]) * 450, .secs = fraction(bytes[23]) * 30 },
+    };
+    const cost = auto.Kernel.edgeCost(&profile, &tables, &class, edge, speed, effects);
+    const upper = @max(speed.kph, bytes[28] % 253);
+    try std.testing.expect(compiled.costUnits(auto.Kernel.edgeLowerBound(&profile, &tables, &class, edge, upper)) <= cost.cost);
+    const node: graph.format.NodeHot = .{ .turn_off = 0, .attr = .{
+        .access = 0,
+        .type = @truncate(bytes[29]),
+        .density = @truncate(bytes[19]),
+        .signal = @truncate(bytes[20]),
+        .drive_on_left = bytes[20] & 16 != 0,
+    } };
+    const previous: graph.class_table.EdgeClass = .{
+        .category = .{ .use = @intCast(@backingInt(uses[bytes[15] % uses.len])) },
+        .flags = .{ .toll = bytes[20] & 32 != 0 },
+    };
+    const turn = auto.Kernel.turnCost(&profile, &node, &previous, &class, .{
+        .movement = .{ .base_turn = .{ .row = bytes[30] }, .sides = @bitCast(@as(u2, @truncate(bytes[29]))) },
+        .degrees = (2 * @as(u16, bytes[31])) % 360,
+        .more_than_two_roads = bytes[29] & 4 != 0,
+        .measured_speed = bytes[26] & 0xf != 0,
+        .internal_turn = @fromBackingInt(@intCast(bytes[28] % 3)),
+    });
+    try std.testing.expect(compiled.costUnits(auto.Kernel.turnLowerBound()) <= turn.cost);
+    try std.testing.expect(std.math.isFinite(turn.secs) and turn.secs >= 0);
+}
+
+test "fuzz motor-costing" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const zero: [32]u8 = @splat(0);
+    const maximum: [32]u8 = @splat(255);
+    try std.testing.fuzz({}, fuzzMotorCosting, .{ .corpus = try seeds(arena.allocator(), &.{ &zero, &maximum }) });
 }
 
 const request_seeds = [_][]const u8{

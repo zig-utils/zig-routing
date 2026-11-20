@@ -166,6 +166,7 @@ pub const View = struct {
     restriction_automaton: ?[]const automaton.State = null,
     restriction_conditions: ?[]const automaton.Condition = null,
     signs: ?[]const format.SectionKind.signs.Record() = null,
+    headings: ?[]const u8 = null,
 
     pub fn parse(files: Files, diagnostic: ?*Diagnostic) !View {
         return parseWithDeadline(files, diagnostic, .none);
@@ -229,6 +230,12 @@ pub const View = struct {
             if (slopes.count != edge_count) {
                 note(diagnostic, .slopes);
                 return error.InvalidSlopeCount;
+            }
+        }
+        if (headers.get(.headings)) |headings| {
+            if (headings.count != edge_count) {
+                note(diagnostic, .headings);
+                return error.InvalidHeadingCount;
             }
         }
         if (headers.get(.metadata)) |metadata| {
@@ -507,7 +514,7 @@ pub const View = struct {
             note(diagnostic, kind);
             if (deadline.expired()) return error.DeadlineExceeded;
             const bytes: []const u8 = switch (kind) {
-                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata, .components, .turn_sides, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules, .turn_restrictions, .restriction_automaton, .restriction_conditions, .signs => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
+                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata, .components, .turn_sides, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules, .turn_restrictions, .restriction_automaton, .restriction_conditions, .signs, .headings => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
                 inline else => |section| std.mem.sliceAsBytes(@field(self, @tagName(section))),
             };
             var hash = std.hash.XxHash3.init(0);

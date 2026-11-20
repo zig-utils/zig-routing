@@ -48,6 +48,7 @@ pub const Units = enum { kilometers, miles };
 pub const DirectionsType = enum { instructions, none, maneuvers };
 pub const ShapeFormat = enum { polyline6, polyline5, geojson, no_shape };
 pub const Costing = enum { auto, bicycle, bus, taxi, motor_scooter, multimodal, pedestrian, transit, truck, motorcycle, none, bikeshare, auto_pedestrian };
+const AutoAlias = enum(u8) { auto_shorter = 100, hov = 101, auto_data_fix = 102 };
 pub const DateTimeType = enum { no_time, current, depart_at, arrive_by, invariant };
 pub const LocationType = enum { @"break", through, via, break_through };
 pub const PreferredSide = enum { either, same, opposite };
@@ -598,24 +599,17 @@ fn fromJsonWithin(arena: Allocator, doc: json.Value, action: Action, deadline: D
 
     // Costing, including the deprecated aliases.
     const requested_costing = json.get([]const u8, root, "/costing", "none");
-    var costing_str = requested_costing;
-    if (std.mem.eql(u8, costing_str, "auto_shorter")) {
-        try o.warnings.append(arena, 100);
-        costing_str = "auto";
-    } else if (std.mem.eql(u8, costing_str, "hov")) {
-        try o.warnings.append(arena, 101);
-        costing_str = "auto";
-    } else if (std.mem.eql(u8, costing_str, "auto_data_fix")) {
-        try o.warnings.append(arena, 102);
-        costing_str = "auto";
-        o.ignore_closures = true;
-    }
+    const alias = parseEnum(AutoAlias, requested_costing);
+    if (alias) |legacy| try o.warnings.append(arena, @backingInt(legacy));
+    const costing_str = if (alias != null) "auto" else requested_costing;
     o.costing = if (costing_str.len == 0) .none else parseEnum(Costing, costing_str) orelse
         return failExtra(125, try std.fmt.allocPrint(arena, "'{s}'", .{costing_str}));
     o.costing_options = json.pointer(root, "/costing_options");
+    if (alias) |legacy| o.costing_options = try normalizeAutoOptions(arena, o.costing_options, legacy);
     if (o.ignore_closures == null and o.costing != .multimodal and o.costing_options != null and o.costing_options.? == .object) {
         const costings = o.costing_options.?.object;
-        if (costings.get(requested_costing) orelse costings.get(@tagName(o.costing))) |costing| {
+        const key = if (alias != null) costing_str else requested_costing;
+        if (costings.get(key) orelse costings.get(@tagName(o.costing))) |costing| {
             o.ignore_closures = json.getOptional(bool, costing, "/ignore_closures");
         }
     }
@@ -685,6 +679,21 @@ fn parseLocationField(arena: Allocator, doc: json.Value, o: *Options, path: []co
         .failure => |failure| return .{ .failure = if (failure.code == 0) .{ .code = code } else failure },
     }
     return null;
+}
+
+noinline fn normalizeAutoOptions(arena: Allocator, options: ?json.Value, alias: AutoAlias) Allocator.Error!json.Value {
+    const input = options orelse .null;
+    var costings: std.json.ObjectMap = if (input == .object) try input.object.clone(arena) else .empty;
+    const previous = costings.get(@tagName(alias)) orelse costings.get("auto") orelse .null;
+    var motor: std.json.ObjectMap = if (previous == .object) try previous.object.clone(arena) else .empty;
+    const flags: []const []const u8 = switch (alias) {
+        .auto_shorter => &.{"shortest"},
+        .hov => &.{"include_hov2"},
+        .auto_data_fix => &.{ "ignore_restrictions", "ignore_oneways", "ignore_access", "ignore_closures" },
+    };
+    for (flags) |flag| try motor.put(arena, flag, .{ .bool = true });
+    try costings.put(arena, "auto", .{ .object = motor });
+    return .{ .object = costings };
 }
 
 fn parseDateTime(root: json.Value, o: *Options) ?u16 {
@@ -1007,6 +1016,28 @@ test "exclusion options follow deprecated alias precedence and closure presence"
         \\{"exclude_polygons":[[[1,2],[3]]]}
     );
     try testing.expectEqual(137, invalid.failure.code);
+}
+
+test "deprecated motor types normalize their flags and copy the alias options" {
+    var state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+    const shorter = (try parseHttp(arena, "/route", &.{},
+        \\{"costing":"auto_shorter","costing_options":{"auto_shorter":{"fixed_speed":50,"shortest":false}}}
+    )).ok;
+    try testing.expectEqual(.auto, shorter.costing);
+    try testing.expectEqualSlices(u16, &.{100}, shorter.warnings.items);
+    try testing.expect(json.get(bool, shorter.costing_options.?, "/auto/shortest", false));
+    try testing.expectEqual(50, json.get(u32, shorter.costing_options.?, "/auto/fixed_speed", 0));
+    const fix = (try parseHttp(arena, "/route", &.{},
+        \\{"costing":"auto_data_fix","costing_options":{"auto":{"fixed_speed":20}},
+        \\ "locations":[{"lat":52.1,"lon":5.1},{"lat":52.2,"lon":5.2}]}
+    )).ok;
+    try testing.expectEqualSlices(u16, &.{102}, fix.warnings.items);
+    try testing.expectEqual(20, json.get(u32, fix.costing_options.?, "/auto/fixed_speed", 0));
+    for ([_][]const u8{ "/auto/ignore_restrictions", "/auto/ignore_oneways", "/auto/ignore_access", "/auto/ignore_closures" }) |path|
+        try testing.expect(json.get(bool, fix.costing_options.?, path, false));
+    try testing.expect(!fix.filter_closures);
 }
 
 /// Whether two parse results are the same in every field a handler reads.

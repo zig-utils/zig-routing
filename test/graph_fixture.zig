@@ -66,6 +66,7 @@ pub fn records(comptime kind: format.SectionKind) []const kind.Record() {
         .metadata => &metadata,
         .components => &.{ 0, 0 },
         .turn_sides => &.{ 3, 0, 0 },
+        .headings => &.{ routing.graph.headings.encode(90), routing.graph.headings.encode(270) },
         .coverage => &.{.{ .west = 0, .south = 0, .east = 100000, .north = 0 }},
         .admins => std.mem.asBytes(&empty_admins),
         .node_admins => &.{ 0, 0 },

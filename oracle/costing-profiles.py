@@ -8,6 +8,7 @@ import random
 
 
 MODES = ("pedestrian", "bicycle")
+MOTOR_MODES = ("auto", "bus", "taxi")
 PROFILES_PER_MODE = 64
 PENALTY = (0, 43_200)
 FACTOR = (0.1, 100_000)
@@ -61,15 +62,23 @@ BICYCLE = {
     "steps_factor": FACTOR,
 }
 
+MOTOR = {
+    "alley_factor": FACTOR,
+    **dict.fromkeys(("use_highways", "use_tolls", "use_rail_ferry"), PREFERENCE),
+    **dict.fromkeys(("toll_booth_cost", "toll_booth_penalty", "rail_ferry_cost"), PENALTY),
+    "restriction_probability": (0, 100),
+    "top_speed": (10, 252),
+}
+
 INTEGERS = {
     "fixed_speed", "max_distance", "max_grade", "max_hiking_difficulty",
     "transit_start_end_max_distance", "transit_transfer_max_distance",
-    "multimodal_start_end_max_distance",
+    "multimodal_start_end_max_distance", "restriction_probability", "top_speed",
 }
 
 
 def sampled(mode, rng):
-    ranges = SHARED | (PEDESTRIAN if mode == "pedestrian" else BICYCLE)
+    ranges = SHARED | {"pedestrian": PEDESTRIAN, "bicycle": BICYCLE}.get(mode, MOTOR)
     settings = [{} for _ in range(PROFILES_PER_MODE)]
     for option, (low, high) in ranges.items():
         # Stratify each option independently and always include both bounds.
@@ -87,12 +96,22 @@ def sampled(mode, rng):
         row["exclude_ferries"] = index % 29 == 0
         if mode == "pedestrian":
             row["type"] = ("foot", "wheelchair", "blind")[index % 3]
-        else:
+        elif mode == "bicycle":
             row["bicycle_type"] = ("road", "cross", "hybrid", "mountain")[index % 4]
+        else:
+            row["include_hov2"] = index % 3 == 0
+            row["include_hov3"] = index % 3 == 1
+            row["include_hot"] = index % 4 == 0
+            row["ignore_restrictions"] = index % 7 == 0
+            row["ignore_non_vehicular_restrictions"] = index % 11 == 0
+            row["ignore_oneways"] = index % 13 == 0
+            row["ignore_access"] = index % 19 == 0
+            row["ignore_closures"] = index % 23 == 0
+            row["exclude_tolls"] = index % 29 == 0
         yield {"mode": mode, "options": row, "paths": []}
 
 
-def production(corpus, rng, path_count):
+def production(corpus, rng, path_count, modes):
     profiles = collections.defaultdict(list)
     for line in corpus:
         if not line.strip() or line.startswith("#"):
@@ -102,14 +121,17 @@ def production(corpus, rng, path_count):
             continue
         request = json.loads(body)
         mode = request["costing"]
-        if mode not in MODES:
+        if mode not in modes:
             continue
         options = request.get("costing_options", {}).get(mode, {})
-        key = (mode, json.dumps(options, sort_keys=True))
-        paths = profiles[key]
-        if len(request["locations"]) == 2 and "date_time" not in request:
-            request["directions_type"] = "none"
-            paths.append(request)
+        for variant in MOTOR_MODES if mode == "auto" else (mode,):
+            key = (variant, json.dumps(options, sort_keys=True))
+            paths = profiles[key]
+            if len(request["locations"]) == 2 and "date_time" not in request:
+                route = {**request, "directions_type": "none"}
+                if variant != mode:
+                    route.update(costing=variant, costing_options={variant: options})
+                paths.append(route)
     for (mode, options), paths in sorted(profiles.items()):
         yield {
             "mode": mode,
@@ -122,14 +144,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("corpus", type=argparse.FileType())
     parser.add_argument("--paths-per-profile", type=int, default=8)
+    parser.add_argument("--motor", action="store_true", help="sample auto, bus, taxi and HOV options")
     args = parser.parse_args()
     rng = random.Random(0x7A52C057)
-    profiles = list(production(args.corpus, rng, args.paths_per_profile))
-    if {p["mode"] for p in profiles} != set(MODES):
-        parser.error("corpus must contain pedestrian and bicycle production profiles")
+    modes = MOTOR_MODES if args.motor else MODES
+    profiles = list(production(args.corpus, rng, args.paths_per_profile, modes))
+    if {p["mode"] for p in profiles} != set(modes):
+        parser.error(f"corpus must provide production profiles for {', '.join(modes)}")
     for profile in profiles:
         print(json.dumps(profile, separators=(",", ":")))
-    for mode in MODES:
+    for mode in modes:
+        if args.motor:
+            for options in ({}, {"include_hov2": True}, {"include_hov3": True, "include_hot": True}):
+                print(json.dumps({"mode": mode, "options": options, "paths": []}, separators=(",", ":")))
         for profile in sampled(mode, rng):
             print(json.dumps(profile, separators=(",", ":")))
 

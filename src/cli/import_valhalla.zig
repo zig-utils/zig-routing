@@ -99,6 +99,7 @@ const Layout = struct {
     sources: []EdgeSource,
     edges: []format.EdgeHot,
     slopes: []u16,
+    headings: []u8,
 
     fn init(a: Allocator, stats: Stats) !Layout {
         return .{
@@ -108,6 +109,7 @@ const Layout = struct {
             .sources = try a.alloc(EdgeSource, stats.edges),
             .edges = try a.alloc(format.EdgeHot, stats.edges),
             .slopes = try a.alloc(u16, stats.edges),
+            .headings = try a.alloc(u8, stats.edges),
         };
     }
 
@@ -136,6 +138,10 @@ const Layout = struct {
                     } else {
                         id.* = edge_index;
                         self.sources[edge_index] = .{ .tile = @intCast(tile_index), .index = @intCast(i) };
+                        self.headings[edge_index] = if (std.math.cast(u3, edge.local.index)) |local|
+                            @truncate(node.headings >> (@as(u6, local) * 8))
+                        else
+                            0;
                         edge_index += 1;
                     }
                 }
@@ -412,6 +418,7 @@ pub fn run(gpa: Allocator, inputs: []const []const u8, output: []const u8, deadl
     try writer.write(.classes, classes.classes);
     try writer.write(.coordinates, layout.coords);
     try writer.write(.slopes, layout.slopes);
+    try writer.write(.headings, layout.headings);
     const labels = try a.alloc(u32, stats.nodes);
     try components.label(labels, layout.first, layout.edges, deadline);
     try writer.write(.components, labels);

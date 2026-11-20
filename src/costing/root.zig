@@ -1,5 +1,6 @@
 //! Costing models compiled from request options (port of Valhalla sif).
 
+pub const auto = @import("auto.zig");
 pub const base = @import("base.zig");
 pub const bicycle = @import("bicycle.zig");
 pub const compiled = @import("compiled.zig");

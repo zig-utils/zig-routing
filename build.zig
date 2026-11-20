@@ -321,9 +321,22 @@ pub fn build(b: *std.Build) void {
     }));
     b.step("bench-cpu", "Time snap projection and polyline encoding").dependOn(&b.addRunArtifact(bench_cpu).step);
 
+    const motor_costing_parity = b.addExecutable(.{
+        .name = "motor-costing-parity",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/motor_costing_parity.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "routing", .module = lib_mod }},
+        }),
+    });
+    const run_motor_costing = b.addRunArtifact(motor_costing_parity);
+    run_motor_costing.addPassthruArgs();
+    b.step("motor-costing-parity", "Compare motor costing calls with the Valhalla oracle").dependOn(&run_motor_costing.step);
+
     // Fuzz targets (test/fuzz.zig). `zig build test` replays their seeds; `zig build fuzz
     // --fuzz` fuzzes, ReleaseSafe by default so bounds and overflow checks stay on.
-    const fuzz_filter = b.option([]const u8, "fuzz-target", "Fuzz one target: request, http, polyline, lz4, dem, protobuf, config, osm-pbf, osm-primitives, osm-dense, node-store, graph-bundle, build-checkpoint, valhalla-tile, costing-reference, range-manifest, http-range, usage-directory, speed-config, motor-tags, admin-index, timezone-geojson, timezone-rules, datetime");
+    const fuzz_filter = b.option([]const u8, "fuzz-target", "Fuzz one target: request, http, polyline, lz4, dem, protobuf, config, osm-pbf, osm-primitives, osm-dense, node-store, graph-bundle, build-checkpoint, valhalla-tile, costing-reference, motor-costing, range-manifest, http-range, usage-directory, speed-config, motor-tags, admin-index, timezone-geojson, timezone-rules, datetime");
     const fuzz_opt: @TypeOf(optimize) = .ReleaseSafe;
     const seed_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("test/fuzz.zig"),
