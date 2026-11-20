@@ -15,4 +15,8 @@ under its license.
 
 Data built with this software from OpenStreetMap is (c) OpenStreetMap contributors and
 available under the Open Database License (ODbL). Timezone boundaries from
-timezone-boundary-builder are also ODbL.
+timezone-boundary-builder (https://github.com/evansiroky/timezone-boundary-builder)
+are derived from OpenStreetMap and distributed under the ODbL.
+
+The generated UTC offset tables use the public-domain IANA Time Zone Database
+(https://www.iana.org/time-zones).

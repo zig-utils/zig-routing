@@ -783,10 +783,11 @@
       "Assign a timezone index to every node during the build, with the same index numbering scheme documented for the format.",
       "IANA rules package: compile tzdata into a compact transition table at build time (comptime or generated file) and expose UTC offset lookup for a zone and instant.",
       "Handle zones added in newer tzdata releases and the upstream extension bit for newer zone ids.",
-      "Attribution for ODbL timezone data in NOTICE and `/status`."
+      "Record timezone boundary attribution in NOTICE and expose it alongside the graph timezone reader."
     ],
     "out_of_scope": [
-      "Date parsing and seconds-of-week logic (P5.07)."
+      "Date parsing and seconds-of-week logic (P5.07).",
+      "Presenting the attribution in the HTTP status response (P7.13)."
     ],
     "notes": [
       "Zig std has TZif parsing (`std.tz`); decide between embedding compiled TZif blobs and a generated table, and record the choice.",

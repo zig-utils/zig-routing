@@ -22,6 +22,7 @@ const checkpoint = @import("checkpoint.zig");
 const node_order = @import("order.zig");
 const admin_index = @import("admin_index.zig");
 const country_access = @import("country_access.zig");
+const timezones = @import("timezones.zig");
 
 const Allocator = std.mem.Allocator;
 const max_degree = turns.max_degree;
@@ -49,6 +50,7 @@ pub const Options = struct {
     admin_speed_region: ?AdminSpeedRegion = null,
     admin_index: ?graph.admin.View = null,
     apply_country_overrides: bool = true,
+    timezone_source: ?timezones.Source = null,
     exit_signs: ?ExitSigns = null,
     speed_rules: ?*const speeds.Config = null,
     infer_turn_channels: bool = true,
@@ -145,6 +147,7 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     try writeTopology(writer, options.scratch_dir, &topology, table.classes, turn_pool.bytes.items, if (terrain) |present| present.slopes.data else null);
     try writer.write(.turn_sides, turn_sides);
     try writeAdmins(writer, options.admin_index, shared.admin_ids);
+    if (options.timezone_source) |source_tz| try writeTimezones(gpa, writer, source_tz, topology.coordinates, options.scratch_dir);
     const topology_ns = timer.read();
     const means: []const i16 = if (terrain) |*present| present.means.data else &.{};
     const cold_bytes = try buildCold(gpa, &shared, &metadata, writer, options.scratch_dir, means);
@@ -345,6 +348,7 @@ noinline fn saveColdStage(session: *checkpoint.Session, shared: *const Shared, m
     const slopes = if (slopes_map) |mapped| try checkpoint.array(u16, mapped) else null;
     try writeTopology(&writer, options.scratch_dir, shared.topology, edge_classes, turn_data.bytes, slopes);
     try writeAdmins(&writer, options.admin_index, shared.admin_ids);
+    if (options.timezone_source) |source| try writeTimezones(gpa, &writer, source, shared.topology.coordinates, options.scratch_dir);
     if (saved_turns.manifest.files.get(.turn_sides) != null) {
         const side_data = try saved_turns.map(.turn_sides, options.deadline);
         defer side_data.unmap();
@@ -1138,6 +1142,18 @@ fn writeAdmins(writer: *format.BundleWriter, index: ?graph.admin.View, ids: ?[]c
 
 fn emitAdmins(index: graph.admin.View, out: *format.SectionWriter(.admins)) !void {
     try index.write(out);
+}
+
+noinline fn writeTimezones(gpa: Allocator, writer: *format.BundleWriter, source: timezones.Source, points: []const format.Coordinate, scratch_dir: []const u8) !void {
+    const rules = try graph.timezone.Rules.parse(source.rules);
+    try rules.verify(writer.deadline);
+    var index = try timezones.build(gpa, source.boundaries, rules, points, writer.deadline);
+    defer index.deinit();
+    var ids = try Scratch(graph.timezone.Id).init(points.len, scratch_dir);
+    defer ids.deinit();
+    try timezones.assign(index.view, points, ids.data, writer.deadline);
+    try writer.write(.node_timezones, ids.data);
+    try writer.write(.timezone_rules, source.rules);
 }
 
 const Job = struct {

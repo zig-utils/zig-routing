@@ -108,11 +108,13 @@ pub const SectionKind = enum(u32) {
     coverage = 14,
     admins = 15,
     node_admins = 16,
+    node_timezones = 17,
+    timezone_rules = 18,
 
     pub fn placement(kind: SectionKind) Placement {
         return switch (kind) {
             .nodes, .edges, .first_edge, .turns, .classes, .turn_sides => .hot,
-            .coordinates, .spatial, .components, .metadata, .coverage, .admins, .node_admins => .warm,
+            .coordinates, .spatial, .components, .metadata, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules => .warm,
             .cold_idx, .cold, .slopes => .cold,
         };
     }
@@ -135,6 +137,8 @@ pub const SectionKind = enum(u32) {
             .coverage => "coverage.bin",
             .admins => "admins.bin",
             .node_admins => "node_admins.bin",
+            .node_timezones => "node_timezones.bin",
+            .timezone_rules => "timezone_rules.bin",
         };
     }
 
@@ -152,8 +156,8 @@ pub const SectionKind = enum(u32) {
             .spatial => u8,
             .metadata => Metadata,
             .coverage => Bounds,
-            .admins => u8,
-            .node_admins => u16,
+            .admins, .timezone_rules => u8,
+            .node_admins, .node_timezones => u16,
             .components, .turn_sides => u32,
         };
     }
@@ -348,6 +352,7 @@ pub const BundleWriter = struct {
         if (!required_sections.subsetOf(self.written)) return error.MissingSection;
         if (self.written.contains(.cold) != self.written.contains(.cold_idx)) return error.MissingSection;
         if (self.written.contains(.admins) != self.written.contains(.node_admins)) return error.MissingSection;
+        if (self.written.contains(.timezone_rules) != self.written.contains(.node_timezones)) return error.MissingSection;
         if (self.deadline.expired()) return error.DeadlineExceeded;
         try self.staging.sync();
         if (self.deadline.expired()) return error.DeadlineExceeded;

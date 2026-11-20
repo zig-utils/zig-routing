@@ -15,8 +15,8 @@
 //! (section headers, checksums and typed topology access), and
 //! `build-checkpoint` (restart manifests), `valhalla-tile` (offline tile import),
 //! `costing-reference` (gate A samples and paths), `speed-config` (default speed tables),
-//! `motor-tags` (motor vehicle access and unit normalization), and `admin-index`
-//! (stored administrative boundaries).
+//! `motor-tags` (motor vehicle access and unit normalization), `admin-index`
+//! (stored administrative boundaries), `timezone-geojson`, and `timezone-rules`.
 //!
 //! The contract for every parser: malformed input returns an error, never
 //! panics, overflows or reads out of bounds. The fuzz step builds ReleaseSafe
@@ -213,6 +213,71 @@ test "fuzz admin-index" {
     try view.write(&writer);
     const records = writer.bytes.items;
     try std.testing.fuzz({}, fuzzAdminIndex, .{ .corpus = try seeds(a, &.{ "", records, records[0 .. records.len - 1] }) });
+}
+
+const stored_timezone_rules = blk: {
+    const data = @embedFile("fuzz/seeds/timezone-rules.bin");
+    const Fixture = struct {
+        const bytes: [data.len]u8 align(8) = data.*;
+    };
+    break :blk &Fixture.bytes;
+};
+
+fn fuzzTimezoneRules(_: void, s: *Smith) !void {
+    var buf: [max_input]u8 align(8) = undefined;
+    const bytes = draw(s, &buf, 0x747a_7275);
+    const rules = graph.timezone.Rules.parse(bytes) catch return;
+    rules.verify(.none) catch {};
+    const zone = rules.id("Europe/Amsterdam") catch return;
+    _ = rules.name(zone) catch null;
+    for ([_]i64{ std.math.minInt(i64), -2717650800, 0, 1772953200, std.math.maxInt(i64) }) |stamp| {
+        _ = rules.offsetAt(zone, stamp) catch null;
+    }
+}
+
+test "fuzz timezone-rules" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const records = stored_timezone_rules;
+    try std.testing.fuzz({}, fuzzTimezoneRules, .{ .corpus = try seeds(state.allocator(), &.{ "", records, records[0 .. records.len - 1] }) });
+}
+
+const timezone_geojson_fixture =
+    \\{"type":"FeatureCollection","features":[
+    \\{"type":"Feature","properties":{"tzid":"Europe/Amsterdam"},"geometry":{
+    \\"type":"Polygon","coordinates":[[[0.2,0.1],[0.7,0.1],[0.7,0.4],[0.2,0.4],[0.2,0.1]]]}},
+    \\{"type":"Feature","geometry":{"coordinates":[[[[0,0.1],[0.2,0.1],[0.2,0.4],[0,0.4],[0,0.1]]]],
+    \\"type":"MultiPolygon"},"properties":{"tzid":"Europe/London"}}]}
+;
+
+fn fuzzTimezoneGeoJson(rules: graph.timezone.Rules, s: *Smith) !void {
+    var buf: [max_input]u8 = undefined;
+    const bytes = draw(s, &buf, 0x747a_6765);
+    const points = [_]graph.format.Coordinate{ (routing.geo.PointLL.init(0.125, 0.2)).toFixed(), (routing.geo.PointLL.init(0.225, 0.2)).toFixed() };
+    var pending = routing.build.timezones.build(std.testing.allocator, bytes, rules, &points, .none) catch return;
+    defer pending.deinit();
+    var ids: [points.len]graph.timezone.Id = undefined;
+    try routing.build.timezones.assign(pending.view, &points, &ids, .none);
+    for (ids) |id| if (id != graph.timezone.unknown) try std.testing.expect((try rules.name(id)) != null);
+}
+
+test "fuzz timezone-geojson" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const rules = try graph.timezone.Rules.parse(stored_timezone_rules);
+    try std.testing.fuzz(rules, fuzzTimezoneGeoJson, .{ .corpus = try seeds(state.allocator(), &.{ "", timezone_geojson_fixture }) });
+}
+
+test "timezone assignment reads shapes and properties in either order" {
+    const rules = try graph.timezone.Rules.parse(stored_timezone_rules);
+    const LL = routing.geo.PointLL;
+    const points = [_]graph.format.Coordinate{ (LL.init(0.1, 0.2)).toFixed(), (LL.init(0.225, 0.2)).toFixed(), (LL.init(0.8, 0.2)).toFixed() };
+    var pending = try routing.build.timezones.build(std.testing.allocator, timezone_geojson_fixture, rules, &points, .none);
+    defer pending.deinit();
+    try pending.view.verify(graph.timezone.max_id, .none);
+    var ids: [points.len]graph.timezone.Id = undefined;
+    try routing.build.timezones.assign(pending.view, &points, &ids, .none);
+    try std.testing.expectEqualSlices(graph.timezone.Id, &.{ try rules.id("Europe/London"), try rules.id("Europe/Amsterdam"), 0 }, &ids);
 }
 
 fn fuzzValhallaTile(_: void, s: *Smith) !void {

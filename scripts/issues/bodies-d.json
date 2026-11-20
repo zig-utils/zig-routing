@@ -666,6 +666,7 @@
       "Non-verbose: version, tileset_last_modified, available actions.",
       "Verbose: has_tiles, has_admins, has_timezones, has_live_traffic, has_transit_tiles, osm_changeset, bbox as GeoJSON, warnings.",
       "Source the facts from bundle headers written at build time (dataset UUID, build time, changeset, bbox, section presence).",
+      "Include the timezone boundary attribution in the status response for bundles with timezone data.",
       "Respect the config flag that allows verbose status.",
       "JSON, OSRM-style and pbf Status output."
     ],

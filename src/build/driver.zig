@@ -22,6 +22,8 @@ pub const Options = struct {
     work_dir: []const u8,
     dem_dir: ?[]const u8 = null,
     default_speeds_config: ?[]const u8 = null,
+    timezone_geojson: ?[]const u8 = null,
+    timezone_rules: ?[]const u8 = null,
     infer_turn_channels: ?bool = null,
     infer_internal_intersections: ?bool = null,
     apply_country_overrides: ?bool = null,
@@ -54,11 +56,17 @@ const Source = struct {
     digest: checkpoint.Fingerprint,
 };
 
+const TimezoneInputs = struct {
+    boundaries: Source,
+    rules: Source,
+};
+
 const Inputs = struct {
     sources: []const Source,
     dem_dir: ?[]const u8,
     dem_digest: ?[32]u8 = null,
     speed_digest: ?[32]u8 = null,
+    timezones: ?TimezoneInputs = null,
     infer_turn_channels: bool = true,
     infer_internal_intersections: bool = true,
     apply_country_overrides: bool = true,
@@ -82,6 +90,11 @@ const Inputs = struct {
         if (self.speed_digest) |digest| {
             hash.update("default-speed-config");
             hash.update(&digest);
+        }
+        if (self.timezones) |input| {
+            hash.update("timezone-inputs");
+            hash.update(std.mem.asBytes(&input.boundaries.digest));
+            hash.update(std.mem.asBytes(&input.rules.digest));
         }
         if (!self.infer_turn_channels) hash.update("turn-channels-off");
         if (!self.infer_internal_intersections) hash.update("internal-intersections-off");
@@ -121,6 +134,7 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
     } else .{
         .sources = try fingerprintInputs(a, options, diagnostic),
         .dem_dir = options.dem_dir,
+        .timezones = try timezoneInputs(options, diagnostic),
         .infer_turn_channels = options.infer_turn_channels orelse true,
         .infer_internal_intersections = options.infer_internal_intersections orelse true,
         .apply_country_overrides = options.apply_country_overrides orelse true,
@@ -179,6 +193,11 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
         if (@backingInt(stage) >= @backingInt(options.from)) break;
         try session.readPrior(stage);
     }
+    var timezone_mappings: ?TimezoneMappings = null;
+    defer if (timezone_mappings) |mapped| mapped.close();
+    if (session.runs(.cold)) {
+        if (inputs.timezones) |input| timezone_mappings = try TimezoneMappings.open(input, options.deadline, diagnostic);
+    }
     const graph_options: assemble.Options = .{
         .scratch_dir = options.work_dir,
         .workers = options.workers,
@@ -190,6 +209,7 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
         .infer_turn_channels = inputs.infer_turn_channels,
         .infer_internal_intersections = inputs.infer_internal_intersections,
         .apply_country_overrides = inputs.apply_country_overrides,
+        .timezone_source = if (timezone_mappings) |mapped| .{ .boundaries = mapped.boundaries.bytes, .rules = mapped.rules.bytes } else null,
     };
     if (session.runs(.read)) {
         var tx = try session.begin(.read);
@@ -286,12 +306,72 @@ fn fingerprintInputs(a: Allocator, options: Options, diagnostic: *Diagnostic) ![
     return rows;
 }
 
+fn timezoneInputs(options: Options, diagnostic: *Diagnostic) !?TimezoneInputs {
+    const paths = options.timezone_geojson orelse {
+        if (options.timezone_rules != null) return error.MissingTimezoneBoundaries;
+        return null;
+    };
+    const rules = options.timezone_rules orelse return error.MissingTimezoneRules;
+    return .{
+        .boundaries = try fingerprintFile(paths, options.deadline, diagnostic),
+        .rules = try fingerprintFile(rules, options.deadline, diagnostic),
+    };
+}
+
+fn fingerprintFile(path: []const u8, deadline: io.Deadline, diagnostic: *Diagnostic) !Source {
+    diagnostic.input = path;
+    const file = try io.File.open(path, .read_only);
+    defer file.close();
+    const digest = try checkpoint.Fingerprint.read(file, deadline);
+    diagnostic.input = null;
+    return .{ .path = path, .digest = digest };
+}
+
+const TimezoneMappings = struct {
+    boundaries: io.Mapping,
+    rules: io.Mapping,
+
+    fn open(input: TimezoneInputs, deadline: io.Deadline, diagnostic: *Diagnostic) !TimezoneMappings {
+        const boundaries = try mapSource(input.boundaries, deadline, diagnostic);
+        errdefer boundaries.unmap();
+        return .{ .boundaries = boundaries, .rules = try mapSource(input.rules, deadline, diagnostic) };
+    }
+
+    fn close(self: TimezoneMappings) void {
+        self.rules.unmap();
+        self.boundaries.unmap();
+    }
+
+    fn mapSource(input: Source, deadline: io.Deadline, diagnostic: *Diagnostic) !io.Mapping {
+        diagnostic.input = input.path;
+        const file = try io.File.open(input.path, .read_only);
+        defer file.close();
+        if (!std.meta.eql(input.digest, try checkpoint.Fingerprint.read(file, deadline)))
+            return error.CheckpointInputMismatch;
+        const mapping = try io.Mapping.mapFd(file, .read_only);
+        diagnostic.input = null;
+        return mapping;
+    }
+};
+
 fn checkOptions(a: Allocator, inputs: *Inputs, options: Options, diagnostic: *Diagnostic) !void {
     if (options.drive_side) |side| if (side != inputs.drive_side) return error.CheckpointInputMismatch;
     if (options.order) |order| if (order != inputs.order) return error.CheckpointInputMismatch;
     if (options.infer_turn_channels) |infer| if (infer != inputs.infer_turn_channels) return error.CheckpointInputMismatch;
     if (options.infer_internal_intersections) |infer| if (infer != inputs.infer_internal_intersections) return error.CheckpointInputMismatch;
     if (options.apply_country_overrides) |apply| if (apply != inputs.apply_country_overrides) return error.CheckpointInputMismatch;
+    if (options.timezone_geojson) |path| {
+        const expected = if (inputs.timezones) |input| input.boundaries else return error.CheckpointInputMismatch;
+        const actual = try fingerprintFile(path, options.deadline, diagnostic);
+        if (!std.meta.eql(expected.digest, actual.digest)) return error.CheckpointInputMismatch;
+        inputs.timezones.?.boundaries = actual;
+    }
+    if (options.timezone_rules) |path| {
+        const expected = if (inputs.timezones) |input| input.rules else return error.CheckpointInputMismatch;
+        const actual = try fingerprintFile(path, options.deadline, diagnostic);
+        if (!std.meta.eql(expected.digest, actual.digest)) return error.CheckpointInputMismatch;
+        inputs.timezones.?.rules = actual;
+    }
     if (options.dem_dir) |dir| {
         const saved = inputs.dem_dir orelse return error.CheckpointInputMismatch;
         if (inputs.dem_digest == null and !std.mem.eql(u8, dir, saved)) return error.CheckpointInputMismatch;

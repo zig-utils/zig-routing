@@ -116,6 +116,8 @@ pub const Artifact = enum {
     admin_index,
     bundle_admins,
     bundle_node_admins,
+    bundle_node_timezones,
+    bundle_timezone_rules,
 
     fn filename(self: Artifact) [:0]const u8 {
         return switch (self) {

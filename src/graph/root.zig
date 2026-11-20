@@ -4,6 +4,7 @@ const std = @import("std");
 
 pub const coverage = @import("coverage.zig");
 pub const admin = @import("admin.zig");
+pub const timezone = @import("timezone.zig");
 pub const constants = @import("constants.zig");
 pub const format = @import("format.zig");
 pub const turn_sides = @import("turn_sides.zig");

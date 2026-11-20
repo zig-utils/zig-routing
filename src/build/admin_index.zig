@@ -3,7 +3,7 @@
 const std = @import("std");
 const admin = @import("../graph/admin.zig");
 const geometry = @import("../geo/polygon.zig");
-const PointLL = @import("../geo/point.zig").PointLL;
+const polygon_grid = @import("polygon_grid.zig");
 const io = @import("../infra/io.zig");
 const boundary = @import("admin_boundaries.zig");
 const checkpoint = @import("checkpoint.zig");
@@ -18,7 +18,7 @@ pub const Index = struct {
     }
 };
 
-const Piece = struct { id: admin.Id, polygon: geometry.Polygon };
+const Piece = polygon_grid.Piece;
 const Grid = []std.ArrayList(Piece);
 
 pub fn build(gpa: Allocator, source: anytype, deadline: io.Deadline) !?Index {
@@ -61,19 +61,18 @@ fn pack(gpa: Allocator, regions: []boundary.Boundary, deadline: io.Deadline) !In
     var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();
     const temp = scratch.allocator();
-    const grid: Grid = try temp.alloc(std.ArrayList(Piece), admin.rows * admin.columns);
-    @memset(grid, .empty);
+    var grid = try polygon_grid.Builder.init(temp, null, deadline);
     for (regions, 1..) |region, i| {
         if (deadline.expired()) return error.DeadlineExceeded;
         for (region.geometry.polygons) |polygon| {
-            try addPolygon(temp, grid, @intCast(i), polygon, deadline);
+            try grid.add(@intCast(i), polygon);
         }
     }
-    const parents = try findParents(temp, gpa, grid, regions, deadline);
+    const parents = try findParents(temp, gpa, grid.cells, regions, deadline);
 
     var storage: std.heap.ArenaAllocator = .init(gpa);
     errdefer storage.deinit();
-    var encoded: Encoder = .{ .a = storage.allocator(), .deadline = deadline };
+    var encoded: Encoder = .{ .a = storage.allocator() };
     for (regions, parents, 0..) |region, parent, i| {
         try checkAt(deadline, i);
         var root = i;
@@ -93,24 +92,18 @@ fn pack(gpa: Allocator, regions: []boundary.Boundary, deadline: io.Deadline) !In
             .default_language = try encoded.string(region.attrs.default_language),
         });
     }
-    for (grid, 0..) |cell, i| {
-        try checkAt(deadline, i);
-        if (cell.items.len == 0) continue;
-        const first = encoded.pieces.items.len;
-        for (cell.items, 0..) |piece, j| {
-            try checkAt(deadline, j);
-            try encoded.piece(piece);
-        }
-        try encoded.cells.append(encoded.a, .{ .id = @intCast(i), .pieces = try span(first, cell.items.len) });
-    }
+    const packed_grid = grid.encode(encoded.a) catch |err| switch (err) {
+        error.PolygonIndexTooLarge => return error.AdminIndexTooLarge,
+        else => return err,
+    };
     return .{
         .storage = storage,
         .view = .{
             .regions = encoded.regions.items,
-            .cells = encoded.cells.items,
-            .pieces = encoded.pieces.items,
-            .rings = encoded.rings.items,
-            .vertices = encoded.vertices.items,
+            .cells = packed_grid.cells,
+            .pieces = packed_grid.pieces,
+            .rings = packed_grid.rings,
+            .vertices = packed_grid.vertices,
             .strings = encoded.strings.items,
         },
     };
@@ -131,29 +124,6 @@ fn bundleIso(level: u8, iso: []const u8) []const u8 {
     if (level == 2) return if (iso.len == 2) iso else "";
     if (level == 4 and iso.len <= 3) return std.mem.sliceTo(iso, 0);
     return "";
-}
-
-fn addPolygon(a: Allocator, grid: Grid, id: admin.Id, polygon: geometry.Polygon, deadline: io.Deadline) !void {
-    const bounds = try geometry.ringBounds(polygon.outer, deadline) orelse return;
-    const lo = admin.cellId(bounds.minpt());
-    const hi = admin.cellId(bounds.maxpt());
-    if (lo == hi) {
-        try grid[lo].append(a, .{ .id = id, .polygon = polygon });
-        return;
-    }
-    for (lo / admin.columns..hi / admin.columns + 1) |row| {
-        for (lo % admin.columns..hi % admin.columns + 1) |col| {
-            if (deadline.expired()) return error.DeadlineExceeded;
-            const cell: u32 = @intCast(row * admin.columns + col);
-            // The piece geometry is kept by the scratch arena until packing
-            // and the parent coverage checks both finish.
-            const clipped = try geometry.clipPolygon(a, polygon, admin.cellBox(cell), deadline);
-            for (clipped.polygons, 0..) |part, i| {
-                try checkAt(deadline, i);
-                try grid[cell].append(a, .{ .id = id, .polygon = part });
-            }
-        }
-    }
 }
 
 fn findParents(temp: Allocator, gpa: Allocator, grid: Grid, regions: []const boundary.Boundary, deadline: io.Deadline) ![]const admin.Id {
@@ -221,42 +191,15 @@ noinline fn covers(parent: admin.Id, pieces: []const Piece, child: geometry.Poly
     return false;
 }
 
-fn span(first: usize, count: usize) !admin.Span {
-    if (first > std.math.maxInt(u32) or count > std.math.maxInt(u32) - first)
-        return error.AdminIndexTooLarge;
-    return .{ .first = @intCast(first), .count = @intCast(count) };
-}
-
 const Encoder = struct {
     a: Allocator,
-    deadline: io.Deadline,
     regions: std.ArrayList(admin.Region) = .empty,
-    cells: std.ArrayList(admin.Cell) = .empty,
-    pieces: std.ArrayList(admin.Piece) = .empty,
-    rings: std.ArrayList(admin.Span) = .empty,
-    vertices: std.ArrayList(PointLL) = .empty,
     strings: std.ArrayList(u8) = .empty,
 
     fn string(self: *Encoder, word: []const u8) !admin.Span {
-        const result = try span(self.strings.items.len, word.len);
+        const result = admin.Span.init(self.strings.items.len, word.len) catch return error.AdminIndexTooLarge;
         try self.strings.appendSlice(self.a, word);
         return result;
-    }
-
-    fn piece(self: *Encoder, part: Piece) !void {
-        const rings = try span(self.rings.items.len, 1 + part.polygon.holes.len);
-        try self.ring(part.polygon.outer);
-        for (part.polygon.holes, 0..) |hole, i| {
-            try checkAt(self.deadline, i);
-            try self.ring(hole);
-        }
-        try self.pieces.append(self.a, .{ .attr = .{ .region = part.id }, .rings = rings });
-    }
-
-    fn ring(self: *Encoder, points: geometry.Ring) !void {
-        const locations = try span(self.vertices.items.len, points.len);
-        try self.vertices.appendSlice(self.a, points);
-        try self.rings.append(self.a, locations);
     }
 };
 

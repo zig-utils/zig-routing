@@ -72,6 +72,10 @@ test "mapped records have checked typed accessors and offline checksums" {
     const slopes = try view.edgeSlopes(@fromBackingInt(@as(u32, 1)));
     try testing.expectEqual(15, slopes.maxUp());
     try testing.expectEqual(-24, slopes.maxDown());
+    const zone = try view.nodeTimezone(@fromBackingInt(0));
+    try testing.expectEqual(@as(routing.graph.timezone.Id, 292), zone);
+    try testing.expectEqualStrings("Europe/Amsterdam", (try view.tz_rules.?.name(zone)).?);
+    try testing.expectEqual(@as(routing.graph.timezone.Id, 0), try view.nodeTimezone(@fromBackingInt(1)));
 
     const dir = try fixture.root.child("bundle");
     defer dir.close();
@@ -80,6 +84,20 @@ test "mapped records have checked typed accessors and offline checksums" {
     defer topology.close();
     try topology.view.verify(.none, null);
     try testing.expectError(error.MissingClassSection, topology.view.class(0));
+}
+
+test "timezone sections are optional together" {
+    const fixture = try Fixture.create();
+    defer fixture.deinit();
+    var buf: [80]u8 = undefined;
+    const dir = try fixture.root.child("bundle");
+    defer dir.close();
+    try dir.deleteFile(format.SectionKind.timezone_rules.filename());
+    try testing.expectError(error.InvalidNodeTimezoneCount, reader.Bundle.open(fixture.path(&buf)));
+    try dir.deleteFile(format.SectionKind.node_timezones.filename());
+    var bundle = try reader.Bundle.open(fixture.path(&buf));
+    defer bundle.close();
+    try testing.expectEqual(@as(routing.graph.timezone.Id, 0), try bundle.view.nodeTimezone(@fromBackingInt(0)));
 }
 
 test "cold sections are optional as a pair and reject unsafe indexes and offsets" {

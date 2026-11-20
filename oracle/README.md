@@ -223,6 +223,27 @@ builders disable country overrides. Link reclassification is tracked in #118.
 The fixtures derive from OpenStreetMap data © OpenStreetMap contributors, under the
 [Open Database License](https://www.openstreetmap.org/copyright).
 
+### Node timezones
+
+Use the pinned image's `valhalla_build_timezones` to build its reference
+database. Point `mjolnir.timezone` at that database and build local tiles
+with `valhalla_build_tiles --end build`. Build the native bundle from the
+same PBF and the 2026f boundary release as described in the
+[timezone design](../docs/design/timezones.md).
+
+```bash
+python3 oracle/compare-timezones.py native-bundle valhalla-tile-dir
+zig-out/bin/zr inspect --verify native-bundle
+```
+
+The comparison reads both the nine-bit zone index and its extension bit.
+Node coordinates pair within two E7 units per axis.
+
+| Input | Paired nodes | Matching timezone IDs |
+| --- | ---: | ---: |
+| Liechtenstein | 6,280 | 6,280 |
+| Utrecht | 30,638 | 30,638 |
+
 ### Way splitting and edge counts
 
 ```bash

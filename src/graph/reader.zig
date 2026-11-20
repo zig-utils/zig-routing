@@ -5,6 +5,7 @@ const io = @import("../infra/io.zig");
 const format = @import("format.zig");
 const class_table = @import("class_table.zig");
 const admin = @import("admin.zig");
+const timezone = @import("timezone.zig");
 const cold = @import("cold.zig");
 const spatial = @import("spatial.zig");
 const turn_sides = @import("turn_sides.zig");
@@ -147,6 +148,9 @@ pub const View = struct {
     admins: ?[]const u8 = null,
     node_admins: ?[]const admin.Id = null,
     admin_index: ?admin.View = null,
+    node_timezones: ?[]const timezone.Id = null,
+    timezone_rules: ?[]const u8 = null,
+    tz_rules: ?timezone.Rules = null,
 
     pub fn parse(files: Files, diagnostic: ?*Diagnostic) !View {
         var headers: Headers = .initFill(null);
@@ -283,6 +287,15 @@ pub const View = struct {
             if (graph.admin_index == null or graph.node_admins == null or graph.node_admins.?.len != node_count)
                 return error.InvalidNodeAdminCount;
         }
+        if (graph.timezone_rules) |bytes| {
+            note(diagnostic, .timezone_rules);
+            graph.tz_rules = try timezone.Rules.parse(bytes);
+        }
+        if (graph.node_timezones != null or graph.tz_rules != null) {
+            note(diagnostic, .node_timezones);
+            if (graph.tz_rules == null or graph.node_timezones == null or graph.node_timezones.?.len != node_count)
+                return error.InvalidNodeTimezoneCount;
+        }
         note(diagnostic, null);
         return graph;
     }
@@ -301,6 +314,12 @@ pub const View = struct {
         _ = try self.node(id);
         const index = self.admin_index orelse return .{};
         return index.names(self.node_admins.?[@backingInt(id)]);
+    }
+
+    pub fn nodeTimezone(self: *const View, id: format.NodeId) !timezone.Id {
+        _ = try self.node(id);
+        const ids = self.node_timezones orelse return timezone.unknown;
+        return ids[@backingInt(id)];
     }
 
     pub fn adminAt(self: *const View, point: @import("../geo/point.zig").PointLL, deadline: io.Deadline) !admin.Names {
@@ -438,7 +457,7 @@ pub const View = struct {
             note(diagnostic, kind);
             if (deadline.expired()) return error.DeadlineExceeded;
             const bytes: []const u8 = switch (kind) {
-                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata, .components, .turn_sides, .coverage, .admins, .node_admins => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
+                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata, .components, .turn_sides, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
                 inline else => |section| std.mem.sliceAsBytes(@field(self, @tagName(section))),
             };
             var hash = std.hash.XxHash3.init(0);
@@ -458,6 +477,15 @@ pub const View = struct {
             for (self.node_admins.?, 0..) |id, i| {
                 if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
                 _ = try index.names(id);
+            }
+        }
+        if (self.tz_rules) |rules| {
+            note(diagnostic, .timezone_rules);
+            try rules.verify(deadline);
+            note(diagnostic, .node_timezones);
+            for (self.node_timezones.?, 0..) |id, i| {
+                if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
+                if (id != timezone.unknown and try rules.name(id) == null) return error.InvalidNodeTimezone;
             }
         }
         note(diagnostic, null);

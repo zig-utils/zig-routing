@@ -2,15 +2,19 @@
 // The native section stores a sparse grid of clipped polygon pieces.
 const std = @import("std");
 const io = @import("../infra/io.zig");
-const polygon = @import("../geo/polygon.zig");
+const grid = @import("polygon_grid.zig");
 const PointLL = @import("../geo/point.zig").PointLL;
 const AABB = @import("../geo/aabb.zig").AABB;
 
-pub const Id = u16;
+pub const Id = grid.Id;
 pub const unknown: Id = 0;
-pub const columns = 180;
-pub const rows = 90;
-const cell_width = 2;
+pub const columns = grid.columns;
+pub const rows = grid.rows;
+pub const Span = grid.Span;
+pub const Cell = grid.Cell;
+pub const Piece = grid.Piece;
+pub const cellId = grid.cellId;
+pub const cellBox = grid.cellBox;
 
 pub const Header = extern struct {
     version: u32 = 1,
@@ -21,16 +25,6 @@ pub const Header = extern struct {
     vertices: u32,
     string_bytes: u32,
     reserved: u32 = 0,
-};
-
-pub const Span = extern struct {
-    first: u32,
-    count: u32,
-
-    pub fn get(self: Span, slice: anytype) error{InvalidAdminIndex}!@TypeOf(slice) {
-        if (self.first > slice.len or self.count > slice.len - self.first) return error.InvalidAdminIndex;
-        return slice[self.first..][0..self.count];
-    }
 };
 
 pub const Region = extern struct {
@@ -46,16 +40,6 @@ pub const Region = extern struct {
     english_name: Span,
     iso_code: Span,
     default_language: Span,
-};
-
-pub const Cell = extern struct {
-    id: u32,
-    pieces: Span,
-};
-
-pub const Piece = extern struct {
-    attr: packed struct(u32) { region: Id, reserved: u16 = 0 },
-    rings: Span,
 };
 
 pub const Names = struct {
@@ -113,7 +97,7 @@ pub const View = struct {
     }
 
     pub fn text(self: View, span: Span) error{InvalidAdminIndex}![]const u8 {
-        return span.get(self.strings);
+        return span.get(self.strings) catch error.InvalidAdminIndex;
     }
 
     /// A state stores the ID of its covering country.
@@ -156,16 +140,19 @@ pub const View = struct {
         const lo_box = cellBox(lo);
         const start_col = lo % columns - @as(u32, @intFromBool(lo % columns != 0 and box.minx == lo_box.minx));
         const start_row = lo / columns - @as(u32, @intFromBool(lo >= columns and box.miny == lo_box.miny));
+        const geometry = self.gridView();
         var found: Id = unknown;
         for (start_row..hi / columns + 1) |row| {
             for (start_col..hi % columns + 1) |col| {
                 if (deadline.expired()) return error.DeadlineExceeded;
-                const pieces = try self.cellPieces(@intCast(row * columns + col));
+                const pieces = geometry.cellPieces(@intCast(row * columns + col)) catch return error.InvalidAdminIndex;
                 for (pieces, 0..) |piece, i| {
                     try checkAt(deadline, i);
                     if (piece.attr.region == found) continue;
                     const area = (try self.region(piece.attr.region)) orelse return error.InvalidAdminIndex;
-                    if (!isPoliticalArea(area) or !try self.intersectsBox(piece, box, deadline)) continue;
+                    if (!isPoliticalArea(area)) continue;
+                    const intersects = geometry.intersectsBox(piece, box, deadline) catch |err| return gridError(err);
+                    if (!intersects) continue;
                     if (found != unknown) return unknown;
                     found = piece.attr.region;
                 }
@@ -184,13 +171,15 @@ pub const View = struct {
     }
 
     noinline fn lookupCell(self: View, id: u32, point: PointLL, deadline: io.Deadline) !Match {
-        const pieces = try self.cellPieces(id);
+        const geometry = self.gridView();
+        const pieces = geometry.cellPieces(id) catch return error.InvalidAdminIndex;
         var country: Id = unknown;
         for (pieces, 0..) |piece, i| {
             try checkAt(deadline, i);
             const area = (try self.region(piece.attr.region)) orelse return error.InvalidAdminIndex;
             if (!isPoliticalArea(area)) continue;
-            if (try self.locate(piece, point, deadline) == .outside) continue;
+            const location = geometry.locate(piece, point, deadline) catch |err| return gridError(err);
+            if (location == .outside) continue;
             // Match the state-first, name-ordered queries in Valhalla.
             if (area.attr.level == 4) return .{ .state = piece.attr.region };
             country = piece.attr.region;
@@ -198,46 +187,8 @@ pub const View = struct {
         return .{ .country = country };
     }
 
-    fn cellPieces(self: View, id: u32) error{InvalidAdminIndex}![]const Piece {
-        var low: usize = 0;
-        var high = self.cells.len;
-        while (low < high) {
-            const mid = low + (high - low) / 2;
-            const cell = self.cells[mid];
-            if (cell.id == id) return cell.pieces.get(self.pieces);
-            if (cell.id < id) {
-                low = mid + 1;
-            } else {
-                high = mid;
-            }
-        }
-        return &.{};
-    }
-
-    fn locate(self: View, piece: Piece, point: PointLL, deadline: io.Deadline) !polygon.Location {
-        const rings = try piece.rings.get(self.rings);
-        if (rings.len == 0) return error.InvalidAdminIndex;
-        const shell = try polygon.locateInRing(try rings[0].get(self.vertices), point, deadline);
-        if (shell != .inside) return shell;
-        for (rings[1..], 0..) |ring, i| {
-            try checkAt(deadline, i);
-            switch (try polygon.locateInRing(try ring.get(self.vertices), point, deadline)) {
-                .inside => return .outside,
-                .boundary => return .boundary,
-                .outside => {},
-            }
-        }
-        return .inside;
-    }
-
-    fn intersectsBox(self: View, piece: Piece, box: AABB, deadline: io.Deadline) !bool {
-        if (try self.locate(piece, box.minpt(), deadline) != .outside) return true;
-        const rings = try piece.rings.get(self.rings);
-        for (rings, 0..) |ring, i| {
-            try checkAt(deadline, i);
-            if (try polygon.ringIntersectsBox(try ring.get(self.vertices), box, deadline)) return true;
-        }
-        return false;
+    fn gridView(self: View) grid.View {
+        return .{ .cells = self.cells, .pieces = self.pieces, .rings = self.rings, .vertices = self.vertices };
     }
 
     pub fn verify(self: View, deadline: io.Deadline) !void {
@@ -252,34 +203,8 @@ pub const View = struct {
             _ = try self.text(area.iso_code);
             _ = try self.text(area.default_language);
         }
-        var previous: ?u32 = null;
-        var piece_offset: usize = 0;
-        for (self.cells, 0..) |cell, i| {
-            try checkAt(deadline, i);
-            if (cell.id >= rows * columns or (previous != null and cell.id <= previous.?) or
-                cell.pieces.first != piece_offset or cell.pieces.count == 0)
-                return error.InvalidAdminIndex;
-            const pieces = try cell.pieces.get(self.pieces);
-            for (pieces, 0..) |piece, j| {
-                try checkAt(deadline, j);
-                if (piece.attr.region == unknown or piece.attr.region > self.regions.len or
-                    piece.attr.reserved != 0 or piece.rings.count == 0)
-                    return error.InvalidAdminIndex;
-                _ = try piece.rings.get(self.rings);
-            }
-            piece_offset += pieces.len;
-            previous = cell.id;
-        }
-        if (piece_offset != self.pieces.len) return error.InvalidAdminIndex;
-        for (self.rings, 0..) |ring, i| {
-            try checkAt(deadline, i);
-            if (ring.count < 3) return error.InvalidAdminIndex;
-            _ = try ring.get(self.vertices);
-        }
-        for (self.vertices, 0..) |vertex, i| {
-            try checkAt(deadline, i);
-            if (!vertex.inRange()) return error.InvalidAdminIndex;
-        }
+        const max_id = std.math.cast(Id, self.regions.len) orelse return error.InvalidAdminIndex;
+        self.gridView().verify(max_id, deadline) catch |err| return gridError(err);
     }
 };
 
@@ -300,18 +225,8 @@ fn take(comptime T: type, item_count: u32, bytes: anytype) error{InvalidAdminInd
     return items;
 }
 
-/// Both positive ends of the world belong to the final column or row.
-pub fn cellId(point: PointLL) u32 {
-    const x: u32 = @intFromFloat(@min(columns - 1, (point.lng + 180) / cell_width));
-    const y: u32 = @intFromFloat(@min(rows - 1, (point.lat + 90) / cell_width));
-    return y * columns + x;
-}
-
-pub fn cellBox(id: u32) AABB {
-    const x: f64 = @floatFromInt(id % columns);
-    const y: f64 = @floatFromInt(id / columns);
-    const lo = PointLL.init(x * cell_width - 180, y * cell_width - 90);
-    return AABB.fromPoints(lo, .init(lo.lng + cell_width, lo.lat + cell_width));
+fn gridError(err: anyerror) anyerror {
+    return if (err == error.InvalidPolygonIndex) error.InvalidAdminIndex else err;
 }
 
 fn checkAt(deadline: io.Deadline, i: usize) !void {
@@ -321,11 +236,7 @@ fn checkAt(deadline: io.Deadline, i: usize) !void {
 comptime {
     std.debug.assert(@import("builtin").target.cpu.arch.endian() == .little);
     std.debug.assert(@sizeOf(Header) == 32 and @offsetOf(Header, "vertices") == 20);
-    std.debug.assert(@sizeOf(PointLL) == 16 and @offsetOf(PointLL, "lng") == 0 and @offsetOf(PointLL, "lat") == 8);
-    std.debug.assert(@sizeOf(Span) == 8 and @offsetOf(Span, "first") == 0 and @offsetOf(Span, "count") == 4);
     std.debug.assert(@sizeOf(Region) == 48 and @offsetOf(Region, "osm_id") == 0 and @offsetOf(Region, "attr") == 8);
     std.debug.assert(@offsetOf(Region, "name") == 16 and @offsetOf(Region, "english_name") == 24);
     std.debug.assert(@offsetOf(Region, "iso_code") == 32 and @offsetOf(Region, "default_language") == 40);
-    std.debug.assert(@sizeOf(Cell) == 12 and @offsetOf(Cell, "id") == 0 and @offsetOf(Cell, "pieces") == 4);
-    std.debug.assert(@sizeOf(Piece) == 12 and @offsetOf(Piece, "attr") == 0 and @offsetOf(Piece, "rings") == 4);
 }

@@ -69,6 +69,8 @@ pub fn records(comptime kind: format.SectionKind) []const kind.Record() {
         .coverage => &.{.{ .west = 0, .south = 0, .east = 100000, .north = 0 }},
         .admins => std.mem.asBytes(&empty_admins),
         .node_admins => &.{ 0, 0 },
+        .node_timezones => &.{ 292, 0 },
+        .timezone_rules => @embedFile("fuzz/seeds/timezone-rules.bin"),
     };
 }
 

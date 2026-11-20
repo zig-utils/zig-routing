@@ -180,7 +180,7 @@ P7.09 | /expansion endpoint | api | port | S | P7.01
 P7.10 | /centroid | search | port | M | P7.01
 P7.11 | /optimized_route: port of the optimizer on top of the matrix | search | port | M | P7.03 P6.13
 P7.12 | /locate with verbose edge and node info | api | port | M | P3.23 P3.17
-P7.13 | /status with verbose output | api | port | S | P1.13 P3.13
+P7.13 | /status with verbose output | api | port | S | P1.13 P3.13 P5.06
 P7.14 | /tile: graph MVT with an MVT encoder | tiles | port | M | P1.07 P3.20
 P7.15 | Scheduling classes: light and heavy request pools with bounded intra-request parallelism | server | new | M | P7.02 P1.16
 P7.16 | Response cache keyed by snapped edges, metric key and traffic epoch | server | perf | M | P4.08 P3.33
