@@ -1135,6 +1135,67 @@ test "Gurka locate reports directed shapes, snapped nodes and missing matches" {
     }
 }
 
+test "Gurka measurements group opposing directions and deduplicate junctions" {
+    const match = routing.match.candidates;
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates("A----B----C", 50), &.{
+        .{ .label = "AB", .tags = &.{
+            .{ .key = "highway", .value = "primary" },
+            .{ .key = "oneway", .value = "yes" },
+        } },
+        .{ .label = "BC", .tags = &.{.{ .key = "highway", .value = "primary" }} },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    var backing = routing.infra.arena.CountingAllocator.init(testing.allocator);
+    var request_memory = routing.infra.arena.Arena.init(backing.allocator(), .{});
+    defer request_memory.deinit();
+    var finder = match.Finder.init(view, request_memory.allocator(), .{});
+    defer finder.deinit();
+    const access: routing.snap.candidates.Access = .{ .mask = .{ .auto = true } };
+    const start = fixture.findNode("A").?.location;
+    const junction = fixture.findNode("B").?.location;
+    const end = fixture.findNode("C").?.location;
+    const middle = start.midpoint(junction);
+    const forward = try directedBetween(view, &fixture, "A", "B");
+    const first = try finder.query(.{ .point = middle }, access, .none);
+    try testing.expectEqual(1, first.len);
+    try testing.expectEqual(1, first[0].arcs().len);
+    try testing.expectEqual(forward, first[0].arcs()[0].edge);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), first[0].arcs()[0].percent_along, 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 90), first[0].arcs()[0].heading, 1);
+
+    const pair = try finder.query(.{ .point = junction.midpoint(end) }, access, .none);
+    try testing.expectEqual(1, pair.len);
+    try testing.expectEqual(2, pair[0].arcs().len);
+    try testing.expectEqual(try view.oppEdge(pair[0].arcs()[0].edge), pair[0].arcs()[1].edge);
+    const at_node = try finder.query(.{ .point = junction, .search_radius = 2 }, access, .none);
+    try testing.expectEqual(1, at_node.len);
+    try testing.expectEqual(try at(view, junction.toFixed()), at_node[0].node.?);
+
+    var uncached = match.Finder.init(view, a, .{ .shape_cache_bytes = 1, .max_search_radius = 5 });
+    defer uncached.deinit();
+    var offset = match.Measurement{
+        .point = .init(middle.lng, middle.lat + 0.00008),
+        .search_radius = 2,
+        .gps_accuracy = 12,
+    };
+    try testing.expectEqual(1, (try finder.query(offset, access, .none)).len);
+    try testing.expectEqual(0, (try uncached.query(offset, access, .none)).len);
+    offset.point = middle;
+    const from_scratch = try uncached.query(offset, access, .none);
+    try testing.expectEqual(forward, from_scratch[0].arcs()[0].edge);
+    try testing.expect(uncached.storage.reserved <= 1);
+    backing.resetCounts();
+    for (0..8) |_| {
+        try testing.expectEqual(forward, (try finder.query(offset, access, .none))[0].arcs()[0].edge);
+    }
+    try testing.expectEqual(0, backing.calls());
+}
+
 // Ported from test/gurka/test_vector_tiles.cc for the edges and nodes layers.
 test "Gurka tile emits graph features and applies zoom and layer filters" {
     const http = routing.server.http;

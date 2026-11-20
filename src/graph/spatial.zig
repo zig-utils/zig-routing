@@ -161,17 +161,27 @@ pub const View = struct {
 
     /// Visit only populated cells that can touch a non-wrapping rectangle.
     pub fn cellsInBox(self: View, west: geo.PointLL, east: geo.PointLL) BoxCells {
+        return self.boxCells(west, east, 1);
+    }
+
+    /// Visit the cells intersecting a non-wrapping rectangle. Callers
+    /// working in a different coordinate precision supply their own margin.
+    pub fn intersectingCells(self: View, west: geo.PointLL, east: geo.PointLL) BoxCells {
+        return self.boxCells(west, east, 0);
+    }
+
+    fn boxCells(self: View, west: geo.PointLL, east: geo.PointLL, margin: u32) BoxCells {
         const first = grid.snapCell(west);
         const last = grid.snapCell(east);
-        const first_column = (first % grid.snap_columns) -| 1;
-        const end_column = @min(last % grid.snap_columns + 2, grid.snap_columns);
-        const row = (first / grid.snap_columns) -| 1;
+        const first_column = (first % grid.snap_columns) -| margin;
+        const end_column = @min(last % grid.snap_columns + 1 + margin, grid.snap_columns);
+        const row = (first / grid.snap_columns) -| margin;
         return .{
             .view = self,
             .first_column = first_column,
             .end_column = end_column,
             .row = row,
-            .last_row = @min(last / grid.snap_columns + 1, grid.snap_rows - 1),
+            .last_row = @min(last / grid.snap_columns + margin, grid.snap_rows - 1),
             .index = self.lowerBound(row * grid.snap_columns + first_column),
         };
     }

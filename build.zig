@@ -359,6 +359,16 @@ pub fn build(b: *std.Build) void {
     run_bench_isochrone.addPassthruArgs();
     b.step("bench-isochrone", "Measure isochrone expansion and write arrival grids").dependOn(&run_bench_isochrone.step);
 
+    const bench_candidates = b.addExecutable(.{ .name = "bench-candidates", .root_module = b.createModule(.{
+        .root_source_file = b.path("test/bench_candidates.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{.{ .name = "routing", .module = lib_mod }},
+    }) });
+    const run_bench_candidates = b.addRunArtifact(bench_candidates);
+    run_bench_candidates.addPassthruArgs();
+    b.step("bench-candidates", "Measure Meili candidate search and write correlations").dependOn(&run_bench_candidates.step);
+
     const bench_exclusions = b.addExecutable(.{ .name = "bench-exclusions", .root_module = b.createModule(.{
         .root_source_file = b.path("test/bench_exclusions.zig"),
         .target = target,
