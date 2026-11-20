@@ -21,7 +21,7 @@
 //! `motor-tags` (motor vehicle access and unit normalization), `admin-index`
 //! (stored administrative boundaries), `timezone-geojson`, `timezone-rules`,
 //! `datetime`, `time-domain`, `lane-tags`, `name-tags`, `geocode-bundle` and
-//! `geocode-address` and `geocode-analysis`.
+//! `geocode-address`, `geocode-analysis` and `geocode-index`.
 //!
 //! The contract for every parser: malformed input returns an error, never
 //! panics, overflows or reads out of bounds. The fuzz step builds ReleaseSafe
@@ -535,6 +535,69 @@ test "fuzz geocode-analysis" {
         "\x01\x03" ++ "London SW1A 2AA",
     };
     try std.testing.fuzz({}, fuzzGeocodeAnalysis, .{ .corpus = try seeds(arena.allocator(), inputs) });
+}
+
+const GeocodeIndexHeader = @FieldType(routing.geocode.index.View, "header");
+const GeocodeIndexBlock = @typeInfo(@FieldType(routing.geocode.index.View, "blocks")).pointer.child;
+
+fn fuzzGeocodeIndex(_: void, s: *Smith) !void {
+    const geocode = routing.geocode;
+    var input: [2048]u8 = undefined;
+    const bytes = draw(s, &input, 0x67696e64);
+    if (bytes.len == 0) return;
+    var storage: [input.len]u8 align(@alignOf(GeocodeIndexHeader)) = undefined;
+    const file = storage[0 .. bytes.len - 1];
+    @memcpy(file, bytes[1..]);
+    if (bytes[0] & 1 == 0 and file.len >= @sizeOf(GeocodeIndexHeader)) {
+        const hash = try geocode.model.checksum(file[@sizeOf(GeocodeIndexHeader)..], .none);
+        std.mem.writeInt(u64, file[@offsetOf(GeocodeIndexHeader, "payload_hash")..][0..8], hash, .little);
+    }
+    const view = geocode.index.View.decode(file, @splat(0), .none) catch return;
+    var scratch: [storage.len]u8 = undefined;
+    try std.testing.expect(view.scratchBytes() <= scratch.len);
+    var total: u64 = 0;
+    for (std.enums.values(geocode.index.Field)) |field| {
+        var cursor = try view.prefix(field, "", &scratch, .none);
+        while (try cursor.next(.none)) |term| {
+            var posting = term.list.iterator();
+            var count: u32 = 0;
+            while (try posting.next()) |id| : (count += 1) {
+                try std.testing.expect(view.header.records.document(id) != null);
+            }
+            try std.testing.expectEqual(term.list.count, count);
+            total += count;
+        }
+    }
+    try std.testing.expectEqual(view.header.postings, total);
+}
+
+test "fuzz geocode-index" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const header: GeocodeIndexHeader = .{
+        .dataset_uuid = @splat(0),
+        .longest_term = 3,
+        .terms = 2,
+        .postings = 3,
+        .analyzed_bytes = 9,
+        .postings_bytes = 2,
+        .dictionary_bytes = 12,
+        .blocks = 1,
+        .payload_hash = 0,
+        .records = .{ .place = 64 },
+        .field_blocks = .{
+            .{ .first = 0, .len = 1 },
+            .{ .first = 1 },
+            .{ .first = 1 },
+            .{ .first = 1 },
+            .{ .first = 1 },
+        },
+    };
+    const block: GeocodeIndexBlock = .{ .dictionary = 0, .postings = 0, .attr = .{ .terms = 2 } };
+    const valid = "\x00" ++ std.mem.asBytes(&header).* ++
+        "\x05\x03\x00\x03oak\x01\x09\x02\x01t\x02\x02\x00\x00" ++ std.mem.asBytes(&block).*;
+    const inputs = &.{ "", "\x01ZRGIDX01", valid };
+    try std.testing.fuzz({}, fuzzGeocodeIndex, .{ .corpus = try seeds(arena.allocator(), inputs) });
 }
 
 fn fuzzLaneTags(_: void, s: *Smith) !void {

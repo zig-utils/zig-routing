@@ -129,6 +129,35 @@ test "geocode bundle keeps multilingual labels and merges streets by municipalit
     try testing.expectEqualStrings("1234", try data.addresses[0].record.hierarchy.postcode.get(data.text));
     try testing.expectEqualStrings("The Schoolhouse", try data.addresses[1].house_name.get(data.text));
     try testing.expectEqualStrings("school", try data.pois[0].kind.get(data.text));
+
+    const dir = try io.Directory.open(output);
+    defer dir.close();
+    _ = try geocode.index_build.build(a, output, 1, .none);
+    var serial = try geocode.index.Index.open(dir, opened.uuid, .none);
+    defer serial.close();
+    const built = try geocode.index_build.build(a, output, 2, .none);
+    try testing.expectEqual(2, built.workers);
+    var parallel = try geocode.index.Index.open(dir, opened.uuid, .none);
+    defer parallel.close();
+    try testing.expectEqualSlices(u8, serial.mapping.bytes, parallel.mapping.bytes);
+    var index_scratch: [64]u8 = undefined;
+    var streets = try parallel.view.prefix(.street, "ma", &index_scratch, .none);
+    const main = (try streets.next(.none)).?;
+    try testing.expectEqualStrings("main", main.text);
+    try testing.expectEqual(3, main.list.count);
+    var posted = main.list.iterator();
+    for ([_]geocode.index.Document{
+        .{ .kind = .street, .row = 0 },
+        .{ .kind = .street, .row = 1 },
+        .{ .kind = .address, .row = 0 },
+    }) |expected| {
+        const id = (try posted.next()).?;
+        try testing.expectEqual(expected, parallel.view.header.records.document(id).?);
+    }
+    var postal = try parallel.view.prefix(.postcode, "123", &index_scratch, .none);
+    try testing.expectEqualStrings("1234", (try postal.next(.none)).?.text);
+    var house_number = try parallel.view.prefix(.house_number, "10", &index_scratch, .none);
+    try testing.expectEqualStrings("10a", (try house_number.next(.none)).?.text);
 }
 
 fn addressTags(allocator: std.mem.Allocator, number: []const u8) !gurka.Tags {

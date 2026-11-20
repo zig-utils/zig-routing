@@ -10,8 +10,11 @@ pub const postcode = @import("postcode.zig");
 pub const address_format = @import("address_format.zig");
 pub const unicode = @import("unicode.zig");
 pub const analyze = @import("analyze.zig");
+pub const index = @import("index.zig");
+pub const index_build = @import("index_build.zig");
 
 test {
     std.testing.refAllDecls(@This());
     _ = @import("tags.zig");
+    _ = @import("index_postings.zig");
 }

@@ -260,6 +260,10 @@ pub const Bundle = struct {
     pub fn open(path: []const u8, deadline: io.Deadline) !Bundle {
         const dir = try io.Directory.open(path);
         defer dir.close();
+        return openInDir(dir, deadline);
+    }
+
+    pub fn openInDir(dir: io.Directory, deadline: io.Deadline) !Bundle {
         var result: Bundle = .{ .uuid = undefined, .data = .{}, .mappings = @splat(null) };
         errdefer result.close();
         var addresses: AddressData = .{};

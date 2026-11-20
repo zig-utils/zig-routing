@@ -149,6 +149,16 @@ pub fn build(b: *std.Build) void {
     const run_bench_analysis = b.addRunArtifact(bench_analysis);
     b.step("bench-geocode-analysis", "Check warm geocoding text analysis throughput on one core").dependOn(&run_bench_analysis.step);
 
+    const bench_geocode_index = b.addExecutable(.{ .name = "bench-geocode-index", .root_module = b.createModule(.{
+        .root_source_file = b.path("test/bench_geocode_index.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "routing", .module = lib_mod }},
+    }) });
+    const run_bench_geocode_index = b.addRunArtifact(bench_geocode_index);
+    run_bench_geocode_index.addPassthruArgs();
+    b.step("bench-geocode-index", "Check warm prefix lookup and geocoder index size").dependOn(&run_bench_geocode_index.step);
+
     const narrative_tests = b.addTest(.{
         .name = "test-narrative",
         .root_module = lib_mod,
@@ -519,7 +529,7 @@ pub fn build(b: *std.Build) void {
 
     // Fuzz targets (test/fuzz.zig). `zig build test` replays their seeds; `zig build fuzz
     // --fuzz` fuzzes, ReleaseSafe by default so bounds and overflow checks stay on.
-    const fuzz_filter = b.option([]const u8, "fuzz-target", "Fuzz one target: request, http, polyline, lz4, dem, protobuf, config, osm-pbf, osm-primitives, osm-dense, node-store, graph-bundle, live-traffic, traffic-feed, predicted-speed, mvt, geocode-bundle, geocode-address, geocode-analysis, build-checkpoint, valhalla-tile, costing-reference, motor-costing, range-manifest, http-range, usage-directory, speed-config, motor-tags, admin-index, timezone-geojson, timezone-rules, datetime");
+    const fuzz_filter = b.option([]const u8, "fuzz-target", "Fuzz one target: request, http, polyline, lz4, dem, protobuf, config, osm-pbf, osm-primitives, osm-dense, node-store, graph-bundle, live-traffic, traffic-feed, predicted-speed, mvt, geocode-bundle, geocode-address, geocode-analysis, geocode-index, build-checkpoint, valhalla-tile, costing-reference, motor-costing, range-manifest, http-range, usage-directory, speed-config, motor-tags, admin-index, timezone-geojson, timezone-rules, datetime");
     const fuzz_opt: @TypeOf(optimize) = .ReleaseSafe;
     const seed_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("test/fuzz.zig"),

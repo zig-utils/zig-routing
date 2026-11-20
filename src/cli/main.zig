@@ -173,6 +173,10 @@ fn createCommands(a: Allocator) !*Command {
     _ = try command(geocode_cmd, "inspect", "Verify and count geocoding bundle records", inspectGeocode, &.{}, &.{
         arg("BUNDLE", "Geocoding bundle directory"),
     });
+    _ = try command(geocode_cmd, "index", "Build a geocoder term index from a bundle", buildGeocodeIndex, &.{
+        option("threads", "Number of parallel analysis workers", .int),
+        option("timeout", "Time limit for building the index", .string),
+    }, &.{arg("BUNDLE", "Geocoding bundle directory")});
     _ = try command(geocode_cmd, "postcode", "Look up postcode centroids and extents", lookupGeocodePostcodes, &.{
         option("timeout", "Time limit for bundle verification and lookup", .string),
     }, &.{
@@ -678,9 +682,23 @@ fn buildGeocode(ctx: *Context) !u8 {
 
 fn inspectGeocode(ctx: *Context) !u8 {
     const geocode = routing.geocode;
-    var opened = try geocode.bundle.Bundle.open(ctx.getArgument(0).?, .none);
+    const a = std.heap.c_allocator;
+    const dir = try io.Directory.open(ctx.getArgument(0).?);
+    defer dir.close();
+    var opened = try geocode.bundle.Bundle.openInDir(dir, .none);
     defer opened.close();
     const data = opened.data;
+    var index: ?geocode.index.Index = geocode.index.Index.open(dir, opened.uuid, .none) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (index) |*present| present.close();
+    var stats: ?geocode.index.Summary = if (index) |present| blk: {
+        if (!std.meta.eql(present.view.header.records, try geocode.index_build.counts(data)))
+            return error.GeocodeIndexRecordCountMismatch;
+        break :blk try present.view.summarize(a, 10, .none);
+    } else null;
+    defer if (stats) |*present| present.deinit(a);
     try ctx.writeJson(.{
         .places = data.places.len,
         .streets = data.streets.len,
@@ -691,11 +709,20 @@ fn inspectGeocode(ctx: *Context) !u8 {
         .house_links = if (data.address_data) |addresses| addresses.house_links.len else 0,
         .interpolations = if (data.address_data) |addresses| addresses.interpolations.len else 0,
         .postcodes = if (data.address_data) |addresses| addresses.postcodes.len else 0,
+        .index = stats,
         .coverage = try data.coverage(.none),
         .attribution = geocode.model.attribution,
         .attribution_url = geocode.model.attribution_url,
         .license = geocode.model.license,
     });
+    return 0;
+}
+
+fn buildGeocodeIndex(ctx: *Context) !u8 {
+    const workers = (try unsigned(ctx, usize, "threads")) orelse 0;
+    const deadline: io.Deadline = if (try duration(ctx, "timeout")) |ns| .fromNow(ns) else .none;
+    const report = try routing.geocode.index_build.build(std.heap.c_allocator, ctx.getArgument(0).?, workers, deadline);
+    try ctx.writeJson(report);
     return 0;
 }
 
