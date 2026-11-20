@@ -140,6 +140,18 @@ pub const Artifact = enum {
     bundle_turnlanes,
     bundle_lane_connectivity,
     way_name_details,
+    bundle_transit_metadata,
+    bundle_transit_stops,
+    bundle_transit_stations,
+    bundle_transit_egresses,
+    bundle_transit_routes,
+    bundle_transit_lines,
+    bundle_transit_departures,
+    bundle_transit_occurrences,
+    bundle_transit_schedules,
+    bundle_transit_days,
+    bundle_transit_exceptions,
+    bundle_transit_transfers,
 
     noinline fn filename(self: Artifact) [:0]const u8 {
         return switch (self) {

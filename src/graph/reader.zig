@@ -11,6 +11,7 @@ const spatial = @import("spatial.zig");
 const turn_sides = @import("turn_sides.zig");
 const restrictions = @import("turn_restrictions.zig");
 const automaton = @import("restriction_automaton.zig");
+const transit = @import("transit.zig");
 const Kind = format.SectionKind;
 const Header = format.SectionHeader;
 const kinds = std.enums.values(Kind);
@@ -171,6 +172,19 @@ pub const View = struct {
     turnlanes: ?[]const u16 = null,
     lane_connectivity: ?[]const format.SectionKind.lane_connectivity.Record() = null,
     turn_lane_index: ?@import("lanes.zig").Table = null,
+    transit_metadata: ?[]const transit.Metadata = null,
+    transit_stops: ?[]const transit.Stop = null,
+    transit_stations: ?[]const transit.Station = null,
+    transit_egresses: ?[]const transit.Egress = null,
+    transit_routes: ?[]const transit.Route = null,
+    transit_lines: ?[]const transit.Line = null,
+    transit_departures: ?[]const transit.Departure = null,
+    transit_occurrences: ?[]const transit.Occurrence = null,
+    transit_schedules: ?[]const transit.Schedule = null,
+    transit_days: ?[]const transit.DayWord = null,
+    transit_exceptions: ?[]const transit.Exception = null,
+    transit_transfers: ?[]const transit.Transfer = null,
+    transit_index: ?transit.View = null,
 
     pub fn parse(files: Files, diagnostic: ?*Diagnostic) !View {
         return parseWithDeadline(files, diagnostic, .none);
@@ -361,8 +375,50 @@ pub const View = struct {
             note(diagnostic, .restriction_automaton);
             return error.MissingSection;
         }
+        try graph.openTransit(diagnostic);
         note(diagnostic, null);
         return graph;
+    }
+
+    fn openTransit(self: *View, diagnostic: ?*Diagnostic) !void {
+        var present: usize = 0;
+        for (format.transit_sections) |kind| {
+            if (self.headers.get(kind)) |entry| {
+                note(diagnostic, kind);
+                if (entry.count > std.math.maxInt(u32)) return error.TooManyRecords;
+                present += 1;
+            }
+        }
+        if (present == 0) return;
+        if (present != format.transit_sections.len) {
+            for (format.transit_sections) |kind| {
+                if (self.headers.get(kind) == null) {
+                    note(diagnostic, kind);
+                    return error.MissingSection;
+                }
+            }
+        }
+        note(diagnostic, .cold);
+        const strings = self.cold_data orelse return error.MissingSection;
+        note(diagnostic, .transit_metadata);
+        const metadata = self.transit_metadata.?;
+        if (metadata.len != 1 or metadata[0].reserved != 0) return error.InvalidTransitMetadata;
+        if (metadata[0].version != transit.section_version) return error.UnsupportedTransitVersion;
+        self.transit_index = .{
+            .metadata = metadata[0],
+            .stops = self.transit_stops.?,
+            .stations = self.transit_stations.?,
+            .egresses = self.transit_egresses.?,
+            .routes = self.transit_routes.?,
+            .lines = self.transit_lines.?,
+            .departures = self.transit_departures.?,
+            .occurrences = self.transit_occurrences.?,
+            .schedules = self.transit_schedules.?,
+            .days = self.transit_days.?,
+            .exceptions = self.transit_exceptions.?,
+            .transfers = self.transit_transfers.?,
+            .strings = strings,
+        };
     }
 
     pub fn header(self: *const View, kind: Kind) ?Header {
@@ -541,8 +597,10 @@ pub const View = struct {
             note(diagnostic, kind);
             if (deadline.expired()) return error.DeadlineExceeded;
             const bytes: []const u8 = switch (kind) {
-                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata, .components, .turn_sides, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules, .turn_restrictions, .restriction_automaton, .restriction_conditions, .signs, .headings, .lb_speeds, .turnlanes, .lane_connectivity => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
-                inline else => |section| std.mem.sliceAsBytes(@field(self, @tagName(section))),
+                inline else => |section| blk: {
+                    const data = @field(self, @tagName(section));
+                    break :blk std.mem.sliceAsBytes(if (@typeInfo(@TypeOf(data)) == .optional) data.? else data);
+                },
             };
             var hash = std.hash.XxHash3.init(0);
             var rest = bytes;
@@ -592,6 +650,10 @@ pub const View = struct {
                 if (!via.attr.has_turn_restrictions) return error.InvalidTurnRestrictions;
                 previous = key;
             }
+        }
+        if (self.transit_index) |index| {
+            note(diagnostic, .transit_metadata);
+            try index.verify(self.nodes.len, deadline);
         }
         note(diagnostic, null);
     }

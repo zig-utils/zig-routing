@@ -5,6 +5,7 @@ const reader = routing.graph.reader;
 const io = routing.infra.io;
 const testing = std.testing;
 const sample = @import("graph_fixture.zig");
+const transit = routing.graph.transit;
 const edges = sample.records(.edges);
 
 const Fixture = struct {
@@ -13,6 +14,10 @@ const Fixture = struct {
     name: io.Directory.TempName,
 
     fn create() !Fixture {
+        return createWithTransit(false);
+    }
+
+    fn createWithTransit(include_transit: bool) !Fixture {
         const parent = try io.Directory.open(".");
         errdefer parent.close();
         const root = try parent.temporaryChild();
@@ -22,7 +27,11 @@ const Fixture = struct {
         }
         const fixture: Fixture = .{ .parent = parent, .root = root.dir, .name = root.name };
         var buf: [80]u8 = undefined;
-        try sample.write(fixture.path(&buf));
+        if (include_transit) {
+            try sample.writeTransit(testing.allocator, fixture.path(&buf));
+        } else {
+            try sample.write(fixture.path(&buf));
+        }
         return fixture;
     }
 
@@ -56,6 +65,8 @@ test "mapped records have checked typed accessors and offline checksums" {
     defer bundle.close();
     const view = &bundle.view;
     try view.verify(.none, null);
+    try testing.expectEqual(null, view.transit_index);
+    try testing.expectEqual(null, view.header(.transit_departures));
     try testing.expectEqual(sample.header(.nodes).dataset_uuid, view.dataset_uuid);
     try testing.expectEqual(1234, (try view.edge(@fromBackingInt(@intCast(0)))).geom.len_m);
     try testing.expectEqual(5, (try view.node(@fromBackingInt(@intCast(1)))).attr.density);
@@ -108,6 +119,117 @@ test "mapped records have checked typed accessors and offline checksums" {
     defer topology.close();
     try topology.view.verify(.none, null);
     try testing.expectError(error.MissingClassSection, topology.view.class(0));
+}
+
+test "transit sections round trip every field with checked timetable access" {
+    const fixture = try Fixture.createWithTransit(true);
+    defer fixture.deinit();
+    var buf: [80]u8 = undefined;
+    var bundle = try reader.Bundle.openVerified(fixture.path(&buf), .none, null);
+    defer bundle.close();
+    const view = &bundle.view;
+    inline for (format.transit_sections) |kind| {
+        const expected = sample.records(kind);
+        const actual = @field(view, @tagName(kind)).?;
+        try testing.expectEqual(expected.len, actual.len);
+        for (expected, actual) |written, read| try testing.expectEqualDeep(written, read);
+        try testing.expectEqual(sample.header(kind), view.header(kind).?);
+    }
+
+    const timetable = view.transit_index.?;
+    try testing.expectEqualDeep(sample.records(.transit_metadata)[0], timetable.metadata);
+    const name = (try timetable.text(timetable.stops[0].place.name)).?;
+    try testing.expectEqualStrings("Main", name);
+    const street_name = try (try view.names(@fromBackingInt(0))).at(0);
+    try testing.expectEqual(street_name.text.ptr, name.ptr);
+    try testing.expectEqual(null, try timetable.text(timetable.stops[1].place.name));
+    try testing.expectError(error.InvalidTransitText, timetable.text(@fromBackingInt(0x8000_0000)));
+
+    const slots = sample.records(.transit_occurrences);
+    for (0..132) |i| {
+        const time: u32 = @intCast(i);
+        const actual = try timetable.nextDeparture(0, time);
+        for (slots) |slot| {
+            if (slot.time < time) continue;
+            try testing.expectEqual(slot.time, actual.?.time);
+            try testing.expectEqual(&timetable.departures[slot.departure], actual.?.departure);
+            break;
+        } else try testing.expectEqual(null, actual);
+    }
+    const fixed = (try timetable.nextDeparture(1, 90061)).?;
+    try testing.expectEqual(90062, fixed.time);
+    try testing.expectEqual(&timetable.departures[4], fixed.departure);
+    try testing.expectEqual(null, try timetable.nextDeparture(1, 90063));
+    try testing.expectError(error.InvalidTransitLine, timetable.nextDeparture(2, 0));
+
+    const start = timetable.metadata.start_day;
+    try testing.expect(try timetable.scheduleActive(0, start - 4, .sunday));
+    try testing.expect(try timetable.scheduleActive(0, start, .sunday));
+    try testing.expect(!try timetable.scheduleActive(0, start + 63, .monday));
+    try testing.expect(try timetable.scheduleActive(0, start + 64, .sunday));
+    try testing.expect(!try timetable.scheduleActive(0, start + 69, .monday));
+    try testing.expect(try timetable.scheduleActive(0, start + 99, .sunday));
+    try testing.expect(try timetable.scheduleActive(0, start + 100, .monday));
+    try testing.expect(!try timetable.scheduleActive(0, start + 100, .sunday));
+    try testing.expectError(error.InvalidTransitSchedule, timetable.scheduleActive(1, start, .sunday));
+}
+
+test "transit groups require all sections, a supported version and valid checksums" {
+    const fixture = try Fixture.createWithTransit(true);
+    defer fixture.deinit();
+    var buf: [80]u8 = undefined;
+    const path = fixture.path(&buf);
+    var diagnostic: reader.Diagnostic = .{};
+    const metadata = try fixture.section(.transit_metadata);
+    defer metadata.close();
+    try metadata.pwriteAll(&.{2}, format.payload_offset);
+    try testing.expectError(error.UnsupportedTransitVersion, reader.Bundle.openDescribed(path, &diagnostic));
+    try testing.expectEqual(.transit_metadata, diagnostic.section.?);
+    try metadata.pwriteAll(&.{1}, format.payload_offset);
+
+    const transfers = try fixture.section(.transit_transfers);
+    defer transfers.close();
+    try transfers.pwriteAll(&.{2}, format.payload_offset);
+    try testing.expectError(error.PayloadHashMismatch, reader.Bundle.openVerified(path, .none, &diagnostic));
+    try testing.expectEqual(.transit_transfers, diagnostic.section.?);
+
+    const dir = try fixture.root.child("bundle");
+    defer dir.close();
+    try dir.deleteFile(format.SectionKind.transit_occurrences.filename());
+    try testing.expectError(error.MissingSection, reader.Bundle.openDescribed(path, &diagnostic));
+    try testing.expectEqual(.transit_occurrences, diagnostic.section.?);
+}
+
+test "timetable references can exceed Valhalla's twelve-bit indices" {
+    const fixture = try Fixture.createWithTransit(true);
+    defer fixture.deinit();
+    var buf: [80]u8 = undefined;
+    var bundle = try reader.Bundle.open(fixture.path(&buf));
+    defer bundle.close();
+    var timetable = bundle.view.transit_index.?;
+    const wide_id = 4096;
+
+    const routes = try testing.allocator.alloc(transit.Route, wide_id + 1);
+    defer testing.allocator.free(routes);
+    @memset(routes, timetable.routes[0]);
+    timetable.routes = routes;
+    const schedules = try testing.allocator.alloc(transit.Schedule, wide_id + 1);
+    defer testing.allocator.free(schedules);
+    @memset(schedules, timetable.schedules[0]);
+    timetable.schedules = schedules;
+
+    var lines = sample.records(.transit_lines)[0..2].*;
+    var timetable_records = sample.records(.transit_departures)[0..5].*;
+    lines[1].route = wide_id;
+    timetable_records[4].route = wide_id;
+    timetable_records[4].schedule = wide_id;
+    timetable.lines = &lines;
+    timetable.departures = &timetable_records;
+    try timetable.verify(bundle.view.nodes.len, .none);
+    const next = (try timetable.nextDeparture(1, 90062)).?;
+    try testing.expectEqual(wide_id, next.departure.route);
+    try testing.expectEqual(wide_id, next.departure.schedule);
+    try testing.expect(try timetable.scheduleActive(next.departure.schedule, timetable.metadata.start_day + 64, .sunday));
 }
 
 test "timezone sections are optional together" {

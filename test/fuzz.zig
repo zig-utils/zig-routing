@@ -120,6 +120,7 @@ fn fuzzGraphBundle(baseline: *const graph.reader.Files, s: *Smith) !void {
     }
     const view = graph.reader.View.parse(files, null) catch return;
     view.verify(.none, null) catch {};
+    if (view.transit_index) |transit| transit.verify(view.nodes.len, .none) catch {};
     const gpa = std.testing.allocator;
     if (view.spatial_index) |spatial| {
         for (0..@min(4, spatial.directory.len)) |i| {
@@ -133,6 +134,13 @@ fn fuzzGraphBundle(baseline: *const graph.reader.Files, s: *Smith) !void {
     }
     const arbitrary = if (raw.len >= 4) std.mem.readInt(u32, raw[0..4], .little) else std.math.maxInt(u32);
     for ([_]u32{ 0, 1, arbitrary, std.math.maxInt(u32) }) |id| {
+        if (view.transit_index) |transit| {
+            _ = transit.scheduleActive(id, @bitCast(arbitrary), .sunday) catch false;
+            if (transit.nextDeparture(id, 100 + arbitrary % 32) catch null) |next| {
+                try expectBorrowed(std.mem.sliceAsBytes(transit.departures), std.mem.asBytes(next.departure));
+                _ = transit.text(next.departure.headsign) catch null;
+            }
+        }
         _ = view.node(@fromBackingInt(@intCast(id))) catch null;
         _ = view.component(@fromBackingInt(id)) catch null;
         _ = view.coordinate(@fromBackingInt(id)) catch null;

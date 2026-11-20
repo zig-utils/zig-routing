@@ -191,6 +191,8 @@ pub fn build(b: *std.Build) void {
     graph_inspect.expectStdOutMatch("\"verified\":true");
     graph_inspect.expectStdOutMatch("\"file\":\"edges.bin\",\"count\":2");
     graph_inspect.expectStdOutMatch("\"file\":\"classes.bin\",\"count\":2");
+    graph_inspect.expectStdOutMatch("\"file\":\"transit_departures.bin\",\"count\":5,\"record_size\":44,\"bytes\":65756");
+    graph_inspect.expectStdOutMatch("\"file\":\"transit_occurrences.bin\",\"count\":9,\"record_size\":8,\"bytes\":65608");
     graph_inspect.expectStdOutMatch("\"placement\":\"hot\",\"resident_bytes\":");
     graph_inspect.expectStdOutMatch("\"placement\":\"warm\",\"resident_bytes\":");
     graph_inspect.expectStdOutMatch("\"placement\":\"cold\",\"resident_bytes\":");

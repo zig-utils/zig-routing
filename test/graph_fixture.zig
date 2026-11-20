@@ -2,6 +2,7 @@
 const std = @import("std");
 const routing = @import("routing");
 const format = routing.graph.format;
+const transit = routing.graph.transit;
 
 const uuid: format.DatasetUuid = .{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x46, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
 
@@ -55,6 +56,23 @@ const cold_bytes =
     "\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x16\x05\x00" ++
     "\x00\x00\x00\x00\x00\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00Main";
 
+const main_text: transit.Text = @fromBackingInt(0);
+const platform: transit.Place = .{
+    .coordinate = coordinates[0],
+    .name = main_text,
+    .one_stop_id = main_text,
+    .timezone = main_text,
+    .graph_node = 0,
+    .flags = .{ .traversability = .forward, .generated = true, .wheelchair_boarding = true },
+};
+const departures = [_]transit.Departure{
+    .{ .line = 0, .route = 0, .trip = 1 << 20, .block = 1 << 22, .schedule = 0, .headsign = main_text, .start_time = 100, .end_time = 131, .headway = 10, .elapsed_time = 25, .flags = .{ .kind = .frequency, .wheelchair = true, .bicycle = true } },
+    .{ .line = 0, .route = 0, .trip = 41, .block = 18, .schedule = 0, .headsign = main_text, .start_time = 105, .end_time = 130, .headway = 12, .elapsed_time = 38, .flags = .{ .kind = .frequency, .bicycle = true } },
+    .{ .line = 0, .route = 0, .trip = 42, .block = 19, .schedule = 0, .headsign = main_text, .start_time = 109, .elapsed_time = 40, .flags = .{ .wheelchair = true } },
+    .{ .line = 0, .route = 0, .trip = 43, .block = 20, .schedule = 0, .headsign = main_text, .start_time = 120, .elapsed_time = 41 },
+    .{ .line = 1, .route = 0, .trip = 44, .block = 21, .schedule = 0, .headsign = main_text, .start_time = 90062, .elapsed_time = 61 },
+};
+
 pub fn records(comptime kind: format.SectionKind) []const kind.Record() {
     return switch (kind) {
         .nodes => &nodes,
@@ -96,6 +114,50 @@ pub fn records(comptime kind: format.SectionKind) []const kind.Record() {
             .{ .state = 4, .attr = .{ .modes = 4 }, .domain = 23622321788 },
             .{ .state = 5, .attr = .{ .modes = 4 }, .domain = 23622321788 },
         },
+        .transit_metadata => &.{.{ .start_day = 20864 }},
+        .transit_stops => &.{
+            .{ .place = platform, .station = 0 },
+            .{ .place = .{ .coordinate = coordinates[1], .name = .none, .one_stop_id = main_text, .graph_node = 1 } },
+        },
+        .transit_stations => &.{.{ .place = platform }},
+        .transit_egresses => &.{.{
+            .place = platform,
+            .station = 0,
+            .connecting_way = 0x0123_4567_89ab_cdef,
+            .connecting_point = .{ .lng = -123, .lat = 456 },
+            .flags = .{ .has_connecting_way = true, .has_connecting_point = true },
+        }},
+        .transit_routes => &.{.{
+            .one_stop_id = main_text,
+            .operator_one_stop_id = main_text,
+            .operator_name = main_text,
+            .operator_website = main_text,
+            .short_name = main_text,
+            .long_name = main_text,
+            .description = main_text,
+            .color = main_text,
+            .text_color = main_text,
+            .flags = .{ .vehicle = .rail },
+        }},
+        .transit_lines => &.{
+            .{ .origin = 0, .destination = 1, .route = 0, .shape = 87, .departures = .{ .count = 4 }, .occurrences = .{ .count = 9 } },
+            .{ .origin = 1, .destination = 0, .route = 0, .departures = .{ .first = 4, .count = 1 }, .occurrences = .{ .first = 9 } },
+        },
+        .transit_departures => &departures,
+        .transit_occurrences => &.{
+            .{ .time = 100, .departure = 0 }, .{ .time = 105, .departure = 1 },
+            .{ .time = 109, .departure = 2 }, .{ .time = 110, .departure = 0 },
+            .{ .time = 117, .departure = 1 }, .{ .time = 120, .departure = 0 },
+            .{ .time = 120, .departure = 3 }, .{ .time = 129, .departure = 1 },
+            .{ .time = 130, .departure = 0 },
+        },
+        .transit_schedules => &.{.{ .days = .{ .count = 4 }, .day_count = 100, .exceptions = .{ .count = 2 }, .flags = .{ .weekdays = 0b0111110 } }},
+        .transit_days => &.{ .{ .bits = 1 }, .{ .bits = 0 }, .{ .bits = 0x21 }, .{ .bits = 8 } },
+        .transit_exceptions => &.{ .{ .day = -4, .flags = .{ .active = true } }, .{ .day = 69, .flags = .{ .active = false } } },
+        .transit_transfers => &.{
+            .{ .origin = 1, .destination = 0, .origin_route = 0, .destination_route = 0, .minimum_time = 180, .flags = .{ .kind = .minimum_time } },
+            .{ .origin_trip = 42, .destination_trip = 44, .flags = .{ .kind = .in_seat } },
+        },
     };
 }
 
@@ -111,9 +173,27 @@ pub fn header(comptime kind: format.SectionKind) format.SectionHeader {
 }
 
 pub fn write(path: []const u8) !void {
+    try writeFixture(path, null);
+}
+
+pub fn writeTransit(a: std.mem.Allocator, path: []const u8) !void {
+    const index = try transit.indexDepartures(a, records(.transit_lines), &departures, .none);
+    defer index.deinit(a);
+    try writeFixture(path, index);
+}
+
+fn writeFixture(path: []const u8, index: ?transit.Indexed) !void {
     var writer = try format.BundleWriter.init(path, uuid, .none);
     defer writer.deinit();
-    inline for (std.enums.values(format.SectionKind)) |kind| try writer.write(kind, records(kind));
+    inline for (std.enums.values(format.SectionKind)) |kind| {
+        if (comptime std.mem.indexOfScalar(format.SectionKind, &format.transit_sections, kind) != null) {
+            if (index) |table| try writer.write(kind, switch (kind) {
+                .transit_lines => table.lines,
+                .transit_occurrences => table.occurrences,
+                else => records(kind),
+            });
+        } else try writer.write(kind, records(kind));
+    }
     try writer.commit();
 }
 
@@ -123,5 +203,5 @@ pub fn main(init: std.process.Init) !void {
     const output = args.next() orelse return error.MissingOutputPath;
     if (args.next() != null) return error.ExtraArguments;
     const path = try std.fs.path.join(init.arena.allocator(), &.{ output, "bundle" });
-    try write(path);
+    try writeTransit(init.arena.allocator(), path);
 }

@@ -5,6 +5,7 @@ const class_table = @import("class_table.zig");
 const constants = @import("constants.zig");
 const turn_restrictions = @import("turn_restrictions.zig");
 const restriction_automaton = @import("restriction_automaton.zig");
+const transit = @import("transit.zig");
 
 pub const magic = "ZRGRAPH\x00".*;
 pub const version: u32 = 1;
@@ -120,12 +121,25 @@ pub const SectionKind = enum(u32) {
     lb_speeds = 24,
     turnlanes = 25,
     lane_connectivity = 26,
+    transit_metadata = 27,
+    transit_stops = 28,
+    transit_stations = 29,
+    transit_egresses = 30,
+    transit_routes = 31,
+    transit_lines = 32,
+    transit_departures = 33,
+    transit_occurrences = 34,
+    transit_schedules = 35,
+    transit_days = 36,
+    transit_exceptions = 37,
+    transit_transfers = 38,
 
     pub fn placement(kind: SectionKind) Placement {
         return switch (kind) {
             .nodes, .edges, .first_edge, .turns, .classes, .turn_sides, .headings => .hot,
             .coordinates, .spatial, .components, .metadata, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules, .lb_speeds => .warm,
             .turn_restrictions, .restriction_automaton, .restriction_conditions => .warm,
+            .transit_metadata, .transit_stops, .transit_stations, .transit_egresses, .transit_routes, .transit_lines, .transit_departures, .transit_occurrences, .transit_schedules, .transit_days, .transit_exceptions, .transit_transfers => .warm,
             .cold_idx, .cold, .slopes, .signs, .turnlanes, .lane_connectivity => .cold,
         };
     }
@@ -158,6 +172,18 @@ pub const SectionKind = enum(u32) {
             .lb_speeds => "lb_speeds.bin",
             .turnlanes => "turnlanes.bin",
             .lane_connectivity => "lane_connectivity.bin",
+            .transit_metadata => "transit_metadata.bin",
+            .transit_stops => "transit_stops.bin",
+            .transit_stations => "transit_stations.bin",
+            .transit_egresses => "transit_egresses.bin",
+            .transit_routes => "transit_routes.bin",
+            .transit_lines => "transit_lines.bin",
+            .transit_departures => "transit_departures.bin",
+            .transit_occurrences => "transit_occurrences.bin",
+            .transit_schedules => "transit_schedules.bin",
+            .transit_days => "transit_days.bin",
+            .transit_exceptions => "transit_exceptions.bin",
+            .transit_transfers => "transit_transfers.bin",
         };
     }
 
@@ -184,6 +210,18 @@ pub const SectionKind = enum(u32) {
             .signs => @import("signs.zig").Entry,
             .lane_connectivity => @import("lanes.zig").Connection,
             .headings, .lb_speeds => u8,
+            .transit_metadata => transit.Metadata,
+            .transit_stops => transit.Stop,
+            .transit_stations => transit.Station,
+            .transit_egresses => transit.Egress,
+            .transit_routes => transit.Route,
+            .transit_lines => transit.Line,
+            .transit_departures => transit.Departure,
+            .transit_occurrences => transit.Occurrence,
+            .transit_schedules => transit.Schedule,
+            .transit_days => transit.DayWord,
+            .transit_exceptions => transit.Exception,
+            .transit_transfers => transit.Transfer,
         };
     }
 
@@ -196,6 +234,10 @@ pub const SectionKind = enum(u32) {
 
 pub const core_sections = [_]SectionKind{ .nodes, .edges, .first_edge, .turns };
 pub const required_sections = std.EnumSet(SectionKind).initMany(&core_sections);
+pub const transit_sections = [_]SectionKind{
+    .transit_metadata,   .transit_stops,       .transit_stations,  .transit_egresses, .transit_routes,     .transit_lines,
+    .transit_departures, .transit_occurrences, .transit_schedules, .transit_days,     .transit_exceptions, .transit_transfers,
+};
 
 /// File header at offset 0. Zero padding runs up to payload_offset.
 pub const SectionHeader = extern struct {

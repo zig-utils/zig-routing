@@ -163,6 +163,44 @@ On the pinned Liechtenstein PBF, `zig build check-edges -- INPUT.osm.pbf SCRATCH
 reported 279 base classes across 15,760 directed edges. Utrecht reported 1,379 across 85,336.
 The class table checksum was identical with 1, 4 and 8 workers on each extract.
 
+### Transit timetable sections
+
+A bundle with transit carries sections 27 through 38 together. They use the v1 section
+header and payload checksum. `zr inspect --verify` reports their sizes and verifies both
+checksums and timetable references. The `transit_metadata.bin` record carries the transit
+layout version and the timetable start date as civil days since 1970-01-01.
+
+| Section | Bytes per record | Contents |
+| --- | ---: | --- |
+| `transit_metadata` | 12 | Layout version and calendar epoch |
+| `transit_stops` | 32 | Platforms, their attributes and parent stations |
+| `transit_stations` | 28 | Stations and their attributes |
+| `transit_egresses` | 56 | Street entrances with optional OSM way and location hints |
+| `transit_routes` | 40 | Vehicle type, operator, names and colours |
+| `transit_lines` | 32 | Directional stop pair, route, shape ID and timetable spans |
+| `transit_departures` | 44 | Fixed and frequency departures, trips, blocks, schedules and access flags |
+| `transit_occurrences` | 8 | Sorted departure instants for lines using frequency service |
+| `transit_schedules` | 24 | Dense calendar span, weekly mask and exception span |
+| `transit_days` | 4 | 32 consecutive days of calendar validity |
+| `transit_exceptions` | 8 | Added or removed service on a relative civil day |
+| `transit_transfers` | 32 | Stop, route and trip references, transfer type and minimum time |
+
+All strings reference the shared `cold.bin` name table, including headsigns, onestop IDs
+and route colours. Route and schedule IDs use u32. A schedule can cover any span of days
+within its u32 day count. Exceptions override the bitset and the weekly mask. The mask
+uses Sunday as bit zero and applies outside the bitset.
+
+Transfer records retain the optional route and trip qualifiers used by
+[`transfers.txt`](https://gtfs.org/documentation/schedule/reference/#transferstxt).
+
+Canonical departures are sorted by line and start time. A fixed-only line searches its
+canonical slice directly. For lines with frequency service, the writer stores one
+occurrence per offered time, including any fixed departures on that line. Each frequency
+series starts at its first time and advances by its headway up to its exclusive end.
+The index costs eight bytes per stored occurrence and orders ties by canonical record
+position. Both paths use a single binary search and return a borrowed record and its
+offered time. Callers can check service dates and access flags on that record.
+
 ## Q3. Hot loop in Zig
 
 ```zig
