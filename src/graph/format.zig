@@ -118,13 +118,15 @@ pub const SectionKind = enum(u32) {
     signs = 22,
     headings = 23,
     lb_speeds = 24,
+    turnlanes = 25,
+    lane_connectivity = 26,
 
     pub fn placement(kind: SectionKind) Placement {
         return switch (kind) {
             .nodes, .edges, .first_edge, .turns, .classes, .turn_sides, .headings => .hot,
             .coordinates, .spatial, .components, .metadata, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules, .lb_speeds => .warm,
             .turn_restrictions, .restriction_automaton, .restriction_conditions => .warm,
-            .cold_idx, .cold, .slopes, .signs => .cold,
+            .cold_idx, .cold, .slopes, .signs, .turnlanes, .lane_connectivity => .cold,
         };
     }
 
@@ -154,6 +156,8 @@ pub const SectionKind = enum(u32) {
             .signs => "signs.bin",
             .headings => "headings.bin",
             .lb_speeds => "lb_speeds.bin",
+            .turnlanes => "turnlanes.bin",
+            .lane_connectivity => "lane_connectivity.bin",
         };
     }
 
@@ -167,7 +171,7 @@ pub const SectionKind = enum(u32) {
             .coordinates => Coordinate,
             .cold_idx => u32,
             .cold => u8,
-            .slopes => u16,
+            .slopes, .turnlanes => u16,
             .spatial => u8,
             .metadata => Metadata,
             .coverage => Bounds,
@@ -178,6 +182,7 @@ pub const SectionKind = enum(u32) {
             .restriction_automaton => restriction_automaton.State,
             .restriction_conditions => restriction_automaton.Condition,
             .signs => @import("signs.zig").Entry,
+            .lane_connectivity => @import("lanes.zig").Connection,
             .headings, .lb_speeds => u8,
         };
     }

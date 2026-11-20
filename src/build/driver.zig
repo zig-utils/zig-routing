@@ -81,8 +81,8 @@ const Inputs = struct {
 
     fn identity(self: Inputs) graph.format.DatasetUuid {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        // The turns checkpoint and bundle carry directed headings.
-        hash.update("zr-build-v5");
+        // The build retains lane tags and connectivity across checkpoints.
+        hash.update("zr-build-v6");
         hash.update(&.{ @intFromBool(self.dem_dir != null), if (self.drive_side) |side| @as(u8, @backingInt(side)) else 2 });
         hash.update(@tagName(self.order));
         if (self.dem_digest) |digest| {
@@ -278,6 +278,7 @@ noinline fn runAssembly(session: *checkpoint.Session, metadata: *assemble.Metada
     defer shape_file.close();
     const tagged = try session.open(.tags);
     defer tagged.close();
+    if (session.runs(.enhance) and !session.runs(.tags)) try metadata.lanes.loadLinks(tagged);
     var admin_mapping: ?io.Mapping = null;
     defer if (admin_mapping) |mapped| mapped.unmap();
     var assembly_options = graph_options;
@@ -489,7 +490,7 @@ fn buildSegments(session: *checkpoint.Session, metadata: *assemble.Metadata, inp
         try edges.saveUsage(&tx, &referenced, .usage_directory, .usage_leaves);
         var restrictions: turn_restrictions.Catalog = .{ .a = gpa, .deadline = deadline };
         defer restrictions.deinit();
-        if (try admin_index.build(gpa, source, deadline, graph_options.use_admin_db, &restrictions)) |compiled| {
+        if (try admin_index.build(gpa, source, deadline, graph_options.use_admin_db, &restrictions, &metadata.lanes)) |compiled| {
             var index = compiled;
             defer index.deinit();
             try admin_index.save(index.view, &tx);
@@ -503,6 +504,8 @@ fn buildSegments(session: *checkpoint.Session, metadata: *assemble.Metadata, inp
             try tx.writeArray(restrictions.via_ways.items, .restriction_via_ways);
         }
         if (restrictions.simple_domains.items.len != 0) try tx.writeArray(restrictions.simple_domains.items, .simple_turn_domains);
+        try metadata.lanes.prepare();
+        if (metadata.lanes.links.items.len != 0) try tx.writeArray(metadata.lanes.links.items, .lane_relations);
         try session.commit(&tx, prep.selected_ways, start);
     } else {
         const tags = try session.open(.tags);
@@ -568,7 +571,7 @@ fn validate(session: *checkpoint.Session) !void {
     defer tx.deinit();
     var writer = try assemble.stageWriter(session.*, tx);
     defer writer.deinit();
-    for ([_]Stage{ .cold, .spatial }) |stage| {
+    for ([_]Stage{ .enhance, .cold, .spatial }) |stage| {
         const saved = try session.open(stage);
         defer saved.close();
         try saved.copySections(&writer);

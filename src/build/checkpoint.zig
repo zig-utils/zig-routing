@@ -135,6 +135,10 @@ pub const Artifact = enum {
     headings,
     bundle_headings,
     bundle_lb_speeds,
+    way_lanes,
+    lane_relations,
+    bundle_turnlanes,
+    bundle_lane_connectivity,
 
     noinline fn filename(self: Artifact) [:0]const u8 {
         return switch (self) {
@@ -246,11 +250,11 @@ pub const Existing = struct {
         return .{ .dir = dir, .manifest = manifest };
     }
 
-    pub fn close(self: Existing) void {
+    pub noinline fn close(self: *const Existing) void {
         self.dir.close();
     }
 
-    pub fn read(self: Existing, key: Artifact, deadline: io.Deadline) !io.File {
+    pub fn read(self: *const Existing, key: Artifact, deadline: io.Deadline) !io.File {
         const expected = self.manifest.files.get(key) orelse return error.MissingCheckpointArtifact;
         const file = try self.dir.readFile(key.filename());
         errdefer file.close();
@@ -259,7 +263,7 @@ pub const Existing = struct {
     }
 
     /// A repeated finalize may keep an already published, identical bundle.
-    pub fn matchesBundle(self: Existing, dir: io.Directory, deadline: io.Deadline) !bool {
+    pub fn matchesBundle(self: *const Existing, dir: io.Directory, deadline: io.Deadline) !bool {
         for (std.enums.values(format.SectionKind)) |kind| {
             const expected = self.manifest.files.get(Artifact.section(kind));
             const file = dir.readFile(kind.filename()) catch |err| switch (err) {
@@ -275,7 +279,7 @@ pub const Existing = struct {
         return true;
     }
 
-    pub fn copySections(self: Existing, writer: *format.BundleWriter) !void {
+    pub fn copySections(self: *const Existing, writer: *format.BundleWriter) !void {
         for (std.enums.values(format.SectionKind)) |kind| {
             const key = Artifact.section(kind);
             if (self.manifest.files.get(key) != null) {
@@ -286,13 +290,13 @@ pub const Existing = struct {
         }
     }
 
-    pub fn readJson(self: Existing, comptime T: type, allocator: Allocator, key: Artifact, deadline: io.Deadline) !std.json.Parsed(T) {
+    pub fn readJson(self: *const Existing, comptime T: type, allocator: Allocator, key: Artifact, deadline: io.Deadline) !std.json.Parsed(T) {
         const mapping = try self.map(key, deadline);
         defer mapping.unmap();
         return std.json.parseFromSlice(T, allocator, mapping.bytes, .{ .allocate = .alloc_always });
     }
 
-    pub fn map(self: Existing, key: Artifact, deadline: io.Deadline) !io.Mapping {
+    pub noinline fn map(self: *const Existing, key: Artifact, deadline: io.Deadline) !io.Mapping {
         const file = try self.read(key, deadline);
         defer file.close();
         return io.Mapping.mapFd(file, .read_only);
@@ -385,7 +389,7 @@ pub const Transaction = struct {
         return .{ .root = root, .dir = staging.dir, .name = staging.name, .stage = stage, .identity = identity, .deadline = deadline };
     }
 
-    pub fn deinit(self: Transaction) void {
+    pub noinline fn deinit(self: *const Transaction) void {
         self.dir.close();
         if (!self.published) remove(self.root, &self.name);
     }

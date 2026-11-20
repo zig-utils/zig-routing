@@ -19,6 +19,7 @@ pub const reader = @import("reader.zig");
 pub const class_table = @import("class_table.zig");
 pub const cold = @import("cold.zig");
 pub const signs = @import("signs.zig");
+pub const lanes = @import("lanes.zig");
 pub const spatial = @import("spatial.zig");
 pub const speed = @import("speed.zig");
 

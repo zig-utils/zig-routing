@@ -58,7 +58,9 @@ pub const EdgeClass = extern struct {
         tagged_speed: bool = false,
         node_connector: bool = false,
         sign: bool = false,
-        reserved: u3 = 0,
+        turnlanes: bool = false,
+        lane_conn: bool = false,
+        reserved: u1 = 0,
     } = .{},
     restrictions: packed struct(u32) {
         start: u16 = 0,
@@ -117,7 +119,7 @@ pub const Interner = struct {
         return .{ .gpa = gpa };
     }
 
-    pub fn deinit(self: *Interner) void {
+    pub noinline fn deinit(self: *Interner) void {
         self.index.deinit(self.gpa);
         self.rows.deinit(self.gpa);
     }

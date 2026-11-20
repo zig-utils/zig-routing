@@ -26,7 +26,7 @@ const edges = [_]format.EdgeHot{
 const first_edge = [_]format.FirstEdge{ 0, 1, 2 };
 const turns = [_]format.TurnEntry{ 0xb9, 0x72 };
 const classes = [_]routing.graph.class_table.EdgeClass{
-    .{ .access = .{ .forward = 3, .reverse = 7 }, .flags = .{ .sign = true } },
+    .{ .access = .{ .forward = 3, .reverse = 7 }, .flags = .{ .sign = true, .turnlanes = true, .lane_conn = true } },
     .{ .access = .{ .forward = 7, .reverse = 3 } },
 };
 const coordinates = [_]format.Coordinate{ .{ .lng = 0, .lat = 0 }, .{ .lng = 100000, .lat = 0 } };
@@ -70,6 +70,8 @@ pub fn records(comptime kind: format.SectionKind) []const kind.Record() {
         .turn_sides => &.{ 3, 0, 0 },
         .headings => &headings,
         .lb_speeds => &lb_speeds,
+        .turnlanes => &.{ 1, 0, 0, 0, 0, 0, 8, 66, 0 },
+        .lane_connectivity => &.{.{ .edge = 0, .from_way = 0x1234_5678_9abc, .to_lanes = 0x21, .from_lanes = 0x31 }},
         .coverage => &.{.{ .west = 0, .south = 0, .east = 100000, .north = 0 }},
         .admins => std.mem.asBytes(&empty_admins),
         .node_admins => &.{ 0, 0 },

@@ -29,6 +29,7 @@ const automaton = @import("../graph/restriction_automaton.zig");
 const automaton_builder = @import("restriction_automaton.zig");
 const conditional_access = @import("conditional_access.zig");
 const sign_build = @import("signs.zig");
+const lane_build = @import("lanes.zig");
 const link_classification = @import("link_classification.zig");
 const grid = @import("../geo/grid.zig");
 const radix = @import("../infra/radix.zig");
@@ -82,16 +83,17 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     if (!options.use_admin_db) options.admin_index = null;
     var restrictions: turn_restrictions.Catalog = .{ .a = gpa, .deadline = options.deadline };
     defer restrictions.deinit();
-    var compiled_admins = try admin_index.build(gpa, source, options.deadline, options.use_admin_db and options.admin_index == null, &restrictions);
+    var metadata = Metadata.init(gpa, options);
+    defer metadata.deinit();
+    var compiled_admins = try admin_index.build(gpa, source, options.deadline, options.use_admin_db and options.admin_index == null, &restrictions, &metadata.lanes);
     defer if (compiled_admins) |*index| index.deinit();
     if (compiled_admins) |index| options.admin_index = index.view;
+    try metadata.lanes.prepare();
     const edge_file = try io.File.temporary(options.scratch_dir);
     defer edge_file.close();
     const shape_file = try io.File.temporary(options.scratch_dir);
     defer shape_file.close();
 
-    var metadata = Metadata.init(gpa, options);
-    defer metadata.deinit();
     const source_stats = try edges.buildWithGeometry(gpa, source, .{ .edges = edge_file, .shapes = shape_file }, .{
         .scratch_dir = options.scratch_dir,
         .workers = options.workers,
@@ -133,11 +135,13 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     };
     var restriction_program: automaton_builder.Program = .{};
     defer restriction_program.deinit(gpa);
+    var lane_output: lane_build.Output = .{ .a = gpa };
+    defer lane_output.deinit();
     var table = blk: {
         var base = try populate(gpa, &shared, &plan, options);
         defer base.deinit();
         try validate(topology.first_edge, topology.output.data, topology.coordinates, base.classes, options.deadline);
-        break :blk try enhanceGraph(gpa, &shared, &plan, base.classes, options, restrictions.source(), &restriction_program);
+        break :blk try enhanceGraph(gpa, &shared, &plan, base.classes, options, restrictions.source(), &restriction_program, &lane_output);
     };
     defer table.deinit();
     var terrain = if (options.dem_source) |source_dem|
@@ -157,6 +161,7 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     try writeTopology(writer, options.scratch_dir, &topology, table.classes, turn_pool.bytes.items, if (terrain) |present| present.slopes.data else null);
     try writer.write(.turn_sides, turn_sides);
     try writer.write(.headings, headings.data);
+    try lane_output.write(writer);
     if (resolved.modes.items.len != 0) try writer.write(.turn_restrictions, resolved.modes.items);
     if (restriction_program.states.len != 0) try writer.write(.restriction_automaton, restriction_program.states);
     if (restriction_program.conditions.len != 0) try writer.write(.restriction_conditions, restriction_program.conditions);
@@ -284,13 +289,21 @@ pub fn buildStaged(
         defer tx.deinit();
         var restriction_program: automaton_builder.Program = .{};
         defer restriction_program.deinit(gpa);
-        const enhanced = try enhanceGraph(gpa, &shared, &plan, edge_classes.?, options, restrictions, &restriction_program);
+        var lane_output: lane_build.Output = .{ .a = gpa };
+        defer lane_output.deinit();
+        const enhanced = try enhanceGraph(gpa, &shared, &plan, edge_classes.?, options, restrictions, &restriction_program, &lane_output);
         gpa.free(enhanced.remap);
         gpa.free(edge_classes.?);
         edge_classes = enhanced.classes;
         try saveAttributes(&topology, enhanced.classes, &tx);
         if (restriction_program.states.len != 0) try tx.writeArray(restriction_program.states, .restriction_states);
         if (restriction_program.conditions.len != 0) try tx.writeArray(restriction_program.conditions, .restriction_conditions);
+        if (lane_output.entries.items.len != 0 or lane_output.connections.items.len != 0) {
+            var writer = try stageWriter(session.*, tx);
+            defer writer.deinit();
+            try lane_output.write(&writer);
+            try tx.saveSections(&writer);
+        }
         try session.commit(&tx, topology.output.data.len, start);
     }
     if (session.endsAt(.enhance)) return;
@@ -519,6 +532,7 @@ pub const Metadata = struct {
     conditional: conditional_access.Parser,
     infer_turn_channels: bool,
     signs: sign_build.Catalog,
+    lanes: lane_build.Catalog,
 
     pub fn init(gpa: Allocator, options: Options) Metadata {
         return .{
@@ -530,6 +544,7 @@ pub const Metadata = struct {
             .conditional = .init(gpa, options.deadline),
             .infer_turn_channels = options.infer_turn_channels,
             .signs = .{ .arena = .init(gpa) },
+            .lanes = .{ .a = gpa, .deadline = options.deadline },
         };
     }
 
@@ -580,6 +595,7 @@ pub const Metadata = struct {
 
     pub fn saveWays(self: *const Metadata, tx: *checkpoint.Transaction) !void {
         try self.signs.saveWays(tx);
+        try self.lanes.saveWays(tx);
         const file = try tx.create(.way_attributes);
         defer file.close();
         var rows: [512]WayEntry = undefined;
@@ -651,6 +667,7 @@ pub const Metadata = struct {
             remaining = remaining[len..];
         }
         try self.signs.loadWays(self.gpa, saved, &self.strings, self.deadline);
+        try self.lanes.loadWays(saved, &self.strings);
         const refs = try saved.map(.name_refs, self.deadline);
         defer refs.unmap();
         for (try checkpoint.array(tags.names.Id, refs), 0..) |id, i| {
@@ -707,6 +724,7 @@ pub const Metadata = struct {
         self.access_scratch.deinit(self.gpa);
         self.conditional.deinit();
         self.signs.deinit(self.gpa);
+        self.lanes.deinit();
         self.name_ids.deinit(self.gpa);
         self.levels.deinit(self.gpa);
         self.strings.deinit();
@@ -763,6 +781,7 @@ pub const Metadata = struct {
         for (&pair, access_masks) |*class, modes| class.detail.access_restriction = modes;
         const indexed = try self.strings.indexWay(attrs, raw_tags, .{ .use_admin_db = self.use_admin_db }, self.deadline);
         try self.signs.addWay(self.gpa, id, indexed);
+        try self.lanes.addWay(id, indexed.turn_lanes_forward, indexed.turn_lanes_backward);
         const name_start = try self.nameOffset();
         const ref_first = attrs.road_class == .motorway or attrs.road_class == .trunk;
         if (!ref_first) try self.appendNames(indexed.name.text);
@@ -1695,7 +1714,7 @@ const EdgeEnhanceJob = struct {
     }
 };
 
-noinline fn enhanceGraph(gpa: Allocator, shared: *const Shared, plan: *const Layout, base: []const classes.EdgeClass, options: Options, restrictions: turn_restrictions.Source, program: *automaton_builder.Program) !classes.Table {
+noinline fn enhanceGraph(gpa: Allocator, shared: *const Shared, plan: *const Layout, base: []const classes.EdgeClass, options: Options, restrictions: turn_restrictions.Source, program: *automaton_builder.Program, lane_output: *lane_build.Output) !classes.Table {
     const topo = shared.topology;
     const deadline = options.deadline;
     const aliases = try Scratch(u32).init(if (plan.split_nodes == 0) 0 else topo.nodes.len, options.scratch_dir);
@@ -1773,8 +1792,17 @@ noinline fn enhanceGraph(gpa: Allocator, shared: *const Shared, plan: *const Lay
     var restriction_starts: RestrictionStarts = .empty;
     defer restriction_starts.deinit(gpa);
     program.* = try compileComplexTurns(gpa, shared, plan, base, order.data, restrictions, &restriction_starts);
+    const catalog = &shared.metadata.lanes;
+    if (catalog.ways.count() != 0 or catalog.links.items.len != 0) {
+        var lane_turns: ResolvedTurns = .{ .stats = restrictions.stats };
+        defer lane_turns.deinit(gpa);
+        if (catalog.ways.count() != 0) lane_turns = try resolveTurns(gpa, shared, plan, base, restrictions, null);
+        try assembleLanes(shared, plan, base, lane_turns.hard.items, &restriction_starts, lane_output);
+    }
     var interner = classes.Interner.init(gpa);
     defer interner.deinit();
+    var lane_index: usize = 0;
+    var connection_index: usize = 0;
     for (topo.nodes, 0..) |node, i| {
         try checkDeadline(deadline, i);
         const first = topo.first_edge[i];
@@ -1797,6 +1825,14 @@ noinline fn enhanceGraph(gpa: Allocator, shared: *const Shared, plan: *const Lay
                 class.restrictions = @bitCast(masks);
                 class.flags.complex_restriction = true;
             }
+            if (lane_index < lane_output.entries.items.len and lane_output.entries.items[lane_index].edge == slot) {
+                class.flags.turnlanes = true;
+                lane_index += 1;
+            }
+            while (connection_index < lane_output.connections.items.len and lane_output.connections.items[connection_index].edge == slot) : (connection_index += 1) {
+                try checkDeadline(deadline, connection_index);
+                class.flags.lane_conn = true;
+            }
             const interned = @backingInt(try interner.intern(class));
             edge.cls.class_id = std.math.cast(classes.ClassId, interned) orelse return error.TooManyClasses;
         }
@@ -1805,6 +1841,57 @@ noinline fn enhanceGraph(gpa: Allocator, shared: *const Shared, plan: *const Lay
     errdefer final.deinit();
     try remapEdges(topo.output.data, final.remap, deadline);
     return final;
+}
+
+noinline fn assembleLanes(shared: *const Shared, plan: *const Layout, base: []const classes.EdgeClass, hard: []const TurnMask, starts: *const RestrictionStarts, output: *lane_build.Output) !void {
+    const topo = shared.topology;
+    const catalog = &shared.metadata.lanes;
+    for (topo.output.data, 0..) |edge, slot| {
+        try checkDeadline(shared.deadline, slot);
+        const class = &base[edge.cls.class_id];
+        if (class.flags.node_connector) continue;
+        const ref = topo.slot_refs.data[slot];
+        const segment = shared.segments[ref / 2];
+        try output.addConnections(@intCast(slot), catalog.linksTo(segment.way_id), shared.deadline);
+        const tag_ids = catalog.ways.get(segment.way_id) orelse continue;
+        const text = shared.metadata.strings.get(tag_ids[ref & 1]) orelse return error.InvalidStringId;
+        if (text.len == 0) continue;
+        try lane_build.parseTurnLanes(output.a, &output.parsed, text, shared.deadline);
+        const exits = try laneExits(shared, plan, base, edge, segment, ref & 1 == 0, hard);
+        const complex = (starts.get(@intCast(slot)) orelse 0) & 0xffff != 0;
+        _ = try output.addTurns(@intCast(slot), exits, complex, shared.deadline);
+    }
+}
+
+fn laneExits(shared: *const Shared, plan: *const Layout, base: []const classes.EdgeClass, edge: format.EdgeHot, segment: edges.Edge, forward: bool, hard: []const TurnMask) !lane_build.ExitTurns {
+    const topo = shared.topology;
+    const opposite = topo.first_edge[edge.head] + edge.cls.opp_local;
+    const first = std.sort.lowerBound(TurnMask, hard, opposite, TurnMask.compare);
+    var restricted: u32 = 0;
+    for (hard[first..], 0..) |entry, i| {
+        if (entry.slot != opposite) break;
+        try checkDeadline(shared.deadline, i);
+        restricted |= entry.exits;
+    }
+    const shape = try segmentShape(shared.shape_points, segment);
+    const incoming = (try turns.rawHeading(shape, !forward, &base[edge.cls.class_id], shared.deadline) + 180) % 360;
+    const node = plan.nodes.items[plan.by_id.get(if (forward) segment.to else segment.from).?];
+    var exits: lane_build.ExitTurns = .empty;
+    for (node.first_alias..node.first_alias + aliasCount(node.degree)) |alias| {
+        try checkDeadline(shared.deadline, alias - node.first_alias);
+        const offset = topo.first_edge[alias];
+        for (offset..offset + topo.groups[alias].real_degree) |slot| {
+            const outgoing = topo.output.data[slot];
+            const class = &base[outgoing.cls.class_id];
+            if (slot == opposite or !class.forwardAccess().auto or
+                (alias == edge.head and (restricted & (@as(u32, 1) << outgoing.cls.local)) != 0)) continue;
+            const ref = topo.slot_refs.data[slot];
+            const points = try segmentShape(shared.shape_points, shared.segments[ref / 2]);
+            const heading = try turns.rawHeading(points, ref & 1 == 0, class, shared.deadline);
+            exits.insert(turns.turnType((@as(u32, heading) + 360 - incoming) % 360));
+        }
+    }
+    return exits;
 }
 
 /// Valhalla visits outbound arcs by auto driveability, effective class, names
@@ -1980,6 +2067,10 @@ const TurnMask = struct {
 
     fn before(_: void, a: TurnMask, b: TurnMask) bool {
         return a.slot < b.slot;
+    }
+
+    fn compare(slot: u32, item: TurnMask) std.math.Order {
+        return std.math.order(slot, item.slot);
     }
 };
 

@@ -79,6 +79,13 @@ test "mapped records have checked typed accessors and offline checksums" {
     try testing.expect(edge_signs[0].attr.route_number and node_signs[0].attr.tagged);
     try testing.expectEqualStrings("Main", try edge_signs[0].text(view.cold_data.?));
     try testing.expectEqualStrings("Main", try node_signs[0].text(view.cold_data.?));
+    const lane_api = routing.graph.lanes;
+    try testing.expectEqualSlices(u16, &.{ 8, 66, 0 }, try lane_api.turnLanes(view, @fromBackingInt(0)));
+    try testing.expectEqual(0, (try lane_api.turnLanes(view, @fromBackingInt(1))).len);
+    const connectivity = try lane_api.laneConnectivity(view, @fromBackingInt(0));
+    try testing.expectEqual(1, connectivity.len);
+    try testing.expectEqual(0x1234_5678_9abc, connectivity[0].from_way);
+    try testing.expectEqual(0, (try lane_api.laneConnectivity(view, @fromBackingInt(1))).len);
     const slopes = try view.edgeSlopes(@fromBackingInt(@as(u32, 1)));
     try testing.expectEqual(15, slopes.maxUp());
     try testing.expectEqual(-24, slopes.maxDown());
@@ -94,6 +101,8 @@ test "mapped records have checked typed accessors and offline checksums" {
     const dir = try fixture.root.child("bundle");
     defer dir.close();
     try dir.deleteFile(format.SectionKind.signs.filename());
+    try dir.deleteFile(format.SectionKind.turnlanes.filename());
+    try dir.deleteFile(format.SectionKind.lane_connectivity.filename());
     try dir.deleteFile(format.SectionKind.classes.filename());
     var topology = try reader.Bundle.open(fixture.path(&buf));
     defer topology.close();

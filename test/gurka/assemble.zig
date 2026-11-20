@@ -4020,6 +4020,97 @@ test "regional registry snaps and routes in one bundle and rejects cross-bundle 
     try testing.expectError(error.DeadlineExceeded, registry.snap(&arena, &locations[0], defaults, cost, .{ .at_ns = 0 }));
 }
 
+test "Gurka lane masks follow directed tags and keep connectivity on each target edge" {
+    const lanes = graph.lanes;
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const fixture = try @import("examples.zig").turnLanes(storage.allocator());
+    var built = try Built.assemble(fixture.osm, 2);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    try view.verify(.none, null);
+    const cases = [_]struct {
+        from: []const u8,
+        to: []const u8,
+        count: u4,
+        masks: []const lanes.Mask,
+        connection: bool,
+    }{
+        .{ .from = "A", .to = "B", .count = 2, .masks = &.{ lanes.left, lanes.through, lanes.through, lanes.right }, .connection = true },
+        .{ .from = "B", .to = "A", .count = 2, .masks = &.{}, .connection = true },
+        .{ .from = "B", .to = "C", .count = 2, .masks = &.{ lanes.left, lanes.through, lanes.through, lanes.right }, .connection = true },
+        .{ .from = "C", .to = "B", .count = 2, .masks = &.{}, .connection = true },
+        .{ .from = "B", .to = "D", .count = 1, .masks = &.{}, .connection = false },
+        .{ .from = "D", .to = "B", .count = 3, .masks = &.{ lanes.left, lanes.through, lanes.through | lanes.right }, .connection = false },
+    };
+    for (cases) |case| {
+        const edge = try directedBetween(view, &fixture, case.from, case.to);
+        const class = try view.class((try view.edge(edge)).cls.class_id);
+        try testing.expectEqual(case.count, class.category.lanes);
+        try testing.expectEqual(case.masks.len != 0, class.flags.turnlanes);
+        try testing.expectEqual(case.connection, class.flags.lane_conn);
+        try testing.expectEqualSlices(lanes.Mask, case.masks, try lanes.turnLanes(view, edge));
+        const connectivity = try lanes.laneConnectivity(view, edge);
+        try testing.expectEqual(@intFromBool(case.connection), connectivity.len);
+        if (case.connection) {
+            try testing.expectEqual(@as(u64, @intCast(fixture.findWay("DB").?.id)), connectivity[0].from_way);
+            try testing.expectEqual(0x221, connectivity[0].to_lanes);
+            try testing.expectEqual(0x321, connectivity[0].from_lanes);
+        }
+    }
+}
+
+test "directional lane tags override general tags and inferred indications honor no turns" {
+    const lanes = graph.lanes;
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const road = gurka.Tag{ .key = "highway", .value = "primary" };
+    const from_ab = gurka.Member{ .kind = .way, .ref = "AB", .role = "from" };
+    const from_db = gurka.Member{ .kind = .way, .ref = "DB", .role = "from" };
+    const to_bc = gurka.Member{ .kind = .way, .ref = "BC", .role = "to" };
+    const fixture = try gurka.Map.init(storage.allocator(), try gurka.mapToCoordinates("A----B----C\n     |\n     D", 100), &.{
+        .{ .label = "AB", .tags = &.{
+            road,
+            .{ .key = "oneway", .value = "-1" },
+            .{ .key = "turn:lanes", .value = "through|through" },
+            .{ .key = "turn:lanes:forward", .value = "left|right" },
+            .{ .key = "turn:lanes:backward", .value = "reverse|merge_to_left" },
+        } },
+        .{ .label = "BC", .tags = &.{
+            road,
+            .{ .key = "turn:lanes:backward", .value = "left|right" },
+        } },
+        .{ .label = "DB", .tags = &.{ road, .{ .key = "turn:lanes", .value = "left|none|none" } } },
+    }, &.{}, &.{
+        .{
+            .members = &.{ from_db, .{ .kind = .node, .ref = "B", .role = "via" }, to_bc },
+            .tags = &.{ .{ .key = "type", .value = "restriction" }, .{ .key = "restriction", .value = "no_right_turn" } },
+        },
+        .{
+            .members = &.{ from_ab, to_bc },
+            .tags = &.{ .{ .key = "type", .value = "connectivity" }, .{ .key = "from", .value = "1" }, .{ .key = "to", .value = "1" } },
+        },
+        .{
+            .members = &.{ from_db, to_bc },
+            .tags = &.{ .{ .key = "type", .value = "connectivity" }, .{ .key = "from", .value = "1|16" }, .{ .key = "to", .value = "1|2" } },
+        },
+    });
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    try view.verify(.none, null);
+    const ab = try directedBetween(view, &fixture, "A", "B");
+    const bc = try directedBetween(view, &fixture, "B", "C");
+    const db = try directedBetween(view, &fixture, "D", "B");
+    try testing.expectEqualSlices(lanes.Mask, &.{ lanes.left, lanes.right }, try lanes.turnLanes(view, ab));
+    try testing.expectEqualSlices(lanes.Mask, &.{}, try lanes.turnLanes(view, try view.oppEdge(ab)));
+    try testing.expectEqualSlices(lanes.Mask, &.{}, try lanes.turnLanes(view, bc));
+    try testing.expectEqualSlices(lanes.Mask, &.{ lanes.left, lanes.right }, try lanes.turnLanes(view, try view.oppEdge(bc)));
+    try testing.expectEqualSlices(lanes.Mask, &.{ lanes.left, lanes.through, lanes.through }, try lanes.turnLanes(view, db));
+    try testing.expectEqual(0, (try lanes.laneConnectivity(view, bc)).len);
+    try testing.expect(view.lane_connectivity == null);
+}
+
 test "signs preserve exits, forks, directions and named nodes from PBF" {
     const sign = graph.signs;
     const Expected = struct { kind: sign.Type, text: []const u8, route: bool = false };

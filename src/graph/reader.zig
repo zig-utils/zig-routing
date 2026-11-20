@@ -74,7 +74,7 @@ pub const Bundle = struct {
         return result;
     }
 
-    pub fn close(self: *Bundle) void {
+    pub noinline fn close(self: *Bundle) void {
         for (kinds) |kind| self.mappings.get(kind).unmap();
         self.* = undefined;
     }
@@ -168,6 +168,9 @@ pub const View = struct {
     signs: ?[]const format.SectionKind.signs.Record() = null,
     headings: ?[]const u8 = null,
     lb_speeds: ?[]const u8 = null,
+    turnlanes: ?[]const u16 = null,
+    lane_connectivity: ?[]const format.SectionKind.lane_connectivity.Record() = null,
+    turn_lane_index: ?@import("lanes.zig").Table = null,
 
     pub fn parse(files: Files, diagnostic: ?*Diagnostic) !View {
         return parseWithDeadline(files, diagnostic, .none);
@@ -305,6 +308,15 @@ pub const View = struct {
             note(diagnostic, .signs);
             if (records.len != 0 and (graph.cold_data == null or graph.coordinates == null or graph.classes == null))
                 return error.MissingSection;
+        }
+        if (graph.turnlanes) |words| {
+            note(diagnostic, .turnlanes);
+            if (graph.classes == null) return error.MissingSection;
+            graph.turn_lane_index = try @import("lanes.zig").Table.parse(words);
+        }
+        if (graph.lane_connectivity != null and graph.classes == null) {
+            note(diagnostic, .lane_connectivity);
+            return error.MissingSection;
         }
         if (graph.spatial) |bytes| {
             note(diagnostic, .spatial);
@@ -525,7 +537,7 @@ pub const View = struct {
             note(diagnostic, kind);
             if (deadline.expired()) return error.DeadlineExceeded;
             const bytes: []const u8 = switch (kind) {
-                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata, .components, .turn_sides, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules, .turn_restrictions, .restriction_automaton, .restriction_conditions, .signs, .headings, .lb_speeds => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
+                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata, .components, .turn_sides, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules, .turn_restrictions, .restriction_automaton, .restriction_conditions, .signs, .headings, .lb_speeds, .turnlanes, .lane_connectivity => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
                 inline else => |section| std.mem.sliceAsBytes(@field(self, @tagName(section))),
             };
             var hash = std.hash.XxHash3.init(0);
@@ -540,6 +552,10 @@ pub const View = struct {
         }
         note(diagnostic, .signs);
         try @import("signs.zig").verify(self, deadline);
+        note(diagnostic, .turnlanes);
+        try @import("lanes.zig").verifyTurns(self, deadline);
+        note(diagnostic, .lane_connectivity);
+        try @import("lanes.zig").verifyConnectivity(self, deadline);
         if (self.admin_index) |index| {
             note(diagnostic, .admins);
             try index.verify(deadline);

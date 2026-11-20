@@ -18,7 +18,7 @@
 //! `costing-reference` (gate A samples and paths), `speed-config` (default speed tables),
 //! `motor-tags` (motor vehicle access and unit normalization), `admin-index`
 //! (stored administrative boundaries), `timezone-geojson`, `timezone-rules`,
-//! `datetime` and `time-domain`.
+//! `datetime`, `time-domain` and `lane-tags`.
 //!
 //! The contract for every parser: malformed input returns an error, never
 //! panics, overflows or reads out of bounds. The fuzz step builds ReleaseSafe
@@ -128,6 +128,14 @@ fn fuzzGraphBundle(baseline: *const graph.reader.Files, s: *Smith) !void {
                 }
             }
         }
+        if (view.turnlanes) |lane_section| {
+            const masks = graph.lanes.turnLanes(&view, edge) catch &.{};
+            if (masks.len != 0) try expectBorrowed(std.mem.sliceAsBytes(lane_section), std.mem.sliceAsBytes(masks));
+        }
+        if (view.lane_connectivity) |connectivity_section| {
+            const links = graph.lanes.laneConnectivity(&view, edge) catch &.{};
+            if (links.len != 0) try expectBorrowed(std.mem.sliceAsBytes(connectivity_section), std.mem.sliceAsBytes(links));
+        }
         _ = view.edgeSlopes(edge) catch null;
         if (view.shape(edge, gpa)) |shape| gpa.free(shape) else |_| {}
         if (view.names(edge)) |names| {
@@ -161,6 +169,29 @@ test "fuzz graph-bundle" {
         candidates[i + 1] = raw;
     }
     try std.testing.fuzz(&baseline, fuzzGraphBundle, .{ .corpus = try seeds(a, &candidates) });
+}
+
+fn fuzzLaneTags(_: void, s: *Smith) !void {
+    const lane_tags = routing.build.lanes;
+    const allocator = std.testing.allocator;
+    var buf: [max_input]u8 = undefined;
+    const input = draw(s, &buf, 0x6c61_6e65);
+    var masks: std.ArrayList(graph.lanes.Mask) = .empty;
+    defer masks.deinit(allocator);
+    try lane_tags.parseTurnLanes(allocator, &masks, input, .none);
+    try std.testing.expectEqual(if (input.len == 0) 0 else 1 + std.mem.count(u8, input, "|"), masks.items.len);
+    for (masks.items) |mask| try std.testing.expect(mask < graph.lanes.merge_to_right * 2);
+    if (lane_tags.packConnection(input, .none)) |mask| {
+        try std.testing.expect(mask >> 60 == 0);
+    } else |err| try std.testing.expectEqual(error.InvalidLaneConnectivity, err);
+}
+
+test "fuzz lane-tags" {
+    var storage: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer storage.deinit();
+    try std.testing.fuzz({}, fuzzLaneTags, .{ .corpus = try seeds(storage.allocator(), &.{
+        "", "left|through;right|", "merge_to_left||reverse|merge_to_right", "none||none||none|", "1|2|3|4|4", "1|16", "||", "\xff",
+    }) });
 }
 
 const valhalla_import = routing.cli.import_valhalla;
@@ -389,7 +420,7 @@ test "Valhalla importer preserves cross-tile edge pairs and cold data" {
     const stats = try valhalla_import.run(test_alloc, &.{archive}, output, .none);
     defer {
         if (root.dir.child("native")) |dir| {
-            for (std.enums.values(graph.format.SectionKind)) |kind| dir.deleteFile(kind.filename()) catch {};
+            for (graph_kinds) |kind| dir.deleteFile(kind.filename()) catch {};
             dir.close();
             root.dir.deleteDir("native") catch {};
         } else |_| {}

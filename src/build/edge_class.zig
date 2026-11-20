@@ -69,8 +69,8 @@ pub fn applySegmentControls(edge_class: *EdgeClass, segment: Edges.Flags, forwar
 
 fn laneCount(way: WayAttrs, forward: bool) u4 {
     if (way.flags.forward_tagged_lanes and way.flags.backward_tagged_lanes)
-        return if (forward) way.forward_lanes else way.backward_lanes;
-    if (way.flags.oneway or way.flags.oneway_reverse) return way.lanes;
+        return @max(1, if (forward) way.forward_lanes else way.backward_lanes);
+    if (way.flags.oneway or way.flags.oneway_reverse) return @max(1, way.lanes);
     return @max(1, way.lanes / 2);
 }
 

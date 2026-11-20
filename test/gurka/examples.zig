@@ -630,6 +630,31 @@ pub fn signs(arena: Allocator) !gurka.Map {
     }});
 }
 
+// Ported from test/gurka/test_turn_lanes.cc (Valhalla 3.9.3).
+pub fn turnLanes(arena: Allocator) !gurka.Map {
+    const road = gurka.Tag{ .key = "highway", .value = "primary" };
+    return gurka.Map.init(arena, try gurka.mapToCoordinates("A----B----C\n     |\n     D", 100), &.{
+        .{ .label = "ABC", .tags = &.{ road, .{ .key = "lanes", .value = "4" }, .{ .key = "turn:lanes", .value = "left|||right" } } },
+        .{ .label = "DB", .tags = &.{
+            road,
+            .{ .key = "lanes:forward", .value = "3" },
+            .{ .key = "lanes:backward", .value = "0" },
+            .{ .key = "turn:lanes", .value = "left|none|none" },
+        } },
+    }, &.{}, &.{.{
+        .members = &.{
+            .{ .kind = .way, .ref = "DB", .role = "from" },
+            .{ .kind = .node, .ref = "B", .role = "via" },
+            .{ .kind = .way, .ref = "ABC", .role = "to" },
+        },
+        .tags = &.{
+            .{ .key = "type", .value = "connectivity" },
+            .{ .key = "from:lanes", .value = "1|2|3" },
+            .{ .key = "to:lanes", .value = "1|2|2" },
+        },
+    }});
+}
+
 // Ported from test/gurka/test_ramps_tc.cc (Valhalla 3.9.3).
 pub const LinkCase = enum { refs, destination_refs, branches, merge, slip_lane, inferred_channels, tagged_channels };
 

@@ -40,7 +40,7 @@ fn fail(rc: anytype) Error {
     return failErrno(c.errno(rc));
 }
 
-fn failErrno(code: c.E) Error {
+noinline fn failErrno(code: c.E) Error {
     return switch (code) {
         .ACCES, .PERM => error.AccessDenied,
         .NOENT => error.FileNotFound,
@@ -148,6 +148,8 @@ pub const Deadline = struct {
 // Files
 // ---------------------------------------------------------------------------
 
+// Keep kernel calls out of callers so checkpoint and bundle code share the
+// same syscall, retry, and error translation paths.
 pub const OpenMode = enum { read_only, read_write, create_truncate };
 
 pub const File = struct {
@@ -155,7 +157,7 @@ pub const File = struct {
 
     /// A disk-backed scratch file scoped to this handle. Closing it releases
     /// its storage even if the process exits during a build.
-    pub fn temporary(directory: []const u8) Error!File {
+    pub noinline fn temporary(directory: []const u8) Error!File {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const path = std.fmt.bufPrint(buf[0 .. buf.len - 1], "{s}/.zr-scratch-XXXXXX", .{directory}) catch
             return error.InvalidArgument;
@@ -169,7 +171,7 @@ pub const File = struct {
 
     extern "c" fn mkostemp(path: [*:0]u8, flags: c_int) c_int;
 
-    pub fn open(path: []const u8, mode: OpenMode) Error!File {
+    pub noinline fn open(path: []const u8, mode: OpenMode) Error!File {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         if (path.len >= buf.len) return error.InvalidArgument;
         @memcpy(buf[0..path.len], path);
@@ -189,7 +191,7 @@ pub const File = struct {
         return .{ .fd = fd };
     }
 
-    pub fn close(self: File) void {
+    pub noinline fn close(self: File) void {
         _ = c.close(self.fd);
     }
 
@@ -199,13 +201,13 @@ pub const File = struct {
 
     /// File size via lseek (portable: glibc does not export fstat as a
     /// plain symbol). Leaves the file offset at the end; reads use pread.
-    pub fn size(self: File) Error!u64 {
+    pub noinline fn size(self: File) Error!u64 {
         const end = c.lseek(self.fd, 0, c.SEEK.END);
         if (end < 0) return fail(@as(c_int, -1));
         return @intCast(end);
     }
 
-    pub fn truncate(self: File, len: u64) Error!void {
+    pub noinline fn truncate(self: File, len: u64) Error!void {
         const size_bytes = std.math.cast(c.off_t, len) orelse return error.OutOfBounds;
         _ = try checkInt(c.ftruncate(self.fd, size_bytes));
     }
@@ -232,7 +234,7 @@ pub const File = struct {
     }
 
     /// Reads exactly `buf.len` bytes at `offset` or fails with OutOfBounds.
-    pub fn preadAll(self: File, buf: []u8, offset: u64) Error!void {
+    pub noinline fn preadAll(self: File, buf: []u8, offset: u64) Error!void {
         var done: usize = 0;
         while (done < buf.len) {
             const n = try self.pread(buf[done..], offset + done);
@@ -246,7 +248,7 @@ pub const File = struct {
     }
 
     /// Writes all of `bytes` at `offset` without moving the file offset.
-    pub fn pwriteAll(self: File, bytes: []const u8, offset: u64) Error!void {
+    pub noinline fn pwriteAll(self: File, bytes: []const u8, offset: u64) Error!void {
         var done: usize = 0;
         while (done < bytes.len) {
             const rc = c.pwrite(self.fd, bytes[done..].ptr, bytes.len - done, @intCast(offset + done));
@@ -256,7 +258,7 @@ pub const File = struct {
     }
 };
 
-fn syncFd(fd: c.fd_t) Error!void {
+noinline fn syncFd(fd: c.fd_t) Error!void {
     while (true) {
         const rc = c.fsync(fd);
         if (rc < 0 and c.errno(rc) == .INTR) continue;
@@ -272,7 +274,7 @@ pub const Directory = struct {
 
     pub const TempName = [36:0]u8;
 
-    pub fn open(path: []const u8) Error!Directory {
+    pub noinline fn open(path: []const u8) Error!Directory {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         if (path.len >= buf.len or std.mem.indexOfScalar(u8, path, 0) != null)
             return error.InvalidArgument;
@@ -281,18 +283,18 @@ pub const Directory = struct {
         return .{ .fd = try checkInt(c.open(@ptrCast(&buf), directory_flags)) };
     }
 
-    pub fn close(self: Directory) void {
+    pub noinline fn close(self: Directory) void {
         _ = c.close(self.fd);
     }
 
-    pub fn child(self: Directory, name: [:0]const u8) Error!Directory {
+    pub noinline fn child(self: Directory, name: [:0]const u8) Error!Directory {
         try checkChildName(name);
         var flags = directory_flags;
         flags.NOFOLLOW = true;
         return .{ .fd = try checkInt(c.openat(self.fd, name, flags)) };
     }
 
-    pub fn createChild(self: Directory, name: [:0]const u8) Error!Directory {
+    pub noinline fn createChild(self: Directory, name: [:0]const u8) Error!Directory {
         try checkChildName(name);
         _ = try checkInt(c.mkdirat(self.fd, name, 0o755));
         errdefer self.deleteDir(name) catch {};
@@ -309,7 +311,7 @@ pub const Directory = struct {
         }
     }
 
-    pub fn temporaryChild(self: Directory) Error!struct { dir: Directory, name: TempName } {
+    pub noinline fn temporaryChild(self: Directory) Error!struct { dir: Directory, name: TempName } {
         var name: TempName = undefined;
         name[0..4].* = ".zr-".*;
         name[name.len] = 0;
@@ -328,30 +330,30 @@ pub const Directory = struct {
         return error.PathAlreadyExists;
     }
 
-    pub fn createFile(self: Directory, name: [:0]const u8) Error!File {
+    pub noinline fn createFile(self: Directory, name: [:0]const u8) Error!File {
         try checkChildName(name);
         const flags: c.O = .{ .CLOEXEC = true, .ACCMODE = .RDWR, .CREAT = true, .EXCL = true };
         return .{ .fd = try checkInt(c.openat(self.fd, name, flags, @as(c.mode_t, 0o644))) };
     }
 
-    pub fn openOrCreateFile(self: Directory, name: [:0]const u8) Error!File {
+    pub noinline fn openOrCreateFile(self: Directory, name: [:0]const u8) Error!File {
         try checkChildName(name);
         const flags: c.O = .{ .CLOEXEC = true, .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true, .NONBLOCK = true };
         return .{ .fd = try checkInt(c.openat(self.fd, name, flags, @as(c.mode_t, 0o644))) };
     }
 
-    pub fn readFile(self: Directory, name: [:0]const u8) Error!File {
+    pub noinline fn readFile(self: Directory, name: [:0]const u8) Error!File {
         try checkChildName(name);
         const flags: c.O = .{ .CLOEXEC = true, .ACCMODE = .RDONLY, .NOFOLLOW = true, .NONBLOCK = true };
         return .{ .fd = try checkInt(c.openat(self.fd, name, flags)) };
     }
 
-    pub fn deleteFile(self: Directory, name: [:0]const u8) Error!void {
+    pub noinline fn deleteFile(self: Directory, name: [:0]const u8) Error!void {
         try checkChildName(name);
         _ = try checkInt(c.unlinkat(self.fd, name, 0));
     }
 
-    pub fn deleteDir(self: Directory, name: [:0]const u8) Error!void {
+    pub noinline fn deleteDir(self: Directory, name: [:0]const u8) Error!void {
         try checkChildName(name);
         _ = try checkInt(c.unlinkat(self.fd, name, c.AT.REMOVEDIR));
     }
@@ -361,7 +363,7 @@ pub const Directory = struct {
     }
 
     /// Atomically publish a sibling name. Existing paths stay intact.
-    pub fn renameExclusive(self: Directory, old: [:0]const u8, new: [:0]const u8) Error!void {
+    pub noinline fn renameExclusive(self: Directory, old: [:0]const u8, new: [:0]const u8) Error!void {
         try checkChildName(old);
         try checkChildName(new);
         if (is_linux) {
@@ -375,7 +377,7 @@ pub const Directory = struct {
     }
 
     /// Atomically swap two existing sibling paths.
-    pub fn exchange(self: Directory, first: [:0]const u8, second: [:0]const u8) Error!void {
+    pub noinline fn exchange(self: Directory, first: [:0]const u8, second: [:0]const u8) Error!void {
         try checkChildName(first);
         try checkChildName(second);
         if (is_linux) {
@@ -388,7 +390,7 @@ pub const Directory = struct {
         }
     }
 
-    pub fn writeAtomic(self: Directory, name: [:0]const u8, bytes: []const u8) !void {
+    pub noinline fn writeAtomic(self: Directory, name: [:0]const u8, bytes: []const u8) !void {
         try checkChildName(name);
         var nonce: [16]u8 = undefined;
         try fillRandom(&nonce);
@@ -406,7 +408,7 @@ pub const Directory = struct {
     }
 
     /// Atomically replace a sibling file.
-    pub fn replaceFile(self: Directory, old: [:0]const u8, new: [:0]const u8) Error!void {
+    pub noinline fn replaceFile(self: Directory, old: [:0]const u8, new: [:0]const u8) Error!void {
         try checkChildName(old);
         try checkChildName(new);
         _ = try checkInt(c.renameat(self.fd, old, self.fd, new));
@@ -415,7 +417,7 @@ pub const Directory = struct {
     const directory_flags: c.O = .{ .DIRECTORY = true, .CLOEXEC = true, .ACCMODE = .RDONLY };
 };
 
-fn checkChildName(name: []const u8) Error!void {
+noinline fn checkChildName(name: []const u8) Error!void {
     if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..") or
         std.mem.indexOfAny(u8, name, "/\x00") != null) return error.InvalidArgument;
 }
@@ -441,7 +443,7 @@ fn fillRandom(bytes: []u8) Error!void {
 }
 
 /// Reads a whole file into memory owned by `allocator`.
-pub fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) (Error || error{FileTooBig})![]u8 {
+pub noinline fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) (Error || error{FileTooBig})![]u8 {
     const file = try File.open(path, .read_only);
     defer file.close();
     const len = try file.size();
@@ -496,7 +498,7 @@ pub const Mapping = struct {
         return mapFd(file, mode);
     }
 
-    pub fn mapFd(file: File, mode: MapMode) Error!Mapping {
+    pub noinline fn mapFd(file: File, mode: MapMode) Error!Mapping {
         const len: usize = @intCast(try file.size());
         if (len == 0) return .{ .bytes = &.{} };
         const prot: c.PROT = if (mode == .read_only) .{ .READ = true } else .{ .READ = true, .WRITE = true };
@@ -508,14 +510,14 @@ pub const Mapping = struct {
         return .{ .bytes = base[0..len] };
     }
 
-    pub fn unmap(self: Mapping) void {
+    pub noinline fn unmap(self: Mapping) void {
         if (self.bytes.len == 0) return;
         _ = c.munmap(@ptrCast(self.bytes.ptr), self.bytes.len);
     }
 
     /// Advises the kernel about a page-aligned range (offset is rounded down,
     /// end rounded up). Unsupported advice is a no-op.
-    pub fn advise(self: Mapping, offset: usize, len: usize, advice: Advice) Error!void {
+    pub noinline fn advise(self: Mapping, offset: usize, len: usize, advice: Advice) Error!void {
         if (offset >= self.bytes.len or len == 0) return;
         const start = std.mem.alignBackward(usize, offset, std.heap.pageSize());
         const end = @min(self.bytes.len, offset +| len);

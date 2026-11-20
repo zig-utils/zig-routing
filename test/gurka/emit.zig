@@ -24,6 +24,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, name, "timed-access")) break :blk try examples.conditionalAccess(arena);
         if (std.mem.eql(u8, name, "access-regions")) break :blk try examples.accessRegions(arena);
         if (std.mem.eql(u8, name, "signs")) break :blk try examples.signs(arena);
+        if (std.mem.eql(u8, name, "turn-lanes")) break :blk try examples.turnLanes(arena);
         if (std.mem.eql(u8, name, "turn-names-us")) break :blk try examples.turnNames(arena, true);
         if (std.mem.eql(u8, name, "turn-names-ca")) break :blk try examples.turnNames(arena, false);
         if (std.mem.eql(u8, name, "driving-side")) break :blk try examples.drivingSide(arena);
