@@ -351,7 +351,7 @@ fn route(ctx: *Context) !u8 {
     var runtime: Runtime = .{ .svc = loaded.config.serviceConfig() };
     defer runtime.close();
     try runtime.open(loaded.config.additional_data.elevation);
-    if (action == .locate or action == .tile) try runtime.openGraph(loaded.config.zig_routing.bundle_path);
+    if (action == .locate or action == .tile or action == .transit_available) try runtime.openGraph(loaded.config.zig_routing.bundle_path);
 
     var arena = routing.infra.arena.Arena.init(std.heap.c_allocator, .{ .cap_bytes = settings.arena_cap_bytes });
     defer arena.deinit();
