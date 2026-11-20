@@ -20,7 +20,7 @@ pub fn wrappedLongitudeDelta(longitude: f64, origin: f64) f64 {
 }
 
 /// Longitude, latitude in degrees (longitude first, as upstream).
-pub const PointLL = struct {
+pub const PointLL = extern struct {
     lng: f64,
     lat: f64,
 

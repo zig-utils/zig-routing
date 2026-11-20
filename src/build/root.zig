@@ -17,6 +17,8 @@ pub const enhance = @import("enhance.zig");
 pub const speeds = @import("speeds.zig");
 pub const order = @import("order.zig");
 pub const tags = @import("tags/root.zig");
+pub const admin_boundaries = @import("admin_boundaries.zig");
+pub const admin_tags = @import("admin_tags.zig");
 
 test {
     std.testing.refAllDecls(@This());

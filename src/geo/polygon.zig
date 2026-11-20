@@ -57,7 +57,139 @@ pub const Polygon = struct {
         const hi = box.maxpt();
         return self.intersectsLine(&.{ lo, .init(hi.lng, lo.lat), hi, .init(lo.lng, hi.lat), lo }, deadline);
     }
+
+    /// Closed-set coverage for simple shells and their holes. A covered
+    /// boundary cannot enter the complement. The only bounded components
+    /// of that complement are the holes, so test an interior point of each.
+    pub fn coversPolygon(self: Polygon, other: Polygon, gpa: Allocator, deadline: Deadline) !bool {
+        const parent = try ringBounds(self.outer, deadline) orelse return false;
+        const child = try ringBounds(other.outer, deadline) orelse return false;
+        if (!parent.covers(child.minpt()) or !parent.covers(child.maxpt())) return false;
+        var cuts: std.ArrayList(f64) = .empty;
+        defer cuts.deinit(gpa);
+        if (!try self.coversRing(other.outer, gpa, &cuts, deadline)) return false;
+        for (other.holes, 0..) |hole, i| {
+            try checkAt(deadline, i);
+            if (!try self.coversRing(hole, gpa, &cuts, deadline)) return false;
+        }
+        for (self.holes, 0..) |hole, i| {
+            try checkAt(deadline, i);
+            if (try interiorPoint(hole, deadline)) |sample| {
+                if (try other.locate(sample, deadline) == .inside) return false;
+            }
+        }
+        return true;
+    }
+
+    fn coversRing(self: Polygon, input: Ring, gpa: Allocator, cuts: *std.ArrayList(f64), deadline: Deadline) !bool {
+        const ring = vertices(input);
+        if (ring.len < 3) return false;
+        var a = ring[ring.len - 1];
+        for (ring, 0..) |b, i| {
+            try checkAt(deadline, i);
+            if (!a.eql(b) and !try self.coversSegment(a, b, gpa, cuts, deadline)) return false;
+            a = b;
+        }
+        return true;
+    }
+
+    noinline fn coversSegment(self: Polygon, a: PointLL, b: PointLL, gpa: Allocator, cuts: *std.ArrayList(f64), deadline: Deadline) !bool {
+        cuts.clearRetainingCapacity();
+        const segment: CoverageSegment = .{ .a = a, .b = b, .bounds = segmentBounds(a, b) };
+        switch (try cutAtBorder(self.outer, segment, gpa, cuts, deadline)) {
+            .on_border => return true,
+            .crosses => return false,
+            .touches => {},
+        }
+        for (self.holes, 0..) |hole, i| {
+            try checkAt(deadline, i);
+            switch (try cutAtBorder(hole, segment, gpa, cuts, deadline)) {
+                .on_border => return true,
+                .crosses => return false,
+                .touches => {},
+            }
+        }
+        try cuts.append(gpa, 1);
+        std.sort.heap(f64, cuts.items, {}, std.sort.asc(f64));
+        var previous: f64 = 0;
+        for (cuts.items, 0..) |t, i| {
+            try checkAt(deadline, i);
+            if (t <= previous) continue;
+            const halfway = previous + (t - previous) * 0.5;
+            const sample = PointLL.init(a.lng + (b.lng - a.lng) * halfway, a.lat + (b.lat - a.lat) * halfway);
+            if (try self.locate(sample, deadline) == .outside) return false;
+            previous = t;
+        }
+        return true;
+    }
 };
+
+const BorderCut = enum { on_border, crosses, touches };
+const CoverageSegment = struct { a: PointLL, b: PointLL, bounds: AABB };
+
+fn cutAtBorder(input: Ring, segment: CoverageSegment, gpa: Allocator, cuts: *std.ArrayList(f64), deadline: Deadline) !BorderCut {
+    const ring = vertices(input);
+    if (ring.len < 3) return .touches;
+    const a = segment.a;
+    const b = segment.b;
+    const use_longitude = @abs(b.lng - a.lng) >= @abs(b.lat - a.lat);
+    var previous = ring[ring.len - 1];
+    for (ring, 0..) |q, i| {
+        try checkAt(deadline, i);
+        defer previous = q;
+        const bounds = segmentBounds(previous, q);
+        if (!segment.bounds.intersects(bounds)) continue;
+        const side_p = orient(a, b, previous);
+        const side_q = orient(a, b, q);
+        if (side_p == 0 and side_q == 0 and bounds.covers(a) and bounds.covers(b)) return .on_border;
+        if (side_p != 0 and side_q == -side_p) {
+            const side_a = orient(previous, q, a);
+            if (side_a != 0 and orient(previous, q, b) == -side_a) return .crosses;
+        }
+        // A shell vertex can touch or pass through the candidate line.
+        // Split there and test the open intervals separately.
+        if (side_q == 0 and segment.bounds.covers(q)) {
+            const t = if (use_longitude) (q.lng - a.lng) / (b.lng - a.lng) else (q.lat - a.lat) / (b.lat - a.lat);
+            if (t > 0 and t < 1) try cuts.append(gpa, t);
+        }
+    }
+    return .touches;
+}
+
+fn interiorPoint(input: Ring, deadline: Deadline) !?PointLL {
+    const ring = vertices(input);
+    if (ring.len < 3) return null;
+    var first = std.math.inf(f64);
+    var second = first;
+    for (ring, 0..) |point, i| {
+        try checkAt(deadline, i);
+        if (point.lat < first) {
+            second = first;
+            first = point.lat;
+        } else if (point.lat > first and point.lat < second) {
+            second = point.lat;
+        }
+    }
+    if (!std.math.isFinite(second)) return null;
+    const y = first + (second - first) * 0.5;
+    var left = std.math.inf(f64);
+    var right = left;
+    var a = ring[ring.len - 1];
+    for (ring, 0..) |b, i| {
+        try checkAt(deadline, i);
+        defer a = b;
+        if ((a.lat > y) == (b.lat > y)) continue;
+        const x = a.lng + (b.lng - a.lng) * ((y - a.lat) / (b.lat - a.lat));
+        if (x < left) {
+            right = left;
+            left = x;
+        } else if (x > left and x < right) {
+            right = x;
+        }
+    }
+    if (!std.math.isFinite(right)) return null;
+    return .init(left + (right - left) * 0.5, y);
+}
 
 pub const MultiPolygon = struct {
     polygons: []const Polygon = &.{},
@@ -95,6 +227,19 @@ pub fn ringBounds(ring: Ring, deadline: Deadline) !?AABB {
         _ = box.expandPoint(point);
     }
     return box;
+}
+
+/// Test the boundary of a closed ring against a box.
+pub fn ringIntersectsBox(input: Ring, box: AABB, deadline: Deadline) error{DeadlineExceeded}!bool {
+    const ring = vertices(input);
+    if (ring.len < 3) return false;
+    var a = ring[ring.len - 1];
+    for (ring, 0..) |b, i| {
+        try checkAt(deadline, i);
+        if (box.intersectsSegment(a, b)) return true;
+        a = b;
+    }
+    return false;
 }
 
 /// Planar signed area in squared coordinate units. Positive is CCW.
@@ -729,6 +874,19 @@ pub fn clipPolygon(gpa: Allocator, poly: Polygon, box: AABB, deadline: Deadline)
 
 const testing = std.testing;
 const p = PointLL.init;
+
+test "polygon coverage includes shared edges and excludes interior holes" {
+    const shell = &.{ p(0, 0), p(6, 0), p(6, 6), p(0, 6) };
+    const hole = &.{ p(2, 2), p(2, 4), p(4, 4), p(4, 2) };
+    const parent: Polygon = .{ .outer = shell, .holes = &.{hole} };
+    try testing.expect(try parent.coversPolygon(parent, testing.allocator, .none));
+    try testing.expect(!try parent.coversPolygon(.{ .outer = shell }, testing.allocator, .none));
+    const attached: Polygon = .{ .outer = &.{ p(0, 0), p(2, 0), p(2, 5), p(0, 5) } };
+    try testing.expect(try parent.coversPolygon(attached, testing.allocator, .none));
+    // The diagonal enters the hole at two vertices, with covered endpoints.
+    const crosses_vertex: Polygon = .{ .outer = &.{ p(1, 1), p(5, 5), p(1, 5) } };
+    try testing.expect(!try parent.coversPolygon(crosses_vertex, testing.allocator, .none));
+}
 
 // Ported from test/util_midgard.cc, PolygonArea.
 test "area and orientation match Midgard for both orders" {

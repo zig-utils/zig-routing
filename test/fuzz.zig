@@ -15,7 +15,8 @@
 //! (section headers, checksums and typed topology access), and
 //! `build-checkpoint` (restart manifests), `valhalla-tile` (offline tile import),
 //! `costing-reference` (gate A samples and paths), `speed-config` (default speed tables),
-//! and `motor-tags` (motor vehicle access and unit normalization).
+//! `motor-tags` (motor vehicle access and unit normalization), and `admin-index`
+//! (stored administrative boundaries).
 //!
 //! The contract for every parser: malformed input returns an error, never
 //! panics, overflows or reads out of bounds. The fuzz step builds ReleaseSafe
@@ -162,6 +163,56 @@ fn checkValhallaTile(tile: valhalla_import.tile_format.Tile) !void {
         _ = info.indoor(a, &levels, .none) catch continue;
         for (0..info.names.len) |index| _ = info.name(index) catch continue;
     }
+}
+
+fn fuzzAdminIndex(_: void, s: *Smith) !void {
+    var buf: [max_input]u8 align(8) = undefined;
+    const input = draw(s, &buf, 0x6164_6d69);
+    const admin = graph.admin.View.parse(input) catch return;
+    admin.verify(.none) catch {};
+    for ([_]routing.geo.PointLL{ .init(0.5, 0.5), .init(1, 1), .init(2, 2), .init(-180, -90) }) |point| {
+        const id = admin.lookup(point, .none) catch continue;
+        _ = admin.names(id) catch {};
+        _ = admin.singleArea(.fromPoints(point, point), .none) catch {};
+    }
+}
+
+test "fuzz admin-index" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const a = state.allocator();
+    const admin = graph.admin;
+    const empty: admin.Span = .{ .first = 0, .count = 0 };
+    const view: admin.View = .{
+        .regions = &.{.{
+            .osm_id = 8,
+            .attr = .{ .level = 2, .drive_on_right = true, .allow_intersection_names = false },
+            .name = .{ .first = 0, .count = 4 },
+            .english_name = empty,
+            .iso_code = .{ .first = 4, .count = 2 },
+            .default_language = empty,
+        }},
+        .cells = &.{.{ .id = admin.cellId(.init(0.5, 0.5)), .pieces = .{ .first = 0, .count = 1 } }},
+        .pieces = &.{.{ .attr = .{ .region = 1 }, .rings = .{ .first = 0, .count = 2 } }},
+        .rings = &.{ .{ .first = 0, .count = 4 }, .{ .first = 4, .count = 4 } },
+        .vertices = &.{
+            .init(0, 0),       .init(2, 0),      .init(2, 2),     .init(0, 2),
+            .init(0.75, 0.75), .init(0.75, 1.5), .init(1.5, 1.5), .init(1.5, 0.75),
+        },
+        .strings = "TestTS",
+    };
+    const Writer = struct {
+        a: std.mem.Allocator,
+        bytes: std.ArrayList(u8) = .empty,
+
+        pub fn append(self: *@This(), bytes: []const u8) !void {
+            try self.bytes.appendSlice(self.a, bytes);
+        }
+    };
+    var writer: Writer = .{ .a = a };
+    try view.write(&writer);
+    const records = writer.bytes.items;
+    try std.testing.fuzz({}, fuzzAdminIndex, .{ .corpus = try seeds(a, &.{ "", records, records[0 .. records.len - 1] }) });
 }
 
 fn fuzzValhallaTile(_: void, s: *Smith) !void {
@@ -396,6 +447,7 @@ fn visitPrimitives(block: routing.build.pbf.block.Block, gpa: std.mem.Allocator)
     while (try relations.next()) |item| {
         var relation = item;
         try visitTags(relation.tags);
+        _ = try routing.build.admin_tags.transform(relation.tags, .none);
         while (try relation.members.next()) |_| {}
     }
 }

@@ -344,6 +344,13 @@ pub fn tileId(point: geo.FixedLL) u32 {
     return row * cols + col;
 }
 
+pub fn tileBounds(tile: u32) @import("../geo/aabb.zig").AABB {
+    const size = @as(f64, @floatFromInt(tile_width)) / 1e7;
+    const west = @as(f64, @floatFromInt(tile % cols)) * size - 180;
+    const south = @as(f64, @floatFromInt(tile / cols)) * size - 90;
+    return .{ .minx = west, .miny = south, .maxx = west + size, .maxy = south + size };
+}
+
 fn check(deadline: io.Deadline, i: usize) !void {
     if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
 }

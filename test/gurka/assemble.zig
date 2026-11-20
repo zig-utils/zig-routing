@@ -828,6 +828,40 @@ fn directedBetween(view: *const graph.reader.View, fixture: *const gurka.Map, fi
     return error.TestEdgeNotFound;
 }
 
+test "assembled admin assignments follow stitched boundaries, holes and islands" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const fixture = try @import("examples.zig").adminBoundaries(arena.allocator());
+    var result = try Built.assemble(fixture.osm, 4);
+    defer result.deinit();
+    const view = &result.bundle.view;
+    try view.verify(.none, null);
+    try testing.expectEqual(3, view.admin_index.?.regions.len);
+    const cases = [_]struct { label: []const u8, iso: []const u8, state: []const u8, left: bool }{
+        .{ .label = "Q", .iso = "GB", .state = "TST", .left = true },
+        .{ .label = "S", .iso = "BE", .state = "", .left = false },
+        .{ .label = "U", .iso = "GB", .state = "", .left = true },
+        .{ .label = "W", .iso = "GB", .state = "", .left = true },
+    };
+    for (cases) |case| {
+        const point = fixture.findNode(case.label).?.location;
+        const id = try at(view, point.toFixed());
+        const area = try view.nodeAdmin(id);
+        try testing.expectEqualStrings(case.iso, area.country_iso);
+        try testing.expectEqualStrings(case.state, area.state_iso);
+        // Valhalla gives W its tile's sole region. The point is outside the polygon.
+        const at_point = try view.adminAt(point, .none);
+        if (std.mem.eql(u8, case.label, "W"))
+            try testing.expectEqualStrings("", at_point.country_iso)
+        else
+            try testing.expectEqualDeep(area, at_point);
+        try testing.expectEqual(case.left, (try view.node(id)).attr.drive_on_left);
+    }
+    try testing.expectEqualStrings("TST", (try view.adminAt(.init(2, 44.6), .none)).state_iso);
+    try testing.expectEqualStrings("GB", (try view.adminAt(.init(4, 44.6), .none)).country_iso);
+    try testing.expectEqualStrings("", (try view.adminAt(.init(4, 45.1), .none)).country_iso);
+}
+
 test "assembled motor vehicle limits follow the original way direction" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();

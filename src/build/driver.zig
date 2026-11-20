@@ -5,6 +5,7 @@ const graph = @import("../graph/root.zig");
 const hgt = @import("../elevation/hgt.zig");
 const checkpoint = @import("checkpoint.zig");
 const assemble = @import("assemble.zig");
+const admin_index = @import("admin_index.zig");
 const speeds = @import("speeds.zig");
 const edges = @import("edges.zig");
 const node_store = @import("node_store.zig");
@@ -215,7 +216,16 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
             defer edge_file.close();
             const shape_file = try prior.read(.shape_points, options.deadline);
             defer shape_file.close();
-            try assemble.buildStaged(&session, &metadata, source_stats.value, edge_file, shape_file, graph_options);
+            const tagged = try session.open(.tags);
+            defer tagged.close();
+            var admin_mapping: ?io.Mapping = null;
+            defer if (admin_mapping) |mapped| mapped.unmap();
+            var assembly_options = graph_options;
+            if (tagged.manifest.files.get(.admin_index) != null) {
+                admin_mapping = try tagged.map(.admin_index, options.deadline);
+                assembly_options.admin_index = try graph.admin.View.parse(admin_mapping.?.bytes);
+            }
+            try assemble.buildStaged(&session, &metadata, source_stats.value, edge_file, shape_file, assembly_options);
         }
     }
     if (session.runs(.validate)) try validate(&session);
@@ -326,6 +336,11 @@ fn buildSegments(session: *checkpoint.Session, metadata: *assemble.Metadata, inp
         try prep.selectWays(source, &referenced.?);
         try prep.saveTags(&tx);
         try edges.saveUsage(&tx, &referenced.?, .usage_directory, .usage_leaves);
+        if (try admin_index.build(gpa, source, deadline)) |compiled| {
+            var index = compiled;
+            defer index.deinit();
+            try admin_index.save(index.view, &tx);
+        }
         try session.commit(&tx, prep.selected_ways, start);
     } else {
         const tags = try session.open(.tags);

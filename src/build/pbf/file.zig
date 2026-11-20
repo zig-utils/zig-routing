@@ -156,6 +156,12 @@ pub const Index = struct {
     }
 
     pub fn forEachBounded(self: *const Index, gpa: Allocator, options: DecodeOptions, deadline: io.Deadline, context: anytype, comptime consume: anytype) !void {
+        return self.scan(gpa, options, deadline, BlockVisitor.bind(&context, consume));
+    }
+
+    // The bounded inflate pipeline is shared across consumers. The callback
+    // runs once per blob, after inflation and before its buffer is released.
+    noinline fn scan(self: *const Index, gpa: Allocator, options: DecodeOptions, deadline: io.Deadline, sink: BlockVisitor) !void {
         if (self.blobs.len == 0) return;
         const requested = if (options.workers == 0) std.Thread.getCpuCount() catch 1 else options.workers;
         const slots_available = if (self.inflate_capacity == 0) self.blobs.len else @min(self.blobs.len, options.buffer_bytes / self.inflate_capacity);
@@ -164,7 +170,7 @@ pub const Index = struct {
         if (thread_count == 1) {
             const scratch = try gpa.alloc(u8, self.inflate_capacity);
             defer gpa.free(scratch);
-            for (0..self.blobs.len) |i| try consume(context, i, try self.inflateInto(i, scratch, deadline));
+            for (0..self.blobs.len) |i| try sink.visit(sink.context, i, try self.inflateInto(i, scratch, deadline));
             return;
         }
 
@@ -189,9 +195,25 @@ pub const Index = struct {
             started += 1;
         }
         for (0..self.blobs.len) |i| {
-            try consume(context, i, try pool.result(i));
+            try sink.visit(sink.context, i, try pool.result(i));
             pool.release(i);
         }
+    }
+};
+
+const BlockVisitor = struct {
+    context: *const anyopaque,
+    visit: *const fn (*const anyopaque, usize, []const u8) anyerror!void,
+
+    fn bind(context: anytype, comptime consume: anytype) BlockVisitor {
+        const Context = @typeInfo(@TypeOf(context)).pointer.child;
+        const Adapter = struct {
+            fn visit(state: *const anyopaque, index: usize, bytes: []const u8) anyerror!void {
+                const typed: *const Context = @ptrCast(@alignCast(state));
+                return consume(typed.*, index, bytes);
+            }
+        };
+        return .{ .context = @ptrCast(context), .visit = Adapter.visit };
     }
 };
 
@@ -262,14 +284,14 @@ pub const Stream = struct {
     }
 
     pub fn validateHeader(self: Stream, gpa: Allocator, deadline: io.Deadline) !void {
-        return self.read(gpa, deadline, {}, null);
+        return self.read(gpa, deadline, null);
     }
 
     pub fn forEach(self: Stream, gpa: Allocator, deadline: io.Deadline, context: anytype, comptime consume: anytype) !void {
-        return self.read(gpa, deadline, context, consume);
+        return self.read(gpa, deadline, BlockVisitor.bind(&context, consume));
     }
 
-    fn read(self: Stream, gpa: Allocator, deadline: io.Deadline, context: anytype, comptime consume: anytype) !void {
+    noinline fn read(self: Stream, gpa: Allocator, deadline: io.Deadline, sink: ?BlockVisitor) !void {
         var encoded: std.ArrayList(u8) = .empty;
         defer encoded.deinit(gpa);
         var decoded: std.ArrayList(u8) = .empty;
@@ -307,10 +329,10 @@ pub const Stream = struct {
                 var arena: std.heap.ArenaAllocator = .init(gpa);
                 defer arena.deinit();
                 _ = try parseHeader(arena.allocator(), bytes, deadline);
-                if (@TypeOf(consume) == @TypeOf(null)) return;
+                if (sink == null) return;
                 seen_header = true;
             } else {
-                if (@TypeOf(consume) != @TypeOf(null)) try consume(context, index, bytes);
+                if (sink) |visitor| try visitor.visit(visitor.context, index, bytes);
                 index += 1;
             }
         }

@@ -106,11 +106,13 @@ pub const SectionKind = enum(u32) {
     components = 12,
     turn_sides = 13,
     coverage = 14,
+    admins = 15,
+    node_admins = 16,
 
     pub fn placement(kind: SectionKind) Placement {
         return switch (kind) {
             .nodes, .edges, .first_edge, .turns, .classes, .turn_sides => .hot,
-            .coordinates, .spatial, .components, .metadata, .coverage => .warm,
+            .coordinates, .spatial, .components, .metadata, .coverage, .admins, .node_admins => .warm,
             .cold_idx, .cold, .slopes => .cold,
         };
     }
@@ -131,6 +133,8 @@ pub const SectionKind = enum(u32) {
             .components => "components.bin",
             .turn_sides => "turn_sides.bin",
             .coverage => "coverage.bin",
+            .admins => "admins.bin",
+            .node_admins => "node_admins.bin",
         };
     }
 
@@ -148,6 +152,8 @@ pub const SectionKind = enum(u32) {
             .spatial => u8,
             .metadata => Metadata,
             .coverage => Bounds,
+            .admins => u8,
+            .node_admins => u16,
             .components, .turn_sides => u32,
         };
     }
@@ -253,12 +259,16 @@ pub const BundleWriter = struct {
     }
 
     pub fn write(self: *BundleWriter, comptime kind: SectionKind, records: []const kind.Record()) !void {
-        const Slice = struct {
-            fn produce(input: []const kind.Record(), out: *SectionWriter(kind)) !void {
-                try out.append(input);
-            }
-        };
-        try self.stream(kind, records, Slice.produce);
+        try self.writeBytes(kind, std.mem.sliceAsBytes(records));
+    }
+
+    noinline fn writeBytes(self: *BundleWriter, kind: SectionKind, bytes: []const u8) !void {
+        const file = try self.startSection(kind);
+        errdefer self.staging.deleteFile(kind.filename()) catch {};
+        defer file.close();
+        var payload: PayloadWriter = .{ .file = file, .deadline = self.deadline };
+        try payload.append(bytes);
+        try self.finishSection(kind, &payload, null);
     }
 
     /// Produce a section in bounded batches. If producing it fails, that
@@ -269,63 +279,66 @@ pub const BundleWriter = struct {
         context: anytype,
         comptime produce: fn (@TypeOf(context), *SectionWriter(kind)) anyerror!void,
     ) !void {
+        const file = try self.startSection(kind);
+        errdefer self.staging.deleteFile(kind.filename()) catch {};
+        defer file.close();
+        var payload: PayloadWriter = .{ .file = file, .deadline = self.deadline };
+        var section: SectionWriter(kind) = .{ .payload = &payload };
+        try produce(context, &section);
+        try self.finishSection(kind, &payload, null);
+    }
+
+    noinline fn startSection(self: *BundleWriter, kind: SectionKind) !io.File {
         if (self.committed) return error.BundleCommitted;
         if (self.written.contains(kind)) return error.DuplicateSection;
         if (self.deadline.expired()) return error.DeadlineExceeded;
+        return self.staging.createFile(kind.filename());
+    }
 
-        const file = try self.staging.createFile(kind.filename());
-        errdefer self.staging.deleteFile(kind.filename()) catch {};
-        defer file.close();
-
-        var section: SectionWriter(kind) = .{ .file = file, .deadline = self.deadline };
-        try produce(context, &section);
+    noinline fn finishSection(self: *BundleWriter, kind: SectionKind, payload: *PayloadWriter, expected_hash: ?u64) !void {
         if (self.deadline.expired()) return error.DeadlineExceeded;
+        const hash = payload.hash.final();
+        if (expected_hash) |expected| {
+            if (hash != expected) return error.PayloadHashMismatch;
+        }
+        const record_size = kind.recordSize();
         const header: SectionHeader = .{
             .kind = @backingInt(kind),
             .dataset_uuid = self.uuid,
-            .record_size = @sizeOf(kind.Record()),
-            .count = (section.offset - payload_offset) / @sizeOf(kind.Record()),
-            .payload_hash = section.hash.final(),
+            .record_size = record_size,
+            .count = (payload.offset - payload_offset) / record_size,
+            .payload_hash = hash,
         };
-        try file.pwriteAll(std.mem.asBytes(&header), 0);
-        try file.truncate(section.offset);
-        try file.sync();
+        try payload.file.pwriteAll(std.mem.asBytes(&header), 0);
+        try payload.file.truncate(payload.offset);
+        try payload.file.sync();
         self.written.insert(kind);
     }
 
-    pub fn copySection(self: *BundleWriter, comptime kind: SectionKind, input: io.File) !void {
-        const T = kind.Record();
+    pub fn copySection(self: *BundleWriter, kind: SectionKind, input: io.File) !void {
         var header: SectionHeader = undefined;
         try input.preadAll(std.mem.asBytes(&header), 0);
+        const record_size = kind.recordSize();
         if (!std.mem.eql(u8, &header.magic_tag, &magic) or header.format_version != version or
-            header.record_size != @sizeOf(T) or header.kind != @backingInt(kind) or header.reserved != 0 or
+            header.record_size != record_size or header.kind != @backingInt(kind) or header.reserved != 0 or
             !std.mem.allEqual(u8, &header.reserved_tail, 0) or !std.mem.eql(u8, &header.dataset_uuid, &self.uuid))
             return error.InvalidSectionHeader;
-        const payload = std.math.mul(u64, header.count, @sizeOf(T)) catch return error.SectionTooLarge;
-        if (try input.size() != std.math.add(u64, payload_offset, payload) catch return error.SectionTooLarge)
-            return error.InvalidSectionSize;
-        const Source = struct {
-            file: io.File,
-            count: u64,
-            hash: u64,
+        const size = std.math.mul(u64, header.count, record_size) catch return error.SectionTooLarge;
+        const end = std.math.add(u64, payload_offset, size) catch return error.SectionTooLarge;
+        if (try input.size() != end) return error.InvalidSectionSize;
 
-            fn produce(source: @This(), output: *SectionWriter(kind)) !void {
-                var records: [@max(1, 128 * 1024 / @sizeOf(T))]T = undefined;
-                var offset: u64 = payload_offset;
-                var remaining = source.count;
-                while (remaining != 0) {
-                    if (output.deadline.expired()) return error.DeadlineExceeded;
-                    const chunk = records[0..@intCast(@min(remaining, records.len))];
-                    const bytes = std.mem.sliceAsBytes(chunk);
-                    try source.file.preadAll(bytes, offset);
-                    try output.append(chunk);
-                    offset += bytes.len;
-                    remaining -= chunk.len;
-                }
-                if (output.hash.final() != source.hash) return error.PayloadHashMismatch;
-            }
-        };
-        try self.stream(kind, Source{ .file = input, .count = header.count, .hash = header.payload_hash }, Source.produce);
+        const file = try self.startSection(kind);
+        errdefer self.staging.deleteFile(kind.filename()) catch {};
+        defer file.close();
+        var payload: PayloadWriter = .{ .file = file, .deadline = self.deadline };
+        var buffer: [128 * 1024]u8 = undefined;
+        while (payload.offset < end) {
+            if (self.deadline.expired()) return error.DeadlineExceeded;
+            const bytes = buffer[0..@intCast(@min(buffer.len, end - payload.offset))];
+            try input.preadAll(bytes, payload.offset);
+            try payload.append(bytes);
+        }
+        try self.finishSection(kind, &payload, header.payload_hash);
     }
 
     /// Publish every section together. A bundle already at the destination
@@ -334,6 +347,7 @@ pub const BundleWriter = struct {
         if (self.committed) return error.BundleCommitted;
         if (!required_sections.subsetOf(self.written)) return error.MissingSection;
         if (self.written.contains(.cold) != self.written.contains(.cold_idx)) return error.MissingSection;
+        if (self.written.contains(.admins) != self.written.contains(.node_admins)) return error.MissingSection;
         if (self.deadline.expired()) return error.DeadlineExceeded;
         try self.staging.sync();
         if (self.deadline.expired()) return error.DeadlineExceeded;
@@ -346,29 +360,41 @@ pub const BundleWriter = struct {
 pub fn SectionWriter(comptime kind: SectionKind) type {
     return struct {
         const Self = @This();
-        const write_chunk = 1024 * 1024;
-
-        file: io.File,
-        deadline: io.Deadline,
-        offset: u64 = payload_offset,
-        hash: std.hash.XxHash3 = .init(0),
+        payload: *PayloadWriter,
 
         pub fn append(self: *Self, records: []const kind.Record()) !void {
-            const bytes: []const u8 = std.mem.sliceAsBytes(records);
-            if (bytes.len > @as(u64, std.math.maxInt(i64)) - self.offset)
-                return error.SectionTooLarge;
-            var remaining = bytes;
-            while (remaining.len != 0) {
-                if (self.deadline.expired()) return error.DeadlineExceeded;
-                const chunk = remaining[0..@min(write_chunk, remaining.len)];
-                try self.file.pwriteAll(chunk, self.offset);
-                self.hash.update(chunk);
-                self.offset += chunk.len;
-                remaining = remaining[chunk.len..];
-            }
+            try self.payload.append(std.mem.sliceAsBytes(records));
+        }
+
+        pub fn deadline(self: Self) io.Deadline {
+            return self.payload.deadline;
+        }
+
+        pub fn payloadBytes(self: Self) u64 {
+            return self.payload.offset - payload_offset;
         }
     };
 }
+
+const PayloadWriter = struct {
+    file: io.File,
+    deadline: io.Deadline,
+    offset: u64 = payload_offset,
+    hash: std.hash.XxHash3 = .init(0),
+
+    noinline fn append(self: *PayloadWriter, bytes: []const u8) !void {
+        if (bytes.len > @as(u64, std.math.maxInt(i64)) - self.offset) return error.SectionTooLarge;
+        var remaining = bytes;
+        while (remaining.len != 0) {
+            if (self.deadline.expired()) return error.DeadlineExceeded;
+            const chunk = remaining[0..@min(1024 * 1024, remaining.len)];
+            try self.file.pwriteAll(chunk, self.offset);
+            self.hash.update(chunk);
+            self.offset += chunk.len;
+            remaining = remaining[chunk.len..];
+        }
+    }
+};
 
 const testing = std.testing;
 const fixture_uuid: DatasetUuid = .{

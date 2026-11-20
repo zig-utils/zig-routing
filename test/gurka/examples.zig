@@ -84,6 +84,74 @@ pub fn motorVehicle(arena: Allocator) !gurka.Map {
     } }}, &.{});
 }
 
+pub fn adminBoundaries(arena: Allocator) !gurka.Map {
+    var layout: gurka.NodeLayout = .{};
+    const vertices = [_]struct { label: u8, lng: f64, lat: f64 }{
+        .{ .label = 'A', .lng = 1, .lat = 44.2 },
+        .{ .label = 'B', .lng = 3, .lat = 44.2 },
+        .{ .label = 'C', .lng = 3, .lat = 45.8 },
+        .{ .label = 'D', .lng = 1, .lat = 45.8 },
+        .{ .label = 'E', .lng = 1.8, .lat = 44.8 },
+        .{ .label = 'F', .lng = 2.2, .lat = 44.8 },
+        .{ .label = 'G', .lng = 2.2, .lat = 45.2 },
+        .{ .label = 'H', .lng = 1.8, .lat = 45.2 },
+        .{ .label = 'I', .lng = 4, .lat = 44.4 },
+        .{ .label = 'J', .lng = 4.5, .lat = 44.4 },
+        .{ .label = 'K', .lng = 4.5, .lat = 45.0 },
+        .{ .label = 'L', .lng = 4, .lat = 45.0 },
+        .{ .label = 'M', .lng = 1.4, .lat = 44.4 },
+        .{ .label = 'N', .lng = 2.6, .lat = 44.4 },
+        .{ .label = 'O', .lng = 2.6, .lat = 45.6 },
+        .{ .label = 'P', .lng = 1.4, .lat = 45.6 },
+        .{ .label = 'Q', .lng = 1.5, .lat = 44.5 },
+        .{ .label = 'R', .lng = 1.6, .lat = 44.6 },
+        .{ .label = 'S', .lng = 1.9, .lat = 44.9 },
+        .{ .label = 'T', .lng = 2.1, .lat = 45.0 },
+        .{ .label = 'U', .lng = 4.25, .lat = 44.6 },
+        .{ .label = 'V', .lng = 4.3, .lat = 44.7 },
+        .{ .label = 'W', .lng = 3.05, .lat = 45 },
+        .{ .label = 'X', .lng = 3.1, .lat = 45.01 },
+    };
+    for (vertices) |v| layout.points[v.label] = .{ .lng = v.lng, .lat = v.lat };
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "residential" }};
+    const boundary = [_]gurka.Tag{ .{ .key = "type", .value = "boundary" }, .{ .key = "boundary", .value = "administrative" } };
+    return gurka.Map.init(arena, layout, &.{
+        .{ .label = "AB" },               .{ .label = "CB" },               .{ .label = "CD" },               .{ .label = "AD" },
+        .{ .label = "EFGHE" },            .{ .label = "IJKLI" },            .{ .label = "MNOPM" },            .{ .label = "QR", .tags = road },
+        .{ .label = "ST", .tags = road }, .{ .label = "UV", .tags = road }, .{ .label = "WX", .tags = road },
+    }, &.{}, &.{
+        .{ .tags = &(boundary ++ [_]gurka.Tag{
+            .{ .key = "admin_level", .value = "2" },
+            .{ .key = "name", .value = "United Kingdom" },
+            .{ .key = "ISO3166-1:alpha2", .value = "GB" },
+        }), .members = &.{
+            .{ .kind = .way, .ref = "CD", .role = "outer" },
+            .{ .kind = .way, .ref = "EFGHE", .role = "inner" },
+            .{ .kind = .way, .ref = "IJKLI", .role = "outer" },
+            .{ .kind = .way, .ref = "AB", .role = "outer" },
+            .{ .kind = .way, .ref = "CB", .role = "outer" },
+            .{ .kind = .way, .ref = "AD", .role = "outer" },
+        } },
+        .{ .tags = &(boundary ++ [_]gurka.Tag{
+            .{ .key = "admin_level", .value = "4" },
+            .{ .key = "name", .value = "Testshire" },
+            .{ .key = "ISO3166-2", .value = "GB-TST" },
+        }), .members = &.{
+            .{ .kind = .way, .ref = "MNOPM", .role = "outer" },
+            .{ .kind = .way, .ref = "EFGHE", .role = "inner" },
+        } },
+        .{ .tags = &(boundary ++ [_]gurka.Tag{
+            .{ .key = "admin_level", .value = "2" },
+            .{ .key = "name", .value = "Belgium" },
+            .{ .key = "ISO3166-1", .value = "BE" },
+        }), .members = &.{.{ .kind = .way, .ref = "EFGHE", .role = "outer" }} },
+        .{ .tags = &(boundary ++ [_]gurka.Tag{
+            .{ .key = "admin_level", .value = "2" },
+            .{ .key = "name", .value = "Unclosed" },
+        }), .members = &.{.{ .kind = .way, .ref = "WX", .role = "outer" }} },
+    });
+}
+
 test "fixture resolves labels, names and relation references" {
     var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer state.deinit();

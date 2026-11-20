@@ -113,6 +113,9 @@ pub const Artifact = enum {
     bundle_coverage,
     default_speeds,
     motor_limits,
+    admin_index,
+    bundle_admins,
+    bundle_node_admins,
 
     fn filename(self: Artifact) [:0]const u8 {
         return switch (self) {
@@ -229,7 +232,7 @@ pub const Existing = struct {
     }
 
     pub fn copySections(self: Existing, writer: *format.BundleWriter) !void {
-        inline for (std.enums.values(format.SectionKind)) |kind| {
+        for (std.enums.values(format.SectionKind)) |kind| {
             const key = Artifact.section(kind);
             if (self.manifest.files.get(key) != null) {
                 const file = try self.read(key, writer.deadline);

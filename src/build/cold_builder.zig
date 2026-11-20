@@ -109,7 +109,7 @@ pub const Builder = struct {
             pos += bytes.len;
         }
         try self.writeNames(out);
-        self.payload_bytes = out.offset - format.payload_offset;
+        self.payload_bytes = out.payloadBytes();
     }
 
     fn writeNames(self: *Builder, out: *Out) !void {

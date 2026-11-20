@@ -4,6 +4,7 @@ const std = @import("std");
 const io = @import("../infra/io.zig");
 const format = @import("format.zig");
 const class_table = @import("class_table.zig");
+const admin = @import("admin.zig");
 const cold = @import("cold.zig");
 const spatial = @import("spatial.zig");
 const turn_sides = @import("turn_sides.zig");
@@ -143,6 +144,9 @@ pub const View = struct {
     turn_sides: ?[]const u32,
     turn_side_index: ?turn_sides.View,
     coverage: ?[]const format.Bounds = null,
+    admins: ?[]const u8 = null,
+    node_admins: ?[]const admin.Id = null,
+    admin_index: ?admin.View = null,
 
     pub fn parse(files: Files, diagnostic: ?*Diagnostic) !View {
         var headers: Headers = .initFill(null);
@@ -270,6 +274,15 @@ pub const View = struct {
             note(diagnostic, .coverage);
             if (records.len != 1 or !records[0].valid()) return error.InvalidBundleCoverage;
         }
+        if (graph.admins) |bytes| {
+            note(diagnostic, .admins);
+            graph.admin_index = try admin.View.parse(bytes);
+        }
+        if (graph.node_admins != null or graph.admin_index != null) {
+            note(diagnostic, .node_admins);
+            if (graph.admin_index == null or graph.node_admins == null or graph.node_admins.?.len != node_count)
+                return error.InvalidNodeAdminCount;
+        }
         note(diagnostic, null);
         return graph;
     }
@@ -282,6 +295,17 @@ pub const View = struct {
         const index = @backingInt(id);
         if (index >= self.nodes.len) return error.InvalidNodeId;
         return &self.nodes[index];
+    }
+
+    pub fn nodeAdmin(self: *const View, id: format.NodeId) !admin.Names {
+        _ = try self.node(id);
+        const index = self.admin_index orelse return .{};
+        return index.names(self.node_admins.?[@backingInt(id)]);
+    }
+
+    pub fn adminAt(self: *const View, point: @import("../geo/point.zig").PointLL, deadline: io.Deadline) !admin.Names {
+        const index = self.admin_index orelse return .{};
+        return index.names(try index.lookup(point, deadline));
     }
 
     pub fn edge(self: *const View, id: format.EdgeId) error{InvalidEdgeId}!*const format.EdgeHot {
@@ -414,7 +438,7 @@ pub const View = struct {
             note(diagnostic, kind);
             if (deadline.expired()) return error.DeadlineExceeded;
             const bytes: []const u8 = switch (kind) {
-                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata, .components, .turn_sides, .coverage => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
+                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata, .components, .turn_sides, .coverage, .admins, .node_admins => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
                 inline else => |section| std.mem.sliceAsBytes(@field(self, @tagName(section))),
             };
             var hash = std.hash.XxHash3.init(0);
@@ -426,6 +450,15 @@ pub const View = struct {
                 rest = rest[chunk.len..];
             }
             if (hash.final() != entry.payload_hash) return error.PayloadHashMismatch;
+        }
+        if (self.admin_index) |index| {
+            note(diagnostic, .admins);
+            try index.verify(deadline);
+            note(diagnostic, .node_admins);
+            for (self.node_admins.?, 0..) |id, i| {
+                if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
+                _ = try index.names(id);
+            }
         }
         note(diagnostic, null);
     }

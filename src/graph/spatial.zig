@@ -356,7 +356,7 @@ const Payload = struct {
         var buf: [64 * 1024]u8 = undefined;
         var offset: u64 = 0;
         while (offset < self.length) {
-            if (out.deadline.expired()) return error.DeadlineExceeded;
+            if (out.deadline().expired()) return error.DeadlineExceeded;
             const bytes = buf[0..@min(buf.len, self.length - offset)];
             try self.file.preadAll(bytes, offset);
             try out.append(bytes);

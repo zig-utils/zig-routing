@@ -20,6 +20,7 @@ const speeds = @import("speeds.zig");
 const components = @import("components.zig");
 const checkpoint = @import("checkpoint.zig");
 const node_order = @import("order.zig");
+const admin_index = @import("admin_index.zig");
 
 const Allocator = std.mem.Allocator;
 const max_degree = turns.max_degree;
@@ -45,6 +46,7 @@ pub const Options = struct {
     dem_source: ?elevation.Source = null,
     admin_drive_side: ?enhance.AdminDriveSide = null,
     admin_speed_region: ?AdminSpeedRegion = null,
+    admin_index: ?graph.admin.View = null,
     exit_signs: ?ExitSigns = null,
     speed_rules: ?*const speeds.Config = null,
     infer_turn_channels: bool = true,
@@ -72,7 +74,11 @@ pub const Stats = struct {
 /// Build the topology, validate it, and write it to the caller's staging
 /// bundle. The caller commits the writer after all build stages succeed.
 /// Parallel builds require an allocator and admin resolver that support concurrent use.
-pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWriter, options: Options) !Stats {
+pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWriter, supplied: Options) !Stats {
+    var options = supplied;
+    var compiled_admins = if (options.admin_index == null) try admin_index.build(gpa, source, options.deadline) else null;
+    defer if (compiled_admins) |*index| index.deinit();
+    if (compiled_admins) |index| options.admin_index = index.view;
     const edge_file = try io.File.temporary(options.scratch_dir);
     defer edge_file.close();
     const shape_file = try io.File.temporary(options.scratch_dir);
@@ -103,11 +109,14 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
 
     var topology = try Topology.init(gpa, &plan, segments, options);
     defer topology.deinit(gpa);
+    var admin_ids = try assignAdmins(topology.coordinates, options);
+    defer if (admin_ids) |*ids| ids.deinit();
     const shared: Shared = .{
         .topology = &topology,
         .segments = segments,
         .shape_points = shape_points,
         .ways = &metadata.ways,
+        .admin_ids = if (admin_ids) |ids| ids.data else null,
         .deadline = options.deadline,
     };
     var table = blk: {
@@ -129,6 +138,7 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
 
     try writeTopology(writer, options.scratch_dir, topology, table.classes, turn_pool.bytes.items, if (terrain) |present| present.slopes.data else null);
     try writer.write(.turn_sides, turn_sides);
+    try writeAdmins(writer, options.admin_index, shared.admin_ids);
     const topology_ns = timer.read();
     const means: []const i16 = if (terrain) |*present| present.means.data else &.{};
     const cold_bytes = try buildCold(gpa, &shared, &metadata, writer, options.scratch_dir, means);
@@ -202,11 +212,17 @@ pub fn buildStaged(
         try Topology.load(gpa, session, options);
     defer topology.deinit(gpa);
     if (topology.placements.data.len != 2 * segments.len) return error.InvalidCheckpoint;
+    var admin_ids = if (session.runs(.enhance) or session.runs(.cold))
+        try assignAdmins(topology.coordinates, options)
+    else
+        null;
+    defer if (admin_ids) |*ids| ids.deinit();
     const shared: Shared = .{
         .topology = &topology,
         .segments = segments,
         .shape_points = points,
         .ways = &metadata.ways,
+        .admin_ids = if (admin_ids) |ids| ids.data else null,
         .deadline = options.deadline,
     };
     var edge_classes: ?[]const classes.EdgeClass = null;
@@ -299,6 +315,7 @@ pub fn buildStaged(
         const means = if (means_map) |mapped| try checkpoint.array(i16, mapped) else &.{};
         if (means.len != 0 and means.len != segments.len) return error.InvalidCheckpoint;
         try writeTopology(&writer, options.scratch_dir, topology, edge_classes.?, turn_data.bytes, if (slopes_map) |mapped| try checkpoint.array(u16, mapped) else null);
+        try writeAdmins(&writer, options.admin_index, shared.admin_ids);
         if (saved_turns.manifest.files.get(.turn_sides) != null) {
             const side_data = try saved_turns.map(.turn_sides, options.deadline);
             defer side_data.unmap();
@@ -1039,8 +1056,62 @@ const Shared = struct {
     segments: []const edges.Edge,
     shape_points: []const geo.FixedLL,
     ways: *const Ways,
+    admin_ids: ?[]const graph.admin.Id = null,
     deadline: io.Deadline,
 };
+
+const AdminJob = struct {
+    index: graph.admin.View,
+    points: []const geo.FixedLL,
+    ids: []graph.admin.Id,
+    deadline: io.Deadline,
+    result: anyerror!void = {},
+
+    fn run(self: *AdminJob) void {
+        self.result = self.assign();
+    }
+
+    fn assign(self: AdminJob) !void {
+        var previous: ?u32 = null;
+        var sole: graph.admin.Id = graph.admin.unknown;
+        for (self.points, self.ids, 0..) |point, *id, i| {
+            try checkDeadline(self.deadline, i);
+            const tile = enhance.tileId(point);
+            if (tile != previous) {
+                sole = try self.index.singleArea(enhance.tileBounds(tile), self.deadline);
+                previous = tile;
+            }
+            id.* = if (sole != graph.admin.unknown) sole else try self.index.lookup(point.toPoint(), self.deadline);
+        }
+    }
+};
+
+fn assignAdmins(points: []const geo.FixedLL, options: Options) !?Scratch(graph.admin.Id) {
+    const index = options.admin_index orelse return null;
+    var ids = try Scratch(graph.admin.Id).init(points.len, options.scratch_dir);
+    errdefer ids.deinit();
+    const cores = if (options.workers == 0) std.Thread.getCpuCount() catch 1 else options.workers;
+    const count = @max(1, @min(cores, max_workers, (points.len + 255) / 256));
+    var jobs: [max_workers]AdminJob = undefined;
+    for (jobs[0..count], 0..) |*job, i| {
+        const start = points.len * i / count;
+        const end = points.len * (i + 1) / count;
+        job.* = .{ .index = index, .points = points[start..end], .ids = ids.data[start..end], .deadline = options.deadline };
+    }
+    try runJobs(jobs[0..count]);
+    return ids;
+}
+
+fn writeAdmins(writer: *format.BundleWriter, index: ?graph.admin.View, ids: ?[]const graph.admin.Id) !void {
+    if (index) |present| {
+        try writer.stream(.admins, present, emitAdmins);
+        try writer.write(.node_admins, ids.?);
+    }
+}
+
+fn emitAdmins(index: graph.admin.View, out: *format.SectionWriter(.admins)) !void {
+    try index.write(out);
+}
 
 const Job = struct {
     shared: *const Shared,
@@ -1190,6 +1261,7 @@ const NodeEnhanceJob = struct {
     tiles: enhance.TileIndex,
     active: []const u32,
     nodes: []format.NodeHot,
+    admin_ids: ?[]const graph.admin.Id,
     options: Options,
     result: anyerror!void = {},
 
@@ -1211,7 +1283,11 @@ const NodeEnhanceJob = struct {
                     admin.resolve(admin.context, self.network.coordinates[id])
                 else
                     null;
-                node.attr.drive_on_left = (override orelse self.options.drive_side) == .left;
+                const admin_side: ?edge_class.DriveSide = if (self.options.admin_index) |index| side: {
+                    const area = (try index.region(self.admin_ids.?[id])) orelse break :side null;
+                    break :side if (area.attr.drive_on_right) .right else .left;
+                } else null;
+                node.attr.drive_on_left = (override orelse admin_side orelse self.options.drive_side) == .left;
                 node.attr.intersection = try enhance.intersection(self.network, id, deadline);
             }
         }
@@ -1257,8 +1333,10 @@ const EdgeEnhanceJob = struct {
                 const configured = if (self.options.speed_rules) |rules| configured: {
                     const region: speeds.Region = if (self.options.admin_speed_region) |admin|
                         admin.resolve(admin.context, self.network.coordinates[edge.head])
-                    else
-                        .{};
+                    else if (self.options.admin_index) |index| region: {
+                        const names = try index.names(self.shared.admin_ids.?[edge.head]);
+                        break :region .{ .country = names.country_iso, .state = names.state_iso };
+                    } else .{};
                     const signed = if (class.flags.link) self.hasExitSign(@intCast(slot)) else false;
                     break :configured rules.speed(region, class, density, signed);
                 } else null;
@@ -1362,6 +1440,7 @@ fn enhanceGraph(gpa: Allocator, shared: *const Shared, plan: *const Layout, base
                 .tiles = tiles,
                 .active = active[active.len * i / count .. active.len * (i + 1) / count],
                 .nodes = topo.nodes,
+                .admin_ids = shared.admin_ids,
                 .options = options,
             };
         }

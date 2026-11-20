@@ -147,6 +147,37 @@ The comparator reports a count and up to `--keep` OSM IDs for each differing fie
 the tag transform before that geometry pass. The checked-in extracts have 3 such ways in
 Liechtenstein and 34 in Utrecht.
 
+### Admin assignments
+
+`zr build` stitches the administrative relations in its OSM input and packs
+their polygons into a sparse grid. Point queries use the clipped polygons.
+Node assignments also follow Valhalla's tile rule when a local tile intersects
+a single eligible admin. A state carries the country whose geometry covers it.
+
+Create the oracle database with `valhalla_build_admins` in the pinned image,
+using the same PBF and the path named by `mjolnir.admin`. Build local tiles
+with that configuration using `valhalla_build_tiles --end build` before
+running the comparison.
+
+```bash
+zig-out/bin/zr build extract.osm.pbf --output native-bundle
+python3 oracle/compare-admins.py native-bundle valhalla-tile-dir
+```
+
+The comparator matches graph coordinates within two E7 units per axis. It
+compares both country and state names and ISO codes. These comparisons applied
+no border exclusions.
+
+| Input | Matched nodes | Same admin | Nodes with an admin |
+| --- | ---: | ---: | ---: |
+| Liechtenstein | 6,280 | 6,280 | 6,280 |
+| Utrecht | 30,638 | 30,638 | 0 |
+| Gurka admin fixture | 8 | 8 | 8 |
+
+Utrecht's state relation has a missing member in the pinned extract. The Gurka
+fixture exercises a complete state, a separate island, an enclave occupying a
+country's hole, and an unclosed boundary.
+
 The fixtures derive from OpenStreetMap data © OpenStreetMap contributors, under the
 [Open Database License](https://www.openstreetmap.org/copyright).
 
