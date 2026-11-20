@@ -25,6 +25,8 @@ const country_access = @import("country_access.zig");
 const timezones = @import("timezones.zig");
 const turn_restrictions = @import("turn_restrictions.zig");
 const mode_turns = @import("../graph/turn_restrictions.zig");
+const automaton = @import("../graph/restriction_automaton.zig");
+const automaton_builder = @import("restriction_automaton.zig");
 
 const Allocator = std.mem.Allocator;
 const max_degree = turns.max_degree;
@@ -132,11 +134,13 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
         .apply_country_overrides = options.apply_country_overrides,
         .deadline = options.deadline,
     };
+    var restriction_program: []automaton.State = &.{};
+    defer gpa.free(restriction_program);
     var table = blk: {
         var base = try populate(gpa, &shared, options.workers);
         defer base.deinit();
         try validate(topology.first_edge, topology.output.data, topology.coordinates, base.classes, options.deadline);
-        break :blk try enhanceGraph(gpa, &shared, &plan, base.classes, options);
+        break :blk try enhanceGraph(gpa, &shared, &plan, base.classes, options, restrictions.source(), &restriction_program);
     };
     defer table.deinit();
     var terrain = if (options.dem_source) |source_dem|
@@ -146,7 +150,7 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     defer if (terrain) |*present| present.deinit();
     var turn_pool = turns.Pool.init(gpa);
     defer turn_pool.deinit();
-    var resolved = try resolveTurns(gpa, &shared, &plan, .{ .entries = restrictions.entries.items, .stats = restrictions.stats });
+    var resolved = try resolveTurns(gpa, &shared, &plan, restrictions.source());
     defer resolved.deinit(gpa);
     const turn_sides = try buildTurns(&shared, table.classes, metadata.name_ids.items, resolved.hard.items, &turn_pool, gpa);
     defer gpa.free(turn_sides);
@@ -154,6 +158,7 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     try writeTopology(writer, options.scratch_dir, &topology, table.classes, turn_pool.bytes.items, if (terrain) |present| present.slopes.data else null);
     try writer.write(.turn_sides, turn_sides);
     if (resolved.modes.items.len != 0) try writer.write(.turn_restrictions, resolved.modes.items);
+    if (restriction_program.len != 0) try writer.write(.restriction_automaton, restriction_program);
     try writeAdmins(writer, options.admin_index, shared.admin_ids);
     if (options.timezone_source) |source_tz| try writeTimezones(gpa, writer, source_tz, topology.coordinates, options.scratch_dir);
     const topology_ns = timer.read();
@@ -274,11 +279,14 @@ pub fn buildStaged(
         const start = io.Timer.start();
         var tx = try session.begin(.enhance);
         defer tx.deinit();
-        const enhanced = try enhanceGraph(gpa, &shared, &plan, edge_classes.?, options);
+        var restriction_program: []automaton.State = &.{};
+        defer gpa.free(restriction_program);
+        const enhanced = try enhanceGraph(gpa, &shared, &plan, edge_classes.?, options, restrictions, &restriction_program);
         gpa.free(enhanced.remap);
         gpa.free(edge_classes.?);
         edge_classes = enhanced.classes;
         try saveAttributes(&topology, enhanced.classes, &tx);
+        if (restriction_program.len != 0) try tx.writeArray(restriction_program, .restriction_states);
         try session.commit(&tx, topology.output.data.len, start);
     }
     if (session.endsAt(.enhance)) return;
@@ -372,6 +380,13 @@ noinline fn saveColdStage(session: *checkpoint.Session, shared: *const Shared, m
         const rows = try saved_turns.map(.mode_turns, options.deadline);
         defer rows.unmap();
         try writer.write(.turn_restrictions, try checkpoint.array(mode_turns.Entry, rows));
+    }
+    const enhancement = try session.open(.enhance);
+    defer enhancement.close();
+    if (enhancement.manifest.files.get(.restriction_states) != null) {
+        const rows = try enhancement.map(.restriction_states, options.deadline);
+        defer rows.unmap();
+        try writer.write(.restriction_automaton, try checkpoint.array(automaton.State, rows));
     }
     const cold_bytes = try buildCold(gpa, shared, metadata, &writer, options.scratch_dir, means);
     try tx.writeJson(gpa, cold_bytes, .source_stats);
@@ -1461,7 +1476,7 @@ const EdgeEnhanceJob = struct {
     }
 };
 
-fn enhanceGraph(gpa: Allocator, shared: *const Shared, plan: *const Layout, base: []const classes.EdgeClass, options: Options) !classes.Table {
+fn enhanceGraph(gpa: Allocator, shared: *const Shared, plan: *const Layout, base: []const classes.EdgeClass, options: Options, restrictions: turn_restrictions.Source, program: *[]automaton.State) !classes.Table {
     const topo = shared.topology;
     const deadline = options.deadline;
     const aliases = try Scratch(u32).init(if (plan.split_nodes == 0) 0 else topo.nodes.len, options.scratch_dir);
@@ -1536,13 +1551,16 @@ fn enhanceGraph(gpa: Allocator, shared: *const Shared, plan: *const Layout, base
     }
     try runJobs(jobs[0..count]);
 
+    var restriction_starts: RestrictionStarts = .empty;
+    defer restriction_starts.deinit(gpa);
+    program.* = try compileComplexTurns(gpa, shared, plan, base, order.data, restrictions, &restriction_starts);
     var interner = classes.Interner.init(gpa);
     defer interner.deinit();
     for (topo.nodes, 0..) |node, i| {
         try checkDeadline(deadline, i);
         const first = topo.first_edge[i];
         const end = topo.first_edge[i + 1];
-        for (topo.output.data[first..end], derived.data[first..end]) |*edge, result| {
+        for (topo.output.data[first..end], derived.data[first..end], first..) |*edge, result, slot| {
             var class = base[edge.cls.class_id];
             const target = topo.nodes[edge.head];
             class.category.density = @intCast((@as(u8, node.attr.density) + target.attr.density) / 2);
@@ -1555,6 +1573,10 @@ fn enhanceGraph(gpa: Allocator, shared: *const Shared, plan: *const Layout, base
                 if (result & configured_speed_flag != 0) class.flags.tagged_speed = false;
                 class.flags.dead_end = target.attr.intersection == .dead_end;
                 edge.speed[0] = @truncate(result >> 8);
+            }
+            if (restriction_starts.get(@intCast(slot))) |masks| {
+                class.restrictions = @bitCast(masks);
+                class.flags.complex_restriction = true;
             }
             const interned = @backingInt(try interner.intern(class));
             edge.cls.class_id = std.math.cast(classes.ClassId, interned) orelse return error.TooManyClasses;
@@ -1763,6 +1785,184 @@ const IncidentTurnEdge = struct {
         return if (a.rank == b.rank) a.slot < b.slot else a.rank < b.rank;
     }
 };
+
+// Matches EdgeClass.restrictions, with the forward mask in the low half.
+const RestrictionStarts = std.AutoHashMapUnmanaged(u32, u32);
+
+// Ported from src/mjolnir/restrictionbuilder.cc (Valhalla 3.9.3).
+const ComplexWalk = struct {
+    shared: *const Shared,
+    layout: *const Layout,
+    classes: []const classes.EdgeClass,
+    order: []const u32,
+
+    const Frame = struct {
+        previous: i64,
+        node: i64,
+        next: u32,
+        end: u32,
+        way: usize,
+        extend: bool = false,
+    };
+
+    fn frame(self: ComplexWalk, previous: i64, node: i64, way: usize) !Frame {
+        const topo = self.shared.topology;
+        const logical = self.layout.nodes.items[self.layout.by_id.get(node) orelse return error.MissingNode];
+        const first = logical.first_alias;
+        return .{
+            .previous = previous,
+            .node = node,
+            .next = topo.first_edge[first],
+            .end = topo.first_edge[first + aliasCount(logical.degree)],
+            .way = way,
+        };
+    }
+
+    fn classFor(self: ComplexWalk, slot: u32) classes.EdgeClass {
+        return self.classes[self.shared.topology.output.data[slot].cls.class_id];
+    }
+
+    fn allowed(class: classes.EdgeClass, modes: u16) bool {
+        if (class.flags.node_connector or class.access.forward & modes == 0) return false;
+        return switch (std.enums.fromInt(graph.constants.Use, class.category.use) orelse return false) {
+            .rail, .bus, .egress_connection, .platform_connection, .transit_connection => false,
+            else => true,
+        };
+    }
+
+    fn wayId(self: ComplexWalk, slot: u32) i64 {
+        return self.shared.segments[self.shared.topology.slot_refs.data[slot] / 2].way_id;
+    }
+
+    fn nodeFor(self: ComplexWalk, slot: u32, destination: bool) i64 {
+        const reference = self.shared.topology.slot_refs.data[slot];
+        const segment = self.shared.segments[reference / 2];
+        return if (destination != (reference & 1 != 0)) segment.to else segment.from;
+    }
+
+    /// Walk the via ways in relation order, trying the next member before
+    /// following more segments of the current way. Alias connectors are
+    /// internal to one OSM junction and do not consume a restriction edge.
+    noinline fn find(self: ComplexWalk, origin: u32, ways: []const i64, modes: u16, path: *[automaton.max_edges]u32) ![]u32 {
+        var stack: [automaton.max_edges - 1]Frame = undefined;
+        var depth: usize = 1;
+        path[0] = origin;
+        stack[0] = try self.frame(self.nodeFor(origin, false), self.nodeFor(origin, true), 0);
+        while (depth != 0) {
+            if (self.shared.deadline.expired()) return error.DeadlineExceeded;
+            const at = &stack[depth - 1];
+            if (at.next == at.end) {
+                depth -= 1;
+                continue;
+            }
+            const slot = self.order[at.next];
+            var next_way = at.way + 1;
+            if (at.extend) {
+                at.extend = false;
+                at.next += 1;
+                next_way = at.way;
+                const head = self.nodeFor(slot, true);
+                for (stack[0..depth]) |prior| {
+                    if (prior.node == head) break;
+                } else {
+                    stack[depth] = try self.frame(at.node, head, next_way);
+                    depth += 1;
+                }
+                continue;
+            }
+            if (!allowed(self.classFor(slot), modes) or self.wayId(slot) != ways[at.way] or
+                self.nodeFor(slot, true) == at.previous)
+            {
+                at.next += 1;
+                continue;
+            }
+            path[depth] = slot;
+            if (next_way == ways.len) return path[0 .. depth + 1];
+            if (depth == stack.len) {
+                at.next += 1;
+                continue;
+            }
+            at.extend = true;
+            stack[depth] = try self.frame(at.node, self.nodeFor(slot, true), next_way);
+            depth += 1;
+        }
+        return path[0..0];
+    }
+
+    noinline fn prohibit(self: ComplexWalk, builder: *automaton_builder.Builder, starts: *RestrictionStarts, path: []u32, modes: u16, only: bool) !void {
+        if (!only) return forbidSequence(builder, starts, path, modes);
+        // Each wrong exit from a mandatory prefix is a forbidden sequence.
+        // Reversing those sequences preserves legality in reverse search too.
+        for (1..path.len) |index| {
+            const prescribed = path[index];
+            const head = self.nodeFor(path[index - 1], true);
+            const at = try self.frame(0, head, 0);
+            for (self.order[at.next..at.end], 0..) |exit, i| {
+                try checkDeadline(self.shared.deadline, i);
+                if (exit == prescribed or !allowed(self.classFor(exit), modes)) continue;
+                path[index] = exit;
+                try forbidSequence(builder, starts, path[0 .. index + 1], modes);
+            }
+            path[index] = prescribed;
+        }
+    }
+};
+
+fn forbidSequence(builder: *automaton_builder.Builder, starts: *RestrictionStarts, path: []const u32, modes: u16) !void {
+    try builder.forbid(path, modes);
+    const forward = try starts.getOrPutValue(builder.a, path[0], 0);
+    forward.value_ptr.* |= modes;
+    const reverse = try starts.getOrPutValue(builder.a, path[path.len - 1], 0);
+    reverse.value_ptr.* |= @as(u32, modes) << 16;
+}
+
+noinline fn compileComplexTurns(gpa: Allocator, shared: *const Shared, layout: *const Layout, base: []const classes.EdgeClass, order: []const u32, source: turn_restrictions.Source, starts: *RestrictionStarts) ![]automaton.State {
+    if (source.complex.len == 0) return &.{};
+    const Origin = struct { segment: u32, next: u32 };
+    var origins: std.AutoHashMapUnmanaged(i64, u32) = .empty;
+    defer origins.deinit(gpa);
+    var from_segments: std.ArrayList(Origin) = .empty;
+    defer from_segments.deinit(gpa);
+    for (source.complex, 0..) |row, i| {
+        try checkDeadline(shared.deadline, i);
+        _ = try origins.getOrPutValue(gpa, row.from, 0);
+    }
+    var segment_index = shared.segments.len;
+    while (segment_index != 0) {
+        segment_index -= 1;
+        try checkDeadline(shared.deadline, segment_index);
+        if (origins.getPtr(shared.segments[segment_index].way_id)) |first| {
+            try from_segments.append(gpa, .{ .segment = @intCast(segment_index), .next = first.* });
+            first.* = @intCast(from_segments.items.len);
+        }
+    }
+    const walk: ComplexWalk = .{ .shared = shared, .layout = layout, .classes = base, .order = order };
+    var builder: automaton_builder.Builder = .{ .a = gpa, .deadline = shared.deadline };
+    defer builder.deinit();
+    const topo = shared.topology;
+    for (source.complex, 0..) |row, i| {
+        try checkDeadline(shared.deadline, i);
+        const kind = try row.kind();
+        const via = try row.vias(source.via_ways);
+        if (row.attr.modes == 0) continue;
+        var ways: [automaton.max_edges - 1]i64 = undefined;
+        @memcpy(ways[0..via.len], via);
+        ways[via.len] = row.to;
+        var origin = origins.get(row.from).?;
+        while (origin != 0) {
+            if (shared.deadline.expired()) return error.DeadlineExceeded;
+            const entry = from_segments.items[origin - 1];
+            origin = entry.next;
+            for (topo.placements.data[2 * entry.segment ..][0..2]) |placement| {
+                if (!ComplexWalk.allowed(walk.classFor(placement.slot), row.attr.modes)) continue;
+                var storage: [automaton.max_edges]u32 = undefined;
+                const path = try walk.find(placement.slot, ways[0 .. via.len + 1], row.attr.modes, &storage);
+                if (path.len != 0) try walk.prohibit(&builder, starts, path, row.attr.modes, kind.only());
+            }
+        }
+    }
+    return builder.finish(topo.output.data.len);
+}
 
 fn turnIncidents(a: Allocator, shared: *const Shared, node: Node, incident: *std.ArrayList(IncidentTurnEdge)) !void {
     incident.clearRetainingCapacity();

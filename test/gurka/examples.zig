@@ -108,6 +108,68 @@ pub fn simpleTurns(arena: Allocator) !gurka.Map {
     });
 }
 
+// Ported from test/gurka/test_only_restrictions.cc (Valhalla 3.9.3).
+pub const OnlyTurns = enum { straight, one_neighbour, many_neighbours };
+
+pub fn onlyTurns(arena: Allocator, scenario: OnlyTurns) !gurka.Map {
+    const primary: gurka.Tags = &.{.{ .key = "highway", .value = "primary" }};
+    const oneway: gurka.Tags = &.{ primary[0], .{ .key = "oneway", .value = "yes" } };
+    const ascii = switch (scenario) {
+        .straight => "A-B-C-D-E-F",
+        .one_neighbour => "      1\n     /\n  B-C---D---E",
+        .many_neighbours => "         1   3--5\n         |   |\nA----B---C---D---E-----F\n         |   |\n         2   4",
+    };
+    const ways: []const gurka.Way = switch (scenario) {
+        .straight => &.{
+            .{ .label = "AB", .tags = primary }, .{ .label = "BC", .tags = primary }, .{ .label = "CD", .tags = primary },
+            .{ .label = "DE", .tags = primary }, .{ .label = "EF", .tags = primary },
+        },
+        .one_neighbour => &.{
+            .{ .label = "BC", .tags = primary }, .{ .label = "CD", .tags = oneway }, .{ .label = "DE", .tags = primary },
+            .{ .label = "C1", .tags = primary },
+        },
+        .many_neighbours => &.{
+            .{ .label = "AB", .tags = oneway },  .{ .label = "BC", .tags = primary }, .{ .label = "CD", .tags = primary },
+            .{ .label = "DE", .tags = oneway },  .{ .label = "EF", .tags = primary }, .{ .label = "C1", .tags = primary },
+            .{ .label = "C2", .tags = primary }, .{ .label = "D3", .tags = primary }, .{ .label = "D4", .tags = primary },
+            .{ .label = "35", .tags = primary },
+        },
+    };
+    return gurka.Map.init(arena, try gurka.mapToCoordinates(ascii, 100), ways, &.{}, &.{.{
+        .members = &.{
+            .{ .kind = .way, .ref = "BC", .role = "from" },
+            .{ .kind = .way, .ref = "CD", .role = "via" },
+            .{ .kind = .way, .ref = "DE", .role = "to" },
+        },
+        .tags = &.{
+            .{ .key = "type", .value = "restriction" },
+            .{ .key = "restriction", .value = switch (scenario) {
+                .straight => "only_straight_on",
+                .one_neighbour => "only_left_turn",
+                .many_neighbours => "only_right_turn",
+            } },
+        },
+    }});
+}
+
+pub fn multiViaTurns(arena: Allocator) !gurka.Map {
+    const oneway: gurka.Tags = &.{ .{ .key = "highway", .value = "primary" }, .{ .key = "oneway", .value = "yes" } };
+    const ascii = "A---B---M---C---D---E\n|       |   |\n|       Z   |\n|           |\nX-----------Y";
+    return gurka.Map.init(arena, try gurka.mapToCoordinates(ascii, 100), &.{
+        .{ .label = "AB", .tags = oneway }, .{ .label = "BMC", .tags = oneway }, .{ .label = "CD", .tags = oneway },
+        .{ .label = "DE", .tags = oneway }, .{ .label = "AX", .tags = oneway },  .{ .label = "XY", .tags = oneway },
+        .{ .label = "YC", .tags = oneway }, .{ .label = "MZ", .tags = oneway },
+    }, &.{}, &.{.{
+        .members = &.{
+            .{ .kind = .way, .ref = "AB", .role = "from" },
+            .{ .kind = .way, .ref = "BMC", .role = "via" },
+            .{ .kind = .way, .ref = "CD", .role = "via" },
+            .{ .kind = .way, .ref = "DE", .role = "to" },
+        },
+        .tags = &.{ .{ .key = "type", .value = "restriction" }, .{ .key = "restriction", .value = "no_straight_on" }, .{ .key = "except", .value = "bicycle" } },
+    }});
+}
+
 // Ported from test/gurka/test_truck.cc (Valhalla 3.9.3). The middle
 // restrictions and the one-way clearance exercise storage in both directions.
 pub fn motorVehicle(arena: Allocator) !gurka.Map {

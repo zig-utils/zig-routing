@@ -122,6 +122,10 @@ pub const Artifact = enum {
     simple_turn_stats,
     mode_turns,
     bundle_turn_restrictions,
+    bundle_restriction_automaton,
+    complex_turn_relations,
+    restriction_via_ways,
+    restriction_states,
 
     fn filename(self: Artifact) [:0]const u8 {
         return switch (self) {

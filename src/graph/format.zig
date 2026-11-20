@@ -4,6 +4,7 @@ const io = @import("../infra/io.zig");
 const class_table = @import("class_table.zig");
 const constants = @import("constants.zig");
 const turn_restrictions = @import("turn_restrictions.zig");
+const restriction_automaton = @import("restriction_automaton.zig");
 
 pub const magic = "ZRGRAPH\x00".*;
 pub const version: u32 = 1;
@@ -112,12 +113,13 @@ pub const SectionKind = enum(u32) {
     node_timezones = 17,
     timezone_rules = 18,
     turn_restrictions = 19,
+    restriction_automaton = 20,
 
     pub fn placement(kind: SectionKind) Placement {
         return switch (kind) {
             .nodes, .edges, .first_edge, .turns, .classes, .turn_sides => .hot,
             .coordinates, .spatial, .components, .metadata, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules => .warm,
-            .turn_restrictions => .warm,
+            .turn_restrictions, .restriction_automaton => .warm,
             .cold_idx, .cold, .slopes => .cold,
         };
     }
@@ -143,6 +145,7 @@ pub const SectionKind = enum(u32) {
             .node_timezones => "node_timezones.bin",
             .timezone_rules => "timezone_rules.bin",
             .turn_restrictions => "turn_restrictions.bin",
+            .restriction_automaton => "restr.bin",
         };
     }
 
@@ -164,6 +167,7 @@ pub const SectionKind = enum(u32) {
             .node_admins, .node_timezones => u16,
             .components, .turn_sides => u32,
             .turn_restrictions => turn_restrictions.Entry,
+            .restriction_automaton => restriction_automaton.State,
         };
     }
 

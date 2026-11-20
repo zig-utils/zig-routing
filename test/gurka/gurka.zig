@@ -253,7 +253,7 @@ fn makeDataset(arena: Allocator, layout: *const NodeLayout, ways: []const Way, n
                 },
             };
         }
-        rel.* = .{ .id = @max(1, next_id), .members = members, .tags = spec.tags };
+        rel.* = .{ .id = @max(1, next_id), .members = members, .tags = try arena.dupe(Tag, spec.tags) };
         next_id = rel.id + 1;
     }
     return .{ .nodes = osm_nodes, .ways = osm_ways, .relations = osm_relations };

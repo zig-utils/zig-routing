@@ -18,6 +18,12 @@ const Foot = struct {
     profile: *const pedestrian.Profile,
     tables: *const routing.costing.compiled.Compiled,
 
+    pub fn restrictionModes(self: Foot) u16 {
+        const permission = self.profile.permission;
+        if (permission.flags.contains(.ignore_restrictions) or permission.flags.contains(.ignore_non_vehicular_restrictions)) return 0;
+        return @bitCast(permission.access_mask);
+    }
+
     pub fn edgeCost(self: Foot, view: *const View, _: Edge, edge: *const Hot, _: search.Direction) !Cost {
         const class = try view.class(edge.cls.class_id);
         return pedestrian.Kernel.edgeCost(self.profile, self.tables, class, edge.*, self.profile.untimedFerrySpeed(edge.*), .{});

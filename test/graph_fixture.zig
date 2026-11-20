@@ -72,6 +72,14 @@ pub fn records(comptime kind: format.SectionKind) []const kind.Record() {
         .node_timezones => &.{ 292, 0 },
         .timezone_rules => @embedFile("fuzz/seeds/timezone-rules.bin"),
         .turn_restrictions => &.{},
+        .restriction_automaton => &.{
+            .{ .edge = std.math.maxInt(u32), .first = 2, .end = 3, .failure = 0 },
+            .{ .edge = std.math.maxInt(u32), .first = 3, .end = 4, .failure = 1, .attr = .{ .reverse = true } },
+            .{ .edge = 0, .first = 4, .end = 5, .failure = 0, .attr = .{ .depth = 1 } },
+            .{ .edge = 1, .first = 5, .end = 6, .failure = 1, .attr = .{ .depth = 1, .reverse = true } },
+            .{ .edge = 1, .first = 6, .end = 6, .failure = 0, .attr = .{ .depth = 2, .forbidden = 1 } },
+            .{ .edge = 0, .first = 6, .end = 6, .failure = 1, .attr = .{ .depth = 2, .reverse = true, .forbidden = 1 } },
+        },
     };
 }
 

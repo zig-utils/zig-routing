@@ -543,6 +543,10 @@ fn visitPrimitives(block: routing.build.pbf.block.Block, gpa: std.mem.Allocator)
         while (try relation.members.next()) |_| {}
     }
     for (restrictions.entries.items) |row| _ = try row.kind();
+    for (restrictions.complex.items) |row| {
+        _ = try row.kind();
+        for (try row.vias(restrictions.via_ways.items)) |via| try std.testing.expect(via != 0);
+    }
 }
 
 fn osmPrimitiveSeed(buffer: []u8) ![]const u8 {
@@ -558,14 +562,24 @@ fn osmPrimitiveSeed(buffer: []u8) ![]const u8 {
             .{ .dense = .{ .id = &.{1}, .lat = &.{-2}, .lon = &.{3}, .keys_vals = &.{ 1, 2, 0 } } },
             .{ .nodes = &.{.{ .id = 2, .lat = 0, .lon = 0 }} },
             .{ .ways = &.{.{ .id = 3, .refs = &.{ 2, -1 }, .keys = &.{ 1, 3, 5, 7 }, .vals = &.{ 2, 4, 6, 8 } }} },
-            .{ .relations = &.{.{
-                .id = 4,
-                .keys = &.{ 9, 10 },
-                .vals = &.{ 10, 11 },
-                .roles_sid = &.{ 12, 13, 14 },
-                .memids = &.{ 3, -1, 3 },
-                .types = &.{ 1, 0, 1 },
-            }} },
+            .{ .relations = &.{
+                .{
+                    .id = 4,
+                    .keys = &.{ 9, 10 },
+                    .vals = &.{ 10, 11 },
+                    .roles_sid = &.{ 12, 13, 14 },
+                    .memids = &.{ 3, -1, 3 },
+                    .types = &.{ 1, 0, 1 },
+                },
+                .{
+                    .id = 5,
+                    .keys = &.{ 9, 10 },
+                    .vals = &.{ 10, 11 },
+                    .roles_sid = &.{ 12, 13, 13, 14 },
+                    .memids = &.{ 3, 1, 1, 1 },
+                    .types = &.{ 1, 1, 1, 1 },
+                },
+            } },
         },
     }, none);
     const blob: pbf.Blob.Values = .{ .raw = data };

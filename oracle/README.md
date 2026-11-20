@@ -282,6 +282,50 @@ python3 oracle/compare-turn-restrictions.py native-bundle reference-bundle
 | Liechtenstein | 15,760 | 44,574 | 2 |
 | Utrecht | 85,336 | 261,602 | 296 |
 
+### Complex turn restrictions
+
+The native build writes `restr.bin` when it resolves one or more forbidden
+via-way sequences. For an only restriction, each wrong exit from a mandatory
+prefix becomes a forbidden sequence. Both search directions use the same
+rules in their respective travel order. The search keeps distinct labels
+for distinct prefixes that reach the same edge.
+
+Generate the two fixtures with the native Gurka tool. Build local Valhalla
+tiles from the same PBF with hierarchy and shortcuts disabled. Run the
+reference builder through `enhance`, then run its `restrictions` stage.
+
+```bash
+zig build gurka-pbf -- only.osm.pbf only-turns
+zig build gurka-pbf -- multi-via.osm.pbf multi-via-turns
+```
+
+The via-way rules match the directed edge sequences and mode masks in the
+pinned reference tiles after pairing by OSM way and directed geometry.
+
+| Input | Forward sequences matched | Reverse sequences matched |
+| --- | ---: | ---: |
+| Gurka only turn fixture | 6 | 6 |
+| Gurka split multi-via fixture | 1 | 1 |
+| Liechtenstein | 0 | 0 |
+| Utrecht | 3 | 3 |
+
+The test suite ports the three upstream only-restriction cases and checks
+384 seeded searches against an independently expanded state graph. It also
+checks partial-edge endpoints and restriction state across junction aliases.
+
+On the restriction-free Luxembourg bundle, run the search benchmark on the
+baseline and candidate with the same sources and label limit.
+
+```bash
+zig build bench-search -Doptimize=ReleaseFast -- "$bundle" 32 125000 82
+```
+
+On an Apple M3 Pro, eight alternating baseline and candidate pairs gave
+median paired throughput changes of +0.90% for pedestrian and -1.45% for
+the motor stub. Both settled and popped the same number of labels at every
+source. Individual timings varied. The loop for bundles without an automaton
+is compiled without restriction checks.
+
 ### Way splitting and edge counts
 
 ```bash

@@ -866,7 +866,8 @@ test "Gurka no turn and only turn restrictions follow travel direction" {
     try testing.expect((try view.node(@fromBackingInt((try view.edge(ad)).head))).attr.has_turn_restrictions);
     try testing.expectEqual(5, built.stats.simple_turns.parsed);
     try testing.expectEqual(4, built.stats.simple_turns.resolved);
-    try testing.expectEqual(1, built.stats.simple_turns.deferred);
+    try testing.expectEqual(0, built.stats.simple_turns.deferred);
+    try testing.expectEqual(1, built.stats.simple_turns.complex);
 
     const from = try at(view, fixture.findNode("C").?.location.toFixed());
     const to = try at(view, fixture.findNode("F").?.location.toFixed());
@@ -884,6 +885,200 @@ test "Gurka no turn and only turn restrictions follow travel direction" {
         try testing.expect(limited_cost > ignored.best().cost);
         arena.reset();
     }
+}
+
+const RestrictionMotor = struct {
+    modes: u16 = 1,
+    ignore: bool = false,
+
+    pub fn restrictionModes(self: RestrictionMotor) u16 {
+        return if (self.ignore) 0 else self.modes;
+    }
+
+    pub fn edgeCost(self: RestrictionMotor, view: *const graph.reader.View, _: format.EdgeId, edge: *const format.EdgeHot, _: search.Direction) !Cost {
+        if ((try view.class(edge.cls.class_id)).access.forward & self.modes == 0) return .forbidden;
+        return .{ .cost = @floatFromInt(edge.geom.len_m), .secs = @floatFromInt(edge.geom.len_m) };
+    }
+
+    pub fn turnCost(_: RestrictionMotor, _: *const graph.reader.View, _: search.Transition, _: search.Label, _: search.Direction) !Cost {
+        return .{};
+    }
+};
+
+const RestrictionSearch = search.Search(RestrictionMotor, routing.search.queue.Heap);
+
+// Ported from test/gurka/test_only_restrictions.cc (Valhalla 3.9.3).
+test "Gurka complex only turns forbid leaving every prefix in both searches" {
+    const examples = @import("examples.zig");
+    for (std.enums.values(examples.OnlyTurns)) |scenario| {
+        var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer storage.deinit();
+        const fixture = try examples.onlyTurns(storage.allocator(), scenario);
+        var built = try Built.assemble(fixture.osm, 2);
+        defer built.deinit();
+        const view = &built.bundle.view;
+        try view.verify(.none, null);
+        try testing.expect(view.restriction_automaton != null);
+        var engine = try RestrictionSearch.init(testing.allocator, view);
+        defer engine.deinit();
+        var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+        defer arena.deinit();
+        const cases = switch (scenario) {
+            .straight => "ABCDEF",
+            .one_neighbour => "BCDE1",
+            .many_neighbours => "ABCDEF12345",
+        };
+        for (cases) |from| {
+            for (cases) |to| {
+                if (from == to) continue;
+                const blocked = switch (scenario) {
+                    .straight => false,
+                    .one_neighbour => from == 'B' and to == '1',
+                    .many_neighbours => (from == 'A' or from == 'B') and std.ascii.isDigit(to),
+                };
+                if (!blocked and scenario != .straight and to != 'E') continue;
+                const origin = try at(view, fixture.findNode(&.{from}).?.location.toFixed());
+                const destination = try at(view, fixture.findNode(&.{to}).?.location.toFixed());
+                for ([_]search.Direction{ .forward, .reverse }) |direction| {
+                    const request: search.Request = .{ .origin = origin, .destination = destination, .direction = direction };
+                    const result = engine.run(&arena, .{}, request, search.Zero{}, .{});
+                    if (blocked) {
+                        try testing.expectError(error.NoPath, result);
+                        _ = try engine.run(&arena, .{ .ignore = true }, request, search.Zero{}, .{});
+                    } else {
+                        try testing.expect((try result).best().cost > 0);
+                    }
+                    arena.reset();
+                }
+            }
+        }
+    }
+}
+
+test "Gurka split via ways preserve a more expensive legal label on the same edge" {
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const fixture = try @import("examples.zig").multiViaTurns(storage.allocator());
+    var built = try Built.assemble(fixture.osm, 2);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    try view.verify(.none, null);
+    const states = view.restriction_automaton orelse return error.MissingTestRestriction;
+    const ab = try directedBetween(view, &fixture, "A", "B");
+    const ax = try directedBetween(view, &fixture, "A", "X");
+    const bm = try directedBetween(view, &fixture, "B", "M");
+    const mc = try directedBetween(view, &fixture, "M", "C");
+    const cd = try directedBetween(view, &fixture, "C", "D");
+    const de = try directedBetween(view, &fixture, "D", "E");
+    const first = try view.class((try view.edge(ab)).cls.class_id);
+    const last = try view.class((try view.edge(de)).cls.class_id);
+    try testing.expect(first.restrictions.start & 1 != 0 and last.restrictions.end & 1 != 0);
+    try testing.expect(first.restrictions.start & 4 == 0 and last.restrictions.end & 4 == 0);
+    var complete: usize = 0;
+    for (states) |state| {
+        if (state.attr.forbidden & 1 != 0) {
+            try testing.expectEqual(5, state.attr.depth);
+            complete += 1;
+        }
+    }
+    try testing.expectEqual(2, complete);
+    const origin = try at(view, fixture.findNode("A").?.location.toFixed());
+    const destination = try at(view, fixture.findNode("E").?.location.toFixed());
+    var engine = try RestrictionSearch.init(testing.allocator, view);
+    defer engine.deinit();
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    const endpoints = routing.search.endpoints;
+    const from = snapLocation(&.{snapEdge(ab, 0.25, 0)}, &.{});
+    const midway = snapLocation(&.{snapEdge(cd, 0.75, 0)}, &.{});
+    const after = snapLocation(&.{snapEdge(de, 0.75, 0)}, &.{});
+    for ([_]search.Direction{ .forward, .reverse }) |direction| {
+        const request: search.Request = .{ .origin = origin, .destination = destination, .direction = direction };
+        const limited = try engine.run(&arena, .{}, request, search.Zero{}, .{});
+        const cost = limited.best().cost;
+        var at_label = limited.best();
+        while (at_label.pred != search.no_index and direction == .forward) at_label = &limited.labels[at_label.pred];
+        try testing.expectEqual(ax, at_label.edgeId());
+        arena.reset();
+        const ignored = try engine.run(&arena, .{ .ignore = true }, request, search.Zero{}, .{});
+        try testing.expect(ignored.best().cost < cost);
+        arena.reset();
+        const bicycle = try engine.run(&arena, .{ .modes = 4 }, request, search.Zero{}, .{});
+        try testing.expect(bicycle.best().cost < cost);
+        arena.reset();
+        const options: endpoints.Options = .{ .costing = .auto, .direction = direction };
+        const partial = try endpoints.route(&engine, &arena, RestrictionMotor{}, from, midway, options, search.Zero{}, .{});
+        try testing.expectEqualSlices(endpoints.Segment, &.{
+            .{ .edge = ab, .begin = 0.25, .end = 1 },
+            .{ .edge = bm, .begin = 0, .end = 1 },
+            .{ .edge = mc, .begin = 0, .end = 1 },
+            .{ .edge = cd, .begin = 0, .end = 0.75 },
+        }, partial.segments);
+        arena.reset();
+        try testing.expectError(error.NoPath, endpoints.route(&engine, &arena, RestrictionMotor{}, from, after, options, search.Zero{}, .{}));
+        arena.reset();
+    }
+}
+
+test "complex restriction state crosses junction aliases without steady-state heap calls" {
+    const leaf_count = 34;
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const nodes = try a.alloc(gurka.OsmNode, leaf_count + 2);
+    for (nodes, 0..) |*node, i| {
+        node.* = .{
+            .id = @intCast(i + 1),
+            .label = "",
+            .location = .{ .lat = 0, .lng = @as(f64, @floatFromInt(i)) * 0.001 },
+            .tags = &.{},
+        };
+    }
+    const tags: gurka.Tags = &.{ .{ .key = "highway", .value = "primary" }, .{ .key = "oneway", .value = "yes" } };
+    const ways = try a.alloc(gurka.OsmWay, leaf_count + 1);
+    for (ways[0..leaf_count], nodes[1 .. leaf_count + 1], 0..) |*way, node, i| {
+        const refs: [2]i64 = if (i == 0) .{ node.id, nodes[0].id } else .{ nodes[0].id, node.id };
+        way.* = .{ .id = @intCast(i + 1), .label = "", .tags = tags, .refs = try a.dupe(i64, &refs) };
+    }
+    ways[leaf_count] = .{ .id = leaf_count + 1, .label = "", .tags = tags, .refs = &.{ leaf_count + 1, leaf_count + 2 } };
+    var built = try Built.assemble(.{ .nodes = nodes, .ways = ways, .relations = &.{.{
+        .id = 1,
+        .members = &.{
+            .{ .kind = .way, .id = 1, .role = "from" },
+            .{ .kind = .way, .id = leaf_count, .role = "via" },
+            .{ .kind = .way, .id = leaf_count + 1, .role = "to" },
+        },
+        .tags = &.{ .{ .key = "type", .value = "restriction" }, .{ .key = "restriction", .value = "no_right_turn" } },
+    }} }, 2);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    try testing.expectEqual(1, built.stats.connectors);
+    try testing.expect(view.restriction_automaton != null);
+    const origin = try at(view, nodes[1].location.toFixed());
+    const destination = try at(view, nodes[nodes.len - 1].location.toFixed());
+    var counting = routing.infra.arena.CountingAllocator.init(testing.allocator);
+    var engine = try RestrictionSearch.init(counting.allocator(), view);
+    defer engine.deinit();
+    var arena = routing.infra.arena.Arena.init(counting.allocator(), .{});
+    defer arena.deinit();
+    for (0..3) |round| {
+        if (round == 1) counting.resetCounts();
+        for ([_]search.Direction{ .forward, .reverse }) |direction| {
+            const request: search.Request = .{ .origin = origin, .destination = destination, .direction = direction };
+            try testing.expectError(error.NoPath, engine.run(&arena, .{}, request, search.Zero{}, .{}));
+            arena.reset();
+            const path = try engine.run(&arena, .{ .ignore = true }, request, search.Zero{}, .{});
+            var label = path.best();
+            var crossed = false;
+            while (label.pred != search.no_index) : (label = &path.labels[label.pred]) {
+                const edge = try view.edge(label.edgeId());
+                crossed = crossed or (try view.class(edge.cls.class_id)).flags.node_connector;
+            }
+            try testing.expect(crossed);
+            arena.reset();
+        }
+    }
+    try testing.expectEqual(0, counting.calls());
 }
 
 test "country defaults apply within borders and preserve explicitly tagged modes" {
@@ -1346,6 +1541,10 @@ const SearchTestCost = struct {
         return kernel.ignore_turn_restrictions or turn.row & 0x80 == 0;
     }
 
+    pub fn restrictionModes(kernel: SearchTestCost) u16 {
+        return if (kernel.ignore_turn_restrictions) 0 else @bitCast(graph.constants.AccessMask{ .auto = true });
+    }
+
     pub fn turnCost(kernel: SearchTestCost, _: *const graph.reader.View, turn: search.Transition, _: search.Label, _: search.Direction) !Cost {
         return kernel.transitionCost(turn.incoming, turn.outgoing, turn.row);
     }
@@ -1455,6 +1654,151 @@ test "forward and reverse A* match reference Dijkstra on random ASCII maps" {
                         try testing.expectEqual(before_edge.head, after_opp.head);
                         label = predecessor;
                     }
+                } else {
+                    try testing.expectError(error.NoPath, actual);
+                }
+                arena.reset();
+            }
+        }
+    }
+}
+
+const RestrictionPath = struct {
+    edges: [4]u32 = undefined,
+    len: usize,
+
+    fn blocks(self: RestrictionPath, suffix: [3]u32, next: u32, reverse: bool) bool {
+        if (next != self.edges[if (reverse) 0 else self.len - 1]) return false;
+        for (suffix[0 .. self.len - 1], 0..) |edge, i| {
+            if (edge != self.edges[if (reverse) i + 1 else self.len - i - 2]) return false;
+        }
+        return true;
+    }
+};
+
+// Brute-force Dijkstra on the graph expanded by the last three physical
+// edges. It compares literal sequences and never reads the compiled automaton.
+fn referenceRestricted(a: std.mem.Allocator, view: *const graph.reader.View, patterns: []const RestrictionPath, starts: []const u32, kernel: SearchTestCost, request: search.Request) !?f32 {
+    const reverse = request.direction == .reverse;
+    const source = @backingInt(if (reverse) request.destination else request.origin);
+    const target = @backingInt(if (reverse) request.origin else request.destination);
+    if (source == target) return 0;
+    const Suffix = [3]u32;
+    const Entry = struct { suffix: Suffix, cost: f32, settled: bool = false };
+    var queue: std.ArrayList(Entry) = .empty;
+    defer queue.deinit(a);
+    var index: std.AutoHashMapUnmanaged(Suffix, usize) = .empty;
+    defer index.deinit(a);
+    for (view.edges, starts, 0..) |edge, start, i| {
+        if (source != (if (reverse) edge.head else start)) continue;
+        const id: u32 = @intCast(i);
+        const weight = kernel.lengthCost(@fromBackingInt(id), edge.geom.len_m).cost;
+        const suffix: Suffix = .{ id, search.no_index, search.no_index };
+        try index.put(a, suffix, queue.items.len);
+        try queue.append(a, .{ .suffix = suffix, .cost = weight });
+    }
+    while (true) {
+        var best: ?usize = null;
+        var distance = std.math.inf(f32);
+        for (queue.items, 0..) |row, i| {
+            if (row.settled or row.cost >= distance) continue;
+            best = i;
+            distance = row.cost;
+        }
+        const chosen = best orelse return null;
+        queue.items[chosen].settled = true;
+        const suffix = queue.items[chosen].suffix;
+        const current = suffix[0];
+        const node = if (reverse) starts[current] else view.edges[current].head;
+        if (node == target) return distance;
+        for (view.edges, starts, 0..) |edge, start, i| {
+            if (node != (if (reverse) edge.head else start)) continue;
+            const next: u32 = @intCast(i);
+            for (patterns) |rule| {
+                if (rule.blocks(suffix, next, reverse)) break;
+            } else {
+                const incoming = if (reverse) next else current;
+                const outgoing = if (reverse) current else next;
+                const row = try view.turnRow(@fromBackingInt(node), view.edges[incoming].cls.opp_local);
+                const turn = row[view.edges[outgoing].cls.local];
+                const delay = kernel.transitionCost(@fromBackingInt(incoming), @fromBackingInt(outgoing), turn);
+                const step = kernel.lengthCost(@fromBackingInt(next), edge.geom.len_m);
+                const cost = distance + (step.cost + delay.cost);
+                if (!std.math.isFinite(cost)) continue;
+                const key: Suffix = .{ next, suffix[0], suffix[1] };
+                const entry = try index.getOrPutValue(a, key, queue.items.len);
+                if (entry.value_ptr.* == queue.items.len) {
+                    try queue.append(a, .{ .suffix = key, .cost = cost });
+                } else {
+                    const row_cost = &queue.items[entry.value_ptr.*].cost;
+                    row_cost.* = @min(row_cost.*, cost);
+                }
+            }
+        }
+    }
+}
+
+test "complex restriction search matches explicit state expansion on random graphs" {
+    const template = "A---B---C\n|   |   |\nD---E---F\n|   |   |\nG---H---I";
+    const links = [_][]const u8{ "AB", "BC", "AD", "BE", "CF", "DE", "EF", "DG", "EH", "FI", "GH", "HI" };
+    const tags: gurka.Tags = &.{.{ .key = "highway", .value = "residential" }};
+    var prng = std.Random.DefaultPrng.init(0x5685849e);
+    const random = prng.random();
+    for (0..16) |_| {
+        var fixture_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer fixture_arena.deinit();
+        const a = fixture_arena.allocator();
+        var ways: std.ArrayList(gurka.Way) = .empty;
+        for (links) |link| {
+            if (ways.items.len != 0 and random.uintLessThan(u8, 4) == 0) continue;
+            try ways.append(a, .{ .label = link, .tags = tags });
+        }
+        const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates(template, 20), ways.items, &.{}, &.{});
+        var built = try Built.assemble(fixture.osm, 1);
+        defer built.deinit();
+        var view = built.bundle.view;
+        const edges = try a.dupe(format.EdgeHot, view.edges);
+        const classes = try a.alloc(graph.class_table.EdgeClass, edges.len);
+        for (edges, classes, 0..) |*edge, *class, i| {
+            class.* = (try view.class(edge.cls.class_id)).*;
+            edge.cls.class_id = @intCast(i);
+        }
+        const starts = try a.alloc(u32, edges.len);
+        for (view.first_edge[0..view.nodes.len], view.first_edge[1..], 0..) |first, end, i| {
+            @memset(starts[first..end], @intCast(i));
+        }
+        var builder: build.restriction_automaton.Builder = .{ .a = a, .deadline = .none };
+        defer builder.deinit();
+        var patterns: [12]RestrictionPath = undefined;
+        for (&patterns) |*path| {
+            path.len = random.intRangeAtMost(usize, 2, path.edges.len);
+            var edge = random.uintLessThan(u32, @intCast(edges.len));
+            for (path.edges[0..path.len]) |*step| {
+                step.* = edge;
+                const outbound = try view.outEdgeRange(@fromBackingInt(edges[edge].head));
+                edge = outbound.first + random.uintLessThan(u32, outbound.count());
+            }
+            try builder.forbid(path.edges[0..path.len], 1);
+            classes[path.edges[0]].restrictions.start = 1;
+            classes[path.edges[path.len - 1]].restrictions.end = 1;
+        }
+        view.edges = edges;
+        view.classes = classes;
+        view.restriction_automaton = try builder.finish(edges.len);
+        var engine = try SearchTest.init(testing.allocator, &view);
+        defer engine.deinit();
+        var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+        defer arena.deinit();
+        for (0..12) |_| {
+            const origin: format.NodeId = @fromBackingInt(random.uintLessThan(u32, @intCast(view.nodes.len)));
+            const destination: format.NodeId = @fromBackingInt(random.uintLessThan(u32, @intCast(view.nodes.len)));
+            const kernel: SearchTestCost = .{ .seed = random.int(u32), .omit = true };
+            for ([_]search.Direction{ .forward, .reverse }) |direction| {
+                const request: search.Request = .{ .origin = origin, .destination = destination, .direction = direction };
+                const cost = try referenceRestricted(testing.allocator, &view, &patterns, starts, kernel, request);
+                const actual = engine.run(&arena, kernel, request, search.Zero{}, .{});
+                if (cost) |expected| {
+                    try testing.expectEqual(expected, (try actual).best().cost);
                 } else {
                     try testing.expectError(error.NoPath, actual);
                 }

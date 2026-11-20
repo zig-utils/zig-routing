@@ -16,6 +16,8 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, name, "admin-boundaries")) break :blk try examples.adminBoundaries(arena);
         if (std.mem.eql(u8, name, "country-access")) break :blk try examples.countryAccess(arena);
         if (std.mem.eql(u8, name, "simple-turns")) break :blk try examples.simpleTurns(arena);
+        if (std.mem.eql(u8, name, "only-turns")) break :blk try examples.onlyTurns(arena, .many_neighbours);
+        if (std.mem.eql(u8, name, "multi-via-turns")) break :blk try examples.multiViaTurns(arena);
         return error.UnknownFixture;
     } else try examples.intersection(arena);
     if (args.next() != null) return error.ExtraArguments;

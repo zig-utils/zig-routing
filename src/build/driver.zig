@@ -254,6 +254,10 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
             }
             var restriction_rows: ?io.Mapping = null;
             defer if (restriction_rows) |mapped| mapped.unmap();
+            var complex_rows: ?io.Mapping = null;
+            defer if (complex_rows) |mapped| mapped.unmap();
+            var via_ways: ?io.Mapping = null;
+            defer if (via_ways) |mapped| mapped.unmap();
             var restriction_source: turn_restrictions.Source = .{};
             if (session.runs(.turns) and tagged.manifest.files.get(.simple_turn_relations) != null) {
                 restriction_rows = try tagged.map(.simple_turn_relations, options.deadline);
@@ -261,6 +265,12 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
                 const counts = try tagged.readJson(turn_restrictions.Stats, gpa, .simple_turn_stats, options.deadline);
                 defer counts.deinit();
                 restriction_source.stats = counts.value;
+            }
+            if (session.runs(.enhance) and tagged.manifest.files.get(.complex_turn_relations) != null) {
+                complex_rows = try tagged.map(.complex_turn_relations, options.deadline);
+                via_ways = try tagged.map(.restriction_via_ways, options.deadline);
+                restriction_source.complex = try checkpoint.array(turn_restrictions.Complex, complex_rows.?);
+                restriction_source.via_ways = try checkpoint.array(i64, via_ways.?);
             }
             try assemble.buildStaged(&session, &metadata, source_stats.value, edge_file, shape_file, assembly_options, restriction_source);
         }
@@ -460,6 +470,10 @@ fn buildSegments(session: *checkpoint.Session, metadata: *assemble.Metadata, inp
         if (restrictions.stats.parsed != 0) {
             try tx.writeArray(restrictions.entries.items, .simple_turn_relations);
             try tx.writeJson(gpa, restrictions.stats, .simple_turn_stats);
+        }
+        if (restrictions.complex.items.len != 0) {
+            try tx.writeArray(restrictions.complex.items, .complex_turn_relations);
+            try tx.writeArray(restrictions.via_ways.items, .restriction_via_ways);
         }
         try session.commit(&tx, prep.selected_ways, start);
     } else {

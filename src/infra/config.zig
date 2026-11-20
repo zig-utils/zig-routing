@@ -112,7 +112,8 @@ pub fn decode(arena: std.mem.Allocator, bytes: []const u8, path: []const u8, env
         return error.InvalidLokiActions;
     if (!std.math.isFinite(config.service_limits.skadi.min_resample) or config.service_limits.skadi.min_resample <= 0)
         return error.InvalidSkadiMinResample;
-    std.mem.sort([]const u8, ignored.items, {}, struct {
+    // Equal keys have the same diagnostic text, so stability has no effect.
+    std.sort.heap([]const u8, ignored.items, {}, struct {
         fn lessThan(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.order(u8, a, b) == .lt;
         }

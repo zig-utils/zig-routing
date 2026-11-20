@@ -9,6 +9,7 @@ const costing = @import("../costing/compiled.zig");
 const paged = @import("paged.zig");
 const queue = @import("queue.zig");
 const endpoints = @import("endpoints.zig");
+const automaton = @import("../graph/restriction_automaton.zig");
 const EdgeId = graph.format.EdgeId;
 const EdgeHot = graph.format.EdgeHot;
 const NodeId = graph.format.NodeId;
@@ -30,9 +31,15 @@ pub const Label = extern struct {
     pub const target: u32 = 1;
     const partial_target: u32 = 2;
     const forbid_uturn: u32 = 4;
+    const partial_start: u32 = 8;
 
     pub fn edgeId(self: Label) EdgeId {
         return @fromBackingInt(self.edge);
+    }
+
+    pub fn cut(self: Label, cuts: []const Cut) Cut {
+        if (self.flags & (partial_start | partial_target) == 0) return .{};
+        return cuts[self.ctx - 1];
     }
 };
 
@@ -157,10 +164,45 @@ const Status = packed struct(u32) {
     label_plus_one: u32 = 0,
 };
 
+const Restrictions = struct {
+    const forbidden = no_index;
+    const AliasStatus = std.AutoHashMapUnmanaged(u64, Status);
+
+    view: *const View,
+    states: []const automaton.State,
+    modes: u16,
+    root: u32,
+    aliases: AliasStatus = .empty,
+
+    noinline fn advance(self: *const Restrictions, context: u32, id: EdgeId) !u32 {
+        const edge = try self.view.edge(id);
+        const class = try self.view.class(edge.cls.class_id);
+        if (class.flags.node_connector) return context;
+        if (context == 0) {
+            const start = if (self.root == automaton.forward_root) class.restrictions.start else class.restrictions.end;
+            if (start & self.modes == 0) return 0;
+        }
+        const next = automaton.advance(self.states, if (context == 0) self.root else context, @backingInt(id));
+        if (self.states[next].attr.forbidden & self.modes != 0) return forbidden;
+        return if (next < automaton.first_context) 0 else next;
+    }
+
+    fn statusId(self: *const Restrictions, edge: u32, context: u32) ?u32 {
+        if (self.states[context].edge != edge) return null;
+        return @as(u32, @intCast(self.view.edges.len)) + (context - automaton.first_context);
+    }
+
+    fn aliasKey(edge: u32, context: u32) u64 {
+        return (@as(u64, edge) << 32) | context;
+    }
+};
+
 /// K supplies edgeCost(view, edge_id, hot, direction), turnCost(view,
 /// transition, predecessor, direction), and optionally slowAllowed for
-/// cold edges and allowedTurn for checking a pair of directed edges. All
-/// weighted costs must be nonnegative. A state is the last directed edge.
+/// cold edges, allowedTurn for checking a pair of directed edges and
+/// restrictionModes() for selecting complex restrictions (defaults to auto).
+/// All weighted costs must be nonnegative. A state is the last directed edge
+/// and the matched restriction prefix.
 /// The cost and admissibility of future steps must be independent of the
 /// path to that state. Queue entries use nonnegative f32 ordering.
 pub fn Search(comptime K: type, comptime Q: type) type {
@@ -173,7 +215,8 @@ pub fn Search(comptime K: type, comptime Q: type) type {
         status: paged.EdgeStatus(Status),
 
         pub fn init(allocator: std.mem.Allocator, view: *const View) !Self {
-            return .{ .view = view, .allocator = allocator, .status = try .init(allocator, view.edges.len) };
+            const virtual = if (view.restriction_automaton) |states| states.len - automaton.first_context else 0;
+            return .{ .view = view, .allocator = allocator, .status = try .init(allocator, view.edges.len + virtual) };
         }
 
         pub fn deinit(self: *Self) void {
@@ -221,6 +264,16 @@ pub fn Search(comptime K: type, comptime Q: type) type {
         }
 
         fn runDirection(self: *Self, comptime direction: Direction, arena: *memory.Arena, kernel: K, query: anytype, potential: anytype, control: Control) !Result {
+            const modes = if (comptime @hasDecl(K, "restrictionModes"))
+                kernel.restrictionModes()
+            else
+                @as(u16, @bitCast(graph.constants.AccessMask{ .auto = true }));
+            if (modes != 0 and self.view.restriction_automaton != null)
+                return self.runLoop(direction, true, arena, kernel, query, potential, control, modes);
+            return self.runLoop(direction, false, arena, kernel, query, potential, control, 0);
+        }
+
+        fn runLoop(self: *Self, comptime direction: Direction, comptime with_restrictions: bool, arena: *memory.Arena, kernel: K, query: anytype, potential: anytype, control: Control, modes: u16) !Result {
             const partial = @TypeOf(query) == PartialRequest;
             const target = if (partial) null else query.target;
             const limit = if (partial) std.math.maxInt(usize) else query.limit;
@@ -229,14 +282,21 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             var labels: std.ArrayList(Label) = .empty;
             var cuts: std.ArrayList(Cut) = .empty;
             var pending: Q = .{};
+            var restrictions: if (with_restrictions) Restrictions else void = if (with_restrictions) .{
+                .view = self.view,
+                .states = self.view.restriction_automaton.?,
+                .modes = modes,
+                .root = if (direction == .forward) automaton.forward_root else automaton.reverse_root,
+            } else {};
+            const tracker = if (with_restrictions) &restrictions else null;
             if (partial) {
-                try self.seedPartials(direction, &pool, kernel, query, &labels, &cuts, &pending, potential, control);
+                try self.seedPartials(direction, &pool, kernel, query, &labels, &cuts, &pending, potential, tracker, control);
             } else {
                 if (target != null and query.start == target.?) {
                     try labels.append(a, .{ .flags = Label.target });
                     return .{ .labels = labels.items, .index = 0, .popped = 0, .settled = 0 };
                 }
-                try self.seedNode(direction, &pool, kernel, query.start, target, &labels, &pending, potential);
+                try self.seedNode(direction, &pool, kernel, query.start, target, &labels, &pending, potential, tracker);
             }
 
             var popped: usize = 0;
@@ -245,7 +305,14 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 popped += 1;
                 if ((popped & 1023) == 0) try control.check();
                 const last = labels.items[top.label];
-                if (last.flags & Label.partial_target == 0 and self.status.get(last.edge).label_plus_one != top.label + 1) continue;
+                const context = if (with_restrictions)
+                    if (last.flags & Label.partial_target != 0) 0 else if (last.flags & Label.partial_start != 0)
+                        try tracker.advance(0, last.edgeId())
+                    else
+                        last.ctx
+                else
+                    0;
+                if (last.flags & Label.partial_target == 0 and self.findStatus(tracker, last.edge, context).label_plus_one != top.label + 1) continue;
                 settled += 1;
                 if (last.flags & Label.target != 0 or settled == limit) {
                     try control.check();
@@ -262,7 +329,9 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     if (partial and last.flags & Label.forbid_uturn != 0 and local == geometry.cls.opp_local) continue;
                     const local_id: EdgeId = @fromBackingInt(@as(u32, @intCast(index)));
                     const next_id = if (direction == .forward) local_id else try self.view.oppEdge(local_id);
-                    const prior = self.status.get(@backingInt(next_id));
+                    const next_context = if (with_restrictions) try tracker.advance(context, next_id) else 0;
+                    if (with_restrictions and next_context == Restrictions.forbidden) continue;
+                    const prior = self.findStatus(tracker, @backingInt(next_id), next_context);
                     const dominated = prior.label_plus_one != 0 and labels.items[prior.label_plus_one - 1].cost <= last.cost;
                     var targets = if (partial) query.targets.on(next_id) else {};
                     if (dominated and (!partial or targets.index == 0)) continue;
@@ -314,13 +383,14 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     const total = if (partial) previous.add(delay).add(edge_cost) else previous.add(edge_cost.add(delay));
                     if (total.cost == std.math.inf(f32)) continue;
                     const head: NodeId = @fromBackingInt(outward.head);
-                    try self.offer(&pool, &labels, &pending, potential, target, head, prior, .{
+                    try self.offer(&pool, &labels, &pending, potential, target, head, prior, tracker, next_context, .{
                         .edge = @backingInt(next_id),
                         .pred = top.label,
                         .cost = total.cost,
                         .secs = total.secs,
                         .dist_m = last.dist_m +| next.geom.len_m,
                         .tcost = delay.cost,
+                        .ctx = next_context,
                     });
                 }
             }
@@ -329,7 +399,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             return error.NoPath;
         }
 
-        fn seedNode(self: *Self, comptime direction: Direction, pool: *Pool, kernel: K, start: NodeId, target: ?NodeId, labels: *std.ArrayList(Label), pending: *Q, potential: anytype) !void {
+        fn seedNode(self: *Self, comptime direction: Direction, pool: *Pool, kernel: K, start: NodeId, target: ?NodeId, labels: *std.ArrayList(Label), pending: *Q, potential: anytype, tracker: anytype) !void {
             const seeds = try self.view.outEdgeRange(start);
             for (self.view.edges[seeds.first..seeds.end], seeds.first..) |*outward, index| {
                 const geometry_id: EdgeId = @fromBackingInt(@as(u32, @intCast(index)));
@@ -341,16 +411,18 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 const edge_cost = try kernel.edgeCost(self.view, id, edge, direction);
                 if (edge_cost.cost == std.math.inf(f32)) continue;
                 const here: NodeId = @fromBackingInt(outward.head);
-                try self.offer(pool, labels, pending, potential, target, here, self.status.get(@backingInt(id)), .{
+                const context = if (@TypeOf(tracker) == @TypeOf(null)) 0 else try tracker.advance(0, id);
+                try self.offer(pool, labels, pending, potential, target, here, self.findStatus(tracker, @backingInt(id), context), tracker, context, .{
                     .edge = @backingInt(id),
                     .cost = edge_cost.cost,
                     .secs = edge_cost.secs,
                     .dist_m = edge.geom.len_m,
+                    .ctx = context,
                 });
             }
         }
 
-        fn seedPartials(self: *Self, comptime direction: Direction, pool: *Pool, kernel: K, query: PartialRequest, labels: *std.ArrayList(Label), cuts: *std.ArrayList(Cut), pending: *Q, potential: anytype, control: Control) !void {
+        fn seedPartials(self: *Self, comptime direction: Direction, pool: *Pool, kernel: K, query: PartialRequest, labels: *std.ArrayList(Label), cuts: *std.ArrayList(Cut), pending: *Q, potential: anytype, tracker: anytype, control: Control) !void {
             const a = pool.arena.allocator();
             for (query.starts, 0..) |candidate, index| {
                 if (index % 64 == 0) try control.check();
@@ -368,12 +440,13 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 const at_node = if (direction == .forward) candidate.end_node else candidate.begin_node;
                 const cost = scale(full, @max(portion.end - portion.begin, std.math.floatEps(f32)), candidate.score);
                 try cuts.append(a, portion);
-                try self.offer(pool, labels, pending, potential, null, node, self.status.get(@backingInt(id)), .{
+                const context = if (@TypeOf(tracker) == @TypeOf(null)) 0 else try tracker.advance(0, id);
+                try self.offer(pool, labels, pending, potential, null, node, self.findStatus(tracker, @backingInt(id), context), tracker, context, .{
                     .edge = @backingInt(id),
                     .cost = cost.cost,
                     .secs = cost.secs,
                     .dist_m = fractionalLength(edge.geom.len_m, portion),
-                    .flags = if (query.forbid_initial_uturn and at_node and portion.begin == portion.end) Label.forbid_uturn else 0,
+                    .flags = Label.partial_start | if (query.forbid_initial_uturn and at_node and portion.begin == portion.end) Label.forbid_uturn else 0,
                     .ctx = std.math.cast(u32, cuts.items.len) orelse return error.TooManySearchLabels,
                 });
                 var dest = query.targets.on(id);
@@ -411,7 +484,13 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             return try kernel.slowAllowed(view, id, edge, predecessor, direction);
         }
 
-        fn offer(self: *Self, pool: *Pool, labels: *std.ArrayList(Label), pending: *Q, potential: anytype, target: ?NodeId, head: NodeId, status: Status, label: Label) !void {
+        inline fn findStatus(self: *Self, tracker: anytype, edge: u32, context: u32) Status {
+            if (@TypeOf(tracker) == @TypeOf(null) or context == 0) return self.status.get(edge);
+            if (tracker.statusId(edge, context)) |id| return self.status.get(id);
+            return tracker.aliases.get(Restrictions.aliasKey(edge, context)) orelse .{};
+        }
+
+        fn offer(self: *Self, pool: *Pool, labels: *std.ArrayList(Label), pending: *Q, potential: anytype, target: ?NodeId, head: NodeId, status: Status, tracker: anytype, context: u32, label: Label) !void {
             if (status.label_plus_one != 0 and labels.items[status.label_plus_one - 1].cost <= label.cost) return;
             if (@backingInt(head) >= self.view.nodes.len) return error.InvalidEdgeHead;
             // A better label may reopen a state for an inconsistent, but
@@ -427,7 +506,11 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             var record = label;
             if (done) record.flags |= Label.target;
             const a = pool.arena.allocator();
-            const slot = try self.status.at(pool, label.edge);
+            const slot = if (@TypeOf(tracker) == @TypeOf(null) or context == 0) try self.status.at(pool, label.edge) else blk: {
+                if (tracker.statusId(label.edge, context)) |id| break :blk try self.status.at(pool, id);
+                const entry = try tracker.aliases.getOrPutValue(a, Restrictions.aliasKey(label.edge, context), .{});
+                break :blk entry.value_ptr;
+            };
             try labels.append(a, record);
             try pending.push(a, queue.Entry.init(roundedDown(@as(f64, label.cost) + estimate), index));
             slot.* = .{ .label_plus_one = index + 1 };

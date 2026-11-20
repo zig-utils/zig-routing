@@ -276,7 +276,7 @@ fn unpack(arena: std.mem.Allocator, result: core.Result, direction: core.Directi
     for (0..count) |i| {
         if (i % 1024 == 0) try control.check();
         const label = result.labels[index];
-        const cut: core.Cut = if (label.ctx == 0) .{} else result.cuts[label.ctx - 1];
+        const cut = label.cut(result.cuts);
         const position = if (direction == .forward) count - i - 1 else i;
         segments[position] = .{ .edge = label.edgeId(), .begin = cut.begin, .end = cut.end };
         index = label.pred;

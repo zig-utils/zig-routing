@@ -10,6 +10,7 @@ const cold = @import("cold.zig");
 const spatial = @import("spatial.zig");
 const turn_sides = @import("turn_sides.zig");
 const restrictions = @import("turn_restrictions.zig");
+const automaton = @import("restriction_automaton.zig");
 const Kind = format.SectionKind;
 const Header = format.SectionHeader;
 const kinds = std.enums.values(Kind);
@@ -153,6 +154,7 @@ pub const View = struct {
     timezone_rules: ?[]const u8 = null,
     tz_rules: ?timezone.Rules = null,
     turn_restrictions: ?[]const restrictions.Entry = null,
+    restriction_automaton: ?[]const automaton.State = null,
 
     pub fn parse(files: Files, diagnostic: ?*Diagnostic) !View {
         var headers: Headers = .initFill(null);
@@ -297,6 +299,10 @@ pub const View = struct {
             note(diagnostic, .node_timezones);
             if (graph.tz_rules == null or graph.node_timezones == null or graph.node_timezones.?.len != node_count)
                 return error.InvalidNodeTimezoneCount;
+        }
+        if (graph.restriction_automaton) |states| {
+            note(diagnostic, .restriction_automaton);
+            try automaton.verify(states, graph.edges.len, .none);
         }
         note(diagnostic, null);
         return graph;
@@ -464,7 +470,7 @@ pub const View = struct {
             note(diagnostic, kind);
             if (deadline.expired()) return error.DeadlineExceeded;
             const bytes: []const u8 = switch (kind) {
-                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata, .components, .turn_sides, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules, .turn_restrictions => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
+                inline .classes, .coordinates, .cold_idx, .cold, .slopes, .spatial, .metadata, .components, .turn_sides, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules, .turn_restrictions, .restriction_automaton => |section| std.mem.sliceAsBytes(@field(self, @tagName(section)).?),
                 inline else => |section| std.mem.sliceAsBytes(@field(self, @tagName(section))),
             };
             var hash = std.hash.XxHash3.init(0);
