@@ -836,6 +836,34 @@ fn defaultLocation(lat: f64, lng: f64, o: *const Options) Location {
     return loc;
 }
 
+// Valhalla converts the availability radius to an unsigned int before
+// checking tile coverage. Integer JSON values wrap and fractional ones truncate.
+fn transitRadius(value: json.Value) ?u32 {
+    return switch (value) {
+        .integer => |number| @truncate(@as(u64, @bitCast(number))),
+        .float => |number| transitFloatRadius(number),
+        .bool => |boolean| @intFromBool(boolean),
+        .number_string => |number| if (std.fmt.parseInt(u64, number, 10)) |integer|
+            @truncate(integer)
+        else |_|
+            transitFloatRadius(std.fmt.parseFloat(f64, number) catch return null),
+        .string => |number| blk: {
+            if (number.len == 0 or std.mem.indexOfScalar(u8, number, '_') != null) break :blk null;
+            if (number[0] == '-') {
+                const magnitude = std.fmt.parseInt(u32, number[1..], 10) catch break :blk null;
+                break :blk 0 -% magnitude;
+            }
+            break :blk std.fmt.parseInt(u32, number, 10) catch null;
+        },
+        else => null,
+    };
+}
+
+fn transitFloatRadius(value: f64) ?u32 {
+    if (!std.math.isFinite(value)) return null;
+    return @intFromFloat(@min(@max(0, value), @as(f64, std.math.maxInt(u32))));
+}
+
 fn parseLocation(r: json.Value, o: *const Options) error{ InvalidCoordinate, ConflictingClosures }!Location {
     // Fast path: an object with only lat and lon (every /height point, most
     // route stops). All other fields take their defaults, exactly as the
@@ -877,7 +905,10 @@ fn parseLocation(r: json.Value, o: *const Options) error{ InvalidCoordinate, Con
     loc.minimum_reachability = json.getOptional(u32, r, "/minimum_reachability");
     loc.minimum_inbound_reachability = json.getOptional(u32, r, "/minimum_inbound_reachability");
     loc.minimum_outbound_reachability = json.getOptional(u32, r, "/minimum_outbound_reachability");
-    loc.radius = json.getOptional(u32, r, "/radius");
+    loc.radius = if (o.action == .transit_available)
+        transitRadius(json.pointer(r, "/radius") orelse .null)
+    else
+        json.getOptional(u32, r, "/radius");
     loc.accuracy = json.getOptional(u32, r, "/accuracy");
     loc.time = json.get(f64, r, "/time", -1);
     loc.skip_ranking_candidates = !json.get(bool, r, "/rank_candidates", true);

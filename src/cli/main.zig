@@ -267,6 +267,7 @@ const Runtime = struct {
     fn close(self: *Runtime) void {
         self.stopping.store(true, .release);
         if (self.warmup) |worker| worker.join();
+        if (self.svc.transit_coverage) |coverage| std.heap.c_allocator.destroy(@constCast(coverage));
         if (self.bundle) |*bundle| bundle.close();
         if (self.pack) |*pack| pack.close();
         if (self.tiles) |*tiles| tiles.deinit();
@@ -275,8 +276,10 @@ const Runtime = struct {
     fn openGraph(self: *Runtime, path: ?[]const u8) !void {
         self.bundle = try routing.graph.reader.Bundle.open(path orelse return);
         self.svc.graph = &self.bundle.?.view;
+        self.svc.transit_coverage = try routing.graph.transit_coverage.Index.init(std.heap.c_allocator, self.bundle.?.view.transit_index, .none);
         self.svc.register(.locate, routing.api.locate_action.handle);
         self.svc.register(.tile, routing.api.tile_action.handle);
+        self.svc.register(.transit_available, routing.api.transit_available_action.handle);
     }
 
     fn startWarmup(self: *Runtime, lock_hot: bool) void {

@@ -1027,7 +1027,7 @@ pub fn fuzzRequest(_: void, s: *Smith) !void {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const path = paths[in[0] % paths.len];
+    const path = if (in[0] & 0x7f == paths.len) "/transit_available" else paths[in[0] % paths.len];
     const doc = in[1..];
     const via_query = in[0] & 0x80 != 0;
     const query: []const request.QueryParam = if (via_query) &.{
@@ -1264,6 +1264,8 @@ test "fuzz motor-costing" {
 }
 
 const request_seeds = [_][]const u8{
+    "\x0e{\"locations\":[{\"lat\":42.08,\"lon\":-71.04,\"radius\":-1},{\"lat\":90,\"lon\":180,\"radius\":2.6}]}",
+    "\x8e{\"locations\":[{\"lat\":0,\"lon\":179.99,\"radius\":18446744073709551615},{\"lat\":0,\"lon\":-179.99,\"radius\":\"-2\"}]}",
     "\x00{\"costing\":\"multimodal\",\"costing_options\":{\"pedestrian\":{\"transit_transfer_max_distance\":805},\"transit\":{\"use_bus\":0.3,\"use_rail\":0.6,\"filters\":{\"stops\":{\"action\":\"include\",\"ids\":[\"x\",3,null]},\"operators\":{\"action\":\"exclude\",\"ids\":[\"op\"]}}}}}",
     "\x00{\"costing\":\"transit\",\"costing_options\":{\"transit\":{\"mode_factor\":\"nan\",\"use_transfers\":2,\"wheelchair\":true,\"bicycle\":\"1\"}}}",
     "\x00{\"locations\":[{\"lat\":47.066161,\"lon\":9.569393},{\"lat\":47.115521,\"lon\":9.63313}],\"costing\":\"pedestrian\",\"costing_options\":{\"pedestrian\":{\"walkway_factor\":0.6,\"sidewalk_factor\":1,\"use_tracks\":0.8,\"max_hiking_difficulty\":3}},\"directions_type\":\"none\"}",

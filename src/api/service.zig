@@ -52,6 +52,7 @@ pub const Service = struct {
     /// Opaque per-service state handlers can reach (elevation tiles, graph, ...).
     state: ?*anyopaque = null,
     graph: ?*const @import("../graph/reader.zig").View = null,
+    transit_coverage: ?*const @import("../graph/transit_coverage.zig").Index = null,
 
     pub fn register(self: *Service, action: Action, f: ActionFn) void {
         self.handlers[@backingInt(action)] = f;
@@ -217,4 +218,26 @@ test "osrm format errors use the OSRM body" {
     try writeError(testing.allocator, &res, .{ .code = 171 }, .osrm);
     try testing.expectEqual(@as(u16, 400), res.status);
     try testing.expect(std.mem.indexOf(u8, res.body.items, "\"code\":\"NoSegment\"") != null);
+}
+
+test "transit availability returns false without a timetable and validates locations" {
+    var svc: Service = .{};
+    svc.register(.transit_available, @import("transit_available_action.zig").handle);
+    var server = http.Server.init(testing.allocator, .{ .address = .loopback_any_port, .threads = 1 }, svc.handler());
+    try server.start();
+    defer server.stop();
+    var buf: [2048]u8 = undefined;
+    var raw: [1024]u8 = undefined;
+    const payload =
+        \\{"locations":[{"lat":42.0803851,"lon":-71.0390241},{"lat":42.1,"lon":-71.1,"radius":-1},{"lat":42.1,"lon":-71.1,"radius":2.6}]}
+    ;
+    const post = try std.fmt.bufPrint(&raw, "POST /transit_available HTTP/1.1\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ payload.len, payload });
+    const response = try get(server.port, post, &buf);
+    try testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200"));
+    try testing.expectEqualStrings(
+        \\[{"input_lat":42.080385,"input_lon":-71.039024,"radius":0,"istransit":false},{"input_lat":42.1,"input_lon":-71.1,"radius":4294967295,"istransit":false},{"input_lat":42.1,"input_lon":-71.1,"radius":2,"istransit":false}]
+    , body(response));
+    const missing = try get(server.port, "GET /transit_available?json=%7B%7D HTTP/1.1\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expect(std.mem.startsWith(u8, missing, "HTTP/1.1 400"));
+    try testing.expect(std.mem.indexOf(u8, body(missing), "\"error_code\":120") != null);
 }

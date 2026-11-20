@@ -231,6 +231,28 @@ cancellation after preloading the graph pages. The output gives elapsed
 time and duration after expiry in nanoseconds. Across 300 requests with
 2 ms, 20 ms and 100 ms budgets, the largest overrun was 0.954 ms.
 
+### Transit availability
+
+`/transit_available` checks the quarter-degree transit tiles that meet
+each location's radius box. The native service indexes the platforms
+referenced by scheduled lines when it opens a bundle. A road-only
+bundle returns `istransit: false` for every valid location.
+
+```bash
+python3 oracle/transit-available-parity.py "$oracle_url" "$native_url" "$road_only_url"
+```
+
+Use the Brockton oracle and native bundles from the itinerary check,
+plus a native road-only bundle. The runner compares response bytes
+for seeded locations, radius and tile boundaries, and validation
+errors. It also checks the road-only response and times 25 batches
+through the native HTTP action.
+
+The Brockton run matched all 1,020 locations byte for byte, including
+365 positive and 655 negative results. The road-only bundle returned
+1,020 negative results. Median HTTP time was 1.046 microseconds per
+location and the slowest batch averaged 1.130 microseconds per location.
+
 ### Timed route optimality (gate B)
 
 ```bash

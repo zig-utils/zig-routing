@@ -21,6 +21,7 @@ pub const class_table = @import("class_table.zig");
 pub const cold = @import("cold.zig");
 pub const openlr = @import("openlr.zig");
 pub const transit = @import("transit.zig");
+pub const transit_coverage = @import("transit_coverage.zig");
 pub const signs = @import("signs.zig");
 pub const lanes = @import("lanes.zig");
 pub const linguistics = @import("linguistics.zig");
