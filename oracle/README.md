@@ -778,9 +778,9 @@ compare partial lengths, shapes, headings, node costs and intersections on the
 same graph. Use `compare-triplegs.py NATIVE.jsonl REFERENCE_DIR DESCRIPTORS`
 with the 3.9.3 `proto/descriptors` directory and `--minimum-legs` to require
 coverage. The report counts paths with different directed OSM ways separately.
-The local tile importer does not retain signs and lanes. Run the comparison
-with `--metadata-only` on a bundle built from the same OSM extract to check
-street names, sign groups and lane masks.
+The local tile importer preserves edge and node signs. Use `--metadata-only`
+with a bundle built from the same OSM extract to check street names, sign
+groups and lane masks together.
 
 For simple urban maneuver parity, use JSON route requests with
 `directions_type` set to `instructions` and the default distance units. Add
@@ -790,6 +790,12 @@ shape, length and time on matching paths within 0.1% of oracle cost.
 The initial Utrecht sample uses the first 300 `route-auto-10km` corpus rows
 with each destination moved to 6% of the straight-line distance from its
 original start, rounded to six decimal places in each coordinate.
+
+For the highway and junction rules, use the first 200 full-length Utrecht
+`route-auto-10km` requests with `directions_type` set to `instructions`. Pass
+`--highway-maneuvers` to `compare-triplegs.py` and use the imported bundle with
+signs. The report includes motorway and per-maneuver coverage alongside the
+Gate D score.
 
 ### HTTP and route checks
 

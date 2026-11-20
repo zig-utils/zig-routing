@@ -119,6 +119,7 @@ pub const Options = struct {
     units: Units = .kilometers,
     language: []const u8 = "en-US",
     directions_type: DirectionsType = .instructions,
+    roundabout_exits: bool = true,
     costing: Costing = .none,
     /// The whole `costing_options` object, parsed later by the costing model.
     costing_options: ?json.Value = null,
@@ -613,6 +614,7 @@ fn fromJsonWithin(arena: Allocator, doc: json.Value, action: Action, deadline: D
     if (json.getOptional([]const u8, root, "/directions_type")) |d| if (parseEnum(DirectionsType, d)) |dt| {
         o.directions_type = dt;
     };
+    o.roundabout_exits = json.get(bool, root, "/roundabout_exits", true);
 
     // Costing, including the deprecated aliases.
     const requested_costing = json.get([]const u8, root, "/costing", "none");
@@ -972,11 +974,13 @@ test "route request: wildloop-style pedestrian with costing options" {
     const r = try parseText(a, .route,
         \\{"locations":[{"lat":47.37,"lon":8.54},{"lat":47.38,"lon":8.55,"type":"through"},{"lat":47.39,"lon":8.56,"type":"via"}],
         \\ "costing":"pedestrian","costing_options":{"pedestrian":{"walkway_factor":0.6,"max_hiking_difficulty":3}},
-        \\ "directions_type":"none","units":"miles","language":"de-DE","id":"leg-1"}
+        \\ "directions_type":"none","roundabout_exits":false,"units":"miles","language":"de-DE","id":"leg-1"}
     );
     const o = r.ok;
     try testing.expectEqual(Costing.pedestrian, o.costing);
     try testing.expectEqual(DirectionsType.none, o.directions_type);
+    try testing.expect(!o.roundabout_exits);
+    try testing.expect((try parseText(a, .route, "{}")).ok.roundabout_exits);
     try testing.expectEqual(Units.miles, o.units);
     try testing.expectEqualStrings("de-DE", o.language);
     try testing.expectEqualStrings("leg-1", o.id.?);
@@ -1118,7 +1122,7 @@ pub fn resultsEqual(x: Result, y: Result) bool {
             if (y != .ok) return false;
             const b = y.ok;
             if (a.action != b.action or a.format != b.format or a.units != b.units or a.directions_type != b.directions_type or
-                a.costing != b.costing or a.shape_format != b.shape_format or a.range != b.range or
+                a.roundabout_exits != b.roundabout_exits or a.costing != b.costing or a.shape_format != b.shape_format or a.range != b.range or
                 a.height_precision != b.height_precision or a.verbose != b.verbose or a.filter_closures != b.filter_closures) return false;
             if (!std.meta.eql(a.resample_distance, b.resample_distance)) return false;
             if ((a.id == null) != (b.id == null) or (a.id != null and !std.mem.eql(u8, a.id.?, b.id.?))) return false;

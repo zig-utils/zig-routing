@@ -267,8 +267,16 @@ pub const Tile = struct {
     header: Header,
     nodes: []align(1) const Node,
     edges: []align(1) const Edge,
+    local_signs: []align(1) const Sign,
     edge_info: []const u8,
     text: []const u8,
+
+    pub fn signText(self: *const Tile, offset: u32) ![]const u8 {
+        if (offset >= self.text.len) return error.InvalidSignOffset;
+        const text = self.text[offset..];
+        const end = std.mem.indexOfScalar(u8, text, 0) orelse return error.UnterminatedSign;
+        return text[0..end];
+    }
 
     pub fn parse(bytes: []const u8) !Tile {
         if (bytes.len < @sizeOf(Header)) return error.TruncatedTileHeader;
@@ -279,7 +287,13 @@ pub const Tile = struct {
         const edge_end = edge_start + @as(usize, header.counts.edges) * @sizeOf(Edge);
         const extended = if (header.tile.extended_edges) @as(usize, header.counts.edges) * @sizeOf(u64) else 0;
         const access_end = edge_end + extended + @as(usize, header.access.restrictions) * 16;
-        if (access_end > header.forward_restriction_offset or
+        const local_sign_count = if (header.tile.id.level == local_level) header.signs.count else 0;
+        // Local road tiles have no transit tables between access restrictions and signs.
+        if (local_sign_count != 0 and (header.transit.departures != 0 or header.transit.stops != 0 or
+            header.signs.routes != 0 or header.signs.schedules != 0 or header.transit.transfers != 0))
+            return error.InvalidTileOffsets;
+        const sign_end = access_end + @as(usize, local_sign_count) * @sizeOf(Sign);
+        if (sign_end > header.forward_restriction_offset or
             header.forward_restriction_offset > header.reverse_restriction_offset or
             header.reverse_restriction_offset > header.edge_info_offset or
             header.edge_info_offset > header.text_offset or header.text_offset > header.lane_connectivity_offset or
@@ -289,12 +303,13 @@ pub const Tile = struct {
             .header = header,
             .nodes = std.mem.bytesAsSlice(Node, bytes[@sizeOf(Header)..node_end]),
             .edges = std.mem.bytesAsSlice(Edge, bytes[edge_start..edge_end]),
+            .local_signs = std.mem.bytesAsSlice(Sign, bytes[access_end..sign_end]),
             .edge_info = bytes[header.edge_info_offset..header.text_offset],
             .text = bytes[header.text_offset..header.lane_connectivity_offset],
         };
     }
 
-    pub fn info(self: Tile, offset: u25) !EdgeInfo {
+    pub noinline fn info(self: *const Tile, offset: u25) !EdgeInfo {
         if (offset >= self.edge_info.len) return error.InvalidEdgeInfoOffset;
         const bytes = self.edge_info[offset..];
         if (bytes.len < @sizeOf(EdgeInfoHeader)) return error.TruncatedEdgeInfo;
@@ -315,6 +330,21 @@ pub const Tile = struct {
             .names = std.mem.bytesAsSlice(NameInfo, bytes[@sizeOf(EdgeInfoHeader)..names_end]),
             .text = self.text,
         };
+    }
+};
+
+// Ported from valhalla/baldr/sign.h.
+pub const Sign = extern struct {
+    data: packed struct(u32) {
+        index: u22,
+        kind: u8,
+        route_number: bool,
+        tagged: bool,
+    },
+    text_offset: u32,
+
+    comptime {
+        std.debug.assert(@sizeOf(Sign) == 8 and @offsetOf(Sign, "data") == 0 and @offsetOf(Sign, "text_offset") == 4);
     }
 };
 

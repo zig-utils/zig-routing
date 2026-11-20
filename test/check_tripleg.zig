@@ -43,16 +43,17 @@ pub fn main(init: std.process.Init) !void {
         const tab = std.mem.indexOfScalar(u8, line, '\t') orelse return error.InvalidCorpusRow;
         if (!std.mem.eql(u8, line[0..tab], "/route")) return error.InvalidCorpusRow;
         arena.reset();
-        const legs = check(&engine, view, &arena, &cache, line[tab + 1 ..]) catch |err| {
+        const checked = check(&engine, view, &arena, &cache, line[tab + 1 ..]) catch |err| {
             try std.json.Stringify.value(.{ .index = index, .failure = @errorName(err) }, .{}, writer);
             try writer.writeByte('\n');
             continue;
         };
+        const legs = checked.legs;
         if (with_maneuvers) {
             const a = arena.allocator();
             const values = try a.alloc(ManeuverResult, legs.len);
             for (legs, values) |*leg, *result| {
-                const maneuvers = routing.narrative.maneuvers.build(a, leg, io.Deadline.fromNowMs(10_000));
+                const maneuvers = routing.narrative.maneuvers.buildWithOptions(a, leg, checked.narrative, io.Deadline.fromNowMs(10_000));
                 result.* = if (maneuvers) |steps| .{ .steps = steps } else |err| .{ .failure = @errorName(err) };
             }
             try std.json.Stringify.value(.{ .index = index, .legs = legs, .maneuvers = values }, .{ .emit_null_optional_fields = false }, writer);
@@ -69,7 +70,12 @@ const ManeuverResult = struct {
     failure: ?[]const u8 = null,
 };
 
-fn check(engine: *Engine, view: *const routing.graph.reader.View, arena: *routing.infra.arena.Arena, cache: *auto.Cache, request_json: []const u8) ![]const trip.TripLeg {
+const Checked = struct {
+    legs: []const trip.TripLeg,
+    narrative: routing.narrative.maneuvers.Options,
+};
+
+fn check(engine: *Engine, view: *const routing.graph.reader.View, arena: *routing.infra.arena.Arena, cache: *auto.Cache, request_json: []const u8) !Checked {
     const a = arena.allocator();
     const deadline = io.Deadline.fromNowMs(10_000);
     const control: search.search.Control = .{ .deadline = deadline };
@@ -111,5 +117,5 @@ fn check(engine: *Engine, view: *const routing.graph.reader.View, arena: *routin
             .leg_count = @intCast(output.len),
         }, control);
     }
-    return output;
+    return .{ .legs = output, .narrative = .{ .roundabout_exits = opts.roundabout_exits } };
 }

@@ -191,28 +191,30 @@ def maneuver_types(descriptors):
     return {int(number): name for name, number in re.findall(r"^\s*(\w+)\s*=\s*(\d+)\s*;", block, re.M)}
 
 
-def compare_maneuvers(comparison, ours, donor, directions, result, types):
+def compare_maneuvers(comparison, ours, donor, directions, result, types, highway):
     native_nodes = ours["node"]
     donor_nodes = nested(donor, 6)
     native_edges = [node["edge"] for node in native_nodes if "edge" in node]
     donor_edges = [edge for node in donor_nodes for edge in nested(node, 1)]
     counts = comparison.counts
-    if [(edge["way_id"], edge["forward"]) for edge in native_edges] != [
+    same_path = [(edge["way_id"], edge["forward"]) for edge in native_edges] == [
         (get(edge, 27), bool(get(edge, 59))) for edge in donor_edges
-    ]:
+    ]
+    if not same_path:
         counts["different_paths"] += 1
-        return
+        if not highway:
+            return
     records = nested(directions, 6)
     if len(records) < 2:
         comparison.check("directions.missing_maneuvers", False)
         return
     numbers = [get(record, 1) for record in records]
-    supported = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16}
+    supported = set(range(1, 28)) | {37, 38} if highway else set(range(1, 12)) | {14, 15, 16}
     if not set(numbers).issubset(supported):
         counts["advanced_maneuvers"] += 1
         return
-    if any(get(edge, 15) or get(edge, 16) or get(edge, 53) or
-           get(edge, 10) in (1, 26, 33, 34, 41, 42) for edge in donor_edges):
+    if any(get(edge, 53) or get(edge, 10) in (26, 33, 34, 41, 42) or
+           (not highway and (get(edge, 15) or get(edge, 16) or get(edge, 10) == 1)) for edge in donor_edges):
         counts["advanced_edge_uses"] += 1
         return
     elapsed = nested(nested(donor_nodes[-1], 12)[0], 1)[0]
@@ -220,8 +222,11 @@ def compare_maneuvers(comparison, ours, donor, directions, result, types):
     actual = native_nodes[-1]["cost"]["elapsed_cost"]["cost"]
     if abs(actual - cost) > abs(cost) * 0.001:
         counts["different_route_costs"] += 1
+        if highway:
+            counts["native_cheaper" if actual < cost else "native_costlier"] += 1
         return
-    counts["matched_legs"] += 1
+    counts["matched_legs"] += same_path
+    counts["gate_d_eligible"] += 1
     steps = result.get("steps", [])
     type_match = [step["type"] for step in steps] == [types.get(number) for number in numbers]
     name_match = [[name["value"].encode() for name in step["street_names"]] for step in steps] == [
@@ -237,7 +242,15 @@ def compare_maneuvers(comparison, ours, donor, directions, result, types):
     comparison.check("shape", shape_match)
     comparison.check("distance", length_match)
     comparison.check("time", time_match)
-    counts["gate_d_passes"] += type_match and name_match and shape_match and length_match and time_match
+    passed = type_match and name_match and shape_match and length_match and time_match
+    counts["gate_d_passes"] += passed
+    if highway:
+        counts["within_cost_different_paths"] += not same_path
+        counts["same_path_maneuver_matches"] += same_path and type_match and name_match
+        counts["legs_with_motorway"] += any(get(edge, 4) == 0 and get(edge, 10) in (0, 1) for edge in donor_edges)
+        for number in set(numbers):
+            if number in {12, 13, *range(17, 28), 37, 38}:
+                counts[f"legs_with_{types[number]}"] += 1
 
 
 def main():
@@ -251,9 +264,12 @@ def main():
                          help="compare names, signs and turn lane masks on independently built bundles")
     options.add_argument("--maneuvers", action="store_true",
                          help="score simple maneuver sequences on matching paths for Gate D")
+    options.add_argument("--highway-maneuvers", action="store_true",
+                         help="score maneuver sequences including highway junctions within the Gate D cost tolerance")
     args = parser.parse_args()
     comparison = Comparison(args.schema)
-    types = maneuver_types(args.schema) if args.maneuvers else {}
+    score_maneuvers = args.maneuvers or args.highway_maneuvers
+    types = maneuver_types(args.schema) if score_maneuvers else {}
     with args.native.open() as rows:
         for line in rows:
             row = json.loads(line)
@@ -264,19 +280,20 @@ def main():
             blob = path.read_bytes()
             reference = list(leg_records(blob))
             comparison.check("leg.count", len(row["legs"]) == len(reference))
-            if args.maneuvers:
+            if score_maneuvers:
                 directions = list(direction_legs(blob))
                 comparison.check("directions.leg_count", len(row["legs"]) == len(directions))
                 for ours, donor, direction, result in zip(row["legs"], reference, directions, row["maneuvers"]):
-                    compare_maneuvers(comparison, ours, donor, direction, result, types)
+                    compare_maneuvers(comparison, ours, donor, direction, result, types, args.highway_maneuvers)
             else:
                 for ours, donor in zip(row["legs"], reference):
                     comparison.leg(ours, donor, args.metadata_only)
     print(json.dumps({"counts": comparison.counts, "differences": comparison.differences}, indent=2))
-    if args.maneuvers:
-        matched = comparison.counts["matched_legs"]
+    if score_maneuvers:
+        eligible = comparison.counts["gate_d_eligible"]
         structural = ("native_route", "leg.count", "directions.leg_count", "directions.missing_maneuvers")
-        return int(matched < args.minimum_legs or comparison.counts["gate_d_passes"] * 100 < matched * 95 or
+        return int(comparison.counts["matched_legs"] < args.minimum_legs or
+                   comparison.counts["gate_d_passes"] * 100 < eligible * 95 or
                    any(comparison.differences[key] for key in structural))
     return int(bool(comparison.differences) or comparison.counts["matched_legs"] < args.minimum_legs)
 

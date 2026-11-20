@@ -12,7 +12,8 @@ const tags = @import("tags/root.zig");
 const pbf = @import("pbf/root.zig");
 const edge_class = @import("edge_class.zig");
 const turns = @import("turns.zig");
-const ColdBuilder = @import("cold_builder.zig").Builder;
+const cold_builder = @import("cold_builder.zig");
+const ColdBuilder = cold_builder.Builder;
 const elevation = @import("elevation.zig");
 const dem = @import("../elevation/root.zig");
 const enhance = @import("enhance.zig");
@@ -33,7 +34,6 @@ const lane_build = @import("lanes.zig");
 const name_details = @import("name_details.zig");
 const link_classification = @import("link_classification.zig");
 const grid = @import("../geo/grid.zig");
-const radix = @import("../infra/radix.zig");
 
 const Allocator = std.mem.Allocator;
 const max_degree = turns.max_degree;
@@ -2600,7 +2600,7 @@ noinline fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *Metadata
     if (builder.record_count != topo.output.data.len / 2) return error.InvalidColdRecordCount;
     try writer.write(.cold_idx, index.data);
     if (coverage.finish()) |bounds| try writer.write(.coverage, &.{bounds});
-    try writeSigns(gpa, shared, metadata, plan, edge_classes, &builder, writer);
+    try writeSigns(shared, metadata, plan, edge_classes, &builder, writer);
     return builder.write(writer);
 }
 
@@ -2646,29 +2646,11 @@ fn signJunction(shared: *const Shared, node: u32) !sign_build.Junction {
     }
 }
 
-const SignSink = struct {
-    rows: std.ArrayList(graph.signs.Entry) = .empty,
-    builder: *ColdBuilder,
-    strings: *tags.names.StringTable,
-    cell: u32 = 0,
-    owner: u32 = 0,
-
-    pub fn add(self: *SignSink, kind: graph.signs.Type, route: bool, text: []const u8) !void {
-        const text_ref = try self.builder.nameRef(try self.strings.intern(text), false);
-        try self.rows.append(self.builder.gpa, .{
-            .cell = self.cell,
-            .owner = self.owner,
-            .text_ref = text_ref,
-            .attr = .{ .sign_type = kind, .route_number = route },
-        });
-    }
-};
-
-noinline fn writeSigns(gpa: Allocator, shared: *const Shared, metadata: *Metadata, plan: *const Layout, edge_classes: []const classes.EdgeClass, builder: *ColdBuilder, writer: *format.BundleWriter) !void {
+noinline fn writeSigns(shared: *const Shared, metadata: *Metadata, plan: *const Layout, edge_classes: []const classes.EdgeClass, builder: *ColdBuilder, writer: *format.BundleWriter) !void {
     if (metadata.signs.ways.count() == 0 and metadata.signs.nodes.count() == 0) return;
     const topo = shared.topology;
-    var sink: SignSink = .{ .builder = builder, .strings = &metadata.strings };
-    defer sink.rows.deinit(gpa);
+    var sink: cold_builder.SignSink = .{ .builder = builder, .strings = &metadata.strings };
+    defer sink.deinit();
     // Edges are appended first so equal keys retain edge records before
     // node records in the stable geographic sort.
     for (topo.groups, 0..) |group, node| {
@@ -2706,15 +2688,7 @@ noinline fn writeSigns(gpa: Allocator, shared: *const Shared, metadata: *Metadat
             try sign_build.writeTokens(source.name, if (toll) .toll_name else .junction_name, false, &sink, shared.deadline);
         }
     }
-    if (sink.rows.items.len == 0) return;
-    const scratch = try gpa.alloc(graph.signs.Entry, sink.rows.items.len);
-    defer gpa.free(scratch);
-    try radix.sortByU64(graph.signs.Entry, gpa, sink.rows.items, scratch, {}, signKey, shared.deadline);
-    try writer.write(.signs, sink.rows.items);
-}
-
-fn signKey(_: void, row: graph.signs.Entry) u64 {
-    return row.key();
+    try sink.write(writer);
 }
 
 noinline fn accessForDirections(gpa: Allocator, scratch: *std.ArrayList(access_restriction.Entry), limits: []const access_restriction.Entry, enabled: [2]bool, deadline: io.Deadline) ![]const access_restriction.Entry {

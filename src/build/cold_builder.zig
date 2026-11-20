@@ -1,10 +1,51 @@
 // Ported from src/mjolnir/graphtilebuilder.cc (Valhalla 3.9.3).
 const std = @import("std");
 const io = @import("../infra/io.zig");
+const radix = @import("../infra/radix.zig");
 const cold = @import("../graph/cold.zig");
 const format = @import("../graph/format.zig");
+const signs = @import("../graph/signs.zig");
 const names = @import("tags/names.zig");
 const Allocator = std.mem.Allocator;
+
+pub const SignSink = struct {
+    rows: std.ArrayList(signs.Entry) = .empty,
+    builder: *Builder,
+    strings: *names.StringTable,
+    cell: u32 = 0,
+    owner: u32 = 0,
+
+    pub fn deinit(self: *SignSink) void {
+        self.rows.deinit(self.builder.gpa);
+    }
+
+    pub fn add(self: *SignSink, kind: signs.Type, route: bool, text: []const u8) !void {
+        return self.addTagged(kind, route, false, text);
+    }
+
+    pub noinline fn addTagged(self: *SignSink, kind: signs.Type, route: bool, tagged: bool, text: []const u8) !void {
+        const text_ref = try self.builder.nameRef(try self.strings.intern(text), false);
+        try self.rows.append(self.builder.gpa, .{
+            .cell = self.cell,
+            .owner = self.owner,
+            .text_ref = text_ref,
+            .attr = .{ .sign_type = kind, .route_number = route, .tagged = tagged },
+        });
+    }
+
+    pub noinline fn write(self: *SignSink, writer: *format.BundleWriter) !void {
+        if (self.rows.items.len == 0) return;
+        const a = self.builder.gpa;
+        const scratch = try a.alloc(signs.Entry, self.rows.items.len);
+        defer a.free(scratch);
+        try radix.sortByU64(signs.Entry, a, self.rows.items, scratch, {}, signKey, writer.deadline);
+        try writer.write(.signs, self.rows.items);
+    }
+
+    fn signKey(_: void, row: signs.Entry) u64 {
+        return row.key();
+    }
+};
 
 pub const Builder = struct {
     gpa: Allocator,

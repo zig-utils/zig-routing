@@ -26,13 +26,7 @@ pub fn sortByU64(
             if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
             counts[@as(u16, @truncate(key >> shift))] += 1;
         }
-        var start: usize = 0;
-        for (counts, 0..) |*bin, i| {
-            if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
-            const count = bin.*;
-            bin.* = start;
-            start += count;
-        }
+        try bucketOffsets(counts, deadline);
         for (source, 0..) |value, i| {
             const key = keyOf(context, value);
             if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
@@ -41,5 +35,16 @@ pub fn sortByU64(
             bin.* += 1;
         }
         std.mem.swap([]T, &source, &target);
+    }
+}
+
+// Shared by the record-specific sort kernels. The histogram only contains counts.
+noinline fn bucketOffsets(counts: []usize, deadline: io.Deadline) !void {
+    var start: usize = 0;
+    for (counts, 0..) |*bin, i| {
+        if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
+        const count = bin.*;
+        bin.* = start;
+        start += count;
     }
 }

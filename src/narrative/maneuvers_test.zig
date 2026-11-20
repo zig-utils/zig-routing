@@ -20,6 +20,10 @@ test "upstream maneuver base directions" {
         .{ .angle = 136, .expected = .kSharpRight },
         .{ .angle = 148, .expected = .kSharpRight },
         .{ .angle = 159, .expected = .kSharpRight },
+        .{ .angle = 160, .expected = .kUturnRight },
+        .{ .angle = 179, .expected = .kUturnRight },
+        .{ .angle = 180, .expected = .kUturnLeft },
+        .{ .angle = 200, .expected = .kUturnLeft },
         .{ .angle = 201, .expected = .kSharpLeft },
         .{ .angle = 213, .expected = .kSharpLeft },
         .{ .angle = 224, .expected = .kSharpLeft },
@@ -108,6 +112,90 @@ test "maneuver build accumulates path cost and preserves street names across a s
     try testing.expectEqual(2, result[1].begin_shape_index);
     try testing.expect(result[1].tee);
     try testing.expectError(error.DeadlineExceeded, builder.build(storage.allocator(), &path, .{ .at_ns = 0 }));
+}
+
+test "ramp angles, signed exits and merge collapse survive the full maneuver build" {
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const local: trip.Edge = .{ .length_km = 0.2, .road_class = .kPrimary, .name = &.{.{ .value = "Approach" }}, .end_shape_index = 1 };
+    const highway: trip.Edge = .{ .length_km = 0.3, .name = &.{.{ .value = "A2", .is_route_number = true }}, .begin_shape_index = 2, .end_shape_index = 3 };
+    const sign: trip.Sign = .{ .exit_numbers = &.{.{ .text = "5" }}, .exit_toward_locations = &.{.{ .text = "Utrecht" }} };
+    for ([_]struct { heading: u32, sign: ?trip.Sign = null, expected: directions.ManeuverType }{
+        .{ .heading = 0, .expected = .kRampStraight },
+        .{ .heading = 65, .expected = .kRampRight },
+        .{ .heading = 295, .expected = .kRampLeft },
+        .{ .heading = 65, .sign = sign, .expected = .kExitRight },
+        .{ .heading = 295, .sign = sign, .expected = .kExitLeft },
+    }) |case| {
+        _ = storage.reset(.retain_capacity);
+        const nodes = [_]trip.Node{
+            .{ .edge = local },
+            .{ .edge = .{
+                .length_km = 0.15,
+                .road_class = .kPrimary,
+                .use = .kRampUse,
+                .begin_heading = case.heading,
+                .begin_shape_index = 1,
+                .end_shape_index = 2,
+                .sign = case.sign,
+            } },
+            .{ .edge = highway },
+            .{},
+        };
+        const path: trip.TripLeg = .{ .node = &nodes, .location = &.{ .{}, .{} } };
+        const result = try builder.build(storage.allocator(), &path, .none);
+        try testing.expectEqual(@as(usize, 3), result.len);
+        const ramp = result[1];
+        try testing.expectEqual(case.expected, ramp.type);
+        try testing.expect(ramp.has_collapsed_merge_maneuver);
+        try testing.expectEqualStrings("A2", ramp.street_names[0].value);
+        try testing.expectEqualStrings(if (case.sign != null) "Utrecht" else "A2", if (case.sign != null) ramp.signs.exit_toward_locations[0].text else ramp.signs.exit_onto_streets[0].text);
+        try testing.expectEqual(@as(u32, 3), ramp.end_shape_index);
+    }
+}
+
+test "roundabout entry counts passed exits and carries the selected exit names and signs" {
+    const exit_sign: trip.Sign = .{ .guide_toward_locations = &.{.{ .text = "City centre" }} };
+    const nodes = [_]trip.Node{
+        .{ .edge = .{ .name = &.{.{ .value = "Approach" }}, .length_km = 0.2, .road_class = .kPrimary, .end_shape_index = 1 } },
+        .{ .edge = .{ .name = &.{ .{ .value = "Molenplein" }, .{ .value = "N 10", .is_route_number = true } }, .length_km = 0.04, .road_class = .kPrimary, .roundabout = true, .begin_shape_index = 1, .end_shape_index = 2 } },
+        .{ .edge = .{ .length_km = 0.04, .road_class = .kPrimary, .roundabout = true, .begin_shape_index = 2, .end_shape_index = 3 }, .intersecting_edge = &.{.{ .begin_heading = 90, .driveability = .kForward }} },
+        .{ .edge = .{ .name = &.{.{ .value = "Exit Road" }}, .length_km = 0.3, .road_class = .kPrimary, .begin_heading = 90, .begin_shape_index = 3, .end_shape_index = 4, .sign = exit_sign } },
+        .{},
+    };
+    const path: trip.TripLeg = .{ .node = &nodes, .location = &.{ .{}, .{} } };
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const result = try builder.build(storage.allocator(), &path, .none);
+    try testing.expectEqual(@as(usize, 4), result.len);
+    try testing.expectEqual(.kRoundaboutEnter, result[1].type);
+    try testing.expectEqual(.kRoundaboutExit, result[2].type);
+    try testing.expectEqual(@as(u32, 2), result[1].roundabout_exit_count);
+    try testing.expectEqual(@as(usize, 1), result[1].street_names.len);
+    try testing.expectEqualStrings("Molenplein", result[1].street_names[0].value);
+    try testing.expectEqualStrings("Exit Road", result[1].roundabout_exit_street_names[0].value);
+    try testing.expectEqualStrings("City centre", result[1].roundabout_exit_signs.guide_toward_locations[0].text);
+    const collapsed = try builder.buildWithOptions(storage.allocator(), &path, .{ .roundabout_exits = false }, .none);
+    try testing.expectEqual(@as(usize, 3), collapsed.len);
+    try testing.expectEqual(.kRoundaboutEnter, collapsed[1].type);
+    try testing.expectEqual(@as(u32, 3), collapsed[1].roundabout_exit_shape_index);
+    try testing.expectEqual(@as(u32, 4), collapsed[1].end_shape_index);
+}
+
+test "a turn channel ending at a side-of-street destination preserves arrival" {
+    const nodes = [_]trip.Node{
+        .{ .edge = .{ .name = &.{.{ .value = "Approach" }}, .length_km = 0.2, .road_class = .kPrimary, .end_shape_index = 1 } },
+        .{ .edge = .{ .length_km = 0.02, .road_class = .kPrimary, .use = .kTurnChannelUse, .begin_heading = 60, .begin_shape_index = 1, .end_shape_index = 2 } },
+        .{},
+    };
+    const path: trip.TripLeg = .{ .node = &nodes, .location = &.{ .{}, .{ .side_of_street = .kRight } } };
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const result = try builder.build(storage.allocator(), &path, .none);
+    try testing.expectEqual(@as(usize, 3), result.len);
+    try testing.expectEqual(.kRight, result[1].type);
+    try testing.expectEqual(.kDestinationRight, result[2].type);
+    try testing.expectEqual(@as(u32, 2), result[2].begin_shape_index);
 }
 
 test "upstream intersecting forward edges separate maneuvers sharing a road name" {

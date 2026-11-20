@@ -8,7 +8,8 @@ const graph = @import("../graph/root.zig");
 const geo = @import("../geo/root.zig");
 const components = @import("../build/components.zig");
 const turns = @import("../build/turns.zig");
-const ColdBuilder = @import("../build/cold_builder.zig").Builder;
+const cold_builder = @import("../build/cold_builder.zig");
+const ColdBuilder = cold_builder.Builder;
 const StringTable = @import("../build/tags/names.zig").StringTable;
 pub const tile_format = @import("valhalla_tile.zig");
 const format = graph.format;
@@ -161,7 +162,7 @@ const Layout = struct {
         defer a.free(handles);
         for (self.sources, self.edges, self.slopes, handles, 0..) |*ref, *output, *slope, *handle, i| {
             if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
-            const tile = tiles[ref.tile].tile;
+            const tile = &tiles[ref.tile].tile;
             const raw = tile.edges[ref.index];
             const head = raw.endpoint.node;
             const other = tiles[self.by_key.get(head.tileKey()) orelse return error.MissingValhallaEndTile];
@@ -235,7 +236,7 @@ const Layout = struct {
         try writer.write(.turn_sides, side_data);
     }
 
-    fn writeCold(self: Layout, a: Allocator, tiles: []const SourceTile, writer: *format.BundleWriter, scratch_dir: []const u8) !void {
+    fn writeCold(self: *const Layout, a: Allocator, tiles: []const SourceTile, writer: *format.BundleWriter, scratch_dir: []const u8) !void {
         var strings = StringTable.init(a);
         defer strings.deinit();
         var cold = try ColdBuilder.init(a, &strings, scratch_dir, writer.deadline);
@@ -278,11 +279,49 @@ const Layout = struct {
             try graph.spatial.addShape(a, &pairs, @intCast(i), points.items, writer.deadline);
         }
         try writer.write(.cold_idx, indices);
+        try self.writeSigns(tiles, &strings, &cold, writer);
         _ = try cold.write(writer);
         if (coverage.finish()) |box| try writer.write(.coverage, &.{box});
         const scratch = try a.alloc(graph.spatial.Pair, pairs.items.len);
         defer a.free(scratch);
         _ = try graph.spatial.write(a, pairs.items, scratch, scratch_dir, writer, writer.deadline);
+    }
+
+    // Ported from GraphTile::GetSigns for the local road tile import.
+    fn writeSigns(self: *const Layout, tiles: []const SourceTile, strings: *StringTable, cold: *ColdBuilder, writer: *format.BundleWriter) !void {
+        var sink: cold_builder.SignSink = .{ .builder = cold, .strings = strings };
+        defer sink.deinit();
+        // The stable sort preserves edge signs before node signs when their keys coincide.
+        try self.collectSigns(tiles, &sink, false, writer.deadline);
+        try self.collectSigns(tiles, &sink, true, writer.deadline);
+        try sink.write(writer);
+    }
+
+    noinline fn collectSigns(self: *const Layout, tiles: []const SourceTile, sink: *cold_builder.SignSink, on_node: bool, deadline: io.Deadline) !void {
+        for (tiles) |*source| {
+            if (deadline.expired()) return error.DeadlineExceeded;
+            for (source.tile.local_signs, 0..) |sign, index| {
+                if (index % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+                if (sign.data.kind == 255 and sign.data.tagged) continue; // Linguistics are separate records.
+                if (sign.data.kind > @backingInt(graph.signs.Type.toll_name)) return error.InvalidValhallaSignType;
+                const kind: graph.signs.Type = @fromBackingInt(sign.data.kind);
+                if ((kind == .junction_name or kind == .toll_name) != on_node) continue;
+                const owner = if (on_node) node: {
+                    if (sign.data.index >= source.tile.nodes.len or !source.tile.nodes[sign.data.index].edges.named) return error.InvalidValhallaSignOwner;
+                    break :node source.node_base + sign.data.index;
+                } else edge: {
+                    if (sign.data.index >= source.edge_ids.len or !source.tile.edges[sign.data.index].access.signs) return error.InvalidValhallaSignOwner;
+                    break :edge source.edge_ids[sign.data.index];
+                };
+                if (owner == no_edge) continue;
+                const node = if (on_node) owner else self.edges[self.sources[owner].opposite].head;
+                const text = try source.tile.signText(sign.text_offset);
+                if (text.len == 0) return error.EmptySign;
+                sink.cell = geo.grid.snapCell(self.coords[node].toPoint());
+                sink.owner = owner;
+                try sink.addTagged(kind, sign.data.route_number, sign.data.tagged, text);
+            }
+        }
     }
 };
 
@@ -348,6 +387,7 @@ fn edgeClass(edge: tile_format.Edge, bike_network: u4) graph.class_table.EdgeCla
             .not_thru = edge.attributes.not_thru,
             .dead_end = edge.access.dead_end,
             .named = edge.local.named,
+            .sign = edge.access.signs,
             .indoor = edge.access.indoor,
             .complex_restriction = edge.attributes.complex_restriction,
             .bike_share_connection = edge.access.bike_share_connection,

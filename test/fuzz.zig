@@ -237,6 +237,9 @@ fn checkValhallaTile(tile: valhalla_import.tile_format.Tile) !void {
         _ = info.indoor(a, &levels, .none) catch continue;
         for (0..info.names.len) |index| _ = info.name(index) catch continue;
     }
+    for (tile.local_signs) |sign| {
+        if (!sign.data.tagged) _ = tile.signText(sign.text_offset) catch continue;
+    }
 }
 
 fn fuzzAdminIndex(_: void, s: *Smith) !void {
@@ -475,6 +478,16 @@ test "Valhalla importer preserves cross-tile edge pairs and cold data" {
     const reverse_name = try (try b.view.names(other)).at(0);
     try std.testing.expectEqualStrings(fixture.reverse_name, reverse_name.text);
     try std.testing.expect(reverse_name.route);
+    const edge_signs = try graph.signs.signsForEdge(&b.view, first);
+    const node_signs = try graph.signs.signsForNode(&b.view, @fromBackingInt(0));
+    try std.testing.expectEqual(@as(usize, 1), edge_signs.len);
+    try std.testing.expectEqual(@as(usize, 1), node_signs.len);
+    try std.testing.expectEqual(.exit_number, edge_signs[0].attr.sign_type);
+    try std.testing.expect(edge_signs[0].attr.route_number);
+    try std.testing.expectEqualStrings(fixture.exit_name, try edge_signs[0].text(b.view.cold_data.?));
+    try std.testing.expectEqual(.junction_name, node_signs[0].attr.sign_type);
+    try std.testing.expectEqualStrings(fixture.junction, try node_signs[0].text(b.view.cold_data.?));
+    try std.testing.expectEqual(@as(usize, 0), (try graph.signs.signsForEdge(&b.view, other)).len);
     try std.testing.expectEqual(@as(i8, 2), record.indoor.layer);
     try std.testing.expect(try record.indoor.includes(2.5, .none));
     try std.testing.expectEqual(@as(u8, 4 | (3 << 3) | (1 << 6)), (try b.view.turnRow(@fromBackingInt(0), 0))[0]);

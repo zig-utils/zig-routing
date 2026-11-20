@@ -7,13 +7,17 @@ pub const first_tile = 519_120;
 pub const way: u64 = 0x0615_0123_4567_89ab;
 pub const name = "Cycle Track";
 pub const reverse_name = "Cycle Trail";
+pub const exit_name = "Exit 3";
+pub const junction = "North Junction";
 pub const left: routing.geo.FixedLL = .{ .lng = 2_499_000, .lat = 50_000 };
 pub const right: routing.geo.FixedLL = .{ .lng = 2_501_000, .lat = 50_200 };
 
 pub fn tile(reverse: bool) [512]u8 {
     const node_offset = @sizeOf(source.Header);
     const edge_offset = node_offset + @sizeOf(source.Node);
-    const info_offset = edge_offset + @sizeOf(source.Edge);
+    const sign_offset = edge_offset + @sizeOf(source.Edge);
+    const sign_count: u24 = if (reverse) 0 else 2;
+    const info_offset = sign_offset + sign_count * @sizeOf(source.Sign);
     const id = first_tile + @as(u22, @intFromBool(reverse));
     const start = if (reverse) right else left;
     const lng = start.lng - if (reverse) @as(i32, 2_500_000) else 0;
@@ -24,6 +28,7 @@ pub fn tile(reverse: bool) [512]u8 {
     @memcpy(header.version[0..5], "3.9.3");
     header.counts.nodes = 1;
     header.counts.edges = 1;
+    header.signs.count = sign_count;
     header.forward_restriction_offset = info_offset;
     header.reverse_restriction_offset = info_offset;
     header.edge_info_offset = info_offset;
@@ -35,6 +40,7 @@ pub fn tile(reverse: bool) [512]u8 {
     node.position.access = 7;
     node.edges.count = 1;
     node.edges.density = 4;
+    node.edges.named = !reverse;
     node.flags.drive_on_right = true;
 
     var edge = std.mem.zeroes(source.Edge);
@@ -44,6 +50,7 @@ pub fn tile(reverse: bool) [512]u8 {
     edge.access.forward = 7;
     edge.access.reverse = 7;
     edge.access.max_up_slope = 12;
+    edge.access.signs = !reverse;
     edge.speed.base = 27;
     edge.speed.name_consistency = 1;
     edge.geometry.turn_types = 4;
@@ -56,6 +63,13 @@ pub fn tile(reverse: bool) [512]u8 {
     var data: [512]u8 = @splat(0);
     @memcpy(data[node_offset..][0..@sizeOf(source.Node)], std.mem.asBytes(&node));
     @memcpy(data[edge_offset..][0..@sizeOf(source.Edge)], std.mem.asBytes(&edge));
+    if (!reverse) {
+        const records = [_]source.Sign{
+            .{ .data = .{ .index = 0, .kind = 0, .route_number = true, .tagged = false }, .text_offset = name.len + 10 },
+            .{ .data = .{ .index = 0, .kind = 6, .route_number = false, .tagged = false }, .text_offset = name.len + 11 + exit_name.len },
+        };
+        @memcpy(data[sign_offset..][0..@sizeOf(@TypeOf(records))], std.mem.asBytes(&records));
+    }
     var temp: [10]u8 = undefined;
     const zero: routing.geo.FixedLL = .{ .lng = 0, .lat = 0 };
     const a: routing.geo.FixedLL = .{ .lng = @divTrunc(left.lng, 10), .lat = @divTrunc(left.lat, 10) };
@@ -83,6 +97,10 @@ pub fn tile(reverse: bool) [512]u8 {
     // Route name, layer 2, and one indoor range from 1.0 to 2.5.
     @memcpy(text[0..name.len], if (reverse) reverse_name else name);
     @memcpy(text[name.len + 1 ..][0..9], "\x01\x02\x00\x08\x06\x02\x14\x32\x00");
+    if (!reverse) {
+        @memcpy(text[name.len + 10 ..][0..exit_name.len], exit_name);
+        @memcpy(text[name.len + 11 + exit_name.len ..][0..junction.len], junction);
+    }
     return data;
 }
 

@@ -3,7 +3,9 @@ const trip = @import("../api/trip.zig");
 const directions = @import("../api/directions.zig");
 const turn = @import("../graph/turn.zig");
 const enhanced = @import("enhanced.zig");
+const junctions = @import("junctions.zig");
 const maneuver = @import("maneuver.zig");
+const signs = @import("signs.zig");
 
 // Ported from ManeuversBuilder::DetermineCardinalDirection.
 pub fn cardinalDirection(heading: u32) directions.CardinalDirection {
@@ -58,11 +60,7 @@ fn directionAt(value: *const maneuver.Maneuver, node: enhanced.Node, previous: e
     return direction;
 }
 
-pub const TurnContext = struct {
-    node: enhanced.Node,
-    previous: enhanced.Edge,
-    current: enhanced.Edge,
-};
+pub const TurnContext = junctions.Context;
 
 // Ported from ManeuversBuilder::SetSimpleDirectionalManeuverType.
 pub fn simpleDirectionalType(value: *const maneuver.Maneuver, context: ?TurnContext) !directions.ManeuverType {
@@ -73,7 +71,7 @@ pub fn simpleDirectionalType(value: *const maneuver.Maneuver, context: ?TurnCont
         .slight_right => .kSlightRight,
         .right => .kRight,
         .sharp_right => .kSharpRight,
-        .reverse => return error.UnsupportedManeuver,
+        .reverse => junctions.reverseType(value, if (context) |at| !at.current.value.drive_on_left else value.drive_on_right),
         .sharp_left => .kSharpLeft,
         .left => .kLeft,
         .slight_left => .kSlightLeft,
@@ -86,13 +84,21 @@ pub fn simpleDirectionalType(value: *const maneuver.Maneuver, context: ?TurnCont
     switch (kind) {
         .straight => {
             const direction = value.begin_relative_direction;
+            if (at.current.value.internal_intersection and !at.current.isTurnChannelUse()) {
+                return switch (direction) {
+                    .left, .keep_left => .kSlightLeft,
+                    .right, .keep_right => .kSlightRight,
+                    else => base,
+                };
+            }
             if (direction != .keep_right and direction != .keep_left) return base;
             const slight: directions.ManeuverType = if (direction == .keep_right) .kSlightRight else .kSlightLeft;
             if (at.current.isTurnChannelUse()) return slight;
             if (at.current.isHighway() and value.length_km < short_continue_threshold) return base;
             if (!try at.node.hasSimilarStraightSignificantRoadClassEdge(degree, heading, incoming_mode, incoming_class)) return base;
             if (!at.current.isHighway() and !try at.node.hasForwardTraversableUseEdge(heading, incoming_mode, .kRampUse)) return slight;
-            if (try at.node.hasSimilarStraightNonRampOrSameNameRampEdge(degree, heading, incoming_mode)) return error.UnsupportedManeuver;
+            if (try at.node.hasSimilarStraightNonRampOrSameNameRampEdge(degree, heading, incoming_mode))
+                return junctions.forkType(direction);
         },
         .slight_right, .slight_left => {
             if (value.begin_relative_direction != .keep_straight or
@@ -117,6 +123,8 @@ pub fn simpleDirectionalType(value: *const maneuver.Maneuver, context: ?TurnCont
 }
 
 const short_continue_threshold: f32 = 0.6;
+const max_internal_length_km: f32 = 0.032;
+const small_end_ramp_fork_threshold: f32 = 0.125;
 
 const std = @import("std");
 const io = @import("../infra/io.zig");
@@ -124,14 +132,29 @@ const Maneuver = maneuver.Maneuver;
 
 // Ported from ManeuversBuilder::Build and ConfirmManeuverTypeAssignment.
 pub fn build(arena: std.mem.Allocator, path: *const trip.TripLeg, deadline: io.Deadline) ![]const Maneuver {
+    return buildWithOptions(arena, path, .{}, deadline);
+}
+
+pub const Options = struct {
+    roundabout_exits: bool = true,
+};
+
+pub fn buildWithOptions(arena: std.mem.Allocator, path: *const trip.TripLeg, options: Options, deadline: io.Deadline) ![]const Maneuver {
     const leg: enhanced.Leg = .{ .value = path, .deadline = deadline };
     const builder: Builder = .{ .leg = leg, .arena = arena };
-    const result = try builder.combine(try builder.produce());
+    var result = try builder.combine(try builder.produce());
+    try signs.countAndSort(arena, result, deadline);
     for (result) |*value| {
         try builder.check();
         try builder.setManeuverType(value, false);
     }
-    return result;
+    try builder.setTraversableOutboundIntersectingEdgeFlags(result);
+    result = try builder.processRoundabouts(result, options.roundabout_exits);
+    try builder.setToStayOnAttribute(result);
+    try builder.enhanceSignlessInterchanges(result);
+    try builder.updateManeuverPlacementForInternalIntersectionTurns(result);
+    result = try builder.collapseSmallEndRampFork(result);
+    return builder.collapseMergeManeuvers(result);
 }
 
 const Builder = struct {
@@ -218,12 +241,17 @@ const Builder = struct {
     // Ported from ManeuversBuilder::InitializeManeuver.
     fn initializeManeuver(self: Builder, index: usize) !Maneuver {
         const previous = self.leg.prevEdge(index, 1) orelse return error.InvalidTripLeg;
+        const roundabout = inRoundabout(previous);
         var value: Maneuver = .{
             .end_heading = previous.value.end_heading,
             .end_node_index = @intCast(index),
             .end_shape_index = previous.value.end_shape_index,
             .drive_on_right = !previous.value.drive_on_left,
             .turn_channel = previous.isTurnChannelUse(),
+            .ramp = previous.isRampUse(),
+            .roundabout = roundabout,
+            .roundabout_exit_count = @intFromBool(roundabout),
+            .internal_intersection = previous.value.internal_intersection and index != 1 and !self.leg.isLastNodeIndex(index),
             .trail_type = trailType(previous),
         };
         copyTravel(&value, previous);
@@ -238,21 +266,30 @@ const Builder = struct {
     // Ported from ManeuversBuilder::UpdateManeuver and GetSpeed.
     fn updateManeuver(self: Builder, value: *Maneuver, previous: enhanced.Edge, index: usize) !void {
         const edge = previous.value;
-        if (value.street_names.len == 0) {
+        const entry_direction = if (self.leg.prevEdge(index, 2)) |earlier|
+            relativeDirection(turn.degree(earlier.value.end_heading, edge.begin_heading))
+        else
+            .keep_straight;
+        const usable_internal_name = value.internal_intersection and
+            ((!edge.drive_on_left and entry_direction == .left) or (edge.drive_on_left and entry_direction == .right));
+        if ((value.street_names.len == 0 and !value.internal_intersection) or usable_internal_name) {
             value.street_names = previous.nameList();
             value.name_style = self.nameStyle(index);
         }
+        value.internal_right_turn_count += @intFromBool(entry_direction == .right);
+        value.internal_left_turn_count += @intFromBool(entry_direction == .left);
         value.length_km += edge.length_km;
-        const speed: f32 = switch (value.travel_mode) {
-            .kPedestrian => 5.1,
-            .kBicycle => 20,
-            else => edge.default_speed,
-        };
-        if (speed > 0) value.basic_time += @trunc(edge.length_km / (speed * (1.0 / 3600.0)) + 0.5);
+        value.basic_time += basicTime(edge, value.travel_mode);
         value.portions_toll = value.portions_toll or edge.toll;
         value.portions_unpaved = value.portions_unpaved or edge.unpaved;
         value.portions_highway = value.portions_highway or previous.isHighway();
         value.has_time_restrictions = value.has_time_restrictions or edge.has_time_restrictions;
+        if (inRoundabout(previous)) {
+            const node = self.leg.node(index) orelse return error.InvalidTripLeg;
+            const mode = if (edge.travel_mode == .kBicycle and previous.isRoadUse()) .kDrive else edge.travel_mode;
+            const exits = try node.countIntersectingEdges(edge.end_heading, mode);
+            value.roundabout_exit_count += if (edge.drive_on_left) exits.left.traversable_outbound else exits.right.traversable_outbound;
+        }
         if (edge.sign) |sign| {
             inline for (.{ "exit_numbers", "exit_onto_streets", "exit_toward_locations", "exit_names" }) |key|
                 @field(value.signs, key) = try self.addSigns(@field(value.signs, key), @field(sign, key));
@@ -275,7 +312,7 @@ const Builder = struct {
             value.pedestrian_crossing = current.isPedestrianCrossingUse() and previous.isFootwayUse();
         }
         value.begin_intersecting_edge_name_consistency = try node.hasIntersectingEdgeNameConsistency();
-        if (!current.isHighway() and current.nameList().len > 1) {
+        if (!current.isHighway() and !current.value.internal_intersection and current.nameList().len > 1) {
             const common = try self.commonBaseNames(current.nameList(), self.nameStyle(index), value.street_names, value.name_style);
             if (common.len < current.nameList().len) value.begin_street_names = current.nameList();
         }
@@ -289,8 +326,43 @@ const Builder = struct {
 
     // Ported from ManeuversBuilder::SetManeuverType.
     fn setManeuverType(self: Builder, value: *Maneuver, none_type_allowed: bool) !void {
-        if (value.type != .kNone or (none_type_allowed and value.turn_channel)) return;
-        value.type = try simpleDirectionalType(value, try self.context(value.begin_node_index));
+        if (value.type != .kNone) return;
+        const at = try self.context(value.begin_node_index);
+        if (value.roundabout) {
+            value.type = .kRoundaboutEnter;
+        } else if (inRoundabout(at.previous)) {
+            value.type = .kRoundaboutExit;
+        } else if (value.fork) {
+            value.type = junctions.forkType(value.begin_relative_direction);
+        } else if (none_type_allowed and (value.internal_intersection or value.turn_channel)) {
+            return;
+        } else if (value.ramp) {
+            const direction = value.begin_relative_direction;
+            const exit = at.previous.isHighway() or value.signs.exit_numbers.len != 0 or
+                (!at.previous.isRampUse() and (direction == .keep_left or direction == .keep_right) and !try self.rampLeadsToHighway(value));
+            value.type = if (exit) junctions.exitType(value) else junctions.rampType(value);
+        } else if (try junctions.mergeDirection(at, value.turn_degree)) |direction| {
+            value.merge_to_relative_direction = direction;
+            value.type = switch (direction) {
+                .keep_left => .kMergeLeft,
+                .keep_right => .kMergeRight,
+                else => .kMerge,
+            };
+        } else {
+            value.type = try simpleDirectionalType(value, at);
+        }
+    }
+
+    // Ported from ManeuversBuilder::RampLeadsToHighway.
+    fn rampLeadsToHighway(self: Builder, value: *const Maneuver) !bool {
+        const last = self.leg.lastNodeIndex() orelse return error.InvalidTripLeg;
+        for (value.end_node_index..last) |index| {
+            try self.check();
+            const edge = self.leg.currEdge(index) orelse return error.InvalidTripLeg;
+            if (edge.isRampUse() or edge.isTurnChannelUse() or edge.value.internal_intersection) continue;
+            return edge.isHighway();
+        }
+        return false;
     }
 
     fn nameStyle(self: Builder, index: usize) maneuver.NameStyle {
@@ -341,11 +413,28 @@ const Builder = struct {
             value.isUnnamedWalkway() != at.previous.isUnnamedWalkway() or
             value.isUnnamedCycleway() != at.previous.isUnnamedCycleway() or
             value.isUnnamedMountainBikeTrail() != at.previous.isUnnamedMountainBikeTrail()) return false;
+        if (inRoundabout(at.previous) != value.roundabout) return false;
+        if (value.roundabout) return true;
+        if (try junctions.isFork(self.leg, index, at) or try junctions.isPedestrianFork(at)) {
+            value.fork = true;
+            return false;
+        }
+        if (previous.internal_intersection != value.internal_intersection) return false;
+        if (previous.internal_intersection and index != 1) return true;
         if (at.previous.isTurnChannelUse() != value.turn_channel) return false;
         if (value.turn_channel) return true;
         if (value.hasExitSign()) return false;
+        if (at.previous.isRampUse() != value.ramp) return false;
         const degree = turn.degree(previous.end_heading, current.begin_heading);
-        if (turn.classify(degree) == .reverse) return error.UnsupportedManeuver;
+        if (value.ramp) return at.current.isForward(degree);
+        if (degree == 180) {
+            value.type = if (previous.drive_on_left) .kUturnRight else .kUturnLeft;
+            return false;
+        }
+        if (try junctions.pencilPointUturn(at, self.nameStyle(index))) |kind| {
+            value.type = kind;
+            return false;
+        }
         if (try isIntersectingForwardEdge(at)) {
             value.intersecting_forward_edge = true;
             return false;
@@ -399,7 +488,22 @@ const Builder = struct {
 
     fn combinePair(self: Builder, previous: *const Maneuver, current: *Maneuver, next: *const Maneuver, following: ?directions.ManeuverType, start: bool) !bool {
         if (current.drive_on_right != next.drive_on_right or current.travel_mode != next.travel_mode or
-            next.isDestinationType() or next.tee or next.fork) return false;
+            next.type == .kDestination) return false;
+        const possible_internal = possibleUnspecifiedInternalManeuver(previous, current, next);
+        const direction = relativeDirection(current.turn_degree);
+        if (possible_internal and (direction == .left or direction == .right) and
+            direction == relativeDirection(next.turn_degree) and
+            relativeDirection(turn.degree(previous.end_heading, next.begin_heading)) == .reverse and
+            try previous.hasSimilarNames(next, true, self.leg.deadline))
+        {
+            combineUnspecifiedInternalManeuver(previous, current, next, if (direction == .left) .kUturnLeft else .kUturnRight);
+            return true;
+        }
+        if (next.tee or next.fork) return false;
+        if (current.internal_intersection and !next.isDestinationType()) {
+            try self.combineInternalManeuver(previous, current, next, start);
+            return true;
+        }
         if (try self.turnChannelCombinable(previous, current, next, start)) {
             try self.combineTurnChannel(previous, current, next, start);
             return true;
@@ -408,8 +512,10 @@ const Builder = struct {
         if (current.pedestrian_type == .kBlind and next.pedestrian_type == .kBlind and
             (current.node_type != null or next.node_type != null or current.bridge or next.bridge or current.tunnel or next.tunnel)) return false;
 
-        const next_edge = self.leg.currEdge(next.begin_node_index) orelse return error.InvalidTripLeg;
-        if (next.begin_relative_direction == .keep_straight and !next_edge.isTurnChannelUse()) {
+        const next_edge = self.leg.currEdge(next.begin_node_index);
+        if (next.begin_relative_direction == .keep_straight and next_edge != null and !next_edge.?.isTurnChannelUse() and
+            !next.internal_intersection and !current.ramp and !next.ramp and !current.roundabout and !next.roundabout)
+        {
             const common = try self.commonBaseNames(current.street_names, current.name_style, next.street_names, next.name_style);
             if (common.len != 0) {
                 if (current.begin_street_names.len == 0 and !current.portions_highway and current.street_names.len > common.len)
@@ -423,6 +529,10 @@ const Builder = struct {
                 return true;
             }
         }
+        if (try self.areRampManeuversCombinable(current, next)) {
+            combineManeuvers(current, next);
+            return true;
+        }
         if (try self.isNextManeuverObvious(current, next, following)) {
             if (current.street_names.len == 0) {
                 current.street_names = next.street_names;
@@ -433,12 +543,35 @@ const Builder = struct {
             combineManeuvers(current, next);
             return true;
         }
+        if (possible_internal and (direction == .left or direction == .right) and next.type == .kRampStraight) {
+            combineUnspecifiedInternalManeuver(previous, current, next, .kNone);
+            return true;
+        }
         return false;
+    }
+
+    // Ported from ManeuversBuilder::CombineInternalManeuver.
+    fn combineInternalManeuver(self: Builder, previous: *const Maneuver, current: *Maneuver, next: *const Maneuver, start: bool) !void {
+        var combined = next.*;
+        combined.turn_degree = turn.degree(if (start) current.end_heading else previous.end_heading, next.begin_heading);
+        if (current.hasUsableInternalIntersectionName()) combined.cross_street_names = current.street_names;
+        combined.internal_right_turn_count = current.internal_right_turn_count;
+        combined.internal_left_turn_count = current.internal_left_turn_count;
+        combined.begin_relative_direction = relativeDirection(combined.turn_degree);
+        if (combined.begin_relative_direction == .keep_straight and
+            combined.internal_left_turn_count > 0 and combined.internal_right_turn_count > 0)
+        {
+            combined.begin_relative_direction = relativeDirection(turn.degree(previous.end_heading, current.end_heading));
+        }
+        prependManeuver(&combined, current);
+        combined.type = if (start) .kStart else .kNone;
+        try self.setManeuverType(&combined, true);
+        current.* = combined;
     }
 
     // Ported from ManeuversBuilder::IsTurnChannelManeuverCombinable.
     fn turnChannelCombinable(self: Builder, previous: *const Maneuver, current: *const Maneuver, next: *const Maneuver, start: bool) !bool {
-        if (!current.turn_channel or current.length_km > 0.2) return false;
+        if (!current.turn_channel or next.isDestinationType() or current.length_km > 0.2) return false;
         const at = try self.context(current.end_node_index);
         const degree = turn.degree(at.previous.value.end_heading, at.current.value.begin_heading);
         if (try at.node.hasForwardTraversableIntersectingEdge(current.end_heading, current.travel_mode)) return false;
@@ -463,26 +596,231 @@ const Builder = struct {
         var combined = next.*;
         combined.turn_degree = turn.degree(if (start) current.end_heading else previous.end_heading, next.begin_heading);
         combined.begin_relative_direction = current.begin_relative_direction;
-        combined.length_km += current.length_km;
-        combined.time += current.time;
-        combined.basic_time += current.basic_time;
-        combined.begin_node_index = current.begin_node_index;
-        combined.begin_shape_index = current.begin_shape_index;
+        prependManeuver(&combined, current);
         if (current.hasSigns() and !next.hasSigns()) combined.signs = current.signs;
         combined.type = if (start) .kStart else .kNone;
         try self.setManeuverType(&combined, true);
         current.* = combined;
     }
 
-    // Ported from ManeuversBuilder::IsNextManeuverObvious for continue maneuvers.
+    // Ported from ManeuversBuilder::AreRampManeuversCombinable.
+    fn areRampManeuversCombinable(self: Builder, current: *const Maneuver, next: *const Maneuver) !bool {
+        if (!current.ramp or !next.ramp or next.fork or current.internal_intersection or next.internal_intersection) return false;
+        const node = self.leg.node(next.begin_node_index) orelse return error.InvalidTripLeg;
+        return !try node.hasTraversableOutboundIntersectingEdge(next.travel_mode) or
+            try node.isStraightestTraversableIntersectingEdgeReversed(current.end_heading, next.travel_mode) or next.type == .kRampStraight;
+    }
+
+    // Ported from ManeuversBuilder::IsNextManeuverObvious.
     fn isNextManeuverObvious(self: Builder, current: *const Maneuver, next: *const Maneuver, following: ?directions.ManeuverType) !bool {
         if (next.type != .kContinue) return false;
         const node = self.leg.node(next.begin_node_index) orelse return error.InvalidTripLeg;
         if (!try node.hasTraversableIntersectingEdge(next.travel_mode)) return true;
         if (next.signs.exit_numbers.len != 0) return false;
+        if (current.ramp and current.fork and !current.contains_obvious_maneuver) {
+            if (current.type == .kStayStraight) return true;
+            const counts = try node.countIntersectingEdges(current.end_heading, current.travel_mode);
+            return (current.type == .kStayLeft and counts.left.all == 0) or
+                (current.type == .kStayRight and counts.right.all == 0);
+        }
         if (next.length_km < short_continue_threshold and following != null and following != .kContinue) return true;
         return !node.isMotorwayJunction() and
             !try node.hasNonBackwardTraversableSameNameRampIntersectingEdge(current.end_heading, next.travel_mode);
+    }
+
+    // Ported from ManeuversBuilder::SetTraversableOutboundIntersectingEdgeFlags.
+    fn setTraversableOutboundIntersectingEdgeFlags(self: Builder, values: []Maneuver) !void {
+        for (values) |*value| {
+            try self.check();
+            var first = true;
+            for (value.begin_node_index..value.end_node_index) |index| {
+                try self.check();
+                if (first) {
+                    const edge = self.leg.currEdge(index) orelse return error.InvalidTripLeg;
+                    first = edge.value.internal_intersection or edge.isTurnChannelUse();
+                    continue;
+                }
+                const at = try self.context(index);
+                const counts = try at.node.countIntersectingEdges(at.previous.value.end_heading, at.previous.value.travel_mode);
+                value.has_right_traversable_outbound_intersecting_edge = value.has_right_traversable_outbound_intersecting_edge or counts.right.traversable_outbound != 0;
+                value.has_left_traversable_outbound_intersecting_edge = value.has_left_traversable_outbound_intersecting_edge or counts.left.traversable_outbound != 0;
+                if (value.has_right_traversable_outbound_intersecting_edge and value.has_left_traversable_outbound_intersecting_edge) break;
+            }
+        }
+    }
+
+    // Ported from ManeuversBuilder::ProcessRoundabouts.
+    fn processRoundabouts(self: Builder, values: []Maneuver, keep_exits: bool) ![]Maneuver {
+        var read: usize = 1;
+        var write: usize = 1;
+        while (read + 1 < values.len) : ({
+            read += 1;
+            write += 1;
+        }) {
+            try self.check();
+            values[write] = values[read];
+            const current = &values[write];
+            if (!current.roundabout) continue;
+            const next = &values[read + 1];
+            const previous = &values[write - 1];
+            var names: std.ArrayList(trip.StreetName) = .empty;
+            for (current.street_names) |name| {
+                try self.check();
+                if (!name.is_route_number) try names.append(self.arena, name);
+            }
+            const common_previous = try self.commonBaseNames(names.items, current.name_style, previous.street_names, previous.name_style);
+            const common_next = try self.commonBaseNames(names.items, current.name_style, next.street_names, next.name_style);
+            current.street_names = if (common_previous.len == 0 and common_next.len == 0) names.items else &.{};
+            current.begin_street_names = &.{};
+            if (next.type != .kRoundaboutExit) continue;
+            if (next.begin_street_names.len != 0 and next.contains_obvious_maneuver) {
+                current.roundabout_exit_street_names = next.begin_street_names;
+            } else {
+                current.roundabout_exit_street_names = next.street_names;
+                current.roundabout_exit_begin_street_names = next.begin_street_names;
+            }
+            current.roundabout_exit_signs = next.signs;
+            if (keep_exits) continue;
+            current.has_combined_enter_exit_roundabout = true;
+            current.roundabout_length_km = current.length_km;
+            current.roundabout_exit_length_km = next.length_km;
+            current.roundabout_exit_begin_heading = next.begin_heading;
+            current.roundabout_exit_turn_degree = next.turn_degree;
+            current.roundabout_exit_shape_index = current.end_shape_index;
+            current.has_left_traversable_outbound_intersecting_edge = next.has_left_traversable_outbound_intersecting_edge;
+            current.has_right_traversable_outbound_intersecting_edge = next.has_right_traversable_outbound_intersecting_edge;
+            combineManeuvers(current, next);
+            read += 1;
+        }
+        values[write] = values[read];
+        return values[0 .. write + 1];
+    }
+
+    // Ported from ManeuversBuilder::SetToStayOnAttribute.
+    fn setToStayOnAttribute(self: Builder, values: []Maneuver) !void {
+        for (1..values.len - 1) |index| {
+            try self.check();
+            const previous = &values[index - 1];
+            const current = &values[index];
+            const next = &values[index + 1];
+            const deadline = self.leg.deadline;
+            current.to_stay_on = switch (current.type) {
+                .kSlightRight, .kRight, .kSharpRight, .kSlightLeft, .kLeft, .kSharpLeft => current.begin_street_names.len == 0 and try current.hasSimilarNames(previous, true, deadline),
+                .kStayStraight, .kStayRight, .kStayLeft => try current.hasSimilarNames(previous, true, deadline) and
+                    (!current.ramp or try current.hasSimilarNames(next, true, deadline)),
+                .kUturnRight, .kUturnLeft => try current.hasSameNames(previous, true, deadline),
+                else => false,
+            };
+        }
+    }
+
+    // Ported from ManeuversBuilder::EnhanceSignlessInterchnages.
+    fn enhanceSignlessInterchanges(self: Builder, values: []Maneuver) !void {
+        for (0..values.len - 1) |index| {
+            try self.check();
+            const previous = &values[index -| 1];
+            const current = &values[index];
+            const next = &values[index + 1];
+            if ((current.ramp or (current.fork and current.street_names.len == 0)) and !current.hasExitSign() and
+                !(previous.ramp or previous.fork) and next.isMergeType() and next.street_names.len != 0)
+            {
+                const name = next.street_names[0];
+                const sign = try self.arena.alloc(trip.SignElement, 1);
+                sign[0] = .{ .text = name.value, .is_route_number = name.is_route_number, .pronunciation = name.pronunciation };
+                current.signs.exit_onto_streets = sign;
+            }
+        }
+    }
+
+    // Ported from ManeuversBuilder::UpdateManeuverPlacementForInternalIntersectionTurns.
+    fn updateManeuverPlacementForInternalIntersectionTurns(self: Builder, values: []Maneuver) !void {
+        for (1..values.len - 1) |index| {
+            try self.check();
+            const previous = &values[index - 1];
+            const current = &values[index];
+            switch (current.type) {
+                .kSlightRight, .kRight, .kSharpRight, .kUturnRight, .kUturnLeft, .kSharpLeft, .kLeft, .kSlightLeft, .kRampRight, .kRampLeft, .kStayRight, .kStayLeft => {},
+                else => continue,
+            }
+            if (previous.travel_mode != current.travel_mode) continue;
+            while (current.begin_node_index + 1 < current.end_node_index) {
+                try self.check();
+                const at = try self.context(current.begin_node_index);
+                if (!at.current.value.internal_intersection or relativeDirection(at.degree()) != .keep_straight) break;
+                try self.moveInternalEdgeToPreviousManeuver(previous, current, at.current.value);
+            }
+        }
+    }
+
+    // Ported from ManeuversBuilder::MoveInternalEdgeToPreviousManeuver.
+    fn moveInternalEdgeToPreviousManeuver(self: Builder, previous: *Maneuver, current: *Maneuver, edge: *const trip.Edge) !void {
+        const next_begin = current.begin_node_index + 1;
+        const boundary = self.leg.node(next_begin) orelse return error.InvalidTripLeg;
+        const start = self.leg.node(previous.begin_node_index) orelse return error.InvalidTripLeg;
+        const end = self.leg.node(current.end_node_index) orelse return error.InvalidTripLeg;
+        const time = basicTime(edge, current.travel_mode);
+        previous.length_km += edge.length_km;
+        previous.basic_time += time;
+        previous.end_node_index = next_begin;
+        previous.end_shape_index = edge.end_shape_index;
+        previous.time = boundary.elapsedTime() - start.elapsedTime();
+        current.length_km -= edge.length_km;
+        current.basic_time -= time;
+        current.begin_node_index = next_begin;
+        current.begin_shape_index = edge.end_shape_index;
+        current.time = end.elapsedTime() - boundary.elapsedTime();
+    }
+
+    // Ported from ManeuversBuilder::CollapseSmallEndRampFork.
+    fn collapseSmallEndRampFork(self: Builder, values: []Maneuver) ![]Maneuver {
+        var write: usize = 1;
+        for (1..values.len - 1) |read| {
+            try self.check();
+            const previous = &values[write - 1];
+            const current = &values[read];
+            const next = &values[read + 1];
+            if (!previous.has_collapsed_small_end_ramp_fork and previous.ramp and current.ramp and !next.ramp and
+                current.length_km <= small_end_ramp_fork_threshold and forkThenTurnSameDirection(current.type, next.type))
+            {
+                combineManeuvers(previous, current);
+                previous.has_collapsed_small_end_ramp_fork = true;
+            } else {
+                values[write] = current.*;
+                write += 1;
+            }
+        }
+        values[write] = values[values.len - 1];
+        return values[0 .. write + 1];
+    }
+
+    // Ported from ManeuversBuilder::CollapseMergeManeuvers.
+    fn collapseMergeManeuvers(self: Builder, values: []Maneuver) ![]Maneuver {
+        var read: usize = 0;
+        var write: usize = 0;
+        while (read < values.len) : ({
+            read += 1;
+            write += 1;
+        }) {
+            try self.check();
+            values[write] = values[read];
+            const current = &values[write];
+            if (read + 1 == values.len or !current.ramp or current.has_collapsed_merge_maneuver) continue;
+            const next = &values[read + 1];
+            if (!next.isMergeType()) continue;
+            if (current.to_stay_on and !try next.hasSameNames(current, true, self.leg.deadline)) current.to_stay_on = false;
+            if (next.street_names.len != 0) {
+                current.street_names = next.street_names;
+                current.name_style = next.name_style;
+            }
+            if (!current.hasSigns()) {
+                current.signs.guide_onto_streets = next.signs.guide_onto_streets;
+                current.signs.guide_toward_locations = next.signs.guide_toward_locations;
+            }
+            combineManeuvers(current, next);
+            current.has_collapsed_merge_maneuver = true;
+            read += 1;
+        }
+        return values[0..write];
     }
 
     // Ported from StreetNames::FindCommonBaseNames and StreetNamesUs::FindCommonBaseNames.
@@ -519,12 +857,59 @@ const Builder = struct {
     }
 };
 
+// Ported from ManeuversBuilder::PossibleUnspecifiedInternalManeuver.
+fn possibleUnspecifiedInternalManeuver(previous: *const Maneuver, current: *const Maneuver, next: *const Maneuver) bool {
+    return !current.internal_intersection and current.travel_mode == .kDrive and
+        !previous.roundabout and !current.roundabout and !next.roundabout and
+        current.length_km <= max_internal_length_km and !current.isStartType() and !next.isDestinationType();
+}
+
+// Ported from ManeuversBuilder::CombineUnspecifiedInternalManeuver.
+fn combineUnspecifiedInternalManeuver(previous: *const Maneuver, current: *Maneuver, next: *const Maneuver, kind: directions.ManeuverType) void {
+    var combined = next.*;
+    combined.turn_degree = turn.degree(previous.end_heading, next.begin_heading);
+    combined.begin_relative_direction = relativeDirection(combined.turn_degree);
+    if (current.street_names.len != 0) combined.cross_street_names = current.street_names;
+    prependManeuver(&combined, current);
+    combined.type = kind;
+    current.* = combined;
+}
+
+fn prependManeuver(current: *Maneuver, previous: *const Maneuver) void {
+    current.length_km += previous.length_km;
+    current.time += previous.time;
+    current.basic_time += previous.basic_time;
+    current.begin_node_index = previous.begin_node_index;
+    current.begin_shape_index = previous.begin_shape_index;
+}
+
+fn basicTime(edge: *const trip.Edge, mode: trip.TravelMode) f32 {
+    const speed: f32 = switch (mode) {
+        .kPedestrian => 5.1,
+        .kBicycle => 20,
+        else => edge.default_speed,
+    };
+    return if (speed > 0) @trunc(edge.length_km / (speed * (1.0 / 3600.0)) + 0.5) else 0;
+}
+
+fn forkThenTurnSameDirection(fork: directions.ManeuverType, following: directions.ManeuverType) bool {
+    return switch (fork) {
+        .kStayRight => following == .kSlightRight or following == .kRight or following == .kSharpRight,
+        .kStayLeft => following == .kSlightLeft or following == .kLeft or following == .kSharpLeft,
+        else => false,
+    };
+}
+
 fn requireSupportedEdge(edge: enhanced.Edge) !void {
     const raw = edge.value;
     if (!(raw.length_km >= 0 and std.math.isFinite(raw.length_km))) return error.InvalidTripLeg;
-    if (raw.travel_mode == .kTransit or edge.isTransitConnection() or edge.isRampUse() or raw.roundabout or
-        raw.internal_intersection or raw.indoor or edge.traversesLevels() or edge.isStepsUse() or
+    if (raw.travel_mode == .kTransit or edge.isTransitConnection() or raw.indoor or edge.traversesLevels() or edge.isStepsUse() or
         edge.isEscalatorUse() or edge.isElevatorUse() or edge.isFerryUse() or edge.isRailFerryUse()) return error.UnsupportedManeuver;
+}
+
+// Ported from ManeuversBuilder::AreRoundaboutsProcessable.
+fn inRoundabout(edge: enhanced.Edge) bool {
+    return edge.value.roundabout and (edge.value.travel_mode == .kDrive or edge.value.travel_mode == .kBicycle);
 }
 
 fn copyTravel(value: *Maneuver, edge: enhanced.Edge) void {
@@ -550,6 +935,8 @@ fn combineManeuvers(current: *Maneuver, next: *const Maneuver) void {
     current.end_heading = next.end_heading;
     current.end_node_index = next.end_node_index;
     current.end_shape_index = next.end_shape_index;
+    current.ramp = current.ramp or next.ramp;
+    current.roundabout = current.roundabout or next.roundabout;
     current.portions_toll = current.portions_toll or next.portions_toll;
     current.portions_unpaved = current.portions_unpaved or next.portions_unpaved;
     current.portions_highway = current.portions_highway or next.portions_highway;
@@ -588,6 +975,60 @@ fn hasPostCardinal(name: []const u8, style: maneuver.NameStyle) bool {
         if (std.mem.endsWith(u8, name, suffix)) return true;
     }
     return false;
+}
+
+test "upstream internal junction maneuvers combine into the expected turns" {
+    const testing = std.testing;
+    for (@import("junction_fixtures.zig").combine_cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        errdefer std.debug.print("failed upstream fixture {s}\n", .{case.name});
+        const a = arena.allocator();
+        const nodes = try a.alloc(trip.Node, case.edges.len + 1);
+        for (case.edges, nodes[0..case.edges.len]) |edge, *node| node.* = .{ .edge = edge };
+        nodes[nodes.len - 1] = .{};
+        const path: trip.TripLeg = .{ .node = nodes };
+        const builder: Builder = .{ .leg = .{ .value = &path }, .arena = a };
+        const combined = try builder.combine(try a.dupe(Maneuver, case.maneuvers));
+        try testing.expectEqual(case.expected.len, combined.len);
+        for (case.expected, combined) |expected, actual| {
+            try testing.expectEqual(expected.kind, actual.type);
+            try testing.expectApproxEqAbs(expected.length_km, actual.length_km, 0.00001);
+            try testing.expectEqual(expected.time, actual.time);
+        }
+    }
+}
+
+test "upstream roundabout fixtures keep or collapse the exit" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const path: trip.TripLeg = .{};
+    const builder: Builder = .{ .leg = .{ .value = &path }, .arena = arena.allocator() };
+    const values = [_]Maneuver{
+        .{ .type = .kStart, .street_names = &.{.{ .value = "first st" }}, .length_km = 1, .time = 1, .end_heading = 100, .end_shape_index = 5 },
+        .{ .type = .kRoundaboutEnter, .roundabout = true, .length_km = 1, .time = 1, .turn_degree = 32, .begin_heading = 150, .end_heading = 250, .begin_shape_index = 5, .end_shape_index = 10 },
+        .{ .type = .kRoundaboutExit, .roundabout = true, .length_km = 2, .time = 1, .turn_degree = 90, .begin_heading = 280, .end_heading = 310, .begin_shape_index = 10, .end_shape_index = 15 },
+        .{ .type = .kDestination, .time = 1, .begin_shape_index = 15, .end_shape_index = 15 },
+    };
+    var separate = values;
+    const preserved = try builder.processRoundabouts(&separate, true);
+    try testing.expectEqualSlices(Maneuver, &values, preserved);
+    var together = values;
+    const combined = try builder.processRoundabouts(&together, false);
+    try testing.expectEqual(@as(usize, 3), combined.len);
+    try testing.expectEqual(.kStart, combined[0].type);
+    try testing.expectEqual(.kRoundaboutEnter, combined[1].type);
+    try testing.expectEqual(.kDestination, combined[2].type);
+    const entry = combined[1];
+    try testing.expect(entry.has_combined_enter_exit_roundabout);
+    try testing.expectEqual(@as(f32, 3), entry.length_km);
+    try testing.expectEqual(@as(f64, 2), entry.time);
+    try testing.expectEqual(@as(f32, 1), entry.roundabout_length_km);
+    try testing.expectEqual(@as(f32, 2), entry.roundabout_exit_length_km);
+    try testing.expectEqual(@as(u32, 280), entry.roundabout_exit_begin_heading);
+    try testing.expectEqual(@as(u32, 90), entry.roundabout_exit_turn_degree);
+    try testing.expectEqual(@as(u32, 10), entry.roundabout_exit_shape_index);
 }
 
 test "upstream intersection headings adjust relative direction" {
