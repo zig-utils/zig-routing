@@ -15,12 +15,14 @@ const Allocator = std.mem.Allocator;
 
 pub const Action = request.Action;
 pub const Options = request.Options;
+const exclusions = @import("exclusions.zig");
 
 /// Service limits from `service_limits` in valhalla.json (defaults as in
 /// scripts/valhalla_build_config).
 pub const Limits = struct {
     skadi_max_shape: usize = 750_000,
     skadi_min_resample: f32 = 10.0,
+    exclusions: exclusions.Limits = .{},
 };
 
 pub const Reply = struct {
@@ -75,16 +77,29 @@ pub const Service = struct {
         var query: std.ArrayList(request.QueryParam) = .empty;
         for (req.query) |q| try query.append(a, .{ .key = q.key, .value = q.value });
         const native_height = self.handlers[@backingInt(Action.height)] == &@import("height_action.zig").handle;
-        const parsed = if (native_height)
-            try request.parseHttpForHeight(a, req.path, query.items, req.body)
-        else
-            try request.parseHttp(a, req.path, query.items, req.body);
+        const parsed = request.parseHttpWithin(a, req.path, query.items, req.body, native_height, ctx.deadline) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.DeadlineExceeded => {
+                res.status = 504;
+                return;
+            },
+        };
         var options = switch (parsed) {
             .failure => |f| return writeError(a, res, f, .json),
             .ok => |o| o,
         };
         if (std.mem.indexOfScalar(Action, self.actions, options.action) == null)
             return writeError(a, res, .{ .code = 106, .extra = try supportedList(a, self.actions) }, options.format);
+        if ((options.exclude_polygons.len != 0 or options.exclude_locations.len != 0) and usesGraphCosting(options.action)) {
+            const failure = exclusions.validate(a, self.limits.exclusions, options.exclude_polygons, options.exclude_locations.len, ctx.deadline) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.DeadlineExceeded => {
+                    res.status = 504;
+                    return;
+                },
+            };
+            if (failure) |f| return writeError(a, res, f, options.format);
+        }
         const f = self.handlers[@backingInt(options.action)] orelse
             return writeError(a, res, .{ .code = 107, .extra = @tagName(options.action) }, options.format);
         if (try f(self, ctx, &options, res)) |failure| {
@@ -94,6 +109,13 @@ pub const Service = struct {
         }
     }
 };
+
+fn usesGraphCosting(action: Action) bool {
+    return switch (action) {
+        .route, .locate, .sources_to_targets, .optimized_route, .isochrone, .trace_route, .trace_attributes, .expansion, .centroid => true,
+        else => false,
+    };
+}
 
 fn supportedList(a: Allocator, actions: []const Action) Allocator.Error![]const u8 {
     var s: std.ArrayList(u8) = .empty;

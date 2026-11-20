@@ -4,6 +4,7 @@ pub const location = @import("location.zig");
 pub const registry = @import("registry.zig");
 pub const reach = @import("reach.zig");
 pub const candidates = @import("search.zig");
+pub const exclusions = @import("exclusions.zig");
 
 const std = @import("std");
 

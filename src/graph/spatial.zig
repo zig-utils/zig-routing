@@ -158,6 +158,47 @@ pub const View = struct {
         try grid.visitSnapSegment(a, b, &sink, deadline);
         return sink.cells.toOwnedSlice(arena);
     }
+
+    /// Visit only populated cells that can touch a non-wrapping rectangle.
+    pub fn cellsInBox(self: View, west: geo.PointLL, east: geo.PointLL) BoxCells {
+        const first = grid.snapCell(west);
+        const last = grid.snapCell(east);
+        const first_column = (first % grid.snap_columns) -| 1;
+        const end_column = @min(last % grid.snap_columns + 2, grid.snap_columns);
+        const row = (first / grid.snap_columns) -| 1;
+        return .{
+            .view = self,
+            .first_column = first_column,
+            .end_column = end_column,
+            .row = row,
+            .last_row = @min(last / grid.snap_columns + 1, grid.snap_rows - 1),
+            .index = self.lowerBound(row * grid.snap_columns + first_column),
+        };
+    }
+};
+
+pub const BoxCells = struct {
+    view: View,
+    first_column: u32,
+    end_column: u32,
+    row: u32,
+    last_row: u32,
+    index: usize,
+
+    pub fn next(self: *BoxCells, deadline: io.Deadline) !?Cell {
+        while (self.index < self.view.directory.len and self.row <= self.last_row) {
+            if (deadline.expired()) return error.DeadlineExceeded;
+            const id = self.view.directory[self.index].id;
+            if (id < self.row * grid.snap_columns + self.end_column) {
+                const index = self.index;
+                self.index += 1;
+                return try self.view.at(index);
+            }
+            self.row = @max(self.row + 1, id / grid.snap_columns);
+            self.index = self.view.lowerBound(self.row * grid.snap_columns + self.first_column);
+        }
+        return null;
+    }
 };
 
 pub const Hit = struct {

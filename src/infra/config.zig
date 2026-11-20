@@ -27,6 +27,9 @@ pub const Config = struct {
     };
 
     pub const ServiceLimits = struct {
+        max_exclude_locations: usize = 50,
+        max_exclude_polygons_length: f32 = 10_000,
+        max_exclude_polygons_vertices: usize = 100,
         skadi: struct {
             max_shape: usize = (service.Limits{}).skadi_max_shape,
             min_resample: f32 = (service.Limits{}).skadi_min_resample,
@@ -81,6 +84,11 @@ pub const Config = struct {
             .limits = .{
                 .skadi_max_shape = self.service_limits.skadi.max_shape,
                 .skadi_min_resample = self.service_limits.skadi.min_resample,
+                .exclusions = .{
+                    .max_exclude_locations = self.service_limits.max_exclude_locations,
+                    .max_exclude_polygons_length = self.service_limits.max_exclude_polygons_length,
+                    .max_exclude_polygons_vertices = self.service_limits.max_exclude_polygons_vertices,
+                },
             },
             .actions = self.loki.actions,
         };
@@ -112,6 +120,8 @@ pub fn decode(arena: std.mem.Allocator, bytes: []const u8, path: []const u8, env
         return error.InvalidLokiActions;
     if (!std.math.isFinite(config.service_limits.skadi.min_resample) or config.service_limits.skadi.min_resample <= 0)
         return error.InvalidSkadiMinResample;
+    if (!std.math.isFinite(config.service_limits.max_exclude_polygons_length) or config.service_limits.max_exclude_polygons_length < 0)
+        return error.InvalidExcludePolygonsLength;
     // Equal keys have the same diagnostic text, so stability has no effect.
     std.sort.heap([]const u8, ignored.items, {}, struct {
         fn lessThan(_: void, a: []const u8, b: []const u8) bool {

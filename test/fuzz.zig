@@ -900,6 +900,7 @@ pub fn fuzzRequest(_: void, s: *Smith) !void {
     const body = if (via_query) "" else doc;
     const fast = try request.parseHttp(arena, path, query, body);
     if (fast == .ok) {
+        _ = try routing.api.exclusions.validate(arena, .{}, fast.ok.exclude_polygons, fast.ok.exclude_locations.len, .none);
         if (fast.ok.costing_options) |options| {
             const base = routing.costing.base;
             var warnings: std.ArrayList(base.Warning) = .empty;
@@ -932,6 +933,10 @@ const request_seeds = [_][]const u8{
     "\x00{\"locations\":[]}",
     "\x00[1,2,3]",
     "\x00{\"locations\":[{\"lat\":\"x\",\"lon\":1e999}],\"costing\":7}",
+    "\x00{\"costing\":\"auto\",\"avoid_polygons\":[[],[[1.01,2.01],[1.02,2.02],[1.03,2.03]]],\"exclude_locations\":[{\"lat\":2,\"lon\":1}]}",
+    "\x00{\"exclude_polygons\":{\"type\":\"FeatureCollection\",\"features\":[{\"type\":\"Feature\",\"geometry\":{\"type\":\"Polygon\",\"coordinates\":[[[1,2],[3,4],[4,4],[1,2]]]},\"properties\":{\"levels\":[1.0,2.5]}}]}}",
+    "\x00{\"exclude_polygons\":[[[179,5],[-179,6],[179,6]]]}",
+    "\x82{\"costing\":\"auto\",\"costing_options\":{\"auto\":{\"ignore_closures\":false}},\"locations\":[{\"lat\":2,\"lon\":1,\"search_filter\":{\"exclude_closures\":false}}]}",
 };
 
 test "fuzz request" {

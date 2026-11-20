@@ -293,6 +293,16 @@ pub fn build(b: *std.Build) void {
     run_bench_search.addPassthruArgs();
     b.step("bench-search", "Measure edge-based Dijkstra throughput and counters on a graph bundle").dependOn(&run_bench_search.step);
 
+    const bench_exclusions = b.addExecutable(.{ .name = "bench-exclusions", .root_module = b.createModule(.{
+        .root_source_file = b.path("test/bench_exclusions.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{.{ .name = "routing", .module = lib_mod }},
+    }) });
+    const run_bench_exclusions = b.addRunArtifact(bench_exclusions);
+    run_bench_exclusions.addPassthruArgs();
+    b.step("bench-exclusions", "Check the request budget for a large avoid polygon").dependOn(&run_bench_exclusions.step);
+
     const bench_partition = b.addExecutable(.{ .name = "bench-partition", .root_module = b.createModule(.{
         .root_source_file = b.path("test/bench_partition.zig"),
         .target = target,

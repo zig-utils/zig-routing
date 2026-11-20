@@ -887,6 +887,74 @@ test "Gurka no turn and only turn restrictions follow travel direction" {
     }
 }
 
+const ClosureCost = struct {
+    edges: [2]format.EdgeId,
+    ignore: bool = false,
+    current: bool = true,
+    filter: bool = false,
+
+    pub fn restrictionPermission(self: ClosureCost) routing.costing.base.Permission {
+        var permission = (RestrictionMotor{}).restrictionPermission();
+        permission.flow.current = self.current;
+        permission.filter_closures = self.filter;
+        if (self.ignore) permission.flags.insert(.ignore_closures);
+        return permission;
+    }
+
+    pub fn closed(self: ClosureCost, edge: routing.snap.candidates.DirectedEdge) bool {
+        return self.restrictionPermission().usesClosures() and (edge.id == self.edges[0] or edge.id == self.edges[1]);
+    }
+
+    pub fn allowed(self: ClosureCost, edge: routing.snap.candidates.DirectedEdge) bool {
+        return self.restrictionPermission().allowedCandidate(edge.class, .{ .closed = self.closed(edge) }, .{});
+    }
+
+    pub fn edgeCost(_: ClosureCost, view: *const graph.reader.View, edge: format.EdgeId, hot: *const format.EdgeHot, direction: search.Direction) !Cost {
+        return (RestrictionMotor{}).edgeCost(view, edge, hot, direction);
+    }
+
+    pub fn allowedTurn(_: ClosureCost, view: *const graph.reader.View, turn: search.Transition, previous: search.Label, direction: search.Direction) !bool {
+        return (RestrictionMotor{}).allowedTurn(view, turn, previous, direction);
+    }
+
+    pub fn turnCost(_: ClosureCost, _: *const graph.reader.View, _: search.Transition, _: search.Label, _: search.Direction) !Cost {
+        return .{};
+    }
+};
+
+// Ported from test_search_filter.cc's closure filtering and costing cases.
+fn checkGurkaClosure(view: *const graph.reader.View, fixture: *const gurka.Map, middle: routing.geo.point.PointLL, from: format.NodeId, to: format.NodeId, edges: [2]format.EdgeId) !void {
+    const snap = routing.snap.candidates;
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    var engine = try search.Search(ClosureCost, routing.search.queue.Heap).init(testing.allocator, view);
+    defer engine.deinit();
+    var cost: ClosureCost = .{ .edges = edges };
+    var location: routing.api.request.Location = .{ .lat = middle.lat, .lng = middle.lng, .minimum_reachability = 0 };
+    const filtered = try snap.search(view, arena.allocator(), location, .{}, cost, .none);
+    for (filtered.edges) |edge| try testing.expect(edge.id != edges[0] and edge.id != edges[1]);
+    location.search_filter.exclude_closures = false;
+    const unfiltered = try snap.search(view, arena.allocator(), location, .{}, cost, .none);
+    try testing.expectEqual(2, unfiltered.edges.len);
+    for (unfiltered.edges) |edge| try testing.expect(edge.id == edges[0] or edge.id == edges[1]);
+    arena.reset();
+
+    cost.filter = true;
+    const detour = try engine.run(&arena, cost, .{ .origin = from, .destination = to }, search.Zero{}, .{});
+    try expectWayPath(view, fixture, detour, .forward, &.{ "AB", "BD", "DE", "EC" });
+    arena.reset();
+    const b = try at(view, fixture.findNode("B").?.location.toFixed());
+    cost.filter = false;
+    const from_closed = try engine.run(&arena, cost, .{ .origin = b, .destination = to }, search.Zero{}, .{});
+    try expectWayPath(view, fixture, from_closed, .forward, &.{"BC"});
+    arena.reset();
+    for ([_]ClosureCost{ .{ .edges = edges, .ignore = true }, .{ .edges = edges, .current = false } }) |disabled| {
+        const open = try engine.run(&arena, disabled, .{ .origin = from, .destination = to }, search.Zero{}, .{});
+        try expectWayPath(view, fixture, open, .forward, &.{ "AB", "BC" });
+        arena.reset();
+    }
+}
+
 const RestrictionMotor = struct {
     modes: u16 = 1,
     ignore: bool = false,
@@ -921,6 +989,97 @@ const RestrictionMotor = struct {
 };
 
 const RestrictionSearch = search.Search(RestrictionMotor, routing.search.queue.Heap);
+
+// Ported from the polygon and location detours in test_avoids.cc.
+test "Gurka exclusions detour around polygon and snapped directed edges" {
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "residential" }};
+    const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates(
+        \\A---B---C
+        \\    |   |
+        \\    D---E
+    , 30), &.{
+        .{ .label = "AB", .tags = road }, .{ .label = "BC", .tags = &.{ road[0], .{ .key = "level", .value = "2" } } },
+        .{ .label = "BD", .tags = road }, .{ .label = "DE", .tags = road },
+        .{ .label = "EC", .tags = road },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 2);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const middle = fixture.findNode("B").?.location.midpoint(fixture.findNode("C").?.location);
+    const delta = 0.00005;
+    const ring: routing.api.exclusions.Ring = .{ .points = &.{
+        .init(middle.lng - delta, middle.lat - delta),
+        .init(middle.lng + delta, middle.lat - delta),
+        .init(middle.lng + delta, middle.lat + delta),
+        .init(middle.lng - delta, middle.lat + delta),
+    } };
+    const bc = try directedBetween(view, &fixture, "B", "C");
+    const cb = try view.oppEdge(bc);
+    const from = try at(view, fixture.findNode("A").?.location.toFixed());
+    const to = try at(view, fixture.findNode("C").?.location.toFixed());
+    var engine = try RestrictionSearch.init(testing.allocator, view);
+    defer engine.deinit();
+    var counting = routing.infra.arena.CountingAllocator.init(testing.allocator);
+    var arena = routing.infra.arena.Arena.init(counting.allocator(), .{});
+    defer arena.deinit();
+    const Cases = routing.api.request.Options;
+    const correct = &.{ "AB", "BD", "DE", "EC" };
+    var avoid = [_]routing.api.request.Location{.{ .lat = middle.lat, .lng = middle.lng, .minimum_reachability = 0 }};
+    const inputs = [_]Cases{
+        .{ .exclude_polygons = &.{ring} },
+        .{ .exclude_polygons = &.{.{ .points = ring.points, .levels = &.{2} }} },
+        .{ .exclude_locations = &avoid },
+    };
+    for (inputs) |options| {
+        const excluded = try routing.snap.exclusions.resolve(view, a, &options, &.{}, .{}, routing.snap.candidates.Access{ .mask = .{ .auto = true } }, .none);
+        try testing.expectEqual(2, excluded.len);
+        for (excluded) |edge| try testing.expect(edge.id == bc or edge.id == cb);
+        for ([_]search.Direction{ .forward, .reverse }) |direction| {
+            const result = try engine.run(&arena, .{}, .{ .origin = from, .destination = to, .direction = direction, .excluded = excluded }, search.Zero{}, .{});
+            try expectWayPath(view, &fixture, result, direction, correct);
+            arena.reset();
+        }
+    }
+    const other_level: Cases = .{ .exclude_polygons = &.{.{ .points = ring.points, .levels = &.{3} }} };
+    const kept = try routing.snap.exclusions.resolve(view, a, &other_level, &.{}, .{}, routing.snap.candidates.Access{ .mask = .{ .auto = true } }, .none);
+    try testing.expectEqual(0, kept.len);
+    const result = try engine.run(&arena, .{}, .{ .origin = from, .destination = to }, search.Zero{}, .{});
+    try expectWayPath(view, &fixture, result, .forward, &.{ "AB", "BC" });
+    arena.reset();
+
+    const endpoints = routing.search.endpoints;
+    const ab = try directedBetween(view, &fixture, "A", "B");
+    const ce = try directedBetween(view, &fixture, "C", "E");
+    const start = snapLocation(&.{snapEdge(ab, 0.25, 0)}, &.{});
+    const before = snapLocation(&.{snapEdge(bc, 0.25, 0)}, &.{});
+    const after = snapLocation(&.{snapEdge(bc, 0.75, 0)}, &.{});
+    const finish = snapLocation(&.{snapEdge(ce, 0.5, 0)}, &.{});
+    const excluded = &[_]search.ExcludedEdge{.{ .id = bc, .percent_along = 0.5 }};
+    const same_node = try engine.run(&arena, .{}, .{ .origin = from, .destination = from, .excluded = excluded }, search.Zero{}, .{});
+    try testing.expectEqual(@as(f32, 0), same_node.best().cost);
+    arena.reset();
+    for ([_]search.Direction{ .forward, .reverse }) |direction| {
+        const opts: endpoints.Options = .{ .costing = .auto, .direction = direction, .excluded = excluded };
+        const arrives = try endpoints.route(&engine, &arena, RestrictionMotor{}, start, before, opts, search.Zero{}, .{});
+        try testing.expectEqual(@as(f32, 0.25), arrives.segments[arrives.segments.len - 1].end);
+        arena.reset();
+        try testing.expectError(error.NoPath, endpoints.route(&engine, &arena, RestrictionMotor{}, start, after, opts, search.Zero{}, .{}));
+        arena.reset();
+        const leaves = try endpoints.route(&engine, &arena, RestrictionMotor{}, after, finish, opts, search.Zero{}, .{});
+        try testing.expectEqual(@as(f32, 0.75), leaves.segments[0].begin);
+        arena.reset();
+        try testing.expectError(error.NoPath, endpoints.route(&engine, &arena, RestrictionMotor{}, before, finish, opts, search.Zero{}, .{}));
+        arena.reset();
+    }
+    counting.resetCounts();
+    _ = try endpoints.route(&engine, &arena, RestrictionMotor{}, start, before, .{ .costing = .auto, .excluded = excluded }, search.Zero{}, .{});
+    try testing.expectEqual(0, counting.calls());
+    arena.reset();
+    try checkGurkaClosure(view, &fixture, middle, from, to, .{ bc, cb });
+}
 
 fn restrictionTiming(text: []const u8, invariant: bool) !search.Timing {
     return .{ .start = try graph.time_info.TimeInfo.fromLocal(null, text, graph.timezone.utc, graph.timezone.utc, 0, .none), .invariant = invariant };

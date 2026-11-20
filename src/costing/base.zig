@@ -573,8 +573,11 @@ pub const Permission = struct {
             !(disallow.start_restriction and edge.restrictions.start != 0) and
             !(disallow.end_restriction and edge.restrictions.end != 0) and
             !(disallow.simple_restriction and state.simple_restriction) and
-            !(self.flow.current and state.closed and !self.flags.contains(.ignore_closures) and
-                (self.filter_closures or disallow.closure));
+            !(state.closed and self.usesClosures() and (self.filter_closures or disallow.closure));
+    }
+
+    pub fn usesClosures(self: Permission) bool {
+        return self.flow.current and !self.flags.contains(.ignore_closures);
     }
 
     pub fn allowedCandidate(self: Permission, edge: *const EdgeClass, state: EdgeState, disallow: Disallow) bool {

@@ -12,7 +12,9 @@
 const std = @import("std");
 const json = @import("json.zig");
 const errors = @import("errors.zig");
+const exclusions = @import("exclusions.zig");
 const datetime = @import("../graph/datetime.zig");
+const Deadline = @import("../infra/io.zig").Deadline;
 const polyline = @import("../geo/polyline.zig");
 const PointLL = @import("../geo/point.zig").PointLL;
 const Allocator = std.mem.Allocator;
@@ -112,6 +114,8 @@ pub const Options = struct {
     costing: Costing = .none,
     /// The whole `costing_options` object, parsed later by the costing model.
     costing_options: ?json.Value = null,
+    ignore_closures: ?bool = null,
+    filter_closures: bool = true,
     verbose: bool = false,
     reverse: bool = false,
     generalize: ?f32 = null,
@@ -120,6 +124,10 @@ pub const Options = struct {
     shape_format: ShapeFormat = .polyline6,
     shape_format_set: bool = false,
     locations: []Location = &.{},
+    sources: []Location = &.{},
+    targets: []Location = &.{},
+    exclude_locations: []Location = &.{},
+    exclude_polygons: []const exclusions.Ring = &.{},
     shape: []Location = &.{},
     encoded_polyline: ?[]const u8 = null,
     // /height
@@ -158,23 +166,35 @@ pub const Result = union(enum) {
 /// other query parameter is added as a string member (body keys win, as
 /// upstream appends query members after the body's).
 pub fn parseHttp(arena: Allocator, path: []const u8, query: []const QueryParam, body: []const u8) Allocator.Error!Result {
-    return parseHttpWith(arena, path, query, body, .locations);
+    return parseWithoutDeadline(arena, path, query, body, .locations);
 }
 
 /// Parse plain /height shapes directly into the coordinates its handler reads.
 pub fn parseHttpForHeight(arena: Allocator, path: []const u8, query: []const QueryParam, body: []const u8) Allocator.Error!Result {
-    return parseHttpWith(arena, path, query, body, .height_points);
+    return parseWithoutDeadline(arena, path, query, body, .height_points);
 }
 
 /// `parseHttp` without the /height shape fast path: the reference the fast
 /// path is tested against.
 pub fn parseHttpReference(arena: Allocator, path: []const u8, query: []const QueryParam, body: []const u8) Allocator.Error!Result {
-    return parseHttpWith(arena, path, query, body, .reference);
+    return parseWithoutDeadline(arena, path, query, body, .reference);
 }
 
+const ParseError = Allocator.Error || error{DeadlineExceeded};
 const ShapeMode = enum { reference, locations, height_points };
 
-fn parseHttpWith(arena: Allocator, path: []const u8, query: []const QueryParam, body: []const u8, mode: ShapeMode) Allocator.Error!Result {
+fn parseWithoutDeadline(arena: Allocator, path: []const u8, query: []const QueryParam, body: []const u8, mode: ShapeMode) Allocator.Error!Result {
+    return parseHttpWith(arena, path, query, body, mode, .none) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DeadlineExceeded => unreachable,
+    };
+}
+
+pub fn parseHttpWithin(arena: Allocator, path: []const u8, query: []const QueryParam, body: []const u8, height_points: bool, deadline: Deadline) ParseError!Result {
+    return parseHttpWith(arena, path, query, body, if (height_points) .height_points else .locations, deadline);
+}
+
+fn parseHttpWith(arena: Allocator, path: []const u8, query: []const QueryParam, body: []const u8, mode: ShapeMode, deadline: Deadline) ParseError!Result {
     const action = Action.fromPath(path) orelse .no_action;
     var text: []const u8 = body;
     for (query) |q| if (std.mem.eql(u8, q.key, "json") and q.value.len > 0) {
@@ -196,9 +216,12 @@ fn parseHttpWith(arena: Allocator, path: []const u8, query: []const QueryParam, 
         const gop = try doc.object.getOrPut(arena, q.key);
         if (!gop.found_existing) gop.value_ptr.* = .{ .string = q.value };
     }
-    var result = try fromJson(arena, doc, action);
+    var result = try fromJsonWithin(arena, doc, action, deadline);
     if (fast) |f| switch (result) {
         .ok => |*o| if (o.encoded_polyline == null) {
+            if (o.locations.len == 0 and o.sources.len == 0 and o.targets.len == 0 and o.exclude_locations.len == 0) {
+                o.filter_closures = !(o.ignore_closures orelse false);
+            }
             if (mode == .height_points) {
                 for (f.points) |*p| p.lng = circularClamp(p.lng, -180, 180);
                 o.height_points = f.points;
@@ -524,6 +547,13 @@ fn truncI32(x: f64) i32 {
 
 /// `from_json` for the fields in scope.
 pub fn fromJson(arena: Allocator, doc: json.Value, action: Action) Allocator.Error!Result {
+    return fromJsonWithin(arena, doc, action, .none) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DeadlineExceeded => unreachable,
+    };
+}
+
+fn fromJsonWithin(arena: Allocator, doc: json.Value, action: Action, deadline: Deadline) ParseError!Result {
     var o: Options = .{ .action = action };
 
     o.verbose = json.get(bool, doc, "/verbose", action == .sources_to_targets);
@@ -567,7 +597,8 @@ pub fn fromJson(arena: Allocator, doc: json.Value, action: Action) Allocator.Err
     };
 
     // Costing, including the deprecated aliases.
-    var costing_str = json.get([]const u8, root, "/costing", "none");
+    const requested_costing = json.get([]const u8, root, "/costing", "none");
+    var costing_str = requested_costing;
     if (std.mem.eql(u8, costing_str, "auto_shorter")) {
         try o.warnings.append(arena, 100);
         costing_str = "auto";
@@ -577,10 +608,17 @@ pub fn fromJson(arena: Allocator, doc: json.Value, action: Action) Allocator.Err
     } else if (std.mem.eql(u8, costing_str, "auto_data_fix")) {
         try o.warnings.append(arena, 102);
         costing_str = "auto";
+        o.ignore_closures = true;
     }
     o.costing = if (costing_str.len == 0) .none else parseEnum(Costing, costing_str) orelse
         return failExtra(125, try std.fmt.allocPrint(arena, "'{s}'", .{costing_str}));
     o.costing_options = json.pointer(root, "/costing_options");
+    if (o.ignore_closures == null and o.costing != .multimodal and o.costing_options != null and o.costing_options.? == .object) {
+        const costings = o.costing_options.?.object;
+        if (costings.get(requested_costing) orelse costings.get(@tagName(o.costing))) |costing| {
+            o.ignore_closures = json.getOptional(bool, costing, "/ignore_closures");
+        }
+    }
 
     if (parseDateTime(root, &o)) |code| return fail(code);
 
@@ -614,15 +652,18 @@ pub fn fromJson(arena: Allocator, doc: json.Value, action: Action) Allocator.Err
         }
         o.shape = pts.items;
     } else {
-        switch (try parseLocations(arena, root, "/shape", &o)) {
-            .ok => |locs| o.shape = locs,
-            .failure => return fail(134),
-        }
+        if (try parseLocationField(arena, root, &o, "/shape", .shape, 134, deadline)) |failure| return failure;
     }
 
-    switch (try parseLocations(arena, root, "/locations", &o)) {
-        .ok => |locs| o.locations = locs,
-        .failure => |f| return .{ .failure = if (f.code == 0) .{ .code = 130 } else f },
+    if (try parseLocationField(arena, root, &o, "/locations", .locations, 130, deadline)) |failure| return failure;
+    if (try parseLocationField(arena, root, &o, "/sources", .sources, 131, deadline)) |failure| return failure;
+    if (try parseLocationField(arena, root, &o, "/targets", .targets, 132, deadline)) |failure| return failure;
+    const avoids = if (root == .object and root.object.contains("avoid_locations")) "/avoid_locations" else "/exclude_locations";
+    if (try parseLocationField(arena, root, &o, avoids, .exclude_locations, 133, deadline)) |failure| return failure;
+    switch (try exclusions.parse(arena, root, circularClamp, deadline)) {
+        .rings => |rings| o.exclude_polygons = rings,
+        .warning => try o.warnings.append(arena, 204),
+        .failure => |failure| return .{ .failure = failure },
     }
 
     o.range = json.get(bool, root, "/range", false);
@@ -635,6 +676,16 @@ pub fn fromJson(arena: Allocator, doc: json.Value, action: Action) Allocator.Err
 }
 
 const LocationsResult = union(enum) { ok: []Location, failure: errors.Failure };
+
+const LocationField = enum { shape, locations, sources, targets, exclude_locations };
+
+fn parseLocationField(arena: Allocator, doc: json.Value, o: *Options, path: []const u8, comptime field: LocationField, code: u16, deadline: Deadline) ParseError!?Result {
+    switch (try parseLocations(arena, doc, path, o, deadline)) {
+        .ok => |locs| @field(o, @tagName(field)) = locs,
+        .failure => |failure| return .{ .failure = if (failure.code == 0) .{ .code = code } else failure },
+    }
+    return null;
+}
 
 fn parseDateTime(root: json.Value, o: *Options) ?u16 {
     if (json.getOptional(u32, root, "/date_time/type")) |value| {
@@ -667,11 +718,17 @@ fn parseDateTime(root: json.Value, o: *Options) ?u16 {
 /// `parse_locations`: any failure parsing one location becomes the
 /// caller's node-specific code (130 locations, 134 shape, ...); a
 /// failure code of 0 means "use the node's code".
-fn parseLocations(arena: Allocator, doc: json.Value, path: []const u8, o: *const Options) Allocator.Error!LocationsResult {
+noinline fn parseLocations(arena: Allocator, doc: json.Value, path: []const u8, o: *Options, deadline: Deadline) ParseError!LocationsResult {
     const items = json.array(doc, path) orelse return .{ .ok = &.{} };
     const locs = try arena.alloc(Location, items.len);
+    var filter_closures = true;
     for (items, 0..) |item, i| {
-        locs[i] = parseLocation(item, o) orelse return .{ .failure = .{ .code = 0 } };
+        if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+        locs[i] = parseLocation(item, o) catch |err| return .{ .failure = .{ .code = switch (err) {
+            error.InvalidCoordinate => 0,
+            error.ConflictingClosures => 143,
+        } } };
+        filter_closures = filter_closures and locs[i].search_filter.exclude_closures;
         locs[i].original_index = @intCast(i);
         if (o.action == .sources_to_targets) continue;
         switch (o.date_time_type) {
@@ -686,6 +743,7 @@ fn parseLocations(arena: Allocator, doc: json.Value, path: []const u8, o: *const
         }
     }
     if (locs.len > 0) {
+        o.filter_closures = filter_closures;
         locs[0].type = .@"break";
         locs[locs.len - 1].type = .@"break";
     }
@@ -697,10 +755,11 @@ fn defaultLocation(lat: f64, lng: f64, o: *const Options) Location {
     var loc: Location = .{ .lat = lat, .lng = circularClamp(lng, -180, 180) };
     if (o.action == .trace_attributes or o.action == .trace_route) loc.type = .via;
     loc.search_filter.exclude_steps = o.costing == .bicycle;
+    if (o.ignore_closures) |ignore| loc.search_filter.exclude_closures = !ignore;
     return loc;
 }
 
-fn parseLocation(r: json.Value, o: *const Options) ?Location {
+fn parseLocation(r: json.Value, o: *const Options) error{ InvalidCoordinate, ConflictingClosures }!Location {
     // Fast path: an object with only lat and lon (every /height point, most
     // route stops). All other fields take their defaults, exactly as the
     // full parser below would leave them.
@@ -715,13 +774,13 @@ fn parseLocation(r: json.Value, o: *const Options) ?Location {
                 lon = json.convert(f64, e.value_ptr.*);
             } else break :fast;
         }
-        const la = lat orelse return null;
-        if (la < -90.0 or la > 90.0) return null;
-        return defaultLocation(la, lon orelse return null, o);
+        const la = lat orelse return error.InvalidCoordinate;
+        if (la < -90.0 or la > 90.0) return error.InvalidCoordinate;
+        return defaultLocation(la, lon orelse return error.InvalidCoordinate, o);
     }
-    const lat = json.getOptional(f64, r, "/lat") orelse return null;
-    if (lat < -90.0 or lat > 90.0) return null;
-    const lon_raw = json.getOptional(f64, r, "/lon") orelse return null;
+    const lat = json.getOptional(f64, r, "/lat") orelse return error.InvalidCoordinate;
+    if (lat < -90.0 or lat > 90.0) return error.InvalidCoordinate;
+    const lon_raw = json.getOptional(f64, r, "/lon") orelse return error.InvalidCoordinate;
     var loc: Location = .{ .lat = lat, .lng = circularClamp(lon_raw, -180, 180) };
 
     if (o.action == .trace_attributes) {
@@ -760,6 +819,7 @@ fn parseLocation(r: json.Value, o: *const Options) ?Location {
     if (json.getOptional([]const u8, r, "/street_side_cutoff")) |c| loc.street_side_cutoff = parseEnum(RoadClass, c);
 
     var exclude_steps: ?bool = null;
+    var exclude_closures: ?bool = null;
     if (json.pointer(r, "/search_filter")) |sf| {
         if (parseEnum(RoadClass, json.get([]const u8, sf, "/min_road_class", "service_other"))) |rc| loc.search_filter.min_road_class = rc;
         if (parseEnum(RoadClass, json.get([]const u8, sf, "/max_road_class", "motorway"))) |rc| loc.search_filter.max_road_class = rc;
@@ -771,9 +831,13 @@ fn parseLocation(r: json.Value, o: *const Options) ?Location {
         loc.search_filter.exclude_restricted = json.get(bool, sf, "/exclude_restricted", false);
         loc.search_filter.level = json.get(f32, sf, "/level", max_level);
         exclude_steps = json.getOptional(bool, sf, "/exclude_steps");
-        if (json.getOptional(bool, sf, "/exclude_closures")) |ec| loc.search_filter.exclude_closures = ec;
+        exclude_closures = json.getOptional(bool, sf, "/exclude_closures");
     }
     loc.search_filter.exclude_steps = exclude_steps orelse (o.costing == .bicycle);
+    if (o.ignore_closures) |ignore| {
+        if (exclude_closures != null) return error.ConflictingClosures;
+        loc.search_filter.exclude_closures = !ignore;
+    } else loc.search_filter.exclude_closures = exclude_closures orelse true;
     loc.waiting_secs = json.get(f32, r, "/waiting", 0);
     return loc;
 }
@@ -919,6 +983,32 @@ test "longitude wraps like circular_range_clamp" {
     try testing.expectEqual(@as(f64, 10), circularClamp(10, -180, 180));
 }
 
+test "exclusion options follow deprecated alias precedence and closure presence" {
+    var state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer state.deinit();
+    const a = state.allocator();
+    const parsed = (try parseHttp(a, "/route", &.{},
+        \\{"costing":"auto", "costing_options":{"auto":{"ignore_closures":true}},
+        \\ "exclude_locations":[{}], "avoid_locations":[{"lat":2,"lon":190}],
+        \\ "exclude_polygons":null, "avoid_polygons":[[],[[1,2],[1,3],[2,3]]]}
+    )).ok;
+    try testing.expectEqual(1, parsed.exclude_locations.len);
+    try testing.expectEqual(@as(f64, -170), parsed.exclude_locations[0].lng);
+    try testing.expect(!parsed.exclude_locations[0].search_filter.exclude_closures);
+    try testing.expect(!parsed.filter_closures);
+    try testing.expectEqual(1, parsed.exclude_polygons.len);
+    try testing.expectEqual(3, parsed.exclude_polygons[0].segmentCount());
+    const conflict = try parseHttp(a, "/route", &.{},
+        \\{"costing":"auto", "costing_options":{"auto":{"ignore_closures":false}},
+        \\ "locations":[{"lat":2,"lon":1,"search_filter":{"exclude_closures":false}}]}
+    );
+    try testing.expectEqual(143, conflict.failure.code);
+    const invalid = try parseHttp(a, "/route", &.{},
+        \\{"exclude_polygons":[[[1,2],[3]]]}
+    );
+    try testing.expectEqual(137, invalid.failure.code);
+}
+
 /// Whether two parse results are the same in every field a handler reads.
 pub fn resultsEqual(x: Result, y: Result) bool {
     switch (x) {
@@ -928,7 +1018,7 @@ pub fn resultsEqual(x: Result, y: Result) bool {
             const b = y.ok;
             if (a.action != b.action or a.format != b.format or a.units != b.units or a.directions_type != b.directions_type or
                 a.costing != b.costing or a.shape_format != b.shape_format or a.range != b.range or
-                a.height_precision != b.height_precision or a.verbose != b.verbose) return false;
+                a.height_precision != b.height_precision or a.verbose != b.verbose or a.filter_closures != b.filter_closures) return false;
             if (!std.meta.eql(a.resample_distance, b.resample_distance)) return false;
             if ((a.id == null) != (b.id == null) or (a.id != null and !std.mem.eql(u8, a.id.?, b.id.?))) return false;
             if ((a.encoded_polyline == null) != (b.encoded_polyline == null)) return false;

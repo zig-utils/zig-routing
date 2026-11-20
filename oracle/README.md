@@ -358,6 +358,35 @@ an ordinary sequence for a via-way relation with the same annotation. The
 native builder preserves both representations. The tests also exercise a timed
 automaton output reached through a failure link.
 
+### Location, polygon and closure exclusions
+
+Replay the exclusion validation corpus against the native service and
+Valhalla 3.9.3 with the default exclusion limits.
+
+```bash
+zig-out/bin/zr diff "$native_url" "$valhalla_url" --corpus oracle/corpora/exclusions-errors.txt
+```
+
+All 13 requests match the reference HTTP status and error body, including the
+OSRM response. The graph tests cover detours, fractional origin and destination
+cuts, and directional closure filtering with an in-memory traffic policy.
+Search marks excluded edges in its status pages before relaxation and retains
+the excluded fractions for partial-edge endpoints.
+Four Utrecht rings selected the same directed edges as the reference after
+pairing by OSM way and directed geometry. The sets contained 6,370, 1,070, 62
+and 1,784 edges.
+
+Run the exclusion budget check against a native Utrecht bundle.
+
+```bash
+zig build bench-exclusions -Doptimize=ReleaseFast -- "$bundle" 5.12 52.09
+```
+
+The check parses, validates and resolves a 100-vertex ring. On an Apple M3 Pro
+it excluded 6,370 directed edges. Across 32 requests, the median was 1.86 ms
+and the maximum was 2.12 ms against a 50 ms deadline. There were zero heap
+calls after warm-up.
+
 ### Way splitting and edge counts
 
 ```bash

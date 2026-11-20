@@ -55,6 +55,60 @@ const WayLimit = struct {
     except_destination: bool,
 };
 
+const AttributeValue = union(enum) {
+    absent,
+    boolean: bool,
+    unsigned: u64,
+    signed: i64,
+    text: []const u8,
+    limits: []const WayLimit,
+
+    fn from(value: anytype) AttributeValue {
+        const T = @TypeOf(value);
+        if (T == []const u8) return .{ .text = value };
+        if (T == []WayLimit or T == []const WayLimit) return .{ .limits = value };
+        return switch (@typeInfo(T)) {
+            .optional => if (value) |present| from(present) else .absent,
+            .bool => .{ .boolean = value },
+            .int => |number| if (number.signedness == .signed) .{ .signed = value } else .{ .unsigned = value },
+            else => @compileError("unsupported tag attribute type"),
+        };
+    }
+};
+
+const AttributeField = struct { name: []const u8, value: AttributeValue };
+
+noinline fn writeAttributes(out: *std.json.Stringify, fields: []const AttributeField) std.json.Stringify.Error!void {
+    try out.beginObject();
+    for (fields) |field| {
+        try out.objectField(field.name);
+        switch (field.value) {
+            .absent => try out.write(null),
+            inline else => |value| try out.write(value),
+        }
+    }
+    try out.endObject();
+}
+
+fn Attributes(comptime T: type) type {
+    return struct {
+        fields: [std.meta.fieldNames(T).len]AttributeField,
+
+        pub fn jsonStringify(self: @This(), out: *std.json.Stringify) std.json.Stringify.Error!void {
+            try writeAttributes(out, &self.fields);
+        }
+    };
+}
+
+fn attributes(values: anytype) Attributes(@TypeOf(values)) {
+    var result: Attributes(@TypeOf(values)) = undefined;
+    const names = comptime std.meta.fieldNames(@TypeOf(values));
+    inline for (names, &result.fields) |name, *entry| {
+        entry.* = .{ .name = name, .value = .from(@field(values, name)) };
+    }
+    return result;
+}
+
 const State = struct {
     gpa: std.mem.Allocator,
     out: *io.Writer,
@@ -121,7 +175,7 @@ const State = struct {
             .step_count = a.step_count,
             .tactile_paving = optionalName(a.tactile_paving),
         };
-        const compact: ?NodeFields = if (std.meta.eql(fields, NodeFields{})) null else fields;
+        const compact: ?Attributes(NodeFields) = if (std.meta.eql(fields, NodeFields{})) null else attributes(fields);
         try self.record(.{ .kind = osm.Kind.node, .id = node.id, .eligible = true, .kept = true, .attributes = compact });
     }
 
@@ -147,7 +201,7 @@ const State = struct {
                 .id = way.id,
                 .eligible = true,
                 .kept = true,
-                .attributes = .{
+                .attributes = attributes(.{
                     .road_class = @backingInt(a.road_class),
                     .use = @backingInt(a.use),
                     .surface = @backingInt(a.surface),
@@ -244,7 +298,7 @@ const State = struct {
                     .trail_visibility = optionalName(a.pedestrian.trail_visibility),
                     .tactile_paving = optionalName(a.pedestrian.tactile_paving),
                     .foot = a.pedestrian.foot,
-                },
+                }),
             });
         } else {
             const kept = if (eligible) false else try tags.includePbfWay(&self.scratch, &way);

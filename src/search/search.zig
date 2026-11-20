@@ -7,6 +7,8 @@ const io = @import("../infra/io.zig");
 const memory = @import("../infra/arena.zig");
 const costing = @import("../costing/compiled.zig");
 const base = @import("../costing/base.zig");
+const DirectedEdge = @import("../snap/edge.zig").DirectedEdge;
+pub const ExcludedEdge = @import("../snap/exclusions.zig").Edge;
 const paged = @import("paged.zig");
 const queue = @import("queue.zig");
 const endpoints = @import("endpoints.zig");
@@ -36,6 +38,8 @@ pub const Label = extern struct {
     const alias_history: u32 = 16;
     const destination_only: u32 = 32;
     const exception_shift = 6;
+    const prune_closures: u32 = 1 << 13;
+    const excluded_start: u32 = 1 << 14;
 
     pub fn edgeId(self: Label) EdgeId {
         return @fromBackingInt(self.edge);
@@ -94,6 +98,7 @@ pub const Request = struct {
     destination: NodeId,
     direction: Direction = .forward,
     timing: Timing = .{},
+    excluded: []const ExcludedEdge = &.{},
 };
 
 pub const PartialRequest = struct {
@@ -102,6 +107,7 @@ pub const PartialRequest = struct {
     direction: Direction = .forward,
     forbid_initial_uturn: bool = false,
     timing: Timing = .{},
+    excluded: []const ExcludedEdge = &.{},
 };
 
 const NodeQuery = struct {
@@ -109,6 +115,7 @@ const NodeQuery = struct {
     target: ?NodeId = null,
     limit: usize = std.math.maxInt(usize),
     timing: Timing = .{},
+    excluded: []const ExcludedEdge = &.{},
 };
 
 pub const Cut = struct {
@@ -203,7 +210,14 @@ pub const L2 = struct {
 
 const Status = packed struct(u32) {
     label_plus_one: u32 = 0,
+
+    // Requests with exclusions reserve label zero as the settled, impassable
+    // state so the ordinary dominance check also prunes excluded edges.
+    const exclusion: u32 = 1;
 };
+
+const PartialExclusion = struct { fraction: f32, seed: Status = .{} };
+const ExclusionFractions = paged.Array(?PartialExclusion, null);
 
 const TurnContext = struct {
     value: u32 = 0,
@@ -229,6 +243,7 @@ const Restrictions = struct {
     timing: Timing,
     control: Control,
     check_access: bool,
+    has_exclusions: bool,
     aliases: AliasStatus = .empty,
 
     noinline fn advance(self: *const Restrictions, context: TurnContext, previous: Label, node: NodeId, id: EdgeId) !TurnContext {
@@ -303,7 +318,8 @@ const Restrictions = struct {
 /// transition, predecessor, direction), and optionally slowAllowed for
 /// cold edges, allowedTurn for checking a pair of directed edges and
 /// restrictionModes() or restrictionPermission() for selecting conditional
-/// and complex restrictions (defaults to auto).
+/// and complex restrictions (defaults to auto). A concrete closed(edge)
+/// policy supplies current-traffic closures when Permission enables them.
 /// All weighted costs must be nonnegative. A state is the last directed edge
 /// and the matched restriction prefix.
 /// The cost and admissibility of future steps must be independent of the
@@ -336,8 +352,8 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             _ = try self.view.node(request.destination);
             defer self.status.clear();
             return switch (request.direction) {
-                .forward => self.runDirection(.forward, arena, kernel, NodeQuery{ .start = request.origin, .target = request.destination, .timing = request.timing }, potential, control),
-                .reverse => self.runDirection(.reverse, arena, kernel, NodeQuery{ .start = request.destination, .target = request.origin, .timing = request.timing }, potential, control),
+                .forward => self.runDirection(.forward, arena, kernel, NodeQuery{ .start = request.origin, .target = request.destination, .timing = request.timing, .excluded = request.excluded }, potential, control),
+                .reverse => self.runDirection(.reverse, arena, kernel, NodeQuery{ .start = request.destination, .target = request.origin, .timing = request.timing, .excluded = request.excluded }, potential, control),
             };
         }
 
@@ -389,6 +405,10 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             const a = arena.allocator();
             var pool: Pool = .init(arena);
             var labels: std.ArrayList(Label) = .empty;
+            if (!partial and target != null and query.start == target.?) {
+                try labels.append(a, .{ .flags = Label.target });
+                return .{ .labels = labels.items, .index = 0, .popped = 0, .settled = 0 };
+            }
             var cuts: std.ArrayList(Cut) = .empty;
             var pending: Q = .{};
             var restrictions: if (with_restrictions) Restrictions else void = if (with_restrictions) .{
@@ -400,16 +420,22 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 .timing = query.timing,
                 .control = control,
                 .check_access = check_access,
+                .has_exclusions = query.excluded.len != 0,
             } else {};
             const tracker = if (with_restrictions) &restrictions else null;
-            if (partial) {
-                try self.seedPartials(direction, &pool, kernel, query, &labels, &cuts, &pending, potential, tracker, control);
-            } else {
-                if (target != null and query.start == target.?) {
-                    try labels.append(a, .{ .flags = Label.target });
-                    return .{ .labels = labels.items, .index = 0, .popped = 0, .settled = 0 };
+            var fractions: ?*ExclusionFractions = null;
+            if (query.excluded.len != 0) {
+                try labels.append(a, .{ .cost = -std.math.inf(f32) });
+                if (partial) {
+                    fractions = try a.create(ExclusionFractions);
+                    fractions.?.* = .{};
                 }
-                try self.seedNode(direction, &pool, kernel, query.start, target, &labels, &pending, potential, tracker);
+                try self.markExcluded(&pool, query.excluded, fractions, control);
+            }
+            if (partial) {
+                try self.seedPartials(direction, &pool, kernel, query, &labels, &cuts, &pending, potential, tracker, fractions, permission, control);
+            } else {
+                try self.seedNode(direction, &pool, kernel, query.start, target, &labels, &pending, potential, tracker, permission, query.excluded.len != 0);
             }
 
             var popped: usize = 0;
@@ -425,7 +451,13 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                         last.turnContext()
                 else
                     .{};
-                if (last.flags & Label.partial_target == 0 and self.findStatus(tracker, last.edge, context).label_plus_one != top.label + 1) continue;
+                if (last.flags & Label.partial_target == 0) {
+                    const active = if (partial and last.flags & Label.excluded_start != 0)
+                        fractions.?.get(last.edge).?.seed
+                    else
+                        self.findStatus(tracker, last.edge, context);
+                    if (active.label_plus_one != top.label + 1) continue;
+                }
                 settled += 1;
                 if (last.flags & Label.target != 0 or settled == limit) {
                     try control.check();
@@ -449,6 +481,8 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     var targets = if (partial) query.targets.on(next_id) else {};
                     if (dominated and (!partial or targets.index == 0)) continue;
                     const next = if (direction == .forward) outward else try self.view.edge(next_id);
+                    const closed = try self.edgeClosed(kernel, permission, next_id);
+                    if (closed and last.flags & Label.prune_closures != 0) continue;
                     const head: NodeId = @fromBackingInt(outward.head);
                     const access = if (with_restrictions and next.cls.cold_checks != 0)
                         try tracker.evaluateAccess(next_id, next, at, last, if (target != null and head == target.?) .end else .middle)
@@ -489,6 +523,8 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                         var count: usize = 0;
                         while (targets.next()) |candidate| : (count += 1) {
                             if (count % 64 == 0) try control.check();
+                            if (fractions != null and prior.label_plus_one == Status.exclusion and
+                                cutsExcluded(fractions.?.get(@backingInt(next_id)).?.fraction, candidate.fraction, direction == .reverse)) continue;
                             const cut: Cut = if (direction == .forward) .{ .end = candidate.fraction } else .{ .begin = candidate.fraction };
                             const step = scale(edge_cost, cut.end - cut.begin, 0);
                             const ending = previous.add(delay).add(step).add(.{ .cost = candidate.score });
@@ -514,8 +550,8 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                         .dist_m = last.dist_m +| next.geom.len_m,
                         .tcost = delay.cost,
                         .ctx = next_context.value,
-                        .flags = Label.contextFlags(next_context, access.state),
-                    });
+                        .flags = Label.contextFlags(next_context, access.state) | closureFlag(!closed),
+                    }, null);
                 }
             }
             try control.check();
@@ -523,12 +559,37 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             return error.NoPath;
         }
 
-        fn seedNode(self: *Self, comptime direction: Direction, pool: *Pool, kernel: K, start: NodeId, target: ?NodeId, labels: *std.ArrayList(Label), pending: *Q, potential: anytype, tracker: anytype) !void {
+        noinline fn markExcluded(self: *Self, pool: *Pool, edges: []const ExcludedEdge, fractions: ?*ExclusionFractions, control: Control) !void {
+            for (edges, 0..) |edge, i| {
+                if (i % 256 == 0) try control.check();
+                _ = try self.view.edge(edge.id);
+                if (!(0 <= edge.percent_along and edge.percent_along <= 1)) return error.InvalidExclusionFraction;
+                const id = @backingInt(edge.id);
+                const status = try self.status.at(pool, id);
+                if (status.label_plus_one == Status.exclusion) continue;
+                status.label_plus_one = Status.exclusion;
+                if (fractions) |table| (try table.at(pool.arena.allocator(), id)).* = .{ .fraction = edge.percent_along };
+            }
+            if (self.view.restriction_automaton) |states| {
+                const base_id: u32 = @intCast(self.view.edges.len);
+                for (states[automaton.first_context..], 0..) |state, i| {
+                    if (i % 256 == 0) try control.check();
+                    if (self.status.get(state.edge).label_plus_one == Status.exclusion) {
+                        (try self.status.at(pool, base_id + @as(u32, @intCast(i)))).label_plus_one = Status.exclusion;
+                    }
+                }
+            }
+        }
+
+        fn seedNode(self: *Self, comptime direction: Direction, pool: *Pool, kernel: K, start: NodeId, target: ?NodeId, labels: *std.ArrayList(Label), pending: *Q, potential: anytype, tracker: anytype, permission: base.Permission, has_exclusions: bool) !void {
             const seeds = try self.view.outEdgeRange(start);
             for (self.view.edges[seeds.first..seeds.end], seeds.first..) |*outward, index| {
                 const geometry_id: EdgeId = @fromBackingInt(@as(u32, @intCast(index)));
                 const id = if (direction == .forward) geometry_id else try self.view.oppEdge(geometry_id);
+                if (has_exclusions and self.status.get(@backingInt(id)).label_plus_one == Status.exclusion) continue;
                 const edge = if (direction == .forward) outward else try self.view.edge(id);
+                const closed = try self.edgeClosed(kernel, permission, id);
+                if (closed and permission.filter_closures) continue;
                 if (comptime @hasDecl(K, "slowAllowed")) {
                     if (edge.cls.cold_checks != 0 and !try Self.slowAllowed(kernel, self.view, id, edge, null, direction)) continue;
                 }
@@ -547,18 +608,25 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     .secs = edge_cost.secs,
                     .dist_m = edge.geom.len_m,
                     .ctx = context.value,
-                    .flags = Label.contextFlags(context, access.state),
-                });
+                    .flags = Label.contextFlags(context, access.state) | closureFlag(!closed),
+                }, null);
             }
         }
 
-        fn seedPartials(self: *Self, comptime direction: Direction, pool: *Pool, kernel: K, query: PartialRequest, labels: *std.ArrayList(Label), cuts: *std.ArrayList(Cut), pending: *Q, potential: anytype, tracker: anytype, control: Control) !void {
+        fn seedPartials(self: *Self, comptime direction: Direction, pool: *Pool, kernel: K, query: PartialRequest, labels: *std.ArrayList(Label), cuts: *std.ArrayList(Cut), pending: *Q, potential: anytype, tracker: anytype, fractions: ?*ExclusionFractions, permission: base.Permission, control: Control) !void {
             const a = pool.arena.allocator();
             for (query.starts, 0..) |candidate, index| {
                 if (index % 64 == 0) try control.check();
                 if (!candidate.valid()) return error.InvalidCandidate;
                 const id = candidate.edge;
                 const edge = try self.view.edge(id);
+                const excluded: ?*PartialExclusion = if (fractions) |table| blk: {
+                    if (table.get(@backingInt(id)) == null) break :blk null;
+                    break :blk &(try table.at(a, @backingInt(id))).*.?;
+                } else null;
+                if (excluded) |entry| if (cutsExcluded(entry.fraction, candidate.fraction, direction == .forward)) continue;
+                const closed = try self.edgeClosed(kernel, permission, id);
+                if (closed and permission.filter_closures) continue;
                 const full = if (comptime @hasDecl(K, "endpointCost"))
                     try kernel.endpointCost(self.view, id, edge, direction)
                 else
@@ -576,19 +644,26 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 if (!access.allowed) continue;
                 try cuts.append(a, portion);
                 const context: TurnContext = if (@TypeOf(tracker) == @TypeOf(null)) .{} else try tracker.advance(.{}, .{}, node, id);
-                try self.offer(pool, labels, pending, potential, null, node, self.findStatus(tracker, @backingInt(id), context), tracker, context, .{
+                var label: Label = .{
                     .edge = @backingInt(id),
                     .cost = cost.cost,
                     .secs = cost.secs,
                     .dist_m = fractionalLength(edge.geom.len_m, portion),
-                    .flags = Label.contextFlags(context, access.state) | Label.partial_start |
+                    .flags = Label.contextFlags(context, access.state) | Label.partial_start | closureFlag(!closed) |
                         (if (query.forbid_initial_uturn and at_node and portion.begin == portion.end) Label.forbid_uturn else 0),
                     .ctx = std.math.cast(u32, cuts.items.len) orelse return error.TooManySearchLabels,
-                });
+                };
+                if (excluded) |entry| {
+                    label.flags |= Label.excluded_start;
+                    try self.offer(pool, labels, pending, potential, null, node, entry.seed, tracker, context, label, &entry.seed);
+                } else {
+                    try self.offer(pool, labels, pending, potential, null, node, self.findStatus(tracker, @backingInt(id), context), tracker, context, label, null);
+                }
                 var dest = query.targets.on(id);
                 var count: usize = 0;
                 while (dest.next()) |match| : (count += 1) {
                     if (count % 64 == 0) try control.check();
+                    if (excluded) |entry| if (cutsExcluded(entry.fraction, match.fraction, direction == .reverse)) continue;
                     const cut: Cut = if (direction == .forward)
                         .{ .begin = candidate.fraction, .end = match.fraction }
                     else
@@ -621,13 +696,29 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             return try kernel.slowAllowed(view, id, edge, predecessor, direction);
         }
 
+        fn closureFlag(prune: bool) u32 {
+            if (comptime !@hasDecl(K, "closed")) return 0;
+            return if (prune) Label.prune_closures else 0;
+        }
+
+        fn edgeClosed(self: *Self, kernel: K, permission: base.Permission, id: EdgeId) !bool {
+            if (comptime !@hasDecl(K, "closed")) return false;
+            if (!permission.usesClosures()) return false;
+            return self.readClosure(kernel, id);
+        }
+
+        noinline fn readClosure(self: *Self, kernel: K, id: EdgeId) !bool {
+            return kernel.closed(try DirectedEdge.read(self.view, id));
+        }
+
         inline fn findStatus(self: *Self, tracker: anytype, edge: u32, context: TurnContext) Status {
             if (@TypeOf(tracker) == @TypeOf(null) or !context.present()) return self.status.get(edge);
             if (tracker.statusId(edge, context)) |id| return self.status.get(id);
+            if (tracker.has_exclusions and self.status.get(edge).label_plus_one == Status.exclusion) return .{ .label_plus_one = Status.exclusion };
             return tracker.aliases.get(Restrictions.aliasKey(edge, context)) orelse .{};
         }
 
-        fn offer(self: *Self, pool: *Pool, labels: *std.ArrayList(Label), pending: *Q, potential: anytype, target: ?NodeId, head: NodeId, status: Status, tracker: anytype, context: TurnContext, label: Label) !void {
+        fn offer(self: *Self, pool: *Pool, labels: *std.ArrayList(Label), pending: *Q, potential: anytype, target: ?NodeId, head: NodeId, status: Status, tracker: anytype, context: TurnContext, label: Label, seed_slot: anytype) !void {
             if (status.label_plus_one != 0 and labels.items[status.label_plus_one - 1].cost <= label.cost) return;
             if (@backingInt(head) >= self.view.nodes.len) return error.InvalidEdgeHead;
             // A better label may reopen a state for an inconsistent, but
@@ -643,7 +734,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             var record = label;
             if (done) record.flags |= Label.target;
             const a = pool.arena.allocator();
-            const slot = if (@TypeOf(tracker) == @TypeOf(null) or !context.present()) try self.status.at(pool, label.edge) else blk: {
+            const slot = if (@TypeOf(seed_slot) != @TypeOf(null)) seed_slot else if (@TypeOf(tracker) == @TypeOf(null) or !context.present()) try self.status.at(pool, label.edge) else blk: {
                 if (tracker.statusId(label.edge, context)) |id| break :blk try self.status.at(pool, id);
                 const entry = try tracker.aliases.getOrPutValue(a, Restrictions.aliasKey(label.edge, context), .{});
                 break :blk entry.value_ptr;
@@ -654,6 +745,10 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             @prefetch(&self.view.first_edge[@backingInt(head)], .{});
         }
     };
+}
+
+fn cutsExcluded(excluded: f32, endpoint: f32, origin: bool) bool {
+    return if (origin) excluded >= endpoint else excluded <= endpoint;
 }
 
 fn scale(cost: costing.Cost, portion: f32, score: f32) costing.Cost {
