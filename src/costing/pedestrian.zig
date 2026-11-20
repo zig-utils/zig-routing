@@ -109,6 +109,7 @@ pub const Profile = struct {
     hills: [16]f32,
     may_allow_edges: bool,
     min_linear_factor: f32,
+    allow_transit_connections: bool = false,
 
     /// PedestrianCost::Allowed for candidate/reach search.
     pub fn allowed(self: *const Profile, edge: DirectedEdge) bool {
@@ -130,7 +131,7 @@ pub const Profile = struct {
         return self.permission.accessibleClass(edge) and
             edge.category.surface <= @backingInt(self.surface_limit) and
             edge.category.sac_scale <= self.max_hiking_difficulty and
-            !isTransitConnection(edge.category.use);
+            (self.allow_transit_connections or !isTransitConnection(edge.category.use));
     }
 
     fn useFactor(self: *const Profile, use: u6) f32 {
@@ -229,6 +230,7 @@ pub const Model = struct {
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update("pedestrian");
         hash.update(&.{@intFromBool(profile.shared.shortest)});
+        if (profile.allow_transit_connections) hash.update("transit-connections");
         if (!profile.shared.shortest) {
             hash.update(std.mem.asBytes(&profile.walking_seconds_per_metre));
             hash.update(std.mem.asBytes(&profile.hills));
@@ -303,7 +305,8 @@ pub const Kernel = struct {
     /// restrictions live in the graph's cold policy for the search.
     pub fn allowed(profile: *const Profile, previous: *const EdgeClass, next: *const EdgeClass, edge: EdgeHot, check: PathCheck) bool {
         return allowedPath(profile, previous, next, next, check) and
-            (check.allowed_by_linear_feature or @as(u64, check.previous_distance) + edge.geom.len_m <= profile.max_distance);
+            (check.allowed_by_linear_feature or profile.allow_transit_connections or
+                @as(u64, check.previous_distance) + edge.geom.len_m <= profile.max_distance);
     }
 
     /// PedestrianCost::AllowedReverse. The limit applies to the completed

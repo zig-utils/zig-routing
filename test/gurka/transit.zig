@@ -107,16 +107,58 @@ test "GTFS transit prepares a restartable graph with the same bytes across worke
     try testing.expectEqual(9001, entrance.connecting_way);
     const incident = try first.view.outEdgeRange(@fromBackingInt(entrance.place.graph_node));
     var street_links: usize = 0;
+    var connector: ?graph.format.EdgeHot = null;
     for (incident.first..incident.end) |slot| {
         const edge = first.view.edges[slot];
         const class = try first.view.class(edge.cls.class_id);
         if (class.category.use == @backingInt(graph.constants.Use.transit_connection)) {
             street_links += 1;
+            connector = edge;
             try testing.expect(class.forwardAccess().pedestrian and !class.forwardAccess().auto);
             try testing.expectEqual(9001, try first.view.wayId(@fromBackingInt(@as(u32, @intCast(slot)))));
         }
     }
     try testing.expectEqual(2, street_links);
+
+    const costing = routing.costing;
+    const costing_json = try routing.api.json.parse(a,
+        \\{"pedestrian":{"mode_factor":2,"transit_start_end_max_distance":9,"transit_transfer_max_distance":7},
+        \\"transit":{"wheelchair":true,"filters":{
+        \\"stops":{"action":"include","ids":["gtfs:0:stop:S","gtfs:0:stop:P1","gtfs:0:stop:P2"]},
+        \\"routes":{"action":"include","ids":["gtfs:0:route:R"]},
+        \\"operators":{"action":"exclude","ids":["another-agency"]}}}}
+    );
+    var warnings: std.ArrayList(costing.base.Warning) = .empty;
+    var model = try costing.multimodal.parse(a, costing_json, &warnings, .none);
+    try testing.expectEqual(0, warnings.items.len);
+    var allocation_counter: routing.infra.arena.CountingAllocator = .init(testing.allocator);
+    var request_memory: std.heap.ArenaAllocator = .init(allocation_counter.allocator());
+    defer request_memory.deinit();
+    const multimodal = try costing.multimodal.Kernel.init(request_memory.allocator(), &first.view, model, .none);
+    allocation_counter.resetCounts();
+    try testing.expect(try multimodal.allowsStation(&first.view, 0));
+    try testing.expect(!try multimodal.allowsStation(&first.view, 1));
+    try testing.expect(try multimodal.allowsStop(&first.view, 0));
+    try testing.expect(!try multimodal.allowsStop(&first.view, 2));
+    try testing.expect(try multimodal.allowsDeparture(&first.view, fixed.departure));
+    try testing.expect(!try multimodal.allowsDeparture(&first.view, frequency.departure));
+    var walk_edge = connector.?;
+    walk_edge.geom.len_m = 8;
+    const walk_class = try first.view.class(walk_edge.cls.class_id);
+    try testing.expect(multimodal.allowsWalk(.start_or_end, walk_class, walk_class, walk_edge, .{}));
+    try testing.expect(!multimodal.allowsWalk(.transfer, walk_class, walk_class, walk_edge, .{}));
+    walk_edge.geom.len_m = 7;
+    try testing.expect(multimodal.allowsWalk(.transfer, walk_class, walk_class, walk_edge, .{}));
+    const walk_cost = multimodal.walkCost(walk_class, walk_edge, 0, .{});
+    const ordinary = costing.pedestrian.Kernel.edgeCost(&multimodal.walking, &multimodal.walking_table, walk_class, walk_edge, 0, .{});
+    try testing.expectEqual(ordinary.cost * 2, walk_cost.cost);
+    try testing.expectEqual(ordinary.secs, walk_cost.secs);
+    try testing.expectEqual(0, multimodal.modeChangeCost(.pedestrian, .transit).cost);
+    try testing.expectEqual(60, multimodal.transferCost(.between_stations).secs);
+    try testing.expectEqual(0, allocation_counter.calls());
+    model.transit.operators = .{ .action = .exclude, .ids = &.{"gtfs:0:agency:operator"} };
+    const restricted = try costing.multimodal.Kernel.init(a, &first.view, model, .none);
+    try testing.expect(!try restricted.allowsDeparture(&first.view, fixed.departure));
 
     try io.writeFile(feed_path, feed);
     var options = common;

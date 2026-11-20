@@ -1044,7 +1044,17 @@ pub fn fuzzRequest(_: void, s: *Smith) !void {
             var warnings: std.ArrayList(base.Warning) = .empty;
             const key = try std.fmt.allocPrint(arena, "/{s}", .{@tagName(fast.ok.costing)});
             const input = routing.api.json.pointer(options, key) orelse .null;
-            const settings = switch (fast.ok.costing) {
+            const settings: ?base.Options = switch (fast.ok.costing) {
+                .transit => blk: {
+                    const parsed = try routing.costing.transit.parse(arena, input, &warnings, .none);
+                    _ = routing.costing.transit.Profile.init(parsed) catch return;
+                    break :blk null;
+                },
+                .multimodal => blk: {
+                    const parsed = try routing.costing.multimodal.parse(arena, options, &warnings, .none);
+                    _ = routing.costing.transit.Profile.init(parsed.transit) catch return;
+                    break :blk parsed.pedestrian.shared;
+                },
                 .pedestrian => (try routing.costing.pedestrian.parse(arena, input, &warnings, .none)).shared,
                 .bicycle => (try routing.costing.bicycle.parse(arena, input, &warnings, .none)).shared,
                 .auto, .bus, .taxi => |mode| (try routing.costing.auto.parse(arena, std.meta.stringToEnum(routing.costing.auto.Mode, @tagName(mode)).?, input, &warnings, .none)).shared,
@@ -1052,7 +1062,7 @@ pub fn fuzzRequest(_: void, s: *Smith) !void {
                 .motorcycle, .motor_scooter => |mode| (try routing.costing.motorcycle.parse(arena, std.meta.stringToEnum(routing.costing.motorcycle.Mode, @tagName(mode)).?, input, &warnings, .none)).shared,
                 else => try base.parse(arena, input, .{}, &warnings, .none),
             };
-            try std.testing.expect(settings.fixed_speed <= base.fixed_speed_max);
+            if (settings) |shared| try std.testing.expect(shared.fixed_speed <= base.fixed_speed_max);
             for (warnings.items) |warning| _ = try warning.description(arena);
         }
     }
@@ -1254,6 +1264,8 @@ test "fuzz motor-costing" {
 }
 
 const request_seeds = [_][]const u8{
+    "\x00{\"costing\":\"multimodal\",\"costing_options\":{\"pedestrian\":{\"transit_transfer_max_distance\":805},\"transit\":{\"use_bus\":0.3,\"use_rail\":0.6,\"filters\":{\"stops\":{\"action\":\"include\",\"ids\":[\"x\",3,null]},\"operators\":{\"action\":\"exclude\",\"ids\":[\"op\"]}}}}}",
+    "\x00{\"costing\":\"transit\",\"costing_options\":{\"transit\":{\"mode_factor\":\"nan\",\"use_transfers\":2,\"wheelchair\":true,\"bicycle\":\"1\"}}}",
     "\x00{\"locations\":[{\"lat\":47.066161,\"lon\":9.569393},{\"lat\":47.115521,\"lon\":9.63313}],\"costing\":\"pedestrian\",\"costing_options\":{\"pedestrian\":{\"walkway_factor\":0.6,\"sidewalk_factor\":1,\"use_tracks\":0.8,\"max_hiking_difficulty\":3}},\"directions_type\":\"none\"}",
     "\x00{\"locations\":[{\"lat\":52.09,\"lon\":5.1,\"type\":\"via\"},{\"lat\":52.1,\"lon\":5.12,\"heading\":90}],\"costing\":\"bicycle\",\"costing_options\":{\"bicycle\":{\"use_roads\":0.2,\"use_hills\":0.4}},\"units\":\"miles\",\"date_time\":{\"type\":1,\"value\":\"2026-11-17T08:00\"}}",
     "\x01{\"shape\":[{\"lat\":47.1,\"lon\":9.5},{\"lat\":47.2,\"lon\":9.6}],\"range\":true,\"height_precision\":2,\"resample_distance\":30}",

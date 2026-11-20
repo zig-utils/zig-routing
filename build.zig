@@ -422,6 +422,19 @@ pub fn build(b: *std.Build) void {
     run_motor_costing.addPassthruArgs();
     b.step("motor-costing-parity", "Compare motor costing calls with the Valhalla oracle").dependOn(&run_motor_costing.step);
 
+    const transit_costing_parity = b.addExecutable(.{
+        .name = "transit-costing-parity",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/transit_costing_parity.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "routing", .module = lib_mod }},
+        }),
+    });
+    const run_transit_costing = b.addRunArtifact(transit_costing_parity);
+    run_transit_costing.addPassthruArgs();
+    b.step("transit-costing-parity", "Compare transit costing calls with the Valhalla oracle").dependOn(&run_transit_costing.step);
+
     const check_tripleg = b.addExecutable(.{ .name = "check-tripleg", .root_module = b.createModule(.{
         .root_source_file = b.path("test/check_tripleg.zig"),
         .target = target,

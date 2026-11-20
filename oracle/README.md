@@ -165,6 +165,36 @@ The scooter oracle profiles keep the grade-adjusted speed within the pinned
 Valhalla speed table. Native tests cover the full fixed-speed range and its
 downhill maximum of 315 km/h using the same seconds-per-metre formula.
 
+### Transit costing
+
+The Valhalla sampler covers bus, rail and neutral edge weights, boarding
+transitions, and both transfer cost methods. It checks the parsed transit
+options alongside the pedestrian mode factor and walking distance limits.
+The Zig checker compares cost and elapsed seconds within a relative error
+of `1e-5`.
+
+```bash
+mkdir -p bench/results/transit-costing
+repo_dir=$PWD
+sample_dir=$repo_dir/bench/results/transit-costing
+docker run --rm \
+  --mount "type=bind,source=$repo_dir/oracle/transit-costing-reference.cc,target=/reference.cc,readonly" \
+  --mount "type=bind,source=$sample_dir,target=/work" \
+  --entrypoint bash ghcr.io/valhalla/valhalla:3.9.3 -euc '
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+      g++ libboost-dev libprotobuf-dev rapidjson-dev zlib1g-dev
+    g++ -std=c++20 -O2 -Wno-psabi -I/usr/local/include/valhalla/third_party \
+      /reference.cc -o /work/reference -lvalhalla -lprotobuf-lite -lprime_server -lz \
+      -l:libcurl.so.4 -l:liblz4.so.1 -l:libtiff.so.6 -l:libgeotiff.so.5 -pthread
+    /work/reference > /work/costs.jsonl
+  '
+zig build transit-costing-parity -Doptimize=ReleaseFast -- "$sample_dir/costs.jsonl"
+```
+
+The ARM64 oracle run produced 4,098 option samples and 16,392 cost calls.
+The maximum relative error for these calls was `1.184e-7`.
+
 ### Timed route optimality (gate B)
 
 ```bash
