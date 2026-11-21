@@ -199,7 +199,8 @@ P7.18 | Phase 7 gate: parity gates E and F, matrix and isochrone scoreboard rows
 ## P8 | P8 Map matching | /trace_route and /trace_attributes.
 P8.01 | Trace candidate search on the shared spatial index | match | port | M | P3.23 P8.01a
 P8.01a | Match Meili's incident edge choice at snapped trace nodes | match | port | M | P3.23a
-P8.02 | Emission and transition cost models with bounded routing between candidates | match | port | L | P8.01 P7.01
+P8.02 | Emission and transition cost models with bounded routing between candidates | match | port | L | P8.01 P7.01 P8.02a
+P8.02a | Verify exact trace transitions across Meili node-dominance differences | match | test | M | P7.01 P8.01
 P8.03 | Viterbi search and top-k | match | port | L | P8.02
 P8.04 | Match results to a path: match_route, discontinuities, edge walking | match | port | M | P8.03
 P8.05 | /trace_route API with shape_match modes and trace options | api | port | M | P8.04 P6.13

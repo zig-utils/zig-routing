@@ -883,12 +883,32 @@
     "out_of_scope": ["Viterbi itself (P8.03)."],
     "notes": [
       "No recursion: upstream overflows the stack on long expansions (#6294 in docs/upstream/valhalla-perf-issues.md).",
-      "Interrupt checks at the expansion's interval, not per point (upstream found per-point checks cost more than the work)."
+      "Interrupt checks at the expansion's interval, not per point (upstream found per-point checks cost more than the work).",
+      "P8.02a tracks the reference check for shorter routes that stock Meili omits through per-node dominance."
     ],
     "accept": [
       "Transition and emission costs equal the oracle's within 1e-4 on instrumented test traces.",
       "Upstream routing and transition cost tests ported and green.",
       "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P8.02a",
+    "goal": "Validate exact trace transitions when stock Meili's per-node dominance discards a viable incoming turn state.",
+    "upstream": ["src/meili/routing.cc", "valhalla/meili/routing.h", "src/meili/transition_cost_model.cc"],
+    "scope": [
+      "Reproduce the documented Utrecht transition on the same graph.",
+      "Keep stock Meili comparisons visible and add independent turn-state validation for the affected routes.",
+      "Check emitted distance, elapsed time, emissions and transition costs with the pinned oracle's costing on the verified directed path."
+    ],
+    "notes": [
+      "The full replay agrees on 7,131 of 7,149 candidate pairs and all reachable pairs. See docs/experiments/trace-transitions.md.",
+      "At node 27822, edge 77666 cannot turn onto 77702. The alternate arrival on 77710 can reach it, and the pinned costing permits the complete 776.220 m native path. Stock Meili uses a 926.220 m path."
+    ],
+    "accept": [
+      "A repeatable oracle check evaluates every move, clipped distance and clock bound on the shorter path.",
+      "An independent directed-state check establishes the shortest feasible transition in the affected cases.",
+      "Emission and transition scores match within 1e-4 when evaluated on the same verified path, with the stock route divergence reported in the validation output."
     ]
   },
   {
