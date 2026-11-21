@@ -142,6 +142,7 @@ P5.12 | Truck costing: full port of truckcost.cc with dimension, weight and hazm
 P5.13 | Motorcycle and motor scooter costing | costing | port | M | P5.11
 P5.14 | Speed model: live, predicted, constrained, free-flow and base resolution with speed_types | graph | port | M | P5.01
 P5.15 | Time-dependent search: depart_at, arrive_by, current, invariant, across timezones | search | port | L | P5.07 P5.14 P3.31
+P5.15a | Match arrive-by behavior at a closed timed access edge | search | port | M | P3.34a P5.15
 P5.16 | Avoid and exclude: locations, polygons, edges and closures | snap | port | M | P3.23 P3.29
 P5.17 | Destination-only, private access and not-thru semantics in an exact search | search | port | M | P5.11
 P5.18 | Alternates by the penalty method with stretch, sharing and local-optimality filters | search | new | M | P5.11 P4.07

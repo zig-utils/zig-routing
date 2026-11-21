@@ -1051,6 +1051,25 @@
     ]
   },
   {
+    "key": "P5.15a",
+    "goal": "Match Valhalla 3.9.3 arrive-by routing when the only connecting edge is closed by a timed access rule.",
+    "upstream": ["src/thor/unidirectional_astar.cc", "valhalla/sif/dynamiccost.h"],
+    "scope": [
+      "Trace the reverse labels and transitions that admit repeated turns while the timed edge is closed.",
+      "Match the pinned routes using shared search policy.",
+      "Preserve time-dependent cases that need distinct arrival times, deadline checks and arena-backed request memory."
+    ],
+    "notes": [
+      "Generate the `timed-access` Gurka fixture and route TSV. Use Valhalla tiles built without hierarchy or shortcuts and with ocean timezones.",
+      "On the R-to-U request arriving at 2026-03-09 06:00, Valhalla returns no path. The imported native graph returns a 660-node leg with repeated reversals on way TU."
+    ],
+    "accept": [
+      "Both engines return no path for the closed departure and arrival requests and agree on the open route.",
+      "Time-dependent search tests cover the regression and retain cases that require multiple arrival times.",
+      "`zig build test` and the binary budget pass."
+    ]
+  },
+  {
     "key": "P5.16",
     "goal": "Requests can exclude parts of the network: avoid locations, avoid polygons, explicit edge exclusions and closures, with the same request semantics and limits as upstream.",
     "upstream": [
