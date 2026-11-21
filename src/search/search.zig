@@ -171,6 +171,9 @@ pub const ExpansionEdgeVisit = struct {
     predecessor: u32 = no_index,
 };
 
+/// A compile-time visitor hook for optional search stage measurement.
+pub const ExpansionStage = enum { queue, successors, restrictions, edge_costing, turn_costing, rasterization };
+
 pub const ExpansionDecision = enum { expand, prune, stop };
 
 const NodeQuery = struct {
@@ -641,6 +644,12 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             return @hasField(Query, "distance_objective") and @TypeOf(@as(Query, undefined).distance_objective) == bool;
         }
 
+        fn hasExpansionStages(comptime Visitor: type) bool {
+            if (comptime Visitor == void or !snap_edge.hasPolicy(Visitor, "expansionStage")) return false;
+            const T = if (@typeInfo(Visitor) == .pointer) @typeInfo(Visitor).pointer.child else Visitor;
+            return @TypeOf(T.expansionStage) != void;
+        }
+
         fn observeEdges(comptime Query: type) bool {
             if (!@hasField(Query, "visitor")) return false;
             const Visitor = @TypeOf(@as(Query, undefined).visitor);
@@ -779,9 +788,14 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 try self.seedNode(direction, &pool, kernel, query.start, target, query.timing, &labels, &pending, potential, tracker, permission, has_exclusions, null, {}, false, control);
             }
 
+            const observer = if (comptime expanding and hasExpansionStages(@TypeOf(query.visitor))) query.visitor else {};
+            const profiled = @TypeOf(observer) != void;
             var popped: usize = 0;
             var settled: usize = 0;
-            while (if (@hasDecl(Q, "popWithin")) try pending.popWithin(a, control) else pending.pop()) |top| {
+            while (true) {
+                if (profiled) observer.expansionSample(popped);
+                const top = (if (@hasDecl(Q, "popWithin")) try pending.popWithin(a, control) else pending.pop()) orelse break;
+                if (profiled) observer.expansionStage(.successors);
                 popped += 1;
                 if ((popped & 1023) == 0) try control.check();
                 const last = labels.items[top.label];
@@ -820,6 +834,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 else
                     .{};
                 if (expanding) {
+                    if (profiled) observer.expansionStage(.rasterization);
                     const decision: ExpansionDecision = if (visits)
                         try query.visitor.visit(.{
                             .node = at,
@@ -831,6 +846,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                         })
                     else
                         .expand;
+                    if (profiled) observer.expansionStage(.successors);
                     if (settled == limit or decision == .stop) {
                         try control.check();
                         return .{ .labels = labels.items, .index = top.label, .popped = popped, .settled = settled, .cuts = cuts.items };
@@ -849,13 +865,16 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 };
                 const forward_row = if (direction == .forward) try self.view.turnRow(at, geometry.cls.opp_local) else &.{};
                 for (self.view.edges[exits.first..exits.end], exits.first.., 0..) |*outward, index, local| {
+                    if (profiled) observer.expansionStage(.successors);
                     if (partial_starts and last.flags & Label.forbid_uturn != 0 and local == geometry.cls.opp_local) continue;
                     const local_id: EdgeId = @fromBackingInt(@as(u32, @intCast(index)));
                     const next_id = if (direction == .forward) local_id else try self.view.oppEdge(local_id);
                     const feature = if (features) |costs| costs.get(next_id) else null;
                     const allowed = feature != null and feature.?.allow;
+                    if (profiled) observer.expansionStage(.restrictions);
                     const next_context: TurnContext = if (with_restrictions) try tracker.advance(context, last, at, next_id) else .{};
                     if (with_restrictions and next_context.value == no_index) continue;
+                    if (profiled) observer.expansionStage(.successors);
                     const terminal_edge: ClosureEdge = if (terminal_closures) |closures| closures.get(@backingInt(next_id)) else .none;
                     const phase = closureBits(last);
                     const kind = if (phase == Label.origin_closure and terminal_edge == .none)
@@ -875,6 +894,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     const closed = kind == .closed or (phase == 0 and kind == .none and try self.edgeClosed(kernel, permission, next_id));
                     if (closed and next_phase == 0) continue;
                     const head: NodeId = @fromBackingInt(outward.head);
+                    if (profiled) observer.expansionStage(.restrictions);
                     const access = if (allowed)
                         base.AccessEvaluation{ .state = last.accessState() }
                     else if (with_restrictions and (model_access or (check_access and next.cls.cold_checks != 0)))
@@ -914,13 +934,16 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     if (comptime @hasDecl(K, "slowAllowed")) {
                         if (!allowed and next.cls.cold_checks != 0 and !try Self.slowAllowed(kernel, self.view, next_id, next, last, direction)) continue;
                     }
+                    if (profiled) observer.expansionStage(.edge_costing);
                     const traversal = try priceEdge(self.view, kernel, next_id, next, direction, time, false);
                     if (traversal.cost.cost == std.math.inf(f32)) continue;
                     const full = distancePrice(traversal.cost, next, distance_only);
                     const edge_cost = try priceCut(full, feature, .{}, 1, distance_only, control);
                     movement.measured_speed = if (direction == .forward) last.measuredSpeed() else traversal.measured_speed;
+                    if (profiled) observer.expansionStage(.turn_costing);
                     const delay = if (distance_only) costing.Cost{} else try priceTurn(self.view, kernel, movement, last, direction, time);
                     if (delay.cost == std.math.inf(f32)) continue;
+                    if (profiled) observer.expansionStage(.successors);
                     const previous: costing.Cost = .{ .cost = last.cost, .secs = last.secs };
                     if (observe_edges) try query.visitor.visitEdge(ExpansionEdgeVisit{
                         .edge = next_id,
@@ -970,7 +993,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                         .tcost = delay.cost,
                         .ctx = next_context.value,
                         .flags = Label.contextFlags(next_context, access.state) | next_phase | traversal.flags(),
-                    }, null, distance_only, floor);
+                    }, null, distance_only, floor, observer);
                 }
             }
             try control.check();
@@ -1043,7 +1066,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     .dist_m = edge.geom.len_m,
                     .ctx = context.value,
                     .flags = Label.contextFlags(context, access.state) | closure | traversal.flags(),
-                }, null, distance_only, floor);
+                }, null, distance_only, floor, {});
             }
         }
 
@@ -1131,9 +1154,9 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 };
                 if (excluded) |entry| {
                     label.flags |= Label.excluded_start;
-                    try self.offer(pool, labels, pending, potential, null, node, entry.seed, tracker, context, label, &entry.seed, distance_only, floor);
+                    try self.offer(pool, labels, pending, potential, null, node, entry.seed, tracker, context, label, &entry.seed, distance_only, floor, {});
                 } else {
-                    try self.offer(pool, labels, pending, potential, null, node, self.findStatus(tracker, @backingInt(id), context, closure), tracker, context, label, null, distance_only, floor);
+                    try self.offer(pool, labels, pending, potential, null, node, self.findStatus(tracker, @backingInt(id), context, closure), tracker, context, label, null, distance_only, floor, {});
                 }
                 if (expanding) continue;
                 var dest = query.targets.on(id);
@@ -1250,7 +1273,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             return tracker.aliases.get(Restrictions.aliasKey(edge, context, closure)) orelse .{};
         }
 
-        fn offer(self: *Self, pool: *Pool, labels: *std.ArrayList(Label), pending: *Q, potential: anytype, target: ?NodeId, head: NodeId, status: Status, tracker: anytype, context: TurnContext, label: Label, seed_slot: anytype, comptime distance_only: bool, floor: f32) !void {
+        fn offer(self: *Self, pool: *Pool, labels: *std.ArrayList(Label), pending: *Q, potential: anytype, target: ?NodeId, head: NodeId, status: Status, tracker: anytype, context: TurnContext, label: Label, seed_slot: anytype, comptime distance_only: bool, floor: f32, observer: anytype) !void {
             const use_time = @TypeOf(tracker) != @TypeOf(null) and tracker.keep_time;
             const pareto = if (distance_only and @TypeOf(tracker) != @TypeOf(null)) tracker.pareto else false;
             var key: Restrictions.AliasKey = if (use_time) Restrictions.timedKey(label, context) else undefined;
@@ -1291,7 +1314,9 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 break :blk entry.value_ptr;
             };
             try labels.append(a, record);
+            if (@TypeOf(observer) != void) observer.expansionStage(.queue);
             try pending.push(a, queue.Entry.init(roundedDown(@as(f64, label.cost) + estimate), index));
+            if (@TypeOf(observer) != void) observer.expansionStage(.successors);
             if (pareto) {
                 try tracker.replaceDominated(a, labels.items, &slot.label_plus_one, index);
             } else {

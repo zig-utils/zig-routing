@@ -122,6 +122,18 @@ pub fn Isochrone(comptime K: type) type {
                     rasterizer: *Rasterizer,
                     observer: @TypeOf(observer),
 
+                    const profiled = @import("../snap/edge.zig").hasPolicy(@TypeOf(observer), "expansionStage");
+                    pub const expansionStage = if (profiled) stage else {};
+                    pub const expansionSample = if (profiled) sample else {};
+
+                    fn stage(adapter: *@This(), phase: core.ExpansionStage) void {
+                        adapter.observer.expansionStage(phase);
+                    }
+
+                    fn sample(adapter: *@This(), popped: usize) void {
+                        adapter.observer.expansionSample(popped);
+                    }
+
                     pub fn visit(adapter: *@This(), event: expansion.Visit) !expansion.Decision {
                         try adapter.observer.observe(event);
                         return adapter.rasterizer.visit(event);
