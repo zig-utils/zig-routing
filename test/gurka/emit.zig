@@ -46,6 +46,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, name, "turn-names-us")) break :blk try examples.turnNames(arena, true);
         if (std.mem.eql(u8, name, "turn-names-ca")) break :blk try examples.turnNames(arena, false);
         if (std.mem.eql(u8, name, "driving-side")) break :blk try examples.drivingSide(arena);
+        if (std.mem.eql(u8, name, "transit-overtake")) break :blk try overtakeStreets(arena);
         if (std.meta.stringToEnum(examples.LinkCase, name)) |link_case| break :blk try examples.links(arena, link_case);
         if (std.mem.eql(u8, name, "timed-turns")) break :blk try examples.timedTurns(arena, false);
         if (std.mem.eql(u8, name, "probable-turns")) break :blk try examples.probableTurns(arena);
@@ -108,6 +109,16 @@ pub fn main(init: std.process.Init) !void {
     } else {
         try fixture.osm.writePbf(init.gpa, path);
     }
+}
+
+fn overtakeStreets(a: std.mem.Allocator) !gurka.Map {
+    var layout: gurka.NodeLayout = .{};
+    layout.points['A'] = .{ .lng = -71.0604, .lat = 42.07 };
+    layout.points['B'] = .{ .lng = -71.06, .lat = 42.07 };
+    layout.points['C'] = .{ .lng = -71.035, .lat = 42.07 };
+    layout.points['D'] = .{ .lng = -71.0346, .lat = 42.07 };
+    const street = [_]gurka.Tag{.{ .key = "highway", .value = "residential" }};
+    return gurka.Map.init(a, layout, &.{ .{ .label = "AB", .tags = &street }, .{ .label = "CD", .tags = &street } }, &.{}, &.{});
 }
 
 fn accessProfiles(arena: std.mem.Allocator, fixture: gurka.Map, path: []const u8) !void {

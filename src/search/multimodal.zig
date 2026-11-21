@@ -218,6 +218,16 @@ pub const Path = struct {
     ignored_filter: [2]bool,
 };
 
+pub const ReplayStep = union(enum) {
+    walk: endpoints.Segment,
+    ride: struct { line: u32, trip: u32, board_minute: i64 },
+};
+
+pub const ReplayResult = union(enum) {
+    cost: Cost,
+    blocked_at: usize,
+};
+
 const Journey = struct {
     stop: u32 = Transit.no_id,
     route: u32 = Transit.no_id,
@@ -412,22 +422,62 @@ pub const Search = struct {
         }
     }
 
-    fn runWithin(self: *const Search, a: Allocator, from: endpoints.Ranked, to: endpoints.Ranked, options: endpoints.Options, filtered: bool, ceiling: f32, control: Control) !Path {
+    fn restrictions(self: *const Search, options: endpoints.Options, control: Control) core.Restrictions {
         const permission = self.kernel.walking.permission;
-        const restrictions: core.Restrictions = .{
+        return .{
             .access = .{ .view = self.view, .permission = permission, .direction = .forward, .timing = options.timing, .control = control, .check_access = self.view.cold_data != null },
             .states = self.view.restriction_automaton orelse &.{},
             .modes = permission.restrictionModes(),
             .has_exclusions = options.excluded.len != 0,
             .keep_time = true,
         };
+    }
+
+    /// Check and price a fixed sequence with the same walking and boarding
+    /// transitions as search. Boarding minutes identify the displayed ride.
+    pub fn reprice(self: *const Search, a: Allocator, from: endpoints.Candidate, to: endpoints.Candidate, steps: []const ReplayStep, options: endpoints.Options, control: Control) !ReplayResult {
+        if (options.direction != .forward or options.timing.invariant or !options.timing.start.valid)
+            return error.UnsupportedTransitDateTime;
+        if (steps.len == 0 or steps[0] != .walk or steps[steps.len - 1] != .walk) return error.InvalidTransitReplay;
+        var query: Query = .{
+            .search = self,
+            .a = a,
+            .control = control,
+            .restrictions = self.restrictions(options, control),
+            .targets = try endpoints.Targets.init(a, &.{to}, .forward, control),
+            .ceiling = undefined,
+            .potential = undefined,
+            .ignored_filter = undefined,
+        };
+        for (options.excluded) |excluded| {
+            try control.check();
+            const entry = try query.excluded.getOrPut(a, excluded.id);
+            if (!entry.found_existing) entry.value_ptr.* = excluded.percent_along;
+        }
+        var prior: ?Label = null;
+        for (steps, 0..) |step, i| {
+            try control.check();
+            var sink: ReplaySink = .{ .expected = step, .terminal = i + 1 == steps.len };
+            if (prior) |label| {
+                if (!try query.canEnter(label.node)) return .{ .blocked_at = i };
+                switch (step) {
+                    .walk => try query.expandWalk(no_label, label, &sink),
+                    .ride => if (label.can_board) try query.expandRides(no_label, label, &sink),
+                }
+            } else try query.seed(from, options.forbid_initial_uturn, &sink);
+            prior = sink.matched orelse return .{ .blocked_at = i };
+        }
+        return .{ .cost = prior.?.step.elapsed };
+    }
+
+    fn runWithin(self: *const Search, a: Allocator, from: endpoints.Ranked, to: endpoints.Ranked, options: endpoints.Options, filtered: bool, ceiling: f32, control: Control) !Path {
         const targets = try endpoints.Targets.init(a, to.candidates(filtered), .forward, control);
         const timetable = if (self.timetable) |*present| present else null;
         var query: Query = .{
             .search = self,
             .a = a,
             .control = control,
-            .restrictions = restrictions,
+            .restrictions = self.restrictions(options, control),
             .targets = targets,
             .ceiling = ceiling,
             .potential = try transit_potential.Potential.init(a, self.view, self.kernel, timetable, self.minimum_ride, &targets, ceiling, control),
@@ -450,8 +500,28 @@ pub const Search = struct {
             if (!last.found_existing) last.value_ptr.* = excluded.percent_along;
         }
         const starts = try endpoints.starts(a, from.candidates(filtered), &query.targets, .forward, control);
-        for (starts) |start| try query.seed(start, options.forbid_initial_uturn);
+        for (starts) |start| try query.seed(start, options.forbid_initial_uturn, &query);
         return query.finish();
+    }
+};
+
+const ReplaySink = struct {
+    expected: ReplayStep,
+    terminal: bool,
+    matched: ?Label = null,
+
+    fn offer(self: *ReplaySink, label: Label, ride: ?Ride) !void {
+        if (label.terminal != self.terminal) return;
+        switch (self.expected) {
+            .walk => |walk| if (label.step.movement != .walk or !std.meta.eql(walk, label.step.movement.walk)) return,
+            .ride => |expected| {
+                const run = ride orelse return;
+                if (run.departure.line != expected.line or run.departure.trip != expected.trip or
+                    @divFloor(run.departure_time, 60) != expected.board_minute) return;
+            },
+        }
+        if (self.matched != null) return error.AmbiguousTransitReplay;
+        self.matched = label;
     }
 };
 
@@ -496,8 +566,8 @@ const Query = struct {
             if (label.inactive) continue;
             if (label.terminal) return self.trace(item.label);
             if (!try self.canEnter(label.node)) continue;
-            try self.expandWalk(item.label, label);
-            if (label.can_board) try self.expandRides(item.label, label);
+            try self.expandWalk(item.label, label, self);
+            if (label.can_board) try self.expandRides(item.label, label, self);
         }
         return if (self.ceiling_hit) error.CostCeilingReached else error.NoPath;
     }
@@ -677,7 +747,7 @@ const Query = struct {
         return @intFromFloat(@as(f32, @floatFromInt(edge.geom.len_m)) * fraction);
     }
 
-    fn seed(self: *Query, start: endpoints.Candidate, forbid_initial_uturn: bool) !void {
+    fn seed(self: *Query, start: endpoints.Candidate, forbid_initial_uturn: bool, sink: anytype) !void {
         try self.control.check();
         const view = self.search.view;
         const edge = try view.edge(start.edge);
@@ -699,7 +769,7 @@ const Query = struct {
             .walk_distance = length(edge, remaining),
             .forbid_initial_uturn = forbid_initial_uturn and remaining == 0,
         };
-        if (!turn.blocked() and label.walk_distance <= self.search.kernel.walking_limit) try self.offer(label, null);
+        if (!turn.blocked() and label.walk_distance <= self.search.kernel.walking_limit) try sink.offer(label, null);
         var targets = self.targets.on(start.edge);
         while (targets.next()) |target| {
             try self.control.check();
@@ -709,11 +779,11 @@ const Query = struct {
             label.terminal = true;
             label.step.movement.walk.end = target.fraction;
             label.step.elapsed = partial(cost, fraction, start.score + target.score);
-            try self.offer(label, null);
+            try sink.offer(label, null);
         }
     }
 
-    fn expandWalk(self: *Query, pred: u32, label: Label) !void {
+    fn expandWalk(self: *Query, pred: u32, label: Label, sink: anytype) !void {
         const view = self.search.view;
         const kernel = self.search.kernel;
         const node = try view.node(label.node);
@@ -774,7 +844,7 @@ const Query = struct {
                     terminal.terminal = true;
                     terminal.step.movement.walk.end = target.fraction;
                     terminal.step.elapsed = elapsed.add(partial(cost, target.fraction, target.score));
-                    try self.offer(terminal, null);
+                    try sink.offer(terminal, null);
                 };
             }
             if (forbidden != null or next.walk_distance > kernel.walking_limit) continue;
@@ -784,11 +854,11 @@ const Query = struct {
             const access = try self.restrictions.access.evaluate(id, edge, label.node, road, .middle);
             if (!access.allowed) continue;
             next.access = access.state;
-            try self.offer(next, null);
+            try sink.offer(next, null);
         }
     }
 
-    fn expandRides(self: *Query, pred: u32, label: Label) !void {
+    fn expandRides(self: *Query, pred: u32, label: Label, sink: anytype) !void {
         const index = &(self.search.timetable orelse return);
         const platform = index.platformAt(label.node) orelse return;
         const view = self.search.view;
@@ -808,12 +878,12 @@ const Query = struct {
             if (!try self.canEnter(destination)) continue;
             var departures = try Departures.init(table, line_id, clock);
             while (try departures.next(self.control)) |departure| {
-                try self.board(pred, label, table, platform, destination, departure, transfer, clock.instant);
+                try self.board(pred, label, table, platform, destination, departure, transfer, clock.instant, sink);
             }
         }
     }
 
-    fn board(self: *Query, pred: u32, label: Label, table: Transit.View, platform: u32, destination: NodeId, scheduled: ScheduledDeparture, transfer: Cost, now: i64) !void {
+    fn board(self: *Query, pred: u32, label: Label, table: Transit.View, platform: u32, destination: NodeId, scheduled: ScheduledDeparture, transfer: Cost, now: i64, sink: anytype) !void {
         const kernel = self.search.kernel;
         const offered = scheduled.offered.departure;
         if (offered.trip == Transit.no_id) return error.InvalidTransitTrip;
@@ -838,7 +908,7 @@ const Query = struct {
         const transition: Cost = .{ .cost = if (continuing) 0 else if (trip.operator != .none and operator != trip.operator) 300 else transfer.cost };
         var elapsed = label.step.elapsed.add(transition).add(kernel.transit.rideCost(costing.transit.vehicleUse(route.flags.vehicle), offered.elapsed_time, wait));
         elapsed.secs = @floatFromInt(arrival - self.restrictions.access.timing.start.unix_time);
-        try self.offer(.{
+        try sink.offer(.{
             .node = destination,
             .step = .{ .movement = .{ .ride = offered.line }, .elapsed = elapsed, .transition = transition },
             .journey = try self.internJourney(.{ .stop = table.lines[offered.line].destination, .trip = offered.trip, .route = offered.route, .block = offered.block, .operator = operator, .service_day = scheduled.service_day, .occurrence = occurrence, .arrived = arrival }),

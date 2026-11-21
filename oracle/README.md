@@ -222,7 +222,8 @@ The default replay returned 97 native routes out of 100. It matched
 25 sequences of lines and stops and 22 sequences including boarding
 time. The streets were built independently from the same PBF, so the
 comparison includes street connectivity and correlation differences.
-Same-graph replay requires the level-3 transit importer.
+For the fixed-cut replay using shared streets and timetables, see
+[same-graph transit replay](../docs/experiments/transit-same-graph.md).
 [Issue #190](https://github.com/zig-utils/zig-routing/issues/190) ·
 [Issue #249](https://github.com/zig-utils/zig-routing/issues/249)
 

@@ -45,12 +45,20 @@ pub const ScheduledRoute = struct {
 pub fn route(view: *const graph.reader.View, arena: *Arena, options: *const request.Options, now: ?i64, control: search.search.Control) !Result {
     try control.check();
     return switch (options.costing) {
-        .transit, .multimodal => scheduled(view, arena, options, now orelse io.wallSeconds(), control),
+        .transit, .multimodal => scheduled(view, arena, options, null, now orelse io.wallSeconds(), control),
         else => .{ .failure = .{ .code = 107, .extra = "route" } },
     };
 }
 
-fn scheduled(view: *const graph.reader.View, arena: *Arena, options: *const request.Options, now: i64, control: search.search.Control) !Result {
+/// Run the scheduled route action with externally supplied directed cuts.
+pub fn routeWithCorrelations(view: *const graph.reader.View, arena: *Arena, options: *const request.Options, correlated: []const snap.candidates.PathLocation, control: search.search.Control) !Result {
+    if (options.costing != .transit and options.costing != .multimodal)
+        return .{ .failure = .{ .code = 107, .extra = "route" } };
+    if (correlated.len != options.locations.len) return error.InvalidRouteCorrelations;
+    return scheduled(view, arena, options, correlated, io.wallSeconds(), control);
+}
+
+fn scheduled(view: *const graph.reader.View, arena: *Arena, options: *const request.Options, supplied: ?[]const snap.candidates.PathLocation, now: i64, control: search.search.Control) !Result {
     if (options.date_time_type == .arrive_by or options.date_time_type == .invariant)
         return .{ .failure = .{ .code = 141 } };
     const a = arena.allocator();
@@ -58,13 +66,15 @@ fn scheduled(view: *const graph.reader.View, arena: *Arena, options: *const requ
     const profiles = try costing.multimodal.parse(a, options.costing_options orelse .null, &warnings, control.deadline);
     const kernel = try costing.multimodal.Kernel.init(a, view, profiles, control.deadline);
     const defaults: snap.candidates.Defaults = .{};
-    const snapped = if (view.transit_index == null)
-        try snap.location.route(view, a, options.locations, defaults, &kernel.walking, control.deadline)
-    else
-        try snap.location.correlate(view, a, options.locations, defaults, &kernel.walking, control.deadline);
-    const correlated = switch (snapped) {
-        .ok => |locations| locations,
-        .failure => |failure| return .{ .failure = failure },
+    const correlated = supplied orelse blk: {
+        const snapped = if (view.transit_index == null)
+            try snap.location.route(view, a, options.locations, defaults, &kernel.walking, control.deadline)
+        else
+            try snap.location.correlate(view, a, options.locations, defaults, &kernel.walking, control.deadline);
+        switch (snapped) {
+            .ok => |locations| break :blk locations,
+            .failure => |failure| return .{ .failure = failure },
+        }
     };
     const ranked = try a.alloc(search.endpoints.Ranked, correlated.len);
     for (ranked, correlated) |*entry, location| entry.* = try search.endpoints.rank(a, location, options.costing, control);

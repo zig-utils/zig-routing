@@ -164,6 +164,53 @@ pub fn restrictedTile() [620]u8 {
     return data;
 }
 
+const transit = source.transit_format;
+pub const transit_tile_size = @sizeOf(source.Header) + 2 * @sizeOf(transit.Departure) +
+    @sizeOf(transit.Stop) + @sizeOf(transit.Route) + @sizeOf(transit.Schedule) + 4;
+
+pub fn transitTile() [transit_tile_size]u8 {
+    var bytes: [transit_tile_size]u8 = @splat(0);
+    var header = std.mem.zeroes(source.Header);
+    header.tile.id = .{ .tile = first_tile, .level = source.transit_level };
+    @memcpy(header.version[0..5], "3.9.3");
+    header.transit.departures = 2;
+    header.transit.stops = 1;
+    header.signs.routes = 1;
+    header.signs.schedules = 1;
+    header.date_created = 4706;
+    header.text_offset = transit_tile_size - 4;
+    header.forward_restriction_offset = header.text_offset;
+    header.reverse_restriction_offset = header.text_offset;
+    header.edge_info_offset = header.text_offset;
+    header.lane_connectivity_offset = transit_tile_size;
+    header.predicted_speed_offset = transit_tile_size;
+    header.tile_size = transit_tile_size;
+    @memcpy(bytes[0..@sizeOf(source.Header)], std.mem.asBytes(&header));
+    const departures = [_]transit.Departure{
+        .{
+            .ids = .{ .line = 1, .route = 0, .trip = 21 },
+            .attrs = .{ .block = 3, .schedule = 0, .headsign = 1, .kind = 0, .wheelchair = true, .bicycle = false, .spare = 0 },
+            .times = 25_200 | (1200 << 17),
+        },
+        .{
+            .ids = .{ .line = 1, .route = 0, .trip = 22 },
+            .attrs = .{ .block = 0, .schedule = 0, .headsign = 1, .kind = 1, .wheelchair = true, .bicycle = true, .spare = 0 },
+            .times = @bitCast(transit.Departure.Frequency{ .start = 25_320, .end = 25_920, .headway = 120, .elapsed = 60 }),
+        },
+    };
+    const stop: transit.Stop = .{ .attrs = .{ .one_stop = 1, .name = 1, .generated = false, .traversability = 3, .spare = 0 } };
+    const route = std.mem.zeroes(transit.Route);
+    const schedule: transit.Schedule = .{ .days = 31, .attrs = .{ .weekdays = 62, .end_day = 6, .spare = 0 } };
+    var at: usize = @sizeOf(source.Header);
+    inline for (.{ departures, stop, route, schedule }) |records| {
+        const encoded = std.mem.asBytes(&records);
+        @memcpy(bytes[at..][0..encoded.len], encoded);
+        at += encoded.len;
+    }
+    @memcpy(bytes[at..], "\x00A\x00\x00");
+    return bytes;
+}
+
 pub fn archive() [4096]u8 {
     var bytes: [4096]u8 = @splat(0);
     tarHeader(bytes[0..512], "index.bin", "00000000040");

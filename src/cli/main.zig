@@ -236,7 +236,7 @@ fn createCommands(a: Allocator) !*Command {
         option("samples", "Random samples per tile (default 1000)", .int),
     }, &.{ arg("PACK", "Packed DEM"), arg("HGT_DIR", "Source tile directory") });
     _ = try command(elevation, "info", "Describe a packed DEM", infoDem, &.{}, &.{arg("PACK", "Packed DEM")});
-    _ = try command(root, "import-valhalla", "Import local Valhalla tiles into a test graph bundle", importValhalla, &.{
+    _ = try command(root, "import-valhalla", "Import Valhalla road and transit tiles into a test graph bundle", importValhalla, &.{
         option("output", "Publish the graph bundle at this path", .string).withRequired(true),
     }, &.{arg("TILES", "Valhalla tile directory, .gph file or indexed tiles.tar").withVariadic(true)});
     const parity = try command(root, "parity", "Run same-graph oracle parity checks", null, &.{}, &.{});
@@ -1051,7 +1051,7 @@ fn importValhalla(ctx: *Context) !u8 {
     if (ctx.wantsJson()) {
         try ctx.writeJson(stats);
     } else {
-        try ctx.out.?.print("imported {d} nodes and {d} directed edges from {d} local Valhalla tiles\n", .{ stats.nodes, stats.edges, stats.tiles });
+        try ctx.out.?.print("imported {d} nodes and {d} directed edges from {d} Valhalla tiles\n", .{ stats.nodes, stats.edges, stats.tiles });
     }
     return 0;
 }

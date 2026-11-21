@@ -971,7 +971,52 @@ test "fuzz valhalla-tile" {
     const raw = valhalla_fixture.tile(false);
     const restricted = valhalla_fixture.restrictedTile();
     const tar = valhalla_fixture.archive();
-    try std.testing.fuzz({}, fuzzValhallaTile, .{ .corpus = try seeds(state.allocator(), &.{ &.{}, &raw, &restricted, &tar, raw[0 .. raw.len - 1] }) });
+    const scheduled = valhalla_fixture.transitTile();
+    try std.testing.fuzz({}, fuzzValhallaTile, .{ .corpus = try seeds(state.allocator(), &.{ &.{}, &raw, &restricted, &tar, &scheduled, raw[0 .. raw.len - 1] }) });
+}
+
+test "Valhalla transit tile decodes departure times and rejects invalid sections" {
+    const source = valhalla_import.tile_format;
+    const transit = source.transit_format;
+    const fixture = valhalla_fixture.transitTile();
+    const tile = try source.Tile.parse(&fixture);
+    try std.testing.expectEqual(@as(usize, 2), tile.transit.departures.len);
+    const first = tile.transit.departures[0];
+    const second = tile.transit.departures[1];
+    try std.testing.expectEqual(@as(u32, 25_200), first.start());
+    try std.testing.expectEqual(@as(u32, 1200), first.elapsed());
+    try std.testing.expectEqual(@as(u32, 25_320), second.start());
+    try std.testing.expectEqual(@as(u32, 60), second.elapsed());
+    try std.testing.expectEqual(@as(u13, 120), second.frequency().?.headway);
+    try std.testing.expectEqualStrings("A", try tile.transitText(first.attrs.headsign));
+    try std.testing.expectEqual(@as(u64, 31), tile.transit.schedules[0].days);
+
+    var bytes = fixture;
+    var header = tile.header;
+    header.transit.departures = 3;
+    @memcpy(bytes[0..@sizeOf(source.Header)], std.mem.asBytes(&header));
+    try std.testing.expectError(error.TruncatedValhallaTransit, source.Tile.parse(&bytes));
+
+    bytes = fixture;
+    const record = bytes[@sizeOf(source.Header)..][0..@sizeOf(transit.Departure)];
+    var wrong = first;
+    wrong.attrs.schedule = 1;
+    @memcpy(record, std.mem.asBytes(&wrong));
+    try std.testing.expectError(error.InvalidValhallaTransitDeparture, source.Tile.parse(&bytes));
+
+    wrong = first;
+    wrong.attrs.headsign = 4;
+    @memcpy(record, std.mem.asBytes(&wrong));
+    try std.testing.expectError(error.InvalidValhallaTransitText, source.Tile.parse(&bytes));
+
+    bytes = fixture;
+    const frequency = bytes[@sizeOf(source.Header) + @sizeOf(transit.Departure) ..][0..@sizeOf(transit.Departure)];
+    wrong = second;
+    var times = second.frequency().?;
+    times.headway = 0;
+    wrong.times = @bitCast(times);
+    @memcpy(frequency, std.mem.asBytes(&wrong));
+    try std.testing.expectError(error.InvalidValhallaTransitDeparture, source.Tile.parse(&bytes));
 }
 
 test "Valhalla tile rejects truncated complex restrictions and out-of-range access edges" {

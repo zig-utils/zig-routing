@@ -8,6 +8,8 @@ const graph = @import("../graph/root.zig");
 const automaton = @import("../graph/restriction_automaton.zig");
 
 pub const local_level = 2;
+pub const transit_level = 3;
+pub const transit_format = @import("valhalla_transit.zig");
 pub const version_major = '3';
 
 pub const GraphId = packed struct(u46) {
@@ -318,6 +320,14 @@ pub const Edge = extern struct {
         link: bool,
     },
 
+    pub fn transitLine(self: Edge) u32 {
+        return @as(u32, self.local.stop_impacts) | (@as(u32, self.local.edge_to_right) << 24);
+    }
+
+    pub fn isTransitRide(self: Edge) bool {
+        return self.speed.use == @backingInt(graph.constants.Use.bus) or self.speed.use == @backingInt(graph.constants.Use.rail);
+    }
+
     pub fn turn(self: Edge, incoming: Edge) struct { entry: graph.format.TurnEntry, sides: u2 } {
         const restricted = if (std.math.cast(u3, self.local.index)) |slot| bit(incoming.endpoint.restrictions, slot) else false;
         const restriction: u8 = if (restricted) 0x80 else 0;
@@ -383,6 +393,7 @@ pub const Tile = struct {
     edges: []align(1) const Edge,
     local_signs: []align(1) const Sign,
     access_restrictions: []align(1) const AccessRestriction,
+    transit: transit_format.Tables,
     bins: []align(1) const u64,
     bounding_circles: []align(1) const u32,
     forward_restrictions: []const u8,
@@ -393,6 +404,11 @@ pub const Tile = struct {
     pub fn signText(self: *const Tile, offset: u32) ![]const u8 {
         if (offset >= self.text.len) return error.InvalidSignOffset;
         return terminatedText(self.text[offset..]) orelse error.UnterminatedSign;
+    }
+
+    pub fn transitText(self: Tile, offset: u24) ![]const u8 {
+        if (offset >= self.text.len) return error.InvalidValhallaTransitText;
+        return terminatedText(self.text[offset..]) orelse error.InvalidValhallaTransitText;
     }
 
     pub fn parse(bytes: []const u8) !Tile {
@@ -409,17 +425,22 @@ pub const Tile = struct {
         const extended = if (header.tile.extended_edges) @as(usize, header.counts.edges) * @sizeOf(u64) else 0;
         const access_start = edge_end + extended;
         const access_end = access_start + @as(usize, header.access.restrictions) * @sizeOf(AccessRestriction);
-        const local_sign_count = if (header.tile.id.level == local_level) header.signs.count else 0;
-        // Local road tiles have no transit tables between access restrictions and signs.
-        if (local_sign_count != 0 and (header.transit.departures != 0 or header.transit.stops != 0 or
-            header.signs.routes != 0 or header.signs.schedules != 0 or header.transit.transfers != 0))
-            return error.InvalidTileOffsets;
-        const sign_end = access_end + @as(usize, local_sign_count) * @sizeOf(Sign);
-        if (sign_end > header.forward_restriction_offset or
+        if (access_end > header.forward_restriction_offset or
             header.forward_restriction_offset > header.reverse_restriction_offset or
             header.reverse_restriction_offset > header.edge_info_offset or
             header.edge_info_offset > header.text_offset or header.text_offset > header.lane_connectivity_offset or
             header.lane_connectivity_offset > bytes.len) return error.InvalidTileOffsets;
+        var tables = bytes[access_end..header.forward_restriction_offset];
+        const transit = try transit_format.Tables.parse(&tables, .{
+            .departures = header.transit.departures,
+            .stops = header.transit.stops,
+            .routes = header.signs.routes,
+            .schedules = header.signs.schedules,
+            .transfers = header.transit.transfers,
+        });
+        const sign_start = header.forward_restriction_offset - tables.len;
+        const sign_end = sign_start + @as(usize, header.signs.count) * @sizeOf(Sign);
+        if (sign_end > header.forward_restriction_offset) return error.InvalidTileOffsets;
         var previous: u32 = 0;
         for (header.bins) |end| {
             if (end < previous) return error.InvalidTileBinOffsets;
@@ -438,8 +459,9 @@ pub const Tile = struct {
             .header = header,
             .nodes = std.mem.bytesAsSlice(Node, bytes[@sizeOf(Header)..node_end]),
             .edges = std.mem.bytesAsSlice(Edge, bytes[edge_start..edge_end]),
-            .local_signs = std.mem.bytesAsSlice(Sign, bytes[access_end..sign_end]),
+            .local_signs = if (header.tile.id.level == local_level) std.mem.bytesAsSlice(Sign, bytes[sign_start..sign_end]) else &.{},
             .access_restrictions = std.mem.bytesAsSlice(AccessRestriction, bytes[access_start..access_end]),
+            .transit = transit,
             .bins = std.mem.bytesAsSlice(u64, bytes[bin_start..bin_end]),
             .bounding_circles = std.mem.bytesAsSlice(u32, circle_bytes),
             .forward_restrictions = bytes[header.forward_restriction_offset..header.reverse_restriction_offset],
@@ -448,6 +470,7 @@ pub const Tile = struct {
             .text = bytes[header.text_offset..header.lane_connectivity_offset],
         };
         try tile.verifyRestrictions(deadline);
+        try tile.transit.verify(tile.text, deadline);
         return tile;
     }
 
