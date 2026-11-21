@@ -38,6 +38,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, name, "driving-side")) break :blk try examples.drivingSide(arena);
         if (std.meta.stringToEnum(examples.LinkCase, name)) |link_case| break :blk try examples.links(arena, link_case);
         if (std.mem.eql(u8, name, "timed-turns")) break :blk try examples.timedTurns(arena, false);
+        if (std.mem.eql(u8, name, "probable-turns")) break :blk try examples.probableTurns(arena);
         return error.UnknownFixture;
     } else try examples.intersection(arena);
     if (scenario) |name| {

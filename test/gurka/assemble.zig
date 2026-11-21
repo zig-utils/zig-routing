@@ -1050,6 +1050,7 @@ fn checkGurkaClosure(view: *const graph.reader.View, fixture: *const gurka.Map, 
 
 const RestrictionMotor = struct {
     modes: u16 = 1,
+    probability: u8 = 0,
     ignore: bool = false,
     ignore_access: bool = false,
     allow_destination_only: bool = true,
@@ -1060,6 +1061,7 @@ const RestrictionMotor = struct {
         if (self.ignore) permission.flags.insert(.ignore_restrictions);
         if (self.ignore_access) permission.flags.insert(.ignore_access);
         permission.allow_destination_only = self.allow_destination_only;
+        permission.restriction_probability = self.probability;
         return permission;
     }
 
@@ -1860,6 +1862,50 @@ test "via-way relation annotations follow the pinned untimed representation" {
     try testing.expectEqual(2, ordinary);
 }
 
+test "probable via ways use the mode mask and threshold without a clock" {
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    var fixture = try @import("examples.zig").multiViaTurns(a);
+    const relations = try a.dupe(gurka.OsmRelation, fixture.osm.relations);
+    relations[0].tags = &.{
+        .{ .key = "type", .value = "restriction" },
+        .{ .key = "restriction:probable", .value = "no_straight_on @ probability=75" },
+        .{ .key = "except", .value = "bus" },
+    };
+    fixture.osm.relations = relations;
+    var built = try Built.assemble(fixture.osm, 2);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    try view.verify(.none, null);
+    const conditions = view.restriction_conditions orelse return error.MissingTestRestriction;
+    try testing.expectEqual(2, conditions.len);
+    const bus: u16 = @bitCast(graph.constants.AccessMask{ .bus = true });
+    for (conditions) |condition| {
+        try testing.expectEqual(75, condition.attr.probability);
+        try testing.expectEqual(0, condition.domain);
+        try testing.expectEqual(0, condition.attr.modes & bus);
+    }
+    const from = try at(view, fixture.findNode("A").?.location.toFixed());
+    const to = try at(view, fixture.findNode("E").?.location.toFixed());
+    var engine = try RestrictionSearch.init(testing.allocator, view);
+    defer engine.deinit();
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    for ([_]search.Direction{ .forward, .reverse }) |direction| {
+        const request: search.Request = .{ .origin = from, .destination = to, .direction = direction };
+        for ([_]RestrictionMotor{ .{ .probability = 0 }, .{ .probability = 75 }, .{ .probability = 76 }, .{ .probability = 75, .modes = bus } }) |kernel| {
+            const result = try engine.run(&arena, kernel, request, search.Zero{}, .{});
+            const blocked = kernel.modes != bus and kernel.probability == 75;
+            try expectWayPath(view, &fixture, result, direction, if (blocked)
+                &.{ "AX", "XY", "YC", "CD", "DE" }
+            else
+                &.{ "AB", "BMC", "BMC", "CD", "DE" });
+            arena.reset();
+        }
+    }
+}
+
 // Ported from test/gurka/test_conditional_restrictions.cc.
 test "Gurka conditional access distinguishes unknown time, modes and destination traffic" {
     var storage: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -2436,6 +2482,82 @@ fn MotorTestCost(comptime model: type) type {
             };
         }
     };
+}
+
+// Ported from test/gurka/test_probable_restrictions.cc (Valhalla 3.9.3).
+test "Gurka probable turn restrictions respect thresholds and timed precedence" {
+    const auto = routing.costing.auto;
+    const Adapter = MotorTestCost(auto);
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const fixture = try @import("examples.zig").probableTurns(a);
+    var built = try Built.assemble(fixture.osm, 2);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    try view.verify(.none, null);
+    try testing.expectEqual(1, built.stats.simple_turns.invalid_probability);
+    try testing.expectEqual(0, built.stats.simple_turns.deferred);
+    try testing.expectEqual(4, built.stats.simple_turns.resolved);
+    const Condition = format.SectionKind.restriction_conditions.Record();
+    const section = built.bundle.mappings.get(.restriction_conditions).bytes;
+    const corrupt = try a.alignedAlloc(u8, .of(Condition), section.len);
+    @memcpy(corrupt, section);
+    for (std.mem.bytesAsSlice(Condition, corrupt[format.payload_offset..])) |*row| {
+        if (row.domain != 0) continue;
+        row.attr.probability = 101;
+        break;
+    } else return error.MissingTestRestriction;
+    var files: graph.reader.Files = .initFill(null);
+    for (std.enums.values(format.SectionKind)) |kind| {
+        const bytes = built.bundle.mappings.get(kind).bytes;
+        if (bytes.len != 0) files.set(kind, bytes);
+    }
+    files.set(.restriction_conditions, corrupt);
+    try testing.expectError(error.InvalidRestrictionConditions, graph.reader.View.parse(files, null));
+
+    const from = try at(view, fixture.findNode("A").?.location.toFixed());
+    const to = try at(view, fixture.findNode("F").?.location.toFixed());
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    var engine = try search.Search(Adapter, routing.search.queue.Heap).init(testing.allocator, view);
+    defer engine.deinit();
+
+    const direct: []const []const u8 = &.{ "AB", "BC", "CF" };
+    const via_g: []const []const u8 = &.{ "AB", "BD", "DG", "GH", "HE", "EC", "CF" };
+    const via_i: []const []const u8 = &.{ "AB", "BD", "DG", "GI", "IJ", "JH", "HE", "EC", "CF" };
+    const Case = struct { date: []const u8, options: []const u8 = "{}", threshold: u8 = 100, path: []const []const u8 };
+    for ([_]Case{
+        .{ .date = "2021-04-02T06:30", .path = direct },
+        .{ .date = "2021-04-02T14:00", .path = via_g },
+        .{ .date = "2021-04-02T14:00", .options = "{\"restriction_probability\":40}", .threshold = 40, .path = via_i },
+        .{ .date = "2021-04-02T14:00", .options = "{\"restriction_probability\":1040}", .path = via_g },
+        .{ .date = "2021-04-02T06:30", .options = "{\"restriction_probability\":0}", .threshold = 0, .path = direct },
+        .{ .date = "2021-04-02T19:20", .path = direct },
+        .{ .date = "", .options = "{\"restriction_probability\":40}", .threshold = 40, .path = direct },
+    }) |case| {
+        const options = try std.json.parseFromSliceLeaky(std.json.Value, a, case.options, .{});
+        var warnings: std.ArrayList(routing.costing.base.Warning) = .empty;
+        const profile = try auto.Model.canonicalize(try auto.parse(a, .auto, options, &warnings, .none));
+        try testing.expectEqual(case.threshold, profile.permission.restriction_probability);
+        const classes = view.classes.?;
+        const tables = try routing.costing.compiled.compileInto(auto.Model, profile, classes, try a.alloc(f32, classes.len), .none);
+        const cost: Adapter = .{ .profile = &profile, .tables = &tables };
+        for ([_]search.Direction{ .forward, .reverse }) |direction| {
+            for ([_]bool{ false, true }) |invariant| {
+                errdefer std.debug.print("\ndate={s} threshold={d} direction={s} invariant={any}\n", .{ case.date, case.threshold, @tagName(direction), invariant });
+                const req: search.Request = .{
+                    .origin = from,
+                    .destination = to,
+                    .direction = direction,
+                    .timing = try restrictionTiming(case.date, invariant),
+                };
+                const result = try engine.run(&arena, cost, req, search.Zero{}, .{});
+                try expectWayPath(view, &fixture, result, direction, case.path);
+                arena.reset();
+            }
+        }
+    }
 }
 
 test "Gurka timed motor routes use free flow at night and constrained flow by day" {

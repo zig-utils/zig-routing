@@ -399,10 +399,15 @@ pub const Restrictions = struct {
         const next = automaton.advance(self.states, parent, @backingInt(id));
         const attributes = self.states[next].attr;
         if (attributes.forbidden & self.modes != 0) return .forbidden;
+        const conditions = self.access.view.restriction_conditions orelse &.{};
+        const threshold = self.access.permission.restriction_probability;
+        if (attributes.probable and threshold != 0 and
+            try automaton.blocksProbable(self.states, conditions, next, self.modes, threshold, self.access.control.deadline))
+            return .forbidden;
         if (attributes.timed) {
             if (try self.access.timing.local(self.access.view, node, previous.secs, self.access.direction)) |local| {
                 try self.access.control.check();
-                if (try automaton.blocksTimed(self.states, self.access.view.restriction_conditions orelse &.{}, next, self.modes, local, self.access.control.deadline)) return .forbidden;
+                if (try automaton.blocksTimed(self.states, conditions, next, self.modes, threshold, local, self.access.control.deadline)) return .forbidden;
             }
         }
         return if (next < automaton.first_context) .{} else .{ .value = next };
@@ -549,8 +554,13 @@ pub fn Search(comptime K: type, comptime Q: type) type {
         fn keepTime(self: *Self, kernel: K, permission: base.Permission, check_access: bool, control: Control) !bool {
             const graph_costs = timed_costs and @hasDecl(K, "timeDependentCosts");
             if (timed_costs and !graph_costs) return true;
-            if (permission.restrictionModes() != 0) {
-                if (self.view.restriction_conditions) |conditions| if (conditions.len != 0) return true;
+            const modes = permission.restrictionModes();
+            if (modes != 0) {
+                for (self.view.restriction_conditions orelse &.{}, 0..) |condition, i| {
+                    if (i % 1024 == 0) try control.check();
+                    if (condition.domain == 0 or condition.attr.modes & modes == 0) continue;
+                    if (automaton.appliesProbability(condition.attr.probability, permission.restriction_probability)) return true;
+                }
             }
             const timed_access = check_access and !permission.flags.contains(.ignore_non_vehicular_restrictions) and self.view.cold_data != null;
             if (!graph_costs and !timed_access) return false;

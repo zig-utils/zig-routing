@@ -290,6 +290,50 @@ pub fn timedTurns(arena: Allocator, only: bool) !gurka.Map {
     }});
 }
 
+// Ported from test/gurka/test_probable_restrictions.cc (Valhalla 3.9.3).
+pub fn probableTurns(arena: Allocator) !gurka.Map {
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "motorway" }};
+    const layout = try gurka.mapToCoordinates(
+        \\I----G----D----B----A
+        \\|    |    |    |
+        \\|    |    |    |
+        \\J----H----E----C----F
+    , 10);
+    const Relation = struct {
+        fn via(comptime from: []const u8, comptime node: []const u8, comptime to: []const u8, comptime tags: gurka.Tags) gurka.Relation {
+            const kind = [_]gurka.Tag{.{ .key = "type", .value = "restriction" }};
+            return .{
+                .members = &.{
+                    .{ .kind = .way, .ref = from, .role = "from" },
+                    .{ .kind = .node, .ref = node, .role = "via" },
+                    .{ .kind = .way, .ref = to, .role = "to" },
+                },
+                .tags = &(kind ++ tags[0..tags.len].*),
+            };
+        }
+    };
+    return gurka.Map.init(arena, layout, &.{
+        .{ .label = "AB", .tags = road }, .{ .label = "BC", .tags = road }, .{ .label = "BD", .tags = road },
+        .{ .label = "CF", .tags = road }, .{ .label = "DE", .tags = road }, .{ .label = "EC", .tags = road },
+        .{ .label = "DG", .tags = road }, .{ .label = "GH", .tags = road }, .{ .label = "HE", .tags = road },
+        .{ .label = "GI", .tags = road }, .{ .label = "IJ", .tags = road }, .{ .label = "JH", .tags = road },
+    }, &.{}, &.{
+        Relation.via("AB", "B", "BC", &.{
+            .{ .key = "restriction:probable", .value = "no_left_turn @ probability=100" },
+            .{ .key = "restriction", .value = "no_left_turn" },
+            .{ .key = "hour_on", .value = "07:00" },
+            .{ .key = "hour_off", .value = "19:00" },
+        }),
+        Relation.via("BD", "D", "DE", &.{
+            .{ .key = "restriction:conditional", .value = "no_left_turn @ (07:00-19:00)" },
+            .{ .key = "restriction:probable", .value = "no_left_turn @ probability=100" },
+        }),
+        Relation.via("DG", "G", "GH", &.{.{ .key = "restriction:probable", .value = "no_left_turn @ probability=75" }}),
+        Relation.via("HE", "E", "EC", &.{.{ .key = "restriction:probable", .value = "only_straight_on @ probability=100" }}),
+        Relation.via("GI", "I", "IJ", &.{.{ .key = "restriction:probable", .value = "no_left_turn @ probability=0" }}),
+    });
+}
+
 // Ported from test/gurka/test_truck.cc (Valhalla 3.9.3). The middle
 // restrictions and the one-way clearance exercise storage in both directions.
 pub fn motorVehicle(arena: Allocator) !gurka.Map {

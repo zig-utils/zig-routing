@@ -21,12 +21,12 @@ pub const Builder = struct {
     deadline: io.Deadline,
     nodes: std.ArrayList(State) = .empty,
     transitions: std.AutoHashMapUnmanaged(u64, u32) = .empty,
-    timed: std.ArrayList(Condition) = .empty,
+    conditions: std.ArrayList(Condition) = .empty,
 
     pub fn deinit(self: *Builder) void {
         self.nodes.deinit(self.a);
         self.transitions.deinit(self.a);
-        self.timed.deinit(self.a);
+        self.conditions.deinit(self.a);
     }
 
     pub fn forbid(self: *Builder, edges: []const u32, modes: u16) !void {
@@ -34,17 +34,21 @@ pub const Builder = struct {
     }
 
     pub fn forbidWhen(self: *Builder, edges: []const u32, modes: u16, domain: u64) !void {
-        if (edges.len < 2 or edges.len > machine.max_edges or modes & 0xf800 != 0)
+        return self.forbidIf(edges, modes, .{ .domain = domain });
+    }
+
+    pub fn forbidIf(self: *Builder, edges: []const u32, modes: u16, predicate: machine.Predicate) !void {
+        if (edges.len < 2 or edges.len > machine.max_edges or modes & 0xf800 != 0 or predicate.probability > 100)
             return error.InvalidRestrictionSequence;
         if (modes == 0) return;
         if (self.nodes.items.len == 0) try self.nodes.appendSlice(self.a, &.{
             State.root(machine.forward_root), State.root(machine.reverse_root),
         });
-        try self.insert(false, edges, modes, domain);
-        try self.insert(true, edges, modes, domain);
+        try self.insert(false, edges, modes, predicate);
+        try self.insert(true, edges, modes, predicate);
     }
 
-    noinline fn insert(self: *Builder, reverse: bool, edges: []const u32, modes: u16, domain: u64) !void {
+    noinline fn insert(self: *Builder, reverse: bool, edges: []const u32, modes: u16, predicate: machine.Predicate) !void {
         const root = if (reverse) machine.reverse_root else machine.forward_root;
         var parent = root;
         for (0..edges.len) |i| {
@@ -64,11 +68,19 @@ pub const Builder = struct {
             }
             parent = entry.value_ptr.*;
         }
-        if (domain == 0) {
+        if (predicate.domain == 0 and predicate.probability == 0) {
             self.nodes.items[parent].attr.forbidden |= modes;
         } else {
-            try self.timed.append(self.a, .{ .state = parent, .attr = .{ .modes = modes }, .domain = domain });
-            self.nodes.items[parent].attr.timed = true;
+            try self.conditions.append(self.a, .{
+                .state = parent,
+                .attr = .{ .modes = modes, .probability = predicate.probability },
+                .domain = predicate.domain,
+            });
+            if (predicate.domain == 0) {
+                self.nodes.items[parent].attr.probable = true;
+            } else {
+                self.nodes.items[parent].attr.timed = true;
+            }
         }
     }
 
@@ -128,6 +140,7 @@ pub const Builder = struct {
                 child.failure = fallback;
                 child.attr.forbidden |= result[fallback].attr.forbidden;
                 child.attr.timed = child.attr.timed or result[fallback].attr.timed;
+                child.attr.probable = child.attr.probable or result[fallback].attr.probable;
             }
         }
         try machine.verify(result, edge_count, self.deadline);
@@ -138,7 +151,7 @@ pub const Builder = struct {
     }
 
     noinline fn finishConditions(self: *const Builder, order: []const u32) ![]Condition {
-        if (self.timed.items.len == 0) return &.{};
+        if (self.conditions.items.len == 0) return &.{};
         const a = self.a;
         const ids = try a.alloc(u32, order.len);
         defer a.free(ids);
@@ -146,7 +159,7 @@ pub const Builder = struct {
             try self.check(state);
             ids[original] = @intCast(state);
         }
-        const sorted = try a.dupe(Condition, self.timed.items);
+        const sorted = try a.dupe(Condition, self.conditions.items);
         errdefer a.free(sorted);
         for (sorted, 0..) |*row, i| {
             try self.check(i);
@@ -156,7 +169,7 @@ pub const Builder = struct {
         var count: usize = 0;
         for (sorted, 0..) |row, i| {
             try self.check(i);
-            if (count != 0 and row.state == sorted[count - 1].state and row.domain == sorted[count - 1].domain) {
+            if (count != 0 and !Condition.before({}, sorted[count - 1], row)) {
                 sorted[count - 1].attr.modes |= row.attr.modes;
             } else {
                 sorted[count] = row;
@@ -189,13 +202,13 @@ test "complex restriction automata inherit overlapping suffixes in both directio
     forward = machine.advance(states, forward, 3);
     try t.expectEqual(3, states[forward].attr.forbidden);
     const local = @import("../graph/datetime.zig").Local.parse("2026-11-16T09:00").?;
-    try t.expect(try machine.blocksTimed(states, program.conditions, forward, 8, local, .none));
+    try t.expect(try machine.blocksTimed(states, program.conditions, forward, 8, 0, local, .none));
     try t.expectEqual(2, program.conditions.len);
     try t.expectEqual(24, program.conditions[0].attr.modes);
     var reverse = machine.reverse_root;
     for ([_]u32{ 3, 2, 1 }) |edge| reverse = machine.advance(states, reverse, edge);
     try t.expectEqual(2, states[reverse].attr.forbidden);
-    try t.expect(try machine.blocksTimed(states, program.conditions, reverse, 16, local, .none));
+    try t.expect(try machine.blocksTimed(states, program.conditions, reverse, 16, 0, local, .none));
     reverse = machine.advance(states, reverse, 0);
     try t.expectEqual(5, states[reverse].attr.forbidden);
 }

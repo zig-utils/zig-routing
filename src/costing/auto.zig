@@ -179,10 +179,12 @@ pub const Model = struct {
         if (!(alley_range.min <= options.alley_factor and options.alley_factor <= alley_range.max) or
             options.top_speed < 10 or options.top_speed > highest_speed or options.shared.fixed_speed > highest_speed or
             options.restriction_probability > 100) return error.InvalidAutoOptions;
+        var permission: base.Permission = .init(options.shared, options.mode.access(), options.filter_closures);
+        permission.restriction_probability = options.restriction_probability;
         return .{
             .mode = options.mode,
             .shared = .init(options.shared),
-            .permission = .init(options.shared, options.mode.access(), options.filter_closures),
+            .permission = permission,
             .highway_bias = motor.highwayBias(options.use_highways),
             .toll_bias = motor.tollBias(options.use_tolls, 4),
             .alley_factor = options.alley_factor,

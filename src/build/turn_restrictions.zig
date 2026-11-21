@@ -35,14 +35,15 @@ pub const Record = extern struct {
         modes: u16,
         kind: u4,
         mode_specific: bool,
-        reserved: u11 = 0,
+        probability: u7 = 0,
+        reserved: u4 = 0,
     },
     reserved: u32 = 0,
 
     pub fn kind(self: Record) !Kind {
-        if (self.reserved != 0 or self.attr.reserved != 0 or self.attr.modes & 0xf800 != 0 or
+        if (self.reserved != 0 or self.attr.reserved != 0 or self.attr.modes & 0xf800 != 0 or self.attr.probability > 100 or
             self.via == 0 or self.from == 0 or self.to == 0 or
-            (!self.attr.mode_specific and self.attr.modes != simple_modes))
+            (!self.attr.mode_specific and (self.attr.modes != simple_modes or self.attr.probability != 0)))
             return error.InvalidCheckpoint;
         return std.enums.fromInt(Kind, self.attr.kind) orelse error.InvalidCheckpoint;
     }
@@ -56,11 +57,11 @@ pub const Complex = extern struct {
         modes: u16,
         kind: u4,
         via_count: u5,
-        reserved: u7 = 0,
+        probability: u7 = 0,
     },
 
     pub fn kind(self: Complex) !Kind {
-        if (self.from == 0 or self.to == 0 or self.attr.via_count == 0 or self.attr.reserved != 0 or
+        if (self.from == 0 or self.to == 0 or self.attr.via_count == 0 or self.attr.probability > 100 or
             self.attr.modes & 0xf800 != 0) return error.InvalidCheckpoint;
         return std.enums.fromInt(Kind, self.attr.kind) orelse error.InvalidCheckpoint;
     }
@@ -85,6 +86,7 @@ pub const Stats = struct {
     mask_truncated: u64 = 0,
     complex: u64 = 0,
     invalid_condition: u64 = 0,
+    invalid_probability: u64 = 0,
 };
 
 pub const Source = struct {
@@ -160,8 +162,9 @@ pub const Catalog = struct {
     pub noinline fn add(self: *Catalog, relation: pbf.block.Relation) !void {
         var tags = relation.tags;
         var is_restriction = false;
+        var preferred_tag = false;
         var conditional: ?Annotated = null;
-        var probable = false;
+        var probable_text: ?[]const u8 = null;
         var legacy: Legacy = .{};
         var ordinary: ?Kind = null;
         var modes: std.EnumArray(Kind, u16) = .initFill(0);
@@ -174,13 +177,15 @@ pub const Catalog = struct {
             } else if (eql(tag.key, "except")) {
                 exceptions = tag.value;
             } else if (eql(tag.key, "restriction")) {
+                preferred_tag = true;
                 ordinary = std.meta.stringToEnum(Kind, tag.value);
             } else if (std.mem.startsWith(u8, tag.key, "restriction:")) {
                 const name = tag.key["restriction:".len..];
                 if (eql(name, "conditional")) {
+                    preferred_tag = true;
                     conditional = try annotated(tag.value, self.deadline);
                 } else if (eql(name, "probable")) {
-                    probable = (try annotated(tag.value, self.deadline)) != null;
+                    probable_text = tag.value;
                 } else if (mode_names.get(name)) |mode| {
                     if (std.meta.stringToEnum(Kind, tag.value)) |kind| {
                         modes.getPtr(kind).* |= mode;
@@ -192,13 +197,23 @@ pub const Catalog = struct {
                 legacy.present = true;
             }
         }
-        if (!is_restriction and conditional == null and !probable) return;
+        if (!is_restriction and conditional == null and probable_text == null) return;
         const entry = try self.seen.getOrPut(self.a, relation.id);
         if (entry.found_existing) return;
         self.stats.parsed += 1;
-        if (ordinary == null and conditional == null and probable) {
-            self.stats.deferred += 1;
-            return;
+        var probability: u7 = 0;
+        if (!preferred_tag) {
+            if (probable_text) |text| {
+                const tag = (try annotated(text, self.deadline)) orelse {
+                    self.stats.invalid_probability += 1;
+                    return;
+                };
+                probability = (try parseProbability(tag.condition, self.deadline)) orelse {
+                    self.stats.invalid_probability += 1;
+                    return;
+                };
+                ordinary = tag.kind;
+            }
         }
         if (ordinary == null and conditional != null) ordinary = conditional.?.kind;
         if (ordinary == null and !has_modes) {
@@ -255,14 +270,16 @@ pub const Catalog = struct {
         if (has_modes) {
             for (std.enums.values(Kind), modes.values) |kind, mask| {
                 if (mask == 0) continue;
-                row.attr = .{ .kind = @backingInt(kind), .modes = mask, .mode_specific = true };
+                row.attr = .{ .kind = @backingInt(kind), .modes = mask, .mode_specific = true, .probability = probability };
                 try self.appendDomains(row, first, @intCast(via_count), domains);
             }
         } else {
+            const predicate = timed or probability != 0;
             row.attr = .{
                 .kind = @backingInt(ordinary.?),
-                .modes = if (exceptions.len == 0) (if (timed) general_modes else simple_modes) else try exceptModes(exceptions, self.deadline),
-                .mode_specific = exceptions.len != 0 or timed,
+                .modes = if (exceptions.len == 0) (if (predicate) general_modes else simple_modes) else try exceptModes(exceptions, self.deadline),
+                .mode_specific = exceptions.len != 0 or predicate,
+                .probability = probability,
             };
             try self.appendDomains(row, first, @intCast(via_count), domains);
         }
@@ -283,6 +300,7 @@ pub const Catalog = struct {
                         .via_count = count,
                         .kind = row.attr.kind,
                         .modes = if (row.attr.mode_specific) row.attr.modes else general_modes,
+                        .probability = row.attr.probability,
                     },
                 });
             }
@@ -354,6 +372,23 @@ fn annotated(text: []const u8, deadline: io.Deadline) !?Annotated {
     return null;
 }
 
+fn parseProbability(text: []const u8, deadline: io.Deadline) !?u7 {
+    const tag = std.mem.trimStart(u8, text, " \t");
+    const name = "probability";
+    if (!std.mem.startsWith(u8, tag, name)) return null;
+    const assignment = std.mem.trim(u8, tag[name.len..], " \t");
+    if (assignment.len == 0 or assignment[0] != '=') return null;
+    const digits = std.mem.trimStart(u8, assignment[1..], " \t");
+    var value: u16 = 0;
+    for (digits, 0..) |char, i| {
+        if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+        if (!std.ascii.isDigit(char)) return null;
+        value = value * 10 + char - '0';
+        if (value > 100) return null;
+    }
+    return if (value == 0) null else @intCast(value);
+}
+
 fn exceptModes(text: []const u8, deadline: io.Deadline) !u16 {
     var modes: u16 = general_modes;
     var tokens = std.mem.tokenizeScalar(u8, text, ';');
@@ -377,4 +412,13 @@ comptime {
     std.debug.assert(@import("builtin").target.cpu.arch.endian() == .little);
     std.debug.assert(@sizeOf(Record) == 40 and @offsetOf(Record, "via") == 8 and @offsetOf(Record, "attr") == 32);
     std.debug.assert(@sizeOf(Complex) == 24 and @offsetOf(Complex, "first_via") == 16 and @offsetOf(Complex, "attr") == 20);
+}
+
+test "probability tags accept integers from one to one hundred" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(?u7, 1), try parseProbability("probability=1", .none));
+    try testing.expectEqual(@as(?u7, 100), try parseProbability(" probability = 100 ", .none));
+    for ([_][]const u8{ "probability=0", "probability=-1", "probability=101", "probability=999999", "probability=1.5", "probability=", "limit=75" }) |text| {
+        try testing.expectEqual(@as(?u7, null), try parseProbability(text, .none));
+    }
 }

@@ -2459,8 +2459,9 @@ const ComplexWalk = struct {
         return path[0..0];
     }
 
-    noinline fn prohibit(self: ComplexWalk, sink: RestrictionSink, path: []u32, modes: u16, only: bool) !void {
-        if (!only) return forbidSequence(sink, path, modes, 0);
+    noinline fn prohibit(self: ComplexWalk, sink: RestrictionSink, path: []u32, modes: u16, only: bool, probability: u7) !void {
+        const predicate: automaton.Predicate = .{ .probability = probability };
+        if (!only) return forbidSequence(sink, path, modes, predicate);
         // Each wrong exit from a mandatory prefix is a forbidden sequence.
         // Reversing those sequences preserves legality in reverse search too.
         for (1..path.len) |index| {
@@ -2471,15 +2472,15 @@ const ComplexWalk = struct {
                 try checkDeadline(self.shared.deadline, i);
                 if (exit == prescribed or !allowed(self.classFor(exit), modes)) continue;
                 path[index] = exit;
-                try forbidSequence(sink, path[0 .. index + 1], modes, 0);
+                try forbidSequence(sink, path[0 .. index + 1], modes, predicate);
             }
             path[index] = prescribed;
         }
     }
 };
 
-fn forbidSequence(sink: RestrictionSink, path: []const u32, modes: u16, domain: u64) !void {
-    try sink.builder.forbidWhen(path, modes, domain);
+fn forbidSequence(sink: RestrictionSink, path: []const u32, modes: u16, predicate: automaton.Predicate) !void {
+    try sink.builder.forbidIf(path, modes, predicate);
     const forward = try sink.starts.getOrPutValue(sink.builder.a, path[0], 0);
     forward.value_ptr.* |= modes;
     const reverse = try sink.starts.getOrPutValue(sink.builder.a, path[path.len - 1], 0);
@@ -2487,13 +2488,23 @@ fn forbidSequence(sink: RestrictionSink, path: []const u32, modes: u16, domain: 
 }
 
 noinline fn compileComplexTurns(gpa: Allocator, shared: *const Shared, layout: *const Layout, base: []const classes.EdgeClass, order: []const u32, source: turn_restrictions.Source, starts: *RestrictionStarts) !automaton_builder.Program {
-    if (source.complex.len == 0 and source.simple_domains.len == 0) return .{};
+    var conditional_nodes = source.simple_domains.len != 0;
+    if (!conditional_nodes) {
+        for (source.entries, 0..) |entry, i| {
+            try checkDeadline(shared.deadline, i);
+            if (entry.attr.probability != 0) {
+                conditional_nodes = true;
+                break;
+            }
+        }
+    }
+    if (source.complex.len == 0 and !conditional_nodes) return .{};
     var builder: automaton_builder.Builder = .{ .a = gpa, .deadline = shared.deadline };
     defer builder.deinit();
     const sink: RestrictionSink = .{ .builder = &builder, .starts = starts };
-    if (source.simple_domains.len != 0) {
-        var timed = try resolveTurns(gpa, shared, layout, base, source, sink);
-        timed.deinit(gpa);
+    if (conditional_nodes) {
+        var conditional = try resolveTurns(gpa, shared, layout, base, source, sink);
+        conditional.deinit(gpa);
     }
     if (source.complex.len != 0) try addComplexTurns(shared, layout, base, order, source, sink);
     return builder.finish(shared.topology.output.data.len);
@@ -2538,7 +2549,7 @@ noinline fn addComplexTurns(shared: *const Shared, layout: *const Layout, base: 
                 if (!ComplexWalk.allowed(walk.classFor(placement.slot), row.attr.modes)) continue;
                 var storage: [automaton.max_edges]u32 = undefined;
                 const path = try walk.find(placement.slot, ways[0 .. via.len + 1], row.attr.modes, &storage);
-                if (path.len != 0) try walk.prohibit(sink, path, row.attr.modes, kind.only());
+                if (path.len != 0) try walk.prohibit(sink, path, row.attr.modes, kind.only(), row.attr.probability);
             }
         }
     }
@@ -2589,8 +2600,10 @@ noinline fn resolveTurns(a: Allocator, shared: *const Shared, plan: *const Layou
         try checkDeadline(shared.deadline, row);
         const kind = try restriction.kind();
         const domain = if (source.simple_domains.len == 0) 0 else source.simple_domains[row];
-        if (sink != null and domain == 0) continue;
-        if (domain != 0 and !restriction.attr.mode_specific) return error.InvalidCheckpoint;
+        const predicate: automaton.Predicate = .{ .domain = domain, .probability = restriction.attr.probability };
+        const conditional = predicate.domain != 0 or predicate.probability != 0;
+        if (sink != null and !conditional) continue;
+        if (conditional and !restriction.attr.mode_specific) return error.InvalidCheckpoint;
         const logical = plan.by_id.get(restriction.via) orelse {
             result.stats.missing_via += 1;
             continue;
@@ -2627,11 +2640,11 @@ noinline fn resolveTurns(a: Allocator, shared: *const Shared, plan: *const Layou
                 for (incident.items, 0..) |in, i| {
                     try checkDeadline(shared.deadline, i);
                     if (in.way != restriction.from) continue;
-                    if (domain != 0) {
+                    if (conditional) {
                         const active = sink orelse continue;
                         const opposing = topo.output.data[in.slot];
                         const incoming = topo.first_edge[opposing.head] + opposing.cls.opp_local;
-                        try forbidSequence(active, &.{ incoming, out.slot }, restriction.attr.modes, domain);
+                        try forbidSequence(active, &.{ incoming, out.slot }, restriction.attr.modes, predicate);
                     } else if (!specific and in.node == out.node) {
                         const local = topo.output.data[out.slot].cls.local;
                         try result.hard.append(a, .{ .slot = in.slot, .exits = @as(u32, 1) << local });

@@ -529,6 +529,7 @@ pub const Permission = struct {
     access_mask: graph.constants.AccessMask,
     filter_closures: bool,
     allow_destination_only: bool = true,
+    restriction_probability: u8 = 0,
 
     pub fn init(options: Options, access_mask: graph.constants.AccessMask, filter_closures: bool) Permission {
         return .{
