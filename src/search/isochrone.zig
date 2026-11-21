@@ -54,10 +54,14 @@ pub const Result = struct {
 /// Builds a grid in minutes and kilometres. The result lives until the
 /// request arena rewinds. Generate contours only after this stage completes.
 pub fn Isochrone(comptime K: type) type {
+    return IsochroneWithQueue(K, queue.RadixQueue);
+}
+
+pub fn IsochroneWithQueue(comptime K: type, comptime Q: type) type {
     return struct {
         const Self = @This();
         view: *const View,
-        engine: expansion.Expansion(K, queue.RadixQueue),
+        engine: expansion.Expansion(K, Q),
 
         pub fn init(a: Allocator, view: *const View) !Self {
             return .{ .view = view, .engine = try .init(a, view) };
@@ -91,7 +95,7 @@ pub fn Isochrone(comptime K: type) type {
                     rasterizer: *Rasterizer,
                     observer: @TypeOf(observer),
 
-                    const profiled = hasPolicy(@TypeOf(observer), "expansionStage");
+                    const profiled = @TypeOf(observer) != void and hasPolicy(@TypeOf(observer), "expansionStage");
                     pub const expansionStage = if (profiled) stage else {};
                     pub const expansionSample = if (profiled) sample else {};
                     pub const movementLayout = if (compact.hasLayout(@TypeOf(observer))) layout else {};
@@ -131,13 +135,25 @@ pub fn Isochrone(comptime K: type) type {
                 bounds: Bounds,
                 observer: @TypeOf(observer),
 
+                const profiled = @TypeOf(observer) != void and hasPolicy(@TypeOf(observer), "expansionStage");
+                pub const expansionStage = if (profiled) stage else {};
+                pub const expansionSample = if (profiled) sample else {};
                 pub const movementLayout = if (compact.hasLayout(@TypeOf(observer))) layout else {};
+
+                fn stage(adapter: *@This(), phase: core.ExpansionStage) void {
+                    adapter.observer.expansionStage(phase);
+                }
+
+                fn sample(adapter: *@This(), popped: usize) void {
+                    adapter.observer.expansionSample(popped);
+                }
 
                 fn layout(adapter: *@This()) *const MovementLayout {
                     return adapter.observer.movementLayout();
                 }
 
                 pub fn visit(adapter: *@This(), event: expansion.Visit) !expansion.Decision {
+                    if (profiled) adapter.observer.expansionStage(.labels);
                     if (@TypeOf(observer) != void) try adapter.observer.observe(event);
                     return if (adapter.bounds.prunes(event.previous orelse .{})) .prune else .expand;
                 }

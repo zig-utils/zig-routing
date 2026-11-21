@@ -1642,6 +1642,9 @@ test "Gurka timed turn conditions switch the legal movement only within the wind
         const last = try directedBetween(view, &fixture, if (only) "B" else "C", if (only) "D" else "F");
         var engine = try RestrictionSearch.init(testing.allocator, view);
         defer engine.deinit();
+        const CompactSearch = search.Search(RestrictionMotor, routing.search.queue.CompactQueue);
+        var compact = try CompactSearch.init(testing.allocator, view);
+        defer compact.deinit();
         var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
         defer arena.deinit();
         const cases = [_]struct { text: []const u8, active: bool }{
@@ -1680,6 +1683,23 @@ test "Gurka timed turn conditions switch the legal movement only within the wind
                         var cached: LayoutExpansionProbe = .{ .layout = &layout, .probe = .{ .target = probe.target } };
                         try testing.expectEqualDeep(baseline, try engine.expand(&arena, .{}, sweep, &cached, .{}));
                         try testing.expectEqualDeep(probe, cached.probe);
+                        arena.reset();
+                        const candidate: routing.search.endpoints.Candidate = .{
+                            .edge = if (forward) first else last,
+                            .fraction = 0.4,
+                            .score = 0,
+                            .begin_node = false,
+                            .end_node = false,
+                        };
+                        var from_cut = sweep;
+                        from_cut.partial_origins = &.{&.{candidate}};
+                        var expected: SettledTrace = .{};
+                        var actual: SettledTrace = .{};
+                        const expected_stats = try engine.expand(&arena, .{}, from_cut, &expected, .{});
+                        arena.reset();
+                        const actual_stats = try compact.expand(&arena, .{}, from_cut, &actual, .{});
+                        try testing.expectEqualDeep(expected_stats, actual_stats);
+                        try testing.expectEqualDeep(expected.events[0..expected.count], actual.events[0..actual.count]);
                         arena.reset();
                     }
                     if (!only) {
@@ -2031,6 +2051,18 @@ test "Gurka conditional access distinguishes unknown time, modes and destination
     }
     try checkTimedDeadEnd(view, &fixture);
 }
+
+const SettledTrace = struct {
+    events: [128]search.ExpansionVisit = undefined,
+    count: usize = 0,
+
+    pub fn visit(self: *SettledTrace, event: search.ExpansionVisit) !search.ExpansionDecision {
+        if (self.count == self.events.len) return error.TestSweepLimit;
+        self.events[self.count] = event;
+        self.count += 1;
+        return .expand;
+    }
+};
 
 const ExpansionProbe = struct {
     target: format.NodeId,

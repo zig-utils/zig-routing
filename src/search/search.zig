@@ -48,6 +48,7 @@ pub const Label = extern struct {
     const measured_speed: u32 = 1 << 15;
     const terminal_closure: u32 = 1 << 16;
     const dominated_arrival: u32 = 1 << 17;
+    const replaced: u32 = 1 << 18;
     const closure_mask = origin_closure | terminal_closure;
 
     pub fn edgeId(self: Label) EdgeId {
@@ -179,7 +180,7 @@ pub const ExpansionEdgeVisit = struct {
 };
 
 /// A compile-time visitor hook for optional search stage measurement.
-pub const ExpansionStage = enum { queue, successors, restrictions, edge_costing, turn_costing, rasterization };
+pub const ExpansionStage = enum { queue, status, labels, successors, restrictions, edge_costing, turn_costing, rasterization };
 
 pub const ExpansionDecision = enum { expand, prune, stop };
 
@@ -646,6 +647,7 @@ const TerminalClosures = paged.Array(ClosureEdge, .none);
 pub fn Search(comptime K: type, comptime Q: type) type {
     return struct {
         const Self = @This();
+        const label_activity = @hasDecl(Q, "label_activity") and Q.label_activity;
         const Pool = memory.PagePool(16 * 1024);
         const timed_costs = @hasDecl(K, "edgeCostAt") or @hasDecl(K, "turnCostAt") or @hasDecl(K, "endpointCostAt");
         const model_access = @hasDecl(K, "restrictionPermission");
@@ -898,10 +900,15 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             while (true) {
                 if (profiled) observer.expansionSample(popped);
                 const top = (if (@hasDecl(Q, "popWithin")) try pending.popWithin(a, control) else pending.pop()) orelse break;
-                if (profiled) observer.expansionStage(.successors);
+                if (profiled) observer.expansionStage(.labels);
                 popped += 1;
                 if ((popped & 1023) == 0) try control.check();
                 const last = labels.items[top.label];
+                // Fractional origins with restriction history recompute
+                // their context on pop, so they still check that state.
+                const check_activity = label_activity and (!with_restrictions or last.flags & Label.partial_start == 0);
+                if (check_activity and last.flags & Label.replaced != 0) continue;
+                if (profiled) observer.expansionStage(.status);
                 const context: TurnContext = if (with_restrictions)
                     if (last.flags & Label.partial_target != 0) .{} else if (last.flags & Label.partial_start != 0)
                         try tracker.advance(.{}, .{}, @fromBackingInt(@as(u32, 0)), last.edgeId())
@@ -910,8 +917,9 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 else
                     .{};
                 if (last.flags & Label.partial_target == 0) {
-                    if (distance_only and with_restrictions and tracker.pareto and last.flags & Label.dominated_arrival != 0) continue;
-                    const active: Status = if (distance_only and with_restrictions and tracker.pareto)
+                    const pareto = distance_only and with_restrictions and tracker.pareto;
+                    if (pareto and last.flags & Label.dominated_arrival != 0) continue;
+                    const active: Status = if (check_activity or pareto)
                         .{ .label_plus_one = top.label + 1 }
                     else if (with_restrictions and tracker.keep_time)
                         tracker.aliases.get(Restrictions.timedKey(last, context)) orelse Status{}
@@ -921,6 +929,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                         self.findStatus(tracker, last.edge, context, closureBits(last));
                     if (active.label_plus_one != top.label + 1) continue;
                 }
+                if (profiled) observer.expansionStage(.successors);
                 settled += 1;
                 if (!expanding and (last.flags & Label.target != 0 or settled == limit)) {
                     try control.check();
@@ -1029,8 +1038,11 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                         Label.origin_closure => if (kind != .none) Label.origin_closure else 0,
                         else => if (terminal_edge == .closed) Label.terminal_closure else 0,
                     } else 0;
+                    if (profiled) observer.expansionStage(.status);
                     const prior = self.findStatus(tracker, @backingInt(next_id), next_context, next_phase);
+                    if (profiled) observer.expansionStage(.labels);
                     const dominated = prior.label_plus_one != 0 and labels.items[prior.label_plus_one - 1].cost <= last.cost;
+                    if (profiled) observer.expansionStage(.successors);
                     var targets = if (partial) query.targets.on(next_id) else {};
                     if (dominated and !observe_edges and (!partial or targets.index == 0)) continue;
                     const closed = kind == .closed or (phase == 0 and kind == .none and try self.edgeClosed(kernel, permission, next_id));
@@ -1449,6 +1461,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             else
                 null;
             const a = pool.arena.allocator();
+            if (@TypeOf(observer) != void) observer.expansionStage(.status);
             const ordinary_slot = if (ordinary) |id| try tracker.directed.slot(a, id) else null;
             const previous = if (ordinary_slot) |slot|
                 slot.*
@@ -1456,6 +1469,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 tracker.aliases.get(key) orelse Status{}
             else
                 status;
+            if (@TypeOf(observer) != void) observer.expansionStage(.labels);
             if (pareto) {
                 if (previous.label_plus_one == Status.exclusion or
                     try tracker.alreadyDominated(labels.items, previous.label_plus_one, label)) return;
@@ -1475,6 +1489,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             var record = label;
             if (done) record.flags |= Label.target;
             const closure = closureBits(label);
+            if (@TypeOf(observer) != void) observer.expansionStage(.status);
             const slot = if (ordinary_slot) |existing| existing else if (use_time) timed: {
                 const entry = try tracker.aliases.getOrPutValue(a, key, .{});
                 break :timed entry.value_ptr;
@@ -1486,15 +1501,26 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 const entry = try tracker.aliases.getOrPutValue(a, Restrictions.aliasKey(label.edge, context, closure), .{});
                 break :blk entry.value_ptr;
             };
+            if (@TypeOf(observer) != void) observer.expansionStage(.labels);
             try labels.append(a, record);
             if (@TypeOf(observer) != void) observer.expansionStage(.queue);
             try pending.push(a, queue.Entry.init(roundedDown(@as(f64, label.cost) + estimate), index));
-            if (@TypeOf(observer) != void) observer.expansionStage(.successors);
+            if (@TypeOf(observer) != void) observer.expansionStage(.status);
             if (pareto) {
                 try tracker.replaceDominated(a, labels.items, &slot.label_plus_one, index);
             } else {
+                // Only a successful replacement retires the old queue entry.
+                // Read the slot itself: exclusions can give a partial seed
+                // a separate slot from its directed edge.
+                if (label_activity and slot.label_plus_one != 0) {
+                    const replaced = &labels.items[slot.label_plus_one - 1];
+                    if (@TypeOf(tracker) == @TypeOf(null) or replaced.flags & Label.partial_start == 0) {
+                        replaced.flags |= Label.replaced;
+                    }
+                }
                 slot.* = .{ .label_plus_one = index + 1 };
             }
+            if (@TypeOf(observer) != void) observer.expansionStage(.successors);
             @prefetch(&self.view.first_edge[@backingInt(head)], .{});
         }
     };

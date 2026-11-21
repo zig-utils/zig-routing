@@ -4,6 +4,7 @@ const routing = @import("routing");
 const io = routing.infra.io;
 const memory = routing.infra.arena;
 const iso = routing.search.isochrone;
+const queue = routing.search.queue;
 const snap = routing.snap.candidates;
 const Candidate = routing.search.endpoints.Candidate;
 const View = routing.graph.reader.View;
@@ -13,6 +14,7 @@ const pedestrian = routing.costing.pedestrian;
 const auto = routing.costing.auto;
 
 const Mode = enum { auto, pedestrian };
+const Traversal = enum { baseline, ordered_queue, label_activity, compact };
 const Location = struct { lat: f64, lon: f64 };
 const Contour = struct { time: ?f32 = null, distance: ?f32 = null };
 const Row = struct {
@@ -55,9 +57,12 @@ const Replay = struct {
 
 const Trace = struct {
     a: std.mem.Allocator,
-    labels: std.ArrayList(Entry) = .empty,
+    labels: union(enum) {
+        basic: std.ArrayList(BasicEntry),
+        state: std.ArrayList(StateEntry),
+    },
 
-    const Entry = extern struct {
+    const BasicEntry = extern struct {
         index: u32,
         edge: u32,
         previous: u32,
@@ -66,15 +71,55 @@ const Trace = struct {
         metres: u32,
     };
 
+    const StateEntry = extern struct {
+        unix_time: i64,
+        seconds_from_now: i64,
+        label: routing.search.search.Label,
+        index: u32,
+        node: u32,
+        cut_begin: f32,
+        cut_end: f32,
+        second_of_week: u32,
+        zone_and_valid: u32,
+    };
+
+    comptime {
+        std.debug.assert(@sizeOf(BasicEntry) == 24 and @sizeOf(StateEntry) == 72);
+        std.debug.assert(@import("builtin").target.cpu.arch.endian() == .little);
+    }
+
     pub fn observe(self: *Trace, event: routing.search.expand.Visit) !void {
-        try self.labels.append(self.a, .{
-            .index = event.index,
-            .edge = event.label.edge,
-            .previous = event.label.pred,
-            .seconds = event.label.secs,
-            .cost = event.label.cost,
-            .metres = event.label.dist_m,
-        });
+        switch (self.labels) {
+            .basic => |*entries| try entries.append(self.a, .{
+                .index = event.index,
+                .edge = event.label.edge,
+                .previous = event.label.pred,
+                .seconds = event.label.secs,
+                .cost = event.label.cost,
+                .metres = event.label.dist_m,
+            }),
+            .state => |*entries| try entries.append(self.a, .{
+                .unix_time = event.time.unix_time,
+                .seconds_from_now = event.time.seconds_from_now,
+                .label = event.label,
+                .index = event.index,
+                .node = @backingInt(event.node),
+                .cut_begin = event.cut.begin,
+                .cut_end = event.cut.end,
+                .second_of_week = event.time.second_of_week,
+                .zone_and_valid = @as(u32, event.time.zone) << 1 | @intFromBool(event.time.valid),
+            }),
+        }
+    }
+
+    fn write(self: Trace, file: io.File) !void {
+        switch (self.labels) {
+            inline else => |entries| {
+                const count: u32 = @intCast(entries.items.len);
+                try file.writeAll(std.mem.asBytes(&count));
+                try file.writeAll(std.mem.sliceAsBytes(entries.items));
+            },
+        }
     }
 };
 
@@ -134,8 +179,10 @@ const Measurement = struct {
     log: *std.Io.Writer,
     grids: io.File,
     traces: ?io.File,
+    trace_states: bool,
     profile: bool,
     stages: bool,
+    measure_memory: bool,
     scratch: std.mem.Allocator,
     layout: ?*const iso.MovementLayout,
 
@@ -153,13 +200,15 @@ const Measurement = struct {
         _ = try engine.runObserved(arena, kernel, request, observed(layout, {}), .{});
         backing.resetCounts();
         arena.reset();
-        var clock: StageClock = if (self.profile) .init() else .{};
+        arena.high_water = 0;
+        var clock: StageClock = if (self.profile and !self.stages) .init() else .{};
         const start = io.monotonicNs();
-        const result = if (self.profile)
+        const result = if (self.profile and !self.stages)
             try engine.runObserved(arena, kernel, request, &clock, .{})
         else
             try engine.runObserved(arena, kernel, request, observed(layout, {}), .{});
         const elapsed = io.monotonicNs() - start;
+        const full_bytes = @max(arena.high_water, arena.used);
         clock.finish();
         if (backing.calls() != 0) return error.IsochroneAllocatedAfterWarmup;
         const tiles = result.grid.tiles;
@@ -169,10 +218,7 @@ const Measurement = struct {
             bounds.minx,         bounds.miny, bounds.maxx,    bounds.maxy, result.stats.settled,
             result.stats.popped,
         });
-        if (self.profile) {
-            try self.log.print("\t{d}", .{clock.samples});
-            for (std.enums.values(StageClock.Stage)) |stage| try self.log.print("\t{d}", .{clock.totals.get(stage)});
-        }
+        if (self.measure_memory) try self.log.print("\t{d}", .{full_bytes});
         try self.grids.writeAll(std.mem.sliceAsBytes(result.grid.data));
         if (self.stages) {
             const expected = try self.scratch.dupe(u8, std.mem.sliceAsBytes(result.grid.data));
@@ -182,30 +228,44 @@ const Measurement = struct {
             if (!std.meta.eql(result.stats, recorded)) return error.DifferentBoundedTraversal;
             backing.resetCounts();
             arena.reset();
+            arena.high_water = 0;
             const traversal_start = io.monotonicNs();
             const traversal = try engine.runTraversal(arena, kernel, request, observed(layout, {}), .{});
             const traversal_ns = io.monotonicNs() - traversal_start;
+            const traversal_bytes = @max(arena.high_water, arena.used);
             if (backing.calls() != 0) return error.TraversalAllocatedAfterWarmup;
             if (!std.meta.eql(result.stats, traversal)) return error.DifferentBoundedTraversal;
             arena.reset();
             _ = try iso.rasterize(self.view, arena, request, replay.events.items, .{});
             arena.reset();
             backing.resetCounts();
+            arena.high_water = 0;
             const raster_start = io.monotonicNs();
             const raster = try iso.rasterize(self.view, arena, request, replay.events.items, .{});
             const raster_ns = io.monotonicNs() - raster_start;
+            const raster_bytes = @max(arena.high_water, arena.used);
             if (backing.calls() != 0) return error.RasterAllocatedAfterWarmup;
             if (!std.mem.eql(u8, expected, std.mem.sliceAsBytes(raster.data))) return error.DifferentRasterReplay;
             try self.log.print("\t{d}\t{d}", .{ traversal_ns, raster_ns });
+            if (self.measure_memory) try self.log.print("\t{d}\t{d}", .{ traversal_bytes, raster_bytes });
+            if (self.profile) {
+                arena.reset();
+                clock = .init();
+                const profiled = try engine.runTraversal(arena, kernel, request, &clock, .{});
+                if (!std.meta.eql(result.stats, profiled)) return error.DifferentBoundedTraversal;
+                clock.finish();
+            }
+        }
+        if (self.profile) {
+            try self.log.print("\t{d}", .{clock.samples});
+            for (std.enums.values(StageClock.Stage)) |stage| try self.log.print("\t{d}", .{clock.totals.get(stage)});
         }
         try self.log.writeByte('\n');
         if (self.traces) |file| {
             arena.reset();
-            var trace: Trace = .{ .a = self.scratch };
+            var trace: Trace = .{ .a = self.scratch, .labels = if (self.trace_states) .{ .state = .empty } else .{ .basic = .empty } };
             _ = try engine.runObserved(arena, kernel, request, observed(layout, &trace), .{});
-            const count: u32 = @intCast(trace.labels.items.len);
-            try file.writeAll(std.mem.asBytes(&count));
-            try file.writeAll(std.mem.sliceAsBytes(trace.labels.items));
+            try trace.write(file);
         }
     }
 };
@@ -252,11 +312,14 @@ pub fn main(init: std.process.Init) !void {
     const input_path = args.next() orelse return error.MissingCorpus;
     const output_path = args.next() orelse return error.MissingGridOutput;
     var trace_path: ?[]const u8 = null;
+    var trace_states = false;
     var profile = false;
     var stages = false;
     var prepare_layout = false;
     var prepare_headings = false;
     var rss = false;
+    var measure_memory = false;
+    var traversal: ?Traversal = null;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--profile") and !profile) {
             profile = true;
@@ -268,11 +331,18 @@ pub fn main(init: std.process.Init) !void {
             prepare_headings = true;
         } else if (std.mem.eql(u8, arg, "--rss") and !rss) {
             rss = true;
+        } else if (std.mem.eql(u8, arg, "--memory") and !measure_memory) {
+            measure_memory = true;
+        } else if (std.mem.eql(u8, arg, "--trace-states") and !trace_states) {
+            trace_states = true;
+        } else if (std.mem.startsWith(u8, arg, "--traversal=") and traversal == null) {
+            traversal = std.meta.stringToEnum(Traversal, arg["--traversal=".len..]) orelse return error.InvalidTraversal;
         } else if (trace_path == null) {
             trace_path = arg;
         } else return error.InvalidArguments;
     }
-    if ((profile and (stages or prepare_layout or prepare_headings)) or (prepare_layout and prepare_headings)) return error.InvalidArguments;
+    if ((profile and (prepare_layout or prepare_headings)) or (prepare_layout and prepare_headings) or
+        (trace_states and trace_path == null)) return error.InvalidArguments;
     const input = try io.File.open(input_path, .read_only);
     defer input.close();
     const data = try init.arena.allocator().alloc(u8, @intCast(try input.size()));
@@ -304,10 +374,35 @@ pub fn main(init: std.process.Init) !void {
         break :blk ready;
     } else null;
     defer if (layout) |ready| ready.deinit(init.gpa);
+    switch (traversal orelse .baseline) {
+        inline else => |variant| try runCorpus(variant, init, view, data, grids, traces, trace_states, profile, stages, measure_memory, if (layout) |*ready| ready else null),
+    }
+    if (rss) std.debug.print("peak_rss_bytes={d}\n", .{try io.peakRssBytes()});
+}
+
+fn runCorpus(
+    comptime traversal: Traversal,
+    init: std.process.Init,
+    view: *const View,
+    data: []const u8,
+    grids: io.File,
+    traces: ?io.File,
+    trace_states: bool,
+    profile: bool,
+    stages: bool,
+    measure_memory: bool,
+    layout: ?*const iso.MovementLayout,
+) !void {
+    const Q = switch (traversal) {
+        .baseline => queue.RadixQueue,
+        .ordered_queue => queue.OrderedRadixQueue,
+        .label_activity => queue.LabelActivityQueue,
+        .compact => queue.CompactQueue,
+    };
     var backing = memory.CountingAllocator.init(init.gpa);
-    var walker = try iso.Isochrone(Foot).init(backing.allocator(), view);
+    var walker = try iso.IsochroneWithQueue(Foot, Q).init(backing.allocator(), view);
     defer walker.deinit();
-    var motorist = try iso.Isochrone(Auto).init(backing.allocator(), view);
+    var motorist = try iso.IsochroneWithQueue(Auto, Q).init(backing.allocator(), view);
     defer motorist.deinit();
     var walk_cache = try pedestrian.Cache.init(init.gpa, view.classes.?, 1);
     defer walk_cache.deinit();
@@ -362,10 +457,12 @@ pub fn main(init: std.process.Init) !void {
             .log = &output.interface,
             .grids = grids,
             .traces = traces,
+            .trace_states = trace_states,
             .profile = profile,
             .stages = stages,
+            .measure_memory = measure_memory,
             .scratch = a,
-            .layout = if (layout) |*ready| ready else null,
+            .layout = layout,
         };
         switch (row.costing) {
             .auto => try measurement.run(&motorist, Auto{ .profile = drive.profile(), .tables = drive.tables(), .arena = request_memory.allocator() }, request),
@@ -373,5 +470,4 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     try output.interface.flush();
-    if (rss) std.debug.print("peak_rss_bytes={d}\n", .{try io.peakRssBytes()});
 }

@@ -123,7 +123,7 @@ same instrumentation, introduced at `ab68938`.
 taskset -c 0 ./bench-isochrone BUNDLE requests.jsonl /dev/null --profile > stages.tsv
 ```
 
-The profiled TSV appends sample count, then sampled nanoseconds for
+The original profiled TSV appended sample count, then sampled nanoseconds for
 queue, successors, restrictions, edge costing, turn costing and
 rasterization. For each request, multiply each stage sample by popped
 labels divided by sample count. Summing the four requests gives each
@@ -231,6 +231,117 @@ conditions, including an advancing request clock.
 All 39 native test steps passed. The Linux x86-64 ReleaseFast binary is
 14,385,776 bytes, 568 bytes above the base, with five search instantiations
 and five costing kernels.
+
+## Exact queue keys and label activity
+
+[#260](https://github.com/zig-utils/zig-routing/issues/260) compares two
+ways to reduce work on a settled label. The composite radix queue orders
+the original nonnegative float bits followed by the insertion index.
+The latter makes equal-cost keys monotone, including zero-cost turns.
+It avoids the secondary heap for equal costs and doubles the radix
+bucket directory. The other variant records replacement in a spare
+flag in the existing 32-byte label. The state slot still controls
+relaxation, and each successful replacement retires the old label.
+A popped label can then check its own flag. Fractional origins with
+restriction history still resolve their status from the reconstructed
+turn context. Both changes add zero graph-side bytes.
+
+The same pinned ARM64 Linux ReleaseFast executable ran on CPU 0 of the
+six-vCPU VM on an Apple M3 Pro. Sixteen trials used each order of the
+four variants equally often. They covered the same 143,389 settled
+labels in Utrecht and 676,580 in Luxembourg. Full-grid intervals
+include traversal and painting. A separate series times isolated
+traversal and raster replay using the same bounds.
+
+| Dataset | Variant | Full grid | Traversal | Raster replay |
+| --- | --- | ---: | ---: | ---: |
+| Utrecht | Baseline | 35.784 ms | 21.718 ms | 12.570 ms |
+| Utrecht | Composite queue | 35.888 ms | 21.609 ms | 12.753 ms |
+| Utrecht | Label activity | 35.547 ms | 21.273 ms | 12.960 ms |
+| Utrecht | Combined | 36.242 ms | 21.687 ms | 12.715 ms |
+| Luxembourg | Baseline | 463.896 ms | 370.547 ms | 84.836 ms |
+| Luxembourg | Composite queue | 460.695 ms | 366.403 ms | 84.590 ms |
+| Luxembourg | Label activity | 462.047 ms | 367.452 ms | 84.755 ms |
+| Luxembourg | Combined | 463.920 ms | 371.755 ms | 84.419 ms |
+
+| Dataset | Variant | Full arena peak bytes | Traversal arena peak bytes | Median RSS bytes |
+| --- | --- | ---: | ---: | ---: |
+| Utrecht | Baseline | 11,256,208 | 5,764,084 | 19,791,872 |
+| Utrecht | Composite queue | 11,280,704 | 5,781,152 | 19,922,944 |
+| Utrecht | Label activity | 11,256,208 | 5,764,084 | 20,054,016 |
+| Utrecht | Combined | 11,280,704 | 5,781,152 | 19,922,944 |
+| Luxembourg | Baseline | 36,431,624 | 29,231,596 | 69,861,376 |
+| Luxembourg | Composite queue | 36,506,792 | 29,252,364 | 70,123,520 |
+| Luxembourg | Label activity | 36,431,624 | 29,231,596 | 70,123,520 |
+| Luxembourg | Combined | 36,506,792 | 29,252,364 | 70,123,520 |
+
+Six separate traversal profiles sampled about one in 32 pops. These
+are median cumulative times inside sampled spans, without scaling them
+to the whole sweep.
+
+| Dataset and variant | Sampled labels | Queue | State lookups and updates | Label access |
+| --- | ---: | ---: | ---: | ---: |
+| Utrecht baseline | 4,599 | 0.232 ms | 0.413 ms | 0.447 ms |
+| Utrecht combined | 4,599 | 0.240 ms | 0.480 ms | 0.463 ms |
+| Luxembourg baseline | 21,519 | 1.098 ms | 1.996 ms | 2.403 ms |
+| Luxembourg combined | 21,519 | 1.128 ms | 2.077 ms | 2.396 ms |
+
+Elapsed times are medians of per-trial request totals. Arena peaks are
+the largest request in each series. The combined variant was about
+1.3% slower on Utrecht and effectively tied on Luxembourg. Checking
+label activity alone saved 0.445 ms in isolated Utrecht traversal and
+0.237 ms across a full grid trial. The two changes stay opt-in for
+reproduction. The full-grid results offer too little gain for the extra
+queue storage or production state handling.
+
+All four configurations produced byte-identical grids and settled label
+records in both directions. The extended trace includes label flags,
+restriction contexts, fractional cuts and the clock. All warmed runs
+made zero backing allocator calls. Timed access and timed multi-via
+fixtures also matched. Full and traversal arena peaks were 2,364,932
+and 5,588 bytes for timed access, and 2,378,656 and 18,608 bytes for
+multi-via turns in every variant. The bounded timed-turn test checks
+active and inactive restrictions, fractional origins and full settled
+state. The full timed-turn fixture still reaches the request arena cap
+described above.
+
+All 39 native test steps passed, with 635 tests and two existing skips.
+Eleven test and CLI binaries cross-compiled for Linux x86-64. The
+symbol-bearing ReleaseFast binary is 14,440,920 bytes, 16 bytes above
+the baseline, with five search instantiations and five costing kernels.
+
+### Queue and label reproduction
+
+Use the same pinned ReleaseFast executable for all four variants. Run
+the [Utrecht replay](#reproduction) and the [Luxembourg corpus](#movement-layout-reproduction).
+Pin the runner to one CPU and repeat these four orders four times.
+
+| First | Second | Third | Fourth |
+| --- | --- | --- | --- |
+| baseline | ordered_queue | compact | label_activity |
+| ordered_queue | label_activity | baseline | compact |
+| label_activity | compact | ordered_queue | baseline |
+| compact | baseline | label_activity | ordered_queue |
+
+Use `--stages` for a separate series with isolated traversal and raster
+replay. The base columns precede the full request arena high-water bytes,
+the isolated traversal and raster nanoseconds, and the two isolated
+arena high-water values. `--rss` prints process peak RSS in bytes to
+stderr. With `--stages --profile`, queue, status and label timings are
+sampled in a separate traversal, so the isolated intervals exclude the
+instrumentation. Profile columns start with the sample count, then
+nanoseconds for queue, status, labels, successors, restrictions, edge
+costing, turn costing and rasterization. Use `--trace-states` for the
+extended trace. The regular trace still works with earlier runners.
+
+```sh
+taskset -c 0 ./bench-isochrone BUNDLE requests.jsonl /dev/null --memory --rss --traversal=baseline
+taskset -c 0 ./bench-isochrone BUNDLE requests.jsonl /dev/null --memory --rss --stages --traversal=compact
+taskset -c 0 ./bench-isochrone BUNDLE requests.jsonl base.grid base.trace --trace-states --traversal=baseline
+taskset -c 0 ./bench-isochrone BUNDLE requests.jsonl test.grid test.trace --trace-states --traversal=compact
+cmp base.grid test.grid
+cmp base.trace test.trace
+```
 
 ## Node-to-grid lookup trial
 

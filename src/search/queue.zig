@@ -160,101 +160,128 @@ pub const BucketQueue = struct {
 
 /// Radix heap for Dijkstra walks with nondecreasing popped costs.
 /// Positive float bit patterns sort in the same order as their values.
-pub const RadixQueue = struct {
-    const empty_key = std.math.maxInt(u32);
-    const digit_bits = 4;
-    const digit_count = 32 / digit_bits;
-    const slots_per_digit = 1 << digit_bits;
-    const Digit = u3;
-    const Slot = u4;
-    const Index = u7;
+pub const RadixQueue = Radix(false, false);
 
-    const Bucket = struct {
-        entries: std.ArrayList(Entry) = .empty,
-        minimum: u32 = empty_key,
-    };
+/// Composite keys are monotone when equal-priority insertions have increasing
+/// label indices. This includes Dijkstra's zero-cost steps.
+pub const OrderedRadixQueue = Radix(true, false);
 
-    buckets: [digit_count * slots_per_digit]Bucket = @splat(.{}),
-    equal: Heap = .{},
-    slots: [digit_count]u16 = @splat(0),
-    digits: u8 = 0,
-    minimum: u32 = 0,
-    redistributing: ?Index = null,
+pub const LabelActivityQueue = Radix(false, true);
+pub const CompactQueue = Radix(true, true);
 
-    pub fn init(unit_size: u32) !RadixQueue {
-        if (unit_size == 0) return error.InvalidBucketWidth;
-        return .{};
-    }
+fn Radix(comptime include_ties: bool, comptime track_replacements: bool) type {
+    return struct {
+        const Self = @This();
+        pub const label_activity = track_replacements;
+        const Key = if (include_ties) u64 else u32;
+        const empty_key = std.math.maxInt(Key);
+        const digit_bits = 4;
+        const digit_count = @bitSizeOf(Key) / digit_bits;
+        const slots_per_digit = 1 << digit_bits;
+        const Digit = @Int(.unsigned, std.math.log2(digit_count));
+        const Digits = @Int(.unsigned, digit_count);
+        const Shift = @Int(.unsigned, std.math.log2(@bitSizeOf(Key)));
+        const Slot = u4;
+        const Index = @Int(.unsigned, @bitSizeOf(Digit) + digit_bits);
 
-    pub fn push(self: *RadixQueue, arena: std.mem.Allocator, entry: Entry) !void {
-        if (entry.key < self.minimum) return error.NonmonotonePriority;
-        return self.insert(arena, entry);
-    }
+        const Bucket = struct {
+            entries: std.ArrayList(Entry) = .empty,
+            minimum: Key = empty_key,
+        };
 
-    fn insert(self: *RadixQueue, arena: std.mem.Allocator, entry: Entry) !void {
-        const differing = entry.key ^ self.minimum;
-        if (differing == 0) return self.equal.push(arena, entry);
-        const digit: Digit = @intCast((31 - @clz(differing)) / digit_bits);
-        const shift: u5 = @as(u5, digit) * digit_bits;
-        const slot: Slot = @truncate(entry.key >> shift);
-        const bucket = &self.buckets[bucketIndex(digit, slot)];
-        try bucket.entries.append(arena, entry);
-        bucket.minimum = @min(bucket.minimum, entry.key);
-        if (bucket.entries.items.len == 1) {
-            self.slots[digit] |= @as(u16, 1) << slot;
-            self.digits |= @as(u8, 1) << digit;
+        buckets: [digit_count * slots_per_digit]Bucket = @splat(.{}),
+        equal: if (include_ties) usize else Heap = if (include_ties) 0 else .{},
+        slots: [digit_count]u16 = @splat(0),
+        digits: Digits = 0,
+        minimum: Key = 0,
+        redistributing: ?Index = null,
+
+        pub fn init(unit_size: u32) !Self {
+            if (unit_size == 0) return error.InvalidBucketWidth;
+            return .{};
         }
-    }
 
-    pub fn popWithin(self: *RadixQueue, arena: std.mem.Allocator, control: anytype) !?Entry {
-        if (self.redistributing != null) {
-            try self.redistribute(arena, control);
-        } else if (self.equal.items.items.len == 0) {
-            if (self.digits == 0) return null;
-            const digit: Digit = @intCast(@ctz(self.digits));
-            const slot: Slot = @intCast(@ctz(self.slots[digit]));
-            const index = bucketIndex(digit, slot);
-            const bucket = &self.buckets[index];
-            if (bucket.entries.items.len == 1) {
-                const entry = bucket.entries.pop().?;
-                self.minimum = entry.key;
-                self.clearBucket(index);
-                return entry;
+        pub fn push(self: *Self, arena: std.mem.Allocator, entry: Entry) !void {
+            if (key(entry) < self.minimum) return error.NonmonotonePriority;
+            return self.insert(arena, entry);
+        }
+
+        fn key(entry: Entry) Key {
+            return if (include_ties) (@as(u64, entry.key) << 32) | entry.label else entry.key;
+        }
+
+        fn insert(self: *Self, arena: std.mem.Allocator, entry: Entry) !void {
+            const value = key(entry);
+            const differing = value ^ self.minimum;
+            if (differing == 0) {
+                if (!include_ties) return self.equal.push(arena, entry);
+                self.equal += 1;
+                return;
             }
-            self.minimum = bucket.minimum;
-            self.redistributing = index;
-            try self.redistribute(arena, control);
+            const digit: Digit = @intCast((@bitSizeOf(Key) - 1 - @clz(differing)) / digit_bits);
+            const shift: Shift = @as(Shift, digit) * digit_bits;
+            const slot: Slot = @truncate(value >> shift);
+            const bucket = &self.buckets[bucketIndex(digit, slot)];
+            try bucket.entries.append(arena, entry);
+            bucket.minimum = @min(bucket.minimum, value);
+            if (bucket.entries.items.len == 1) {
+                self.slots[digit] |= @as(u16, 1) << slot;
+                self.digits |= @as(Digits, 1) << digit;
+            }
         }
-        return self.equal.pop();
-    }
 
-    fn bucketIndex(digit: Digit, slot: Slot) Index {
-        return @as(Index, digit) * slots_per_digit + slot;
-    }
-
-    fn clearBucket(self: *RadixQueue, index: Index) void {
-        const digit: Digit = @intCast(index / slots_per_digit);
-        const slot: Slot = @truncate(index);
-        self.slots[digit] &= ~(@as(u16, 1) << slot);
-        if (self.slots[digit] == 0) self.digits &= ~(@as(u8, 1) << digit);
-        self.buckets[index].minimum = empty_key;
-    }
-
-    noinline fn redistribute(self: *RadixQueue, arena: std.mem.Allocator, control: anytype) !void {
-        const index = self.redistributing.?;
-        const bucket = &self.buckets[index].entries;
-        var moved: usize = 0;
-        while (bucket.last()) |entry| : (moved += 1) {
-            if (moved % 256 == 0) try control.check();
-            // All entries in the selected bucket share the new minimum's
-            // leading digits. Keep the original copy until insertion succeeds.
-            try self.insert(arena, entry);
-            _ = bucket.pop();
+        pub fn popWithin(self: *Self, arena: std.mem.Allocator, control: anytype) !?Entry {
+            if (self.redistributing != null) {
+                try self.redistribute(arena, control);
+            } else if (if (include_ties) self.equal == 0 else self.equal.items.items.len == 0) {
+                if (self.digits == 0) return null;
+                const digit: Digit = @intCast(@ctz(self.digits));
+                const slot: Slot = @intCast(@ctz(self.slots[digit]));
+                const index = bucketIndex(digit, slot);
+                const bucket = &self.buckets[index];
+                if (bucket.entries.items.len == 1) {
+                    const entry = bucket.entries.pop().?;
+                    self.minimum = key(entry);
+                    self.clearBucket(index);
+                    return entry;
+                }
+                self.minimum = bucket.minimum;
+                self.redistributing = index;
+                try self.redistribute(arena, control);
+            }
+            if (!include_ties) return self.equal.pop();
+            self.equal -= 1;
+            return .{ .key = @truncate(self.minimum >> 32), .label = @truncate(self.minimum) };
         }
-        self.clearBucket(index);
-        self.redistributing = null;
-    }
-};
+
+        fn bucketIndex(digit: Digit, slot: Slot) Index {
+            return @as(Index, digit) * slots_per_digit + slot;
+        }
+
+        fn clearBucket(self: *Self, index: Index) void {
+            const digit: Digit = @intCast(index / slots_per_digit);
+            const slot: Slot = @truncate(index);
+            self.slots[digit] &= ~(@as(u16, 1) << slot);
+            if (self.slots[digit] == 0) self.digits &= ~(@as(Digits, 1) << digit);
+            self.buckets[index].minimum = empty_key;
+        }
+
+        noinline fn redistribute(self: *Self, arena: std.mem.Allocator, control: anytype) !void {
+            const index = self.redistributing.?;
+            const bucket = &self.buckets[index].entries;
+            var moved: usize = 0;
+            while (bucket.last()) |entry| : (moved += 1) {
+                if (moved % 256 == 0) try control.check();
+                // All entries in the selected bucket share the new minimum's
+                // leading digits. Keep the original copy until insertion succeeds.
+                try self.insert(arena, entry);
+                _ = bucket.pop();
+            }
+            self.clearBucket(index);
+            self.redistributing = null;
+        }
+    };
+}
 
 test "four-way heap handles ties and sparse final child groups" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -382,14 +409,35 @@ test "radix queue preserves fractional costs and label ties" {
     try t.expectEqual(@as(?Entry, null), try pending.popWithin(a, Uncancelled{}));
 }
 
+test "composite radix keys keep monotone ties in exact heap order" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var pending = try OrderedRadixQueue.init(1);
+    var heap: Heap = .{};
+    var rng = std.Random.DefaultPrng.init(0x260);
+    const random = rng.random();
+    var minimum: f32 = 0;
+    for (0..4096) |i| {
+        const extra: u8 = if (i % 2 == 0) 0 else random.uintLessThan(u8, 64);
+        const entry = Entry.init(minimum + @as(f32, @floatFromInt(extra)) * 0.125, @intCast(i));
+        try heap.push(a, entry);
+        try pending.push(a, entry);
+        if (i % 3 != 0) continue;
+        const expected = heap.pop().?;
+        try t.expectEqual(@as(?Entry, expected), try pending.popWithin(a, Uncancelled{}));
+        minimum = @bitCast(expected.key);
+    }
+    while (heap.pop()) |entry| try t.expectEqual(@as(?Entry, entry), try pending.popWithin(a, Uncancelled{}));
+    try t.expectEqual(@as(?Entry, null), try pending.popWithin(a, Uncancelled{}));
+}
+
 test "radix queue retains entries across interrupted redistribution" {
     const t = std.testing;
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var pending = try RadixQueue.init(1);
-    for (0..1024) |label| try pending.push(a, Entry.init(300, @intCast(label)));
-
     const CancelAfterFirstCheck = struct {
         checked: bool = false,
 
@@ -398,13 +446,18 @@ test "radix queue retains entries across interrupted redistribution" {
             self.checked = true;
         }
     };
-    var control: CancelAfterFirstCheck = .{};
-    try t.expectError(error.Cancelled, pending.popWithin(a, &control));
-    try t.expect(pending.redistributing != null);
-    try pending.push(a, Entry.init(300.25, 1024));
-    for (0..1024) |label| {
-        try t.expectEqual(@as(?Entry, Entry.init(300, @intCast(label))), try pending.popWithin(a, Uncancelled{}));
+    inline for (.{ RadixQueue, OrderedRadixQueue }) |Q| {
+        var pending = try Q.init(1);
+        for (0..1024) |label| try pending.push(a, Entry.init(300, @intCast(label)));
+
+        var control: CancelAfterFirstCheck = .{};
+        try t.expectError(error.Cancelled, pending.popWithin(a, &control));
+        try t.expect(pending.redistributing != null);
+        try pending.push(a, Entry.init(300.25, 1024));
+        for (0..1024) |label| {
+            try t.expectEqual(@as(?Entry, Entry.init(300, @intCast(label))), try pending.popWithin(a, Uncancelled{}));
+        }
+        try t.expectEqual(@as(?Entry, Entry.init(300.25, 1024)), try pending.popWithin(a, Uncancelled{}));
+        try t.expectEqual(@as(?Entry, null), try pending.popWithin(a, Uncancelled{}));
     }
-    try t.expectEqual(@as(?Entry, Entry.init(300.25, 1024)), try pending.popWithin(a, Uncancelled{}));
-    try t.expectEqual(@as(?Entry, null), try pending.popWithin(a, Uncancelled{}));
 }
