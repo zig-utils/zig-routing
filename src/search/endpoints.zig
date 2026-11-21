@@ -18,11 +18,16 @@ pub const Candidate = struct {
     begin_node: bool,
     end_node: bool,
     reach: Reach = .{},
+    exclude_closures: ?bool = null,
 
     pub fn valid(self: Candidate) bool {
         return self.fraction >= 0 and self.fraction <= 1 and
             std.math.isFinite(self.score) and self.score >= 0 and
             !(self.begin_node and self.end_node);
+    }
+
+    pub fn allowsClosure(self: Candidate, filter_closures: bool) bool {
+        return !(self.exclude_closures orelse filter_closures);
     }
 };
 
@@ -77,6 +82,7 @@ pub fn rank(arena: std.mem.Allocator, location: snap.PathLocation, costing: requ
                 .begin_node = edge.node == .begin,
                 .end_node = edge.node == .end,
                 .reach = edge.reach,
+                .exclude_closures = location.exclude_closures,
             };
             minimum = @min(minimum, score);
             offset += 1;

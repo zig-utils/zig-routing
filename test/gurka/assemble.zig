@@ -2736,7 +2736,6 @@ test "barriers permit the forced return without admitting through traffic" {
 
 // Ported from test_closure_penalty.cc and test_search_filter.cc using a pinned
 // live closure observation on each directed edge (Valhalla 3.9.3).
-// Closed destination stretches and the open bypass between closed ends are #244.
 test "live closure penalties find the earliest exit from a closed stretch" {
     const auto = routing.costing.auto;
     const Adapter = MotorTestCost(auto);
@@ -2784,6 +2783,235 @@ test "live closure penalties find the earliest exit from a closed stretch" {
         try testing.expectEqual(ab, route.segments[0].edge);
         try testing.expectEqual(case.next, route.segments[1].edge);
         try testing.expectEqual(de, route.segments[route.segments.len - 1].edge);
+        arena.reset();
+    }
+}
+
+fn closureSnap(edges: []const routing.snap.candidates.PathEdge, exclude: bool) routing.snap.candidates.PathLocation {
+    var location = snapLocation(edges, &.{});
+    location.exclude_closures = exclude;
+    return location;
+}
+
+fn expectClosurePath(view: *const graph.reader.View, fixture: *const gurka.Map, path: routing.search.endpoints.Path, names: []const []const u8) !void {
+    errdefer {
+        std.debug.print("\nActual ways", .{});
+        for (path.segments) |segment| {
+            const id = view.wayId(segment.edge) catch continue;
+            for (fixture.osm.ways) |way| {
+                if (way.id == id) std.debug.print(" {s}", .{way.label});
+            }
+        }
+        std.debug.print("\n", .{});
+    }
+    try testing.expectEqual(names.len, path.segments.len);
+    for (path.segments, names) |segment, name| {
+        const way = fixture.findWay(name).?;
+        try testing.expectEqual(@as(u64, @intCast(way.id)), try view.wayId(segment.edge));
+    }
+}
+
+fn checkClosurePenalty(comptime model: type, a: std.mem.Allocator, view: *const graph.reader.View, fixture: *const gurka.Map, mode: anytype, costing: routing.api.request.Costing, edges: []const format.EdgeId) !void {
+    const endpoints = routing.search.endpoints;
+    const Adapter = MotorTestCost(model);
+    const qt = try directedBetween(view, fixture, "T", "Q");
+    const be = try directedBetween(view, fixture, "B", "E");
+    const fc = try directedBetween(view, fixture, "F", "C");
+    const da = try directedBetween(view, fixture, "D", "A");
+    const from = closureSnap(&.{ snapEdge(qt, 1.0 / 3.0, 0), snapEdge(try view.oppEdge(qt), 2.0 / 3.0, 0) }, false);
+    const closed_goal = closureSnap(&.{ snapEdge(be, 1.0 / 3.0, 0), snapEdge(try view.oppEdge(be), 2.0 / 3.0, 0) }, false);
+    const cases = [_]struct {
+        factor: []const u8,
+        goal: routing.snap.candidates.PathLocation,
+        path: []const []const u8,
+    }{
+        .{ .factor = "1", .goal = closed_goal, .path = &.{ "QT", "NQ", "KN", "HK", "EH", "BE" } },
+        .{ .factor = "9", .goal = closed_goal, .path = &.{ "QT", "TU", "RU", "OR", "LO", "IL", "FI", "CF", "BC", "BE" } },
+        .{ .factor = "9", .goal = closureSnap(&.{snapEdge(fc, 1, 0)}, true), .path = &.{ "QT", "TU", "RU", "OR", "LO", "IL", "FI", "CF" } },
+        .{ .factor = "9", .goal = closureSnap(&.{snapEdge(da, 1, 0)}, true), .path = &.{ "QT", "ST", "PS", "MP", "JM", "GJ", "DG", "AD" } },
+    };
+    var engine = try search.Search(Adapter, routing.search.queue.Heap).init(testing.allocator, view);
+    defer engine.deinit();
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    for (cases) |case| {
+        const json = try std.fmt.allocPrint(a, "{{\"closure_factor\":{s},\"speed_types\":[\"freeflow\",\"constrained\",\"predicted\",\"current\"]}}", .{case.factor});
+        const input = try routing.api.json.parse(a, json);
+        var warnings: std.ArrayList(routing.costing.base.Warning) = .empty;
+        const request = if (comptime model == routing.costing.truck)
+            try model.parse(a, input, &warnings, .none)
+        else
+            try model.parse(a, mode, input, &warnings, .none);
+        const profile = try model.Model.canonicalize(request);
+        const classes = view.classes.?;
+        const tables = try routing.costing.compiled.compileInto(model.Model, profile, classes, try a.alloc(f32, classes.len), .none);
+        const adapter: Adapter = .{ .profile = &profile, .tables = &tables, .closures = .{ .edges = edges } };
+        for ([_]search.Direction{ .forward, .reverse }) |direction| {
+            errdefer std.debug.print("\nclosure costing={s} factor={s} direction={s} goal={s}\n", .{ @tagName(costing), case.factor, @tagName(direction), case.path[case.path.len - 1] });
+            const options: endpoints.Options = .{
+                .costing = costing,
+                .direction = direction,
+                .timing = try restrictionTiming("2026-11-02T12:00", true),
+            };
+            const path = try endpoints.route(&engine, &arena, adapter, from, case.goal, options, search.Zero{}, .{});
+            try expectClosurePath(view, fixture, path, case.path);
+            arena.reset();
+        }
+    }
+}
+
+// Ported from test/gurka/test_closure_penalty.cc (Valhalla 3.9.3).
+test "closure penalties choose between a closed road and an open bypass in six motor modes" {
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const fixture = try @import("examples.zig").closurePenalty(a);
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    var closed: [12]format.EdgeId = undefined;
+    for ([_][]const u8{ "BE", "EH", "HK", "NQ", "QT", "KN" }, 0..) |name, i| {
+        closed[2 * i] = try directedBetween(view, &fixture, name[0..1], name[1..2]);
+        closed[2 * i + 1] = try view.oppEdge(closed[2 * i]);
+    }
+    // The upstream test leaves KN open. Also close it to exercise a fully
+    // closed route between the admitted endpoints.
+    for ([_][]const format.EdgeId{ closed[0..10], &closed }) |edges| {
+        for (std.enums.values(routing.costing.auto.Mode)) |mode| {
+            const costing = std.meta.stringToEnum(routing.api.request.Costing, @tagName(mode)).?;
+            try checkClosurePenalty(routing.costing.auto, a, view, &fixture, mode, costing, edges);
+        }
+        for (std.enums.values(routing.costing.motorcycle.Mode)) |mode| {
+            const costing = std.meta.stringToEnum(routing.api.request.Costing, @tagName(mode)).?;
+            try checkClosurePenalty(routing.costing.motorcycle, a, view, &fixture, mode, costing, edges);
+        }
+        try checkClosurePenalty(routing.costing.truck, a, view, &fixture, {}, .truck, edges);
+    }
+}
+
+// Extends the closure waypoint cases in test/gurka/test_search_filter.cc.
+test "waypoint closure filters admit adjacent terminal closures and reject intermediate closures" {
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const one_way: gurka.Tags = &.{ .{ .key = "highway", .value = "primary" }, .{ .key = "oneway", .value = "yes" } };
+    const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates("A---B---C---D---E---F\n    |       |\n    X-------Y", 100), &.{
+        .{ .label = "AB", .tags = one_way }, .{ .label = "BC", .tags = one_way }, .{ .label = "CD", .tags = one_way },
+        .{ .label = "DE", .tags = one_way }, .{ .label = "EF", .tags = one_way }, .{ .label = "BX", .tags = one_way },
+        .{ .label = "XY", .tags = one_way }, .{ .label = "YD", .tags = one_way },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const ab = try directedBetween(view, &fixture, "A", "B");
+    const bc = try directedBetween(view, &fixture, "B", "C");
+    const de = try directedBetween(view, &fixture, "D", "E");
+    const ef = try directedBetween(view, &fixture, "E", "F");
+    const Auto = routing.costing.auto;
+    const Adapter = MotorTestCost(Auto);
+    const endpoints = routing.search.endpoints;
+    const input = try routing.api.json.parse(a, "{\"closure_factor\":1}");
+    var warnings: std.ArrayList(routing.costing.base.Warning) = .empty;
+    const profile = try Auto.Model.canonicalize(try Auto.parse(a, .auto, input, &warnings, .none));
+    const classes = view.classes.?;
+    const tables = try routing.costing.compiled.compileInto(Auto.Model, profile, classes, try a.alloc(f32, classes.len), .none);
+    const adapter: Adapter = .{ .profile = &profile, .tables = &tables, .closures = .{ .edges = &.{ bc, de, ef } } };
+    var counting = routing.infra.arena.CountingAllocator.init(testing.allocator);
+    var engine = try search.Search(Adapter, routing.search.queue.Heap).init(counting.allocator(), view);
+    defer engine.deinit();
+    var arena = routing.infra.arena.Arena.init(counting.allocator(), .{});
+    defer arena.deinit();
+    const from = closureSnap(&.{snapEdge(ab, 0.5, 0)}, true);
+    const finish = closureSnap(&.{snapEdge(ef, 0.75, 0)}, false);
+    var denied_finish = finish;
+    denied_finish.exclude_closures = true;
+    const on_finish = closureSnap(&.{snapEdge(ef, 0.25, 0)}, false);
+    var denied_start = on_finish;
+    denied_start.exclude_closures = true;
+
+    const point = fixture.findNode("E").?.location.midpoint(fixture.findNode("F").?.location);
+    const snap = routing.snap.candidates;
+    const snap_cost: ClosureCost = .{ .edges = .{ ef, try view.oppEdge(ef) } };
+    const correlated = try snap.search(view, a, .{
+        .lat = point.lat,
+        .lng = point.lng,
+        .minimum_reachability = 0,
+        .search_filter = .{ .exclude_closures = false },
+    }, .{}, snap_cost, .none);
+    const ranked = try endpoints.rank(a, correlated, .auto, .{});
+    for (ranked.all) |candidate| {
+        if (candidate.edge != ef) continue;
+        try testing.expect(candidate.allowsClosure(true));
+        break;
+    } else return error.MissingTestEdge;
+
+    for ([_]search.Direction{ .forward, .reverse }) |direction| {
+        const options: endpoints.Options = .{ .costing = .auto, .direction = direction };
+        const path = try endpoints.route(&engine, &arena, adapter, from, finish, options, search.Zero{}, .{});
+        try expectClosurePath(view, &fixture, path, &.{ "AB", "BX", "XY", "YD", "DE", "EF" });
+        arena.reset();
+        try testing.expectError(error.NoPath, endpoints.route(&engine, &arena, adapter, from, denied_finish, options, search.Zero{}, .{}));
+        arena.reset();
+        const same = try endpoints.route(&engine, &arena, adapter, on_finish, finish, options, search.Zero{}, .{});
+        try expectClosurePath(view, &fixture, same, &.{"EF"});
+        try testing.expectEqual(@as(f32, 0.25), same.segments[0].begin);
+        try testing.expectEqual(@as(f32, 0.75), same.segments[0].end);
+        arena.reset();
+        try testing.expectError(error.NoPath, endpoints.route(&engine, &arena, adapter, denied_start, finish, options, search.Zero{}, .{}));
+        arena.reset();
+        try testing.expectError(error.NoPath, endpoints.route(&engine, &arena, adapter, on_finish, denied_finish, options, search.Zero{}, .{}));
+        arena.reset();
+    }
+    counting.resetCounts();
+    _ = try endpoints.route(&engine, &arena, adapter, from, finish, .{ .costing = .auto }, search.Zero{}, .{});
+    try testing.expectEqual(0, counting.calls());
+}
+
+test "closed edge labels retain whether they can still leave the origin closure" {
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const primary: gurka.Tag = .{ .key = "highway", .value = "primary" };
+    const one_way: gurka.Tag = .{ .key = "oneway", .value = "yes" };
+    const usual: gurka.Tags = &.{ primary, one_way, .{ .key = "maxspeed", .value = "45" } };
+    const bypass: gurka.Tags = &.{ primary, one_way, .{ .key = "maxspeed", .value = "90" } };
+    const layout = try gurka.mapToCoordinates("S---A---B---C---D---T\n\n      X       Y", 100);
+    const fixture = try gurka.Map.init(a, layout, &.{
+        .{ .label = "SA", .tags = usual },
+        .{ .label = "AB", .tags = &.{ primary, one_way, .{ .key = "maxspeed", .value = "25" } } },
+        .{ .label = "AXB", .tags = bypass },
+        .{ .label = "BC", .tags = usual },
+        .{ .label = "CD", .tags = &.{ primary, one_way, .{ .key = "maxspeed", .value = "10" } } },
+        .{ .label = "CYD", .tags = bypass },
+        .{ .label = "DT", .tags = usual },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    var closed: [5]format.EdgeId = undefined;
+    for ([_][]const u8{ "SA", "AB", "BC", "CD", "DT" }, &closed) |name, *id| {
+        id.* = try directedBetween(view, &fixture, name[0..1], name[1..2]);
+    }
+    const Auto = routing.costing.auto;
+    const Adapter = MotorTestCost(Auto);
+    const endpoints = routing.search.endpoints;
+    var warnings: std.ArrayList(routing.costing.base.Warning) = .empty;
+    const profile = try Auto.Model.canonicalize(try Auto.parse(a, .auto, .null, &warnings, .none));
+    const classes = view.classes.?;
+    const tables = try routing.costing.compiled.compileInto(Auto.Model, profile, classes, try a.alloc(f32, classes.len), .none);
+    const adapter: Adapter = .{ .profile = &profile, .tables = &tables, .closures = .{ .edges = &closed } };
+    var engine = try search.Search(Adapter, routing.search.queue.Heap).init(testing.allocator, view);
+    defer engine.deinit();
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    const from = closureSnap(&.{snapEdge(closed[0], 0.5, 0)}, false);
+    const to = closureSnap(&.{snapEdge(closed[4], 0.5, 0)}, false);
+    for ([_]search.Direction{ .forward, .reverse }) |direction| {
+        const options: endpoints.Options = .{ .costing = .auto, .direction = direction, .timing = try restrictionTiming("2026-11-02T12:00", true) };
+        const result = try endpoints.route(&engine, &arena, adapter, from, to, options, search.Zero{}, .{});
+        // AXB reaches BC more cheaply, but that label entered a terminal
+        // closure and cannot take CYD. The more expensive arrival can.
+        try expectClosurePath(view, &fixture, result, &.{ "SA", "AB", "BC", "CYD", "DT" });
         arena.reset();
     }
 }

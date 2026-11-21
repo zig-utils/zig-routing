@@ -334,6 +334,42 @@ pub fn probableTurns(arena: Allocator) !gurka.Map {
     });
 }
 
+// Ported from test/gurka/test_closure_penalty.cc (Valhalla 3.9.3).
+pub fn closurePenalty(arena: Allocator) !gurka.Map {
+    const layout = try gurka.mapToCoordinatesAt(
+        \\A-----B-----C
+        \\|     2     |
+        \\|     |     |
+        \\D-----E-----F
+        \\|     |     |
+        \\G-----H-----I
+        \\|     |     |
+        \\J-----K-----L
+        \\|     |     |
+        \\M-----N-----O
+        \\|     |     |
+        \\P-----Q-----R
+        \\|     |     |
+        \\|     1     |
+        \\S-----T-----U
+    , 100, .{ .lng = 0.05, .lat = 0.2 });
+    const Group = struct { speed: []const u8, names: []const []const u8 };
+    var ways: std.ArrayList(gurka.Way) = .empty;
+    for ([_]Group{
+        .{ .speed = "30", .names = &.{ "AB", "BC", "DE", "EF", "GH", "HI", "JK", "KL", "MN", "NO", "PQ", "QR", "ST", "TU" } },
+        .{ .speed = "20", .names = &.{ "AD", "DG", "GJ", "JM", "MP", "PS" } },
+        .{ .speed = "45", .names = &.{ "BE", "EH", "HK", "KN", "NQ", "QT" } },
+        .{ .speed = "35", .names = &.{ "CF", "FI", "IL", "LO", "OR", "RU" } },
+    }) |group| {
+        const tags = try arena.dupe(gurka.Tag, &.{
+            .{ .key = "highway", .value = "primary" },
+            .{ .key = "maxspeed", .value = group.speed },
+        });
+        for (group.names) |label| try ways.append(arena, .{ .label = label, .tags = tags });
+    }
+    return gurka.Map.init(arena, layout, ways.items, &.{}, &.{});
+}
+
 // Ported from test/gurka/test_truck.cc (Valhalla 3.9.3). The middle
 // restrictions and the one-way clearance exercise storage in both directions.
 pub fn motorVehicle(arena: Allocator) !gurka.Map {

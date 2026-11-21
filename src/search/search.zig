@@ -38,9 +38,11 @@ pub const Label = extern struct {
     const alias_history: u32 = 16;
     const destination_only: u32 = 32;
     const exception_shift = 6;
-    const prune_closures: u32 = 1 << 13;
+    const origin_closure: u32 = 1 << 13;
     const excluded_start: u32 = 1 << 14;
     const measured_speed: u32 = 1 << 15;
+    const terminal_closure: u32 = 1 << 16;
+    const closure_mask = origin_closure | terminal_closure;
 
     pub fn edgeId(self: Label) EdgeId {
         return @fromBackingInt(self.edge);
@@ -418,14 +420,14 @@ pub const Restrictions = struct {
         return @as(u32, @intCast(self.access.view.edges.len)) + (context.value - automaton.first_context);
     }
 
-    fn aliasKey(edge: u32, context: TurnContext) AliasKey {
-        return .{ .edge = edge, .value = context.value, .previous_edge = context.alias };
+    fn aliasKey(edge: u32, context: TurnContext, closure: u32) AliasKey {
+        return .{ .edge = edge, .value = context.value, .previous_edge = context.alias, .access_flags = closure };
     }
 
     fn timedKey(label: Label, context: TurnContext) AliasKey {
-        var key = aliasKey(label.edge, context);
+        var key = aliasKey(label.edge, context, label.flags & Label.closure_mask);
         key.elapsed = @bitCast(label.secs);
-        const access = Label.destination_only | (0x7f << Label.exception_shift) | Label.prune_closures |
+        const access = Label.destination_only | (0x7f << Label.exception_shift) | Label.closure_mask |
             Label.excluded_start | Label.forbid_uturn | Label.measured_speed;
         key.access_flags = label.flags & access;
         return key;
@@ -436,6 +438,9 @@ const TemporalInputs = struct {
     speeds: base.Flow = .{},
     access_modes: u16 = 0,
 };
+
+const ClosureEdge = enum { none, closed, connector };
+const TerminalClosures = paged.Array(ClosureEdge, .none);
 
 /// K supplies edgeCost(view, edge_id, hot, direction), turnCost(view,
 /// transition, predecessor, direction), and optionally slowAllowed for
@@ -597,6 +602,10 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             const target = if (partial_starts) null else query.target;
             const limit = if (partial) std.math.maxInt(usize) else query.limit;
             const a = arena.allocator();
+            const terminal_closures = if (comptime partial and @hasDecl(K, "closed"))
+                try self.terminalClosures(a, kernel, direction, query.targets, permission, control)
+            else
+                null;
             var pool: Pool = .init(arena);
             var labels: std.ArrayList(Label) = .empty;
             if (!partial_starts and target != null and query.start == target.?) {
@@ -666,7 +675,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     else if (partial_starts and last.flags & Label.excluded_start != 0)
                         fractions.?.get(last.edge).?.seed
                     else
-                        self.findStatus(tracker, last.edge, context);
+                        self.findStatus(tracker, last.edge, context, closureBits(last));
                     if (active.label_plus_one != top.label + 1) continue;
                 }
                 settled += 1;
@@ -710,13 +719,24 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     const next_id = if (direction == .forward) local_id else try self.view.oppEdge(local_id);
                     const next_context: TurnContext = if (with_restrictions) try tracker.advance(context, last, at, next_id) else .{};
                     if (with_restrictions and next_context.value == no_index) continue;
-                    const prior = self.findStatus(tracker, @backingInt(next_id), next_context);
+                    const terminal_edge: ClosureEdge = if (terminal_closures) |closures| closures.get(@backingInt(next_id)) else .none;
+                    const phase = closureBits(last);
+                    const kind = if (phase == Label.origin_closure and terminal_edge == .none)
+                        try self.closureKind(kernel, permission, next_id, outward)
+                    else
+                        terminal_edge;
+                    const next_phase: u32 = if (comptime @hasDecl(K, "closed")) switch (phase) {
+                        Label.terminal_closure => if (terminal_edge != .none) Label.terminal_closure else continue,
+                        Label.origin_closure => if (kind != .none) Label.origin_closure else 0,
+                        else => if (terminal_edge == .closed) Label.terminal_closure else 0,
+                    } else 0;
+                    const prior = self.findStatus(tracker, @backingInt(next_id), next_context, next_phase);
                     const dominated = prior.label_plus_one != 0 and labels.items[prior.label_plus_one - 1].cost <= last.cost;
                     var targets = if (partial) query.targets.on(next_id) else {};
                     if (dominated and (!partial or targets.index == 0)) continue;
                     const next = if (direction == .forward) outward else try self.view.edge(next_id);
-                    const closed = try self.edgeClosed(kernel, permission, next_id);
-                    if (closed and last.flags & Label.prune_closures != 0) continue;
+                    const closed = kind == .closed or (phase == 0 and kind == .none and try self.edgeClosed(kernel, permission, next_id));
+                    if (closed and next_phase == 0) continue;
                     const head: NodeId = @fromBackingInt(outward.head);
                     const access = if (with_restrictions and (model_access or (check_access and next.cls.cold_checks != 0)))
                         try tracker.access.evaluate(next_id, next, at, last, if (target != null and head == target.?) .end else .middle)
@@ -765,6 +785,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                         var count: usize = 0;
                         while (targets.next()) |candidate| : (count += 1) {
                             if (count % 64 == 0) try control.check();
+                            if (closed and !candidate.allowsClosure(permission.filter_closures)) continue;
                             if (fractions != null and prior.label_plus_one == Status.exclusion and
                                 cutsExcluded(fractions.?.get(@backingInt(next_id)).?.fraction, candidate.fraction, direction == .reverse)) continue;
                             const cut: Cut = if (direction == .forward) .{ .end = candidate.fraction } else .{ .begin = candidate.fraction };
@@ -799,7 +820,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                         .dist_m = metres,
                         .tcost = delay.cost,
                         .ctx = next_context.value,
-                        .flags = Label.contextFlags(next_context, access.state) | closureFlag(!closed) | traversal.flags(),
+                        .flags = Label.contextFlags(next_context, access.state) | next_phase | traversal.flags(),
                     }, null);
                 }
             }
@@ -854,13 +875,14 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     base.AccessEvaluation{};
                 if (!access.allowed) continue;
                 const context: TurnContext = if (@TypeOf(tracker) == @TypeOf(null)) .{} else try tracker.advance(.{}, .{}, start, id);
-                try self.offer(pool, labels, pending, potential, target, here, self.findStatus(tracker, @backingInt(id), context), tracker, context, .{
+                const closure: u32 = if (closed) Label.origin_closure else 0;
+                try self.offer(pool, labels, pending, potential, target, here, self.findStatus(tracker, @backingInt(id), context, closure), tracker, context, .{
                     .edge = @backingInt(id),
                     .cost = edge_cost.cost,
                     .secs = edge_cost.secs,
                     .dist_m = edge.geom.len_m,
                     .ctx = context.value,
-                    .flags = Label.contextFlags(context, access.state) | closureFlag(!closed) | traversal.flags(),
+                    .flags = Label.contextFlags(context, access.state) | closure | traversal.flags(),
                 }, null);
             }
         }
@@ -892,7 +914,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 } else null;
                 if (excluded) |entry| if (cutsExcluded(entry.fraction, candidate.fraction, direction == .forward)) continue;
                 const closed = try self.edgeClosed(kernel, permission, id);
-                if (closed and permission.filter_closures) continue;
+                if (closed and !candidate.allowsClosure(permission.filter_closures)) continue;
                 const price_at_time = timed_costs and query.timing.start.valid;
                 const check_limits = @TypeOf(tracker) != @TypeOf(null) and tracker.access.check_access and edge.cls.cold_checks != 0;
                 const tail: NodeId = if (price_at_time or check_limits)
@@ -922,12 +944,13 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 if (!access.allowed) continue;
                 try cuts.append(a, portion);
                 const context: TurnContext = if (@TypeOf(tracker) == @TypeOf(null)) .{} else try tracker.advance(.{}, .{}, node, id);
+                const closure: u32 = if (closed) Label.origin_closure else 0;
                 var label: Label = .{
                     .edge = @backingInt(id),
                     .cost = cost.cost,
                     .secs = cost.secs,
                     .dist_m = metres,
-                    .flags = Label.contextFlags(context, access.state) | Label.partial_start | closureFlag(!closed) | traversal.flags() |
+                    .flags = Label.contextFlags(context, access.state) | Label.partial_start | closure | traversal.flags() |
                         (if (query.forbid_initial_uturn and at_node and portion.begin == portion.end) Label.forbid_uturn else 0),
                     .ctx = std.math.cast(u32, cuts.items.len) orelse return error.TooManySearchLabels,
                 };
@@ -935,13 +958,14 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     label.flags |= Label.excluded_start;
                     try self.offer(pool, labels, pending, potential, null, node, entry.seed, tracker, context, label, &entry.seed);
                 } else {
-                    try self.offer(pool, labels, pending, potential, null, node, self.findStatus(tracker, @backingInt(id), context), tracker, context, label, null);
+                    try self.offer(pool, labels, pending, potential, null, node, self.findStatus(tracker, @backingInt(id), context, closure), tracker, context, label, null);
                 }
                 if (expanding) continue;
                 var dest = query.targets.on(id);
                 var count: usize = 0;
                 while (dest.next()) |match| : (count += 1) {
                     if (count % 64 == 0) try control.check();
+                    if (closed and !match.allowsClosure(permission.filter_closures)) continue;
                     if (excluded) |entry| if (cutsExcluded(entry.fraction, match.fraction, direction == .reverse)) continue;
                     const cut: Cut = if (direction == .forward)
                         .{ .begin = candidate.fraction, .end = match.fraction }
@@ -975,11 +999,6 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             return try kernel.slowAllowed(view, id, edge, predecessor, direction);
         }
 
-        fn closureFlag(prune: bool) u32 {
-            if (comptime !@hasDecl(K, "closed")) return 0;
-            return if (prune) Label.prune_closures else 0;
-        }
-
         fn edgeClosed(self: *Self, kernel: K, permission: base.Permission, id: EdgeId) !bool {
             if (comptime !@hasDecl(K, "closed")) return false;
             if (!permission.usesClosures()) return false;
@@ -990,11 +1009,69 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             return kernel.closed(try DirectedEdge.read(self.view, id));
         }
 
-        inline fn findStatus(self: *Self, tracker: anytype, edge: u32, context: TurnContext) Status {
-            if (@TypeOf(tracker) == @TypeOf(null) or tracker.keep_time or !context.present()) return self.status.get(edge);
-            if (tracker.statusId(edge, context)) |id| return self.status.get(id);
+        fn isConnector(self: *Self, edge: *const EdgeHot) !bool {
+            return edge.geom.len_m == 0 and (try self.view.class(edge.cls.class_id)).flags.node_connector;
+        }
+
+        fn closureKind(self: *Self, kernel: K, permission: base.Permission, id: EdgeId, outward: *const EdgeHot) !ClosureEdge {
+            if (try self.isConnector(outward)) return .connector;
+            return if (try self.edgeClosed(kernel, permission, id)) .closed else .none;
+        }
+
+        inline fn closureBits(label: Label) u32 {
+            return if (comptime @hasDecl(K, "closed")) label.flags & Label.closure_mask else 0;
+        }
+
+        /// Follow closed edges backward from admitted targets in search order.
+        /// The search still checks access, costs, and turns on each marked edge.
+        noinline fn terminalClosures(self: *Self, a: std.mem.Allocator, kernel: K, comptime direction: Direction, targets: *const endpoints.Targets, permission: base.Permission, control: Control) !?*TerminalClosures {
+            if (!permission.usesClosures()) return null;
+            var stack: std.ArrayList(EdgeId) = .empty;
+            var found: ?*TerminalClosures = null;
+            for (targets.entries, 0..) |entry, i| {
+                if (i % 64 == 0) try control.check();
+                const candidate = entry.candidate;
+                if (!candidate.allowsClosure(permission.filter_closures) or !try self.edgeClosed(kernel, permission, candidate.edge)) continue;
+                const marked = found orelse blk: {
+                    const created = try a.create(TerminalClosures);
+                    created.* = .{};
+                    found = created;
+                    break :blk created;
+                };
+                const id = @backingInt(candidate.edge);
+                if (marked.get(id) != .none) continue;
+                (try marked.at(a, id)).* = .closed;
+                try stack.append(a, candidate.edge);
+            }
+            const marked = found orelse return null;
+            while (stack.pop()) |edge| {
+                try control.check();
+                const toward_predecessors = if (direction == .forward) try self.view.oppEdge(edge) else edge;
+                const at: NodeId = @fromBackingInt((try self.view.edge(toward_predecessors)).head);
+                const exits = try self.view.outEdgeRange(at);
+                for (self.view.edges[exits.first..exits.end], exits.first.., 0..) |*outward, i, local| {
+                    if (local % 64 == 0) try control.check();
+                    const outward_id: EdgeId = @fromBackingInt(@as(u32, @intCast(i)));
+                    const candidate = if (direction == .forward) try self.view.oppEdge(outward_id) else outward_id;
+                    const id = @backingInt(candidate);
+                    if (marked.get(id) != .none) continue;
+                    const kind = try self.closureKind(kernel, permission, candidate, outward);
+                    if (kind == .none) continue;
+                    (try marked.at(a, id)).* = kind;
+                    try stack.append(a, candidate);
+                }
+            }
+            return marked;
+        }
+
+        inline fn findStatus(self: *Self, tracker: anytype, edge: u32, context: TurnContext, closure: u32) Status {
+            if (@TypeOf(tracker) == @TypeOf(null) or tracker.keep_time) return self.status.get(edge);
+            if (closure == 0) {
+                if (!context.present()) return self.status.get(edge);
+                if (tracker.statusId(edge, context)) |id| return self.status.get(id);
+            }
             if (tracker.has_exclusions and self.status.get(edge).label_plus_one == Status.exclusion) return .{ .label_plus_one = Status.exclusion };
-            return tracker.aliases.get(Restrictions.aliasKey(edge, context)) orelse .{};
+            return tracker.aliases.get(Restrictions.aliasKey(edge, context, closure)) orelse .{};
         }
 
         fn offer(self: *Self, pool: *Pool, labels: *std.ArrayList(Label), pending: *Q, potential: anytype, target: ?NodeId, head: NodeId, status: Status, tracker: anytype, context: TurnContext, label: Label, seed_slot: anytype) !void {
@@ -1019,12 +1096,16 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             var record = label;
             if (done) record.flags |= Label.target;
             const a = pool.arena.allocator();
+            const closure = closureBits(label);
             const slot = if (use_time) timed: {
                 const entry = try tracker.aliases.getOrPutValue(a, key, .{});
                 break :timed entry.value_ptr;
-            } else if (@TypeOf(seed_slot) != @TypeOf(null)) seed_slot else if (@TypeOf(tracker) == @TypeOf(null) or !context.present()) try self.status.at(pool, label.edge) else blk: {
-                if (tracker.statusId(label.edge, context)) |id| break :blk try self.status.at(pool, id);
-                const entry = try tracker.aliases.getOrPutValue(a, Restrictions.aliasKey(label.edge, context), .{});
+            } else if (@TypeOf(seed_slot) != @TypeOf(null)) seed_slot else if (@TypeOf(tracker) == @TypeOf(null)) try self.status.at(pool, label.edge) else blk: {
+                if (closure == 0) {
+                    if (!context.present()) break :blk try self.status.at(pool, label.edge);
+                    if (tracker.statusId(label.edge, context)) |id| break :blk try self.status.at(pool, id);
+                }
+                const entry = try tracker.aliases.getOrPutValue(a, Restrictions.aliasKey(label.edge, context, closure), .{});
                 break :blk entry.value_ptr;
             };
             try labels.append(a, record);

@@ -54,6 +54,7 @@ pub const PathLocation = struct {
     edges: []const PathEdge,
     filtered_edges: []const PathEdge,
     rank_candidates: bool,
+    exclude_closures: ?bool = null,
 };
 
 pub const DirectedEdge = @import("edge.zig").DirectedEdge;
@@ -481,6 +482,7 @@ const Work = struct {
             .edges = try self.edges.toOwnedSlice(q.arena),
             .filtered_edges = try self.filtered.toOwnedSlice(q.arena),
             .rank_candidates = !q.location.skip_ranking_candidates,
+            .exclude_closures = q.location.search_filter.exclude_closures,
         };
     }
 
