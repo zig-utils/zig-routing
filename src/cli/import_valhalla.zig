@@ -306,6 +306,8 @@ const Layout = struct {
         if (!present) return;
         var words: std.ArrayList(u32) = .empty;
         defer words.deinit(a);
+        var hashes: std.ArrayList(bins.SourceHash) = .empty;
+        defer hashes.deinit(a);
         const directory = 1 + tiles.len * bins.words_per_tile;
         try words.resize(a, directory);
         words.items[0] = @intCast(tiles.len);
@@ -326,11 +328,12 @@ const Layout = struct {
                     if (edge == no_edge) continue;
                     const circle = if (source.tile.bounding_circles.len != 0) source.tile.bounding_circles[j] else @as(u32, @bitCast(bins.Circle.absent));
                     try words.appendSlice(a, &.{ edge, circle });
+                    try hashes.append(a, .fromGraphId(raw));
                 }
-                const entries = (words.items.len - directory) / (@sizeOf(bins.Entry) / @sizeOf(u32));
-                words.items[index + 1 + bin] = std.math.cast(u32, entries) orelse return error.ValhallaBinsTooLarge;
+                words.items[index + 1 + bin] = std.math.cast(u32, hashes.items.len) orelse return error.ValhallaBinsTooLarge;
             }
         }
+        try words.appendSlice(a, std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(hashes.items)));
         try writer.write(.snap_bins, words.items);
     }
 

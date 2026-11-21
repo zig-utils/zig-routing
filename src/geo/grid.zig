@@ -191,6 +191,13 @@ pub const Tiles = struct {
 
     /// Tiles a box covers, split across the antimeridian when wrapping.
     pub fn tileList(self: Tiles, gpa: Allocator, bbox: AABB, out: *std.ArrayList(i32)) Allocator.Error!void {
+        return self.tileListWithin(gpa, bbox, out, .none) catch |err| switch (err) {
+            error.DeadlineExceeded => unreachable,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+    }
+
+    pub fn tileListWithin(self: Tiles, gpa: Allocator, bbox: AABB, out: *std.ArrayList(i32), deadline: io.Deadline) (Allocator.Error || error{DeadlineExceeded})!void {
         var boxes: [2]AABB = undefined;
         var n: usize = 1;
         const tb = self.bounds;
@@ -212,6 +219,7 @@ pub const Tiles = struct {
             const maxcol = @max(self.col(bb.maxx), 0);
             var r = minrow;
             while (r <= maxrow) : (r += 1) {
+                if (deadline.expired()) return error.DeadlineExceeded;
                 var c = mincol;
                 while (c <= maxcol) : (c += 1) try out.append(gpa, self.tileIdColRow(c, r));
             }

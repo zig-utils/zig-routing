@@ -18,6 +18,24 @@ pub const Entry = extern struct {
     circle: Circle,
 };
 
+/// Hash of the source GraphId in the pinned Meili candidate set.
+/// Keep the native directory four-byte aligned.
+pub const SourceHash = extern struct {
+    low: u32,
+    high: u32,
+
+    pub fn fromGraphId(raw: u64) SourceHash {
+        var mixed = (raw ^ (raw >> 33)) *% 0xff51afd7ed558ccd;
+        mixed = (mixed ^ (mixed >> 33)) *% 0xc4ceb9fe1a85ec53;
+        const hash = mixed ^ (mixed >> 33);
+        return .{ .low = @truncate(hash), .high = @truncate(hash >> 32) };
+    }
+
+    pub fn value(self: SourceHash) u64 {
+        return @as(u64, self.high) << 32 | self.low;
+    }
+};
+
 // Ported from src/baldr/boundingcircle.cc (Valhalla 3.9.3).
 pub const Circle = packed struct(u32) {
     y: u13,
@@ -54,31 +72,59 @@ pub const Circle = packed struct(u32) {
 pub const View = struct {
     tiles: []const Tile,
     entries: []const Entry,
+    source_hashes: ?[]const SourceHash = null,
 
     pub fn parse(words: []const u32) !View {
         if (words.len == 0 or words[0] == 0 or words[0] > (words.len - 1) / words_per_tile)
             return error.InvalidSnapBinDirectory;
         const limit = 1 + @as(usize, words[0]) * words_per_tile;
         const tiles = std.mem.bytesAsSlice(Tile, std.mem.sliceAsBytes(words[1..limit]));
-        if ((words.len - limit) % 2 != 0) return error.InvalidSnapBinDirectory;
-        const entries = std.mem.bytesAsSlice(Entry, std.mem.sliceAsBytes(words[limit..]));
-        if (tiles[tiles.len - 1].ends[bins_per_tile - 1] != entries.len) return error.InvalidSnapBinDirectory;
-        return .{ .tiles = tiles, .entries = entries };
+        const count = tiles[tiles.len - 1].ends[bins_per_tile - 1];
+        const words_per_entry = @sizeOf(Entry) / @sizeOf(u32);
+        if (count > (words.len - limit) / words_per_entry) return error.InvalidSnapBinDirectory;
+        const end = limit + @as(usize, count) * words_per_entry;
+        const entries = std.mem.bytesAsSlice(Entry, std.mem.sliceAsBytes(words[limit..end]));
+        const hashes = words[end..];
+        if (hashes.len == 0) return .{ .tiles = tiles, .entries = entries };
+        if (hashes.len != end - limit) return error.InvalidSnapBinDirectory;
+        return .{
+            .tiles = tiles,
+            .entries = entries,
+            .source_hashes = std.mem.bytesAsSlice(SourceHash, std.mem.sliceAsBytes(hashes)),
+        };
     }
 
-    pub fn edgesIn(self: View, tile: u32, bin: u16) ![]const Entry {
+    const Range = struct { begin: usize = 0, end: usize = 0 };
+
+    fn rangeIn(self: View, tile: u32, bin: u16) !Range {
         if (bin >= bins_per_tile) return error.InvalidSnapBin;
         const index = std.sort.lowerBound(Tile, self.tiles, tile, struct {
             fn compare(id: u32, entry: Tile) std.math.Order {
                 return std.math.order(id, entry.id);
             }
         }.compare);
-        if (index == self.tiles.len or self.tiles[index].id != tile) return &.{};
+        if (index == self.tiles.len or self.tiles[index].id != tile) return .{};
         const record = &self.tiles[index];
         const begin = if (bin != 0) record.ends[bin - 1] else if (index != 0) self.tiles[index - 1].ends[bins_per_tile - 1] else 0;
         const end = record.ends[bin];
         if (begin > end or end > self.entries.len) return error.InvalidSnapBinOffsets;
-        return self.entries[begin..end];
+        return .{ .begin = begin, .end = end };
+    }
+
+    pub fn edgesIn(self: View, tile: u32, bin: u16) ![]const Entry {
+        const range = try self.rangeIn(tile, bin);
+        return self.entries[range.begin..range.end];
+    }
+
+    pub const OrderedEntries = struct {
+        edges: []const Entry,
+        hashes: []const SourceHash,
+    };
+
+    pub fn orderedEdgesIn(self: View, tile: u32, bin: u16) !OrderedEntries {
+        const range = try self.rangeIn(tile, bin);
+        const hashes = self.source_hashes orelse return error.MissingSnapSourceHashes;
+        return .{ .edges = self.entries[range.begin..range.end], .hashes = hashes[range.begin..range.end] };
     }
 
     pub fn verify(self: View, edge_count: usize, deadline: io.Deadline) !void {
@@ -104,4 +150,5 @@ comptime {
     std.debug.assert(@import("builtin").target.cpu.arch.endian() == .little);
     std.debug.assert(@sizeOf(Tile) == 104 and @offsetOf(Tile, "id") == 0 and @offsetOf(Tile, "ends") == 4);
     std.debug.assert(@sizeOf(Entry) == 8 and @offsetOf(Entry, "edge") == 0 and @offsetOf(Entry, "circle") == 4);
+    std.debug.assert(@sizeOf(SourceHash) == 8 and @offsetOf(SourceHash, "low") == 0 and @offsetOf(SourceHash, "high") == 4);
 }

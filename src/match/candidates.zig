@@ -6,6 +6,8 @@ const graph = @import("../graph/root.zig");
 const snap = @import("../snap/search.zig");
 const request = @import("../api/request.zig");
 const memory = @import("../infra/arena.zig");
+const encounter = @import("encounter.zig");
+const fine = @import("fine_grid.zig");
 const Deadline = @import("../infra/io.zig").Deadline;
 const Allocator = std.mem.Allocator;
 const EdgeId = graph.format.EdgeId;
@@ -80,6 +82,12 @@ pub const Finder = struct {
     candidates: std.ArrayList(Candidate) = .empty,
     pending: Shape = undefined,
     query_number: u64 = 0,
+    ordered_cells: std.AutoHashMapUnmanaged(u64, []const encounter.Arc) = .empty,
+    bin_list: std.ArrayList(i32) = .empty,
+    bin_order: encounter.Set = .{},
+    candidate_order: encounter.Set = .{},
+    cell_arcs: std.ArrayList(encounter.Arc) = .empty,
+    square_shapes: std.AutoHashMapUnmanaged(EdgeId, ?EdgeId) = .empty,
 
     pub fn init(view: *const View, a: Allocator, options: Options) Finder {
         return .{
@@ -98,6 +106,11 @@ pub const Finder = struct {
         self.points.deinit(self.a);
         self.segments.deinit(self.a);
         self.candidates.deinit(self.a);
+        self.bin_list.deinit(self.a);
+        self.bin_order.deinit(self.a);
+        self.candidate_order.deinit(self.a);
+        self.cell_arcs.deinit(self.a);
+        self.square_shapes.deinit(self.a);
     }
 
     /// Retains its capacity between points. The returned slice expires
@@ -114,6 +127,12 @@ pub const Finder = struct {
         const radius = @min(self.options.max_search_radius, @max(input.gps_accuracy, input.search_radius));
         const squared: f64 = @as(f32, radius * radius);
         const approx = geo.DistanceApproximator.init(input.point);
+        if (self.view.snap_bin_index) |bins| {
+            if (bins.source_hashes != null) {
+                try self.collectOrdered(index, bins, input.point, approx, radius, squared, costing, deadline);
+                return self.candidates.items;
+            }
+        }
         // The graph indexes E7 shapes, while correlation projects onto E6.
         const margin = 0.08;
         const span_lat = (@as(f64, radius) + margin) / geo.constants.meters_per_degree_lat;
@@ -132,6 +151,107 @@ pub const Finder = struct {
         return self.candidates.items;
     }
 
+    fn collectOrdered(self: *Finder, index: graph.spatial.View, bins: graph.snap_bins.View, point: Point, approx: geo.DistanceApproximator, radius: f32, squared: f64, costing: anytype, deadline: Deadline) !void {
+        const span_lat: f32 = radius / @as(f32, geo.constants.meters_per_degree_lat);
+        const span_lon: f32 = @floatCast(@min(180, radius / @abs(approx.m_per_lng_degree)));
+        const south = @max(-90, point.lat - span_lat);
+        const north = @min(90, point.lat + span_lat);
+        const bounds: geo.AABB = if (span_lon == 180)
+            .init(-180, south, 180, north)
+        else
+            .init(point.lng - span_lon, south, point.lng + span_lon, north);
+        const tiles: geo.grid.Tiles = .initGrid(.init(-180, -90), 0.25, 1440, 720, 5, true);
+        const subdivisions: geo.grid.Tiles = .initGrid(.init(-180, -90), tiles.subdivision_size, 7200, 3600, 1, true);
+        self.bin_list.clearRetainingCapacity();
+        try subdivisions.tileListWithin(self.a, bounds, &self.bin_list, deadline);
+        self.candidate_order.clear();
+        for (self.bin_list.items) |bin_id| {
+            if (deadline.expired()) return error.DeadlineExceeded;
+            const rc = subdivisions.rowColumn(bin_id);
+            const tile = tiles.tileIdColRow(@divTrunc(rc.col, 5), @divTrunc(rc.row, 5));
+            const bin: u16 = @intCast(@mod(rc.col, 5) + 5 * @mod(rc.row, 5));
+            const source = try bins.orderedEdgesIn(@intCast(tile), bin);
+            if (source.edges.len == 0) continue;
+            const grid: fine.Grid = .{ .origin = tiles.base(tile) };
+            const start = grid.square(bounds.minpt()).clamp();
+            const end = grid.square(bounds.maxpt()).clamp();
+            self.bin_order.clear();
+            for (@as(usize, @intCast(start.row))..@as(usize, @intCast(end.row + 1))) |row| {
+                for (@as(usize, @intCast(start.column))..@as(usize, @intCast(end.column + 1))) |column| {
+                    if (deadline.expired()) return error.DeadlineExceeded;
+                    const square: fine.Square = .{ .row = @intCast(row), .column = @intCast(column) };
+                    const arcs = try self.orderedCell(index, bin_id, source, grid, square, deadline);
+                    for (arcs, 0..) |arc, i| {
+                        if (i % 64 == 0 and deadline.expired()) return error.DeadlineExceeded;
+                        try self.bin_order.insert(self.a, arc, deadline);
+                    }
+                }
+            }
+            var arcs = self.bin_order.iterator();
+            while (arcs.next()) |arc| {
+                if (deadline.expired()) return error.DeadlineExceeded;
+                try self.candidate_order.insert(self.a, arc, deadline);
+            }
+        }
+        var arcs = self.candidate_order.iterator();
+        while (arcs.next()) |arc| {
+            if (deadline.expired()) return error.DeadlineExceeded;
+            const line = (try self.cachedShape(arc.shape, deadline)) orelse continue;
+            try self.consider(line, arc.edge, approx, squared, costing, deadline);
+        }
+    }
+
+    fn orderedCell(self: *Finder, index: graph.spatial.View, bin: i32, source: graph.snap_bins.View.OrderedEntries, grid: fine.Grid, square: fine.Square, deadline: Deadline) ![]const encounter.Arc {
+        const key = @as(u64, @intCast(bin)) * (fine.side * fine.side) + square.id();
+        if (self.ordered_cells.get(key)) |arcs| return arcs;
+        self.square_shapes.clearRetainingCapacity();
+        const bounds = grid.bounds(square);
+        // The shared grid indexes E7 geometry. Meili traverses E6 shapes.
+        const margin = 0.0000005;
+        const min: Point = .init(bounds.minx - margin, bounds.miny - margin);
+        const max: Point = .init(bounds.maxx + margin, bounds.maxy + margin);
+        var cells = index.intersectingCells(min, max);
+        while (try cells.next(deadline)) |cell| {
+            var edges = cell.edges();
+            while (try edges.next()) |id| {
+                if (deadline.expired()) return error.DeadlineExceeded;
+                const entry = try self.square_shapes.getOrPut(self.a, id);
+                if (entry.found_existing) continue;
+                entry.value_ptr.* = null;
+                const line = (try self.cachedShape(id, deadline)) orelse continue;
+                if (!line.bounds.intersects(bounds)) continue;
+                for (line.points[0 .. line.points.len - 1], line.points[1..]) |from, to| {
+                    if (deadline.expired()) return error.DeadlineExceeded;
+                    if (!try grid.visits(from, to, square, deadline)) continue;
+                    entry.value_ptr.* = id;
+                    try self.square_shapes.put(self.a, line.opposing.id, id);
+                    break;
+                }
+            }
+        }
+        self.cell_arcs.clearRetainingCapacity();
+        for (source.edges, source.hashes) |entry, hash| {
+            if (deadline.expired()) return error.DeadlineExceeded;
+            const id: EdgeId = @fromBackingInt(entry.edge);
+            if (self.square_shapes.get(id) orelse null) |representative| {
+                try self.cell_arcs.append(self.a, .{ .edge = id, .shape = representative, .hash = hash.value() });
+            }
+        }
+        if (self.storage.cap_exceeded or self.options.shape_cache_bytes == 0) return self.cell_arcs.items;
+        return self.rememberCell(key) catch |err| {
+            if (!self.storage.cap_exceeded) return err;
+            return self.cell_arcs.items;
+        };
+    }
+
+    fn rememberCell(self: *Finder, key: u64) Allocator.Error![]const encounter.Arc {
+        const a = self.storage.allocator();
+        try self.ordered_cells.ensureUnusedCapacity(a, 1);
+        const arcs = try a.dupe(encounter.Arc, self.cell_arcs.items);
+        self.ordered_cells.putAssumeCapacityNoClobber(key, arcs);
+        return arcs;
+    }
+
     fn collect(self: *Finder, index: graph.spatial.View, bounds: geo.AABB, approx: geo.DistanceApproximator, squared: f64, check_bounds: bool, costing: anytype, deadline: Deadline) !void {
         var cells = index.intersectingCells(bounds.minpt(), bounds.maxpt());
         while (try cells.next(deadline)) |cell| {
@@ -140,44 +260,48 @@ pub const Finder = struct {
                 if (deadline.expired()) return error.DeadlineExceeded;
                 const line = (try self.shape(id, deadline)) orelse continue;
                 if (check_bounds and !line.bounds.intersects(bounds)) continue;
-                const edge = line.edge;
-                const opposing = line.opposing;
-                const allowed = costing.allowed(edge);
-                const opposite_allowed = costing.allowed(opposing);
-                if (!allowed and !opposite_allowed) continue;
-                var hit = try snap.project(approx, line.points, deadline);
-                if (hit.squared > squared) continue;
-                const start = line.points[hit.segment];
-                const length = line.segments[hit.segment].prefix + start.distance(hit.point);
-                const first = if (edge.reverse) edge else opposing;
-                const last = if (edge.reverse) opposing else edge;
-                var node: ?NodeId = null;
-                var ratio: f64 = 0;
-                if (length <= 1) {
-                    hit.point = line.points[0];
-                    hit.segment = 0;
-                    node = @fromBackingInt(first.hot.head);
-                } else if (line.length - length <= 1) {
-                    hit.point = line.points[line.points.len - 1];
-                    hit.segment = line.segments.len - 1;
-                    ratio = 1;
-                    node = @fromBackingInt(last.hot.head);
-                } else {
-                    ratio = length / line.length;
-                }
-                if (node) |end| {
-                    const dx = geo.point.wrappedLongitudeDelta(hit.point.lng, approx.center_lng) * approx.m_per_lng_degree;
-                    const dy = (hit.point.lat - approx.center_lat) * geo.constants.meters_per_degree_lat;
-                    hit.squared = dx * dx + dy * dy;
-                    if (hit.squared > squared or (try self.nodes.getOrPut(self.a, end)).found_existing) continue;
-                }
-                var candidate: Candidate = .{ .point = hit.point, .squared_distance = hit.squared, .node = node };
-                const heading = line.segments[hit.segment].heading;
-                if (allowed) candidate.append(edge, ratio, heading);
-                if (opposite_allowed) candidate.append(opposing, ratio, heading);
-                try self.candidates.append(self.a, candidate);
+                try self.consider(line, id, approx, squared, costing, deadline);
             }
         }
+    }
+
+    fn consider(self: *Finder, line: *const Shape, first_edge: EdgeId, approx: geo.DistanceApproximator, squared: f64, costing: anytype, deadline: Deadline) !void {
+        const edge = if (first_edge == line.edge.id) line.edge else line.opposing;
+        const opposing = if (first_edge == line.edge.id) line.opposing else line.edge;
+        const allowed = costing.allowed(edge);
+        const opposite_allowed = costing.allowed(opposing);
+        if (!allowed and !opposite_allowed) return;
+        var hit = try snap.project(approx, line.points, deadline);
+        if (hit.squared > squared) return;
+        const start = line.points[hit.segment];
+        const length = line.segments[hit.segment].prefix + start.distance(hit.point);
+        const first = if (edge.reverse) edge else opposing;
+        const last = if (edge.reverse) opposing else edge;
+        var node: ?NodeId = null;
+        var ratio: f64 = 0;
+        if (length <= 1) {
+            hit.point = line.points[0];
+            hit.segment = 0;
+            node = @fromBackingInt(first.hot.head);
+        } else if (line.length - length <= 1) {
+            hit.point = line.points[line.points.len - 1];
+            hit.segment = line.segments.len - 1;
+            ratio = 1;
+            node = @fromBackingInt(last.hot.head);
+        } else {
+            ratio = length / line.length;
+        }
+        if (node) |end| {
+            const dx = geo.point.wrappedLongitudeDelta(hit.point.lng, approx.center_lng) * approx.m_per_lng_degree;
+            const dy = (hit.point.lat - approx.center_lat) * geo.constants.meters_per_degree_lat;
+            hit.squared = dx * dx + dy * dy;
+            if (hit.squared > squared or (try self.nodes.getOrPut(self.a, end)).found_existing) return;
+        }
+        var candidate: Candidate = .{ .point = hit.point, .squared_distance = hit.squared, .node = node };
+        const heading = line.segments[hit.segment].heading;
+        if (allowed) candidate.append(edge, ratio, heading);
+        if (opposite_allowed) candidate.append(opposing, ratio, heading);
+        try self.candidates.append(self.a, candidate);
     }
 
     fn shape(self: *Finder, id: EdgeId, deadline: Deadline) !?*const Shape {
@@ -187,6 +311,15 @@ pub const Finder = struct {
             return cached;
         }
         if ((try self.uncached.getOrPut(self.a, id)).found_existing) return null;
+        return self.loadShape(id, deadline);
+    }
+
+    fn cachedShape(self: *Finder, id: EdgeId, deadline: Deadline) !?*const Shape {
+        if (self.shapes.getPtr(id)) |cached| return cached;
+        return self.loadShape(id, deadline);
+    }
+
+    fn loadShape(self: *Finder, id: EdgeId, deadline: Deadline) !?*const Shape {
         const edge = try snap.DirectedEdge.read(self.view, id);
         if (edge.class.flags.node_connector or edge.class.category.use >= @backingInt(graph.constants.Use.egress_connection)) return null;
         const opposing = try snap.DirectedEdge.read(self.view, try self.view.oppEdge(id));

@@ -994,7 +994,7 @@ test "Valhalla tile rejects descending bin offsets and incomplete bounding circl
     const header_bytes = bytes[0..@sizeOf(source.Header)];
     const original = std.mem.bytesToValue(source.Header, header_bytes);
     var bad = original;
-    bad.bins[0] += 1;
+    bad.bins[4] += 1;
     @memcpy(header_bytes, std.mem.asBytes(&bad));
     try std.testing.expectError(error.InvalidTileBinOffsets, source.Tile.parse(&bytes));
 
@@ -1038,11 +1038,29 @@ test "Valhalla importer retains restriction directions, predicates and access ac
     const zone = try bundle.view.nodeTimezone(@fromBackingInt(0));
     try std.testing.expectEqualStrings("America/Ciudad_Juarez", (try bundle.view.tz_rules.?.name(zone)).?);
     const bins = bundle.view.snap_bin_index.?;
-    const entries = try bins.edgesIn(valhalla_fixture.first_tile, 0);
-    try std.testing.expectEqual(1, entries.len);
-    try std.testing.expectEqual(1, entries[0].edge);
-    try std.testing.expectEqual(0, @as(u32, @bitCast(entries[0].circle)));
-    try std.testing.expectEqual(0, (try bins.edgesIn(valhalla_fixture.first_tile, 1)).len);
+    const entries = try bins.orderedEdgesIn(valhalla_fixture.first_tile, 4);
+    try std.testing.expectEqual(1, entries.edges.len);
+    try std.testing.expectEqual(1, entries.edges[0].edge);
+    try std.testing.expectEqual(0, @as(u32, @bitCast(entries.edges[0].circle)));
+    const source_id: valhalla_import.tile_format.GraphId = .{ .tile = valhalla_fixture.first_tile + 1 };
+    try std.testing.expectEqual(graph.snap_bins.SourceHash.fromGraphId(@as(u46, @bitCast(source_id))).value(), entries.hashes[0].value());
+    try std.testing.expectEqual(0, (try bins.edgesIn(valhalla_fixture.first_tile, 5)).len);
+
+    const matcher = routing.match.candidates;
+    const measurement: matcher.Measurement = .{ .point = valhalla_fixture.left.toTilePoint(), .search_radius = 10 };
+    const access: routing.snap.candidates.Access = .{ .mask = .{ .auto = true } };
+    var backed = std.testing.FailingAllocator.init(test_alloc, .{});
+    var finder = matcher.Finder.init(&bundle.view, backed.allocator(), .{});
+    defer finder.deinit();
+    const candidates = try finder.query(measurement, access, .none);
+    try std.testing.expectEqual(1, candidates.len);
+    try std.testing.expectEqual(0, @backingInt(candidates[0].node.?));
+    try std.testing.expectEqual(2, candidates[0].direction_count);
+    try std.testing.expectEqual(1, @backingInt(candidates[0].arcs()[0].edge));
+    try std.testing.expectEqual(0, @backingInt(candidates[0].arcs()[1].edge));
+    const warmed = backed.alloc_index;
+    _ = try finder.query(measurement, access, .none);
+    try std.testing.expectEqual(warmed, backed.alloc_index);
     const states = bundle.view.restriction_automaton.?;
     const conditions = bundle.view.restriction_conditions.?;
     try std.testing.expectEqual(2, conditions.len);

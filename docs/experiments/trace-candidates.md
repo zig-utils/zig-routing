@@ -5,6 +5,10 @@ effective radius, the larger of search radius and GPS accuracy capped at
 the configured maximum. It keeps both allowed directions of each
 interior match and one candidate per snapped node. The request-local
 cache limits bytes for decoded shapes and their geometry metadata.
+When a single-level Valhalla import includes source hashes, the matcher
+uses the bin order and hashes to reconstruct the pinned Linux oracle's
+two Meili set passes. It derives fine cells from the shared spatial
+index and shares the same request cache budget for their ordered entries.
 
 The test corpus contains 156 distinct Utrecht measurements from
 `test/mapmatch.cc` in Valhalla 3.9.3. Use the [Utrecht extract](../../oracle/datasets.tsv)
@@ -30,16 +34,16 @@ python3 oracle/trace-candidates.py compare measurements.tsv oracle.tsv native.ts
 
 Each probe warms the full set, then reports the measurement index, query
 time in nanoseconds and candidate count. The comparison uses both the
-node and directed edge IDs. The input graph must preserve the pinned
-tile's local ordering.
+node and directed edge IDs. Reimport with the current `zr import-valhalla`
+to include the source hashes and preserve the pinned tile's local ordering.
 
-Five paired trials on an ARM64 Linux VM on an Apple M3 Pro gave a median
-per-trial p50 of 4.292 microseconds for native and 6.084 microseconds for
-Valhalla. The trial order alternated.
+Seven paired trials on one vCPU of an ARM64 Linux VM on an Apple M3 Pro
+gave a median per-trial p50 of 3.417 microseconds for native and 5.333
+microseconds for Valhalla. The legacy native path measured 3.833
+microseconds on the same graph without source hashes. Trial order rotated
+and compilation and fuzzing had finished before measurements began.
 
-All 156 measurements agree on interior-edge and snapped-node identities.
-All 1,115 paired directed candidates agree on distance within 1 mm.
-The directed-edge sets agree on 84 measurements. At 52.0911, 5.09806, for
-example, both versions return node 10501. Valhalla retains incident
-edges 28948 and 28951, and the native graph retains edge 28949.
-Exact representative-edge parity remains open. [Issue #248](https://github.com/zig-utils/zig-routing/issues/248).
+All 156 measurements agree on the ordered directed candidates and
+snapped nodes. All 1,307 paired directed candidates agree on distance
+within 1 mm. At 52.0911, 5.09806, both engines retain incident edges
+28948 and 28951 for node 10501. [Issue #248](https://github.com/zig-utils/zig-routing/issues/248).

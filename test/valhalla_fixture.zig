@@ -129,7 +129,7 @@ pub fn restrictedTile() [620]u8 {
     const original_info = header.edge_info_offset;
     header.access.restrictions = 1;
     const bin_start = original_info + @sizeOf(source.AccessRestriction);
-    header.bins = @splat(1);
+    header.bins = (@as([4]u32, @splat(0))) ++ (@as([21]u32, @splat(1)));
     header.bounding_circles_offset = bin_start + @sizeOf(u64);
     header.forward_restriction_offset = header.bounding_circles_offset + @sizeOf(u32);
     header.reverse_restriction_offset = header.forward_restriction_offset + @sizeOf(source.ComplexRestriction) + @sizeOf(@TypeOf(vias));
