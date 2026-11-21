@@ -435,6 +435,16 @@ pub fn build(b: *std.Build) void {
     run_bench_candidates.addPassthruArgs();
     b.step("bench-candidates", "Measure Meili candidate search and write correlations").dependOn(&run_bench_candidates.step);
 
+    const check_transitions = b.addExecutable(.{ .name = "check-trace-transitions", .root_module = b.createModule(.{
+        .root_source_file = b.path("test/check_trace_transitions.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{.{ .name = "routing", .module = lib_mod }},
+    }) });
+    const run_check_transitions = b.addRunArtifact(check_transitions);
+    run_check_transitions.addPassthruArgs();
+    b.step("check-trace-transitions", "Write instrumented emission and transition costs").dependOn(&run_check_transitions.step);
+
     const bench_gtfs = b.addExecutable(.{ .name = "bench-gtfs", .root_module = b.createModule(.{
         .root_source_file = b.path("test/bench_gtfs.zig"),
         .target = target,

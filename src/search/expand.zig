@@ -7,6 +7,7 @@ const View = @import("../graph/reader.zig").View;
 pub const Request = core.ExpansionRequest;
 pub const Bounds = core.ExpansionBounds;
 pub const Visit = core.ExpansionVisit;
+pub const EdgeVisit = core.ExpansionEdgeVisit;
 pub const Decision = core.ExpansionDecision;
 pub const Stats = core.SweepStats;
 
@@ -29,6 +30,10 @@ pub fn Expansion(comptime K: type, comptime Q: type) type {
         /// void to collect only counts. Request allocations live in the arena.
         pub fn run(self: *Self, arena: *memory.Arena, kernel: K, request: Request, visitor: anytype, control: core.Control) !Stats {
             return self.search.expand(arena, kernel, request, visitor, control);
+        }
+
+        pub fn runDistance(self: *Self, arena: *memory.Arena, kernel: K, request: Request, visitor: anytype, ordering: anytype, control: core.Control) !core.Result {
+            return self.search.expandDistance(arena, kernel, request, visitor, ordering, control);
         }
     };
 }

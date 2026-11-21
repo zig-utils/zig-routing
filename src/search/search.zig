@@ -7,7 +7,8 @@ const io = @import("../infra/io.zig");
 const memory = @import("../infra/arena.zig");
 const costing = @import("../costing/compiled.zig");
 const base = @import("../costing/base.zig");
-const DirectedEdge = @import("../snap/edge.zig").DirectedEdge;
+const snap_edge = @import("../snap/edge.zig");
+const DirectedEdge = snap_edge.DirectedEdge;
 pub const ExcludedEdge = @import("../snap/exclusions.zig").Edge;
 const paged = @import("paged.zig");
 const queue = @import("queue.zig");
@@ -42,6 +43,7 @@ pub const Label = extern struct {
     const excluded_start: u32 = 1 << 14;
     const measured_speed: u32 = 1 << 15;
     const terminal_closure: u32 = 1 << 16;
+    const dominated_arrival: u32 = 1 << 17;
     const closure_mask = origin_closure | terminal_closure;
 
     pub fn edgeId(self: Label) EdgeId {
@@ -156,6 +158,14 @@ pub const ExpansionVisit = struct {
     previous: ?Label,
     cut: Cut,
     time: graph.time_info.TimeInfo,
+};
+
+pub const ExpansionEdgeVisit = struct {
+    edge: EdgeId,
+    cut: Cut = .{},
+    before: costing.Cost = .{},
+    full: costing.Cost,
+    predecessor: u32 = no_index,
 };
 
 pub const ExpansionDecision = enum { expand, prune, stop };
@@ -383,6 +393,8 @@ pub const Restrictions = struct {
     modes: u16,
     has_exclusions: bool,
     keep_time: bool,
+    pareto: bool = false,
+    arrivals: std.ArrayList(u32) = .empty,
     aliases: AliasStatus = .empty,
 
     pub noinline fn advance(self: *const Restrictions, context: TurnContext, previous: Label, node: NodeId, id: EdgeId) !TurnContext {
@@ -441,6 +453,41 @@ pub const Restrictions = struct {
             Label.excluded_start | Label.forbid_uturn | Label.measured_speed;
         key.access_flags = label.flags & access;
         return key;
+    }
+
+    fn alreadyDominated(self: *const Restrictions, labels: []const Label, head: u32, candidate: Label) !bool {
+        var cursor = head;
+        var scanned: usize = 0;
+        while (cursor != 0) : (scanned += 1) {
+            if (scanned % 64 == 0) try self.access.control.check();
+            const index = cursor - 1;
+            const previous = labels[index];
+            if (previous.cost <= candidate.cost and previous.secs <= candidate.secs) return true;
+            cursor = self.arrivals.items[index];
+        }
+        return false;
+    }
+
+    fn replaceDominated(self: *Restrictions, a: std.mem.Allocator, labels: []Label, head: *u32, index: u32) !void {
+        try self.arrivals.resize(a, index + 1);
+        const candidate = labels[index];
+        var link = head;
+        var scanned: usize = 0;
+        while (link.* != 0) : (scanned += 1) {
+            if (scanned % 64 == 0) try self.access.control.check();
+            const old = link.* - 1;
+            const previous = &labels[old];
+            // Keep an earlier equal-distance route as long as its clock
+            // allows it. A later quicker arrival can still reach other ends.
+            if (candidate.cost < previous.cost and candidate.secs <= previous.secs) {
+                previous.flags |= Label.dominated_arrival;
+                link.* = self.arrivals.items[old];
+            } else {
+                link = &self.arrivals.items[old];
+            }
+        }
+        self.arrivals.items[index] = head.*;
+        head.* = index + 1;
     }
 };
 
@@ -530,23 +577,44 @@ pub fn Search(comptime K: type, comptime Q: type) type {
         }
 
         pub fn expand(self: *Self, arena: *memory.Arena, kernel: K, request: ExpansionRequest, visitor: anytype, control: Control) !SweepStats {
+            const result = try self.expandWithPrices(arena, kernel, request, visitor, Zero{}, false, control);
+            return .{ .popped = result.popped, .settled = result.settled };
+        }
+
+        /// A trace expansion prices labels by length. The ordering estimate
+        /// affects queue order, while bounds and dominance use actual costs.
+        pub fn expandDistance(self: *Self, arena: *memory.Arena, kernel: K, request: ExpansionRequest, visitor: anytype, ordering: anytype, control: Control) !Result {
+            return self.expandWithPrices(arena, kernel, request, visitor, ordering, true, control);
+        }
+
+        fn expandWithPrices(self: *Self, arena: *memory.Arena, kernel: K, request: ExpansionRequest, visitor: anytype, ordering: anytype, comptime distance_only: bool, control: Control) !Result {
             try control.check();
             if (!(request.bounds.cost >= 0 and request.bounds.seconds >= 0)) return error.InvalidExpansionBounds;
-            if (request.limit == 0) return .{};
+            if (request.limit == 0) return .{ .labels = &.{}, .index = no_index, .popped = 0, .settled = 0 };
             defer self.status.clear();
             const query = .{
                 .expansion = request,
+                .distance_objective = if (distance_only) true else {},
                 .timing = request.timing,
                 .excluded = request.excluded,
                 .limit = request.limit,
                 .forbid_initial_uturn = request.forbid_initial_uturn,
                 .visitor = visitor,
             };
-            const result = try switch (request.direction) {
-                .forward => self.runDirection(.forward, arena, kernel, query, Zero{}, control),
-                .reverse => self.runDirection(.reverse, arena, kernel, query, Zero{}, control),
+            return switch (request.direction) {
+                .forward => self.runDirection(.forward, arena, kernel, query, ordering, control),
+                .reverse => self.runDirection(.reverse, arena, kernel, query, ordering, control),
             };
-            return .{ .popped = result.popped, .settled = result.settled };
+        }
+
+        fn distanceObjective(comptime Query: type) bool {
+            return @hasField(Query, "distance_objective") and @TypeOf(@as(Query, undefined).distance_objective) == bool;
+        }
+
+        fn observeEdges(comptime Query: type) bool {
+            if (!@hasField(Query, "visitor")) return false;
+            const Visitor = @TypeOf(@as(Query, undefined).visitor);
+            return Visitor != void and snap_edge.hasPolicy(Visitor, "visitEdge");
         }
 
         fn runDirection(self: *Self, comptime direction: Direction, arena: *memory.Arena, kernel: K, query: anytype, potential: anytype, control: Control) !Result {
@@ -559,9 +627,15 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             const modes = permission.restrictionModes();
             const simple = if (self.view.turn_restrictions) |rows| rows.len != 0 else false;
             const check_access = !permission.flags.contains(.ignore_restrictions) and (query.timing.start.valid or model_access);
-            const keep_time = query.timing.start.valid and !query.timing.invariant and
-                try self.keepTime(kernel, permission, check_access, control);
-            if (model_access or check_access or (timed_costs and query.timing.start.valid) or (modes != 0 and (simple or self.view.restriction_automaton != null)))
+            // Distance alone cannot dominate a faster arrival if a trace
+            // transition has an independent elapsed-time bound.
+            const keep_elapsed = if (comptime distanceObjective(@TypeOf(query)))
+                std.math.isFinite(query.expansion.bounds.seconds)
+            else
+                false;
+            const keep_time = keep_elapsed or (query.timing.start.valid and !query.timing.invariant and
+                try self.keepTime(kernel, permission, check_access, control));
+            if (keep_elapsed or model_access or check_access or (timed_costs and query.timing.start.valid) or (modes != 0 and (simple or self.view.restriction_automaton != null)))
                 return self.runLoop(direction, true, arena, kernel, query, potential, control, permission, check_access, keep_time);
             return self.runLoop(direction, false, arena, kernel, query, potential, control, permission, false, false);
         }
@@ -609,6 +683,8 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             const limits = if (comptime @hasDecl(K, "restrictionDimensions")) kernel.restrictionDimensions() else null;
             const partial = @TypeOf(query) == PartialRequest;
             const expanding = @hasField(@TypeOf(query), "expansion");
+            const distance_only = comptime distanceObjective(@TypeOf(query));
+            const observe_edges = comptime observeEdges(@TypeOf(query));
             const partial_starts = partial or expanding;
             const target = if (partial_starts) null else query.target;
             const limit = if (partial) std.math.maxInt(usize) else query.limit;
@@ -641,6 +717,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 .modes = permission.restrictionModes(),
                 .has_exclusions = query.excluded.len != 0,
                 .keep_time = keep_time,
+                .pareto = distance_only and keep_time and !query.timing.start.valid,
             } else {};
             const tracker = if (with_restrictions) &restrictions else null;
             var fractions: ?*ExclusionFractions = null;
@@ -659,12 +736,12 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 }
                 for (query.expansion.origins) |origin| {
                     try control.check();
-                    try self.seedNode(direction, &pool, kernel, origin, null, query.timing, &labels, &pending, potential, tracker, permission, query.excluded.len != 0, query.expansion.bounds);
+                    try self.seedNode(direction, &pool, kernel, origin, null, query.timing, &labels, &pending, potential, tracker, permission, query.excluded.len != 0, query.expansion.bounds, query.visitor, distance_only);
                 }
             } else if (partial) {
                 try self.seedPartials(direction, &pool, kernel, query, query.starts, &labels, &cuts, &pending, potential, tracker, fractions, permission, control);
             } else {
-                try self.seedNode(direction, &pool, kernel, query.start, target, query.timing, &labels, &pending, potential, tracker, permission, query.excluded.len != 0, null);
+                try self.seedNode(direction, &pool, kernel, query.start, target, query.timing, &labels, &pending, potential, tracker, permission, query.excluded.len != 0, null, {}, false);
             }
 
             var popped: usize = 0;
@@ -681,7 +758,10 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 else
                     .{};
                 if (last.flags & Label.partial_target == 0) {
-                    const active: Status = if (with_restrictions and tracker.keep_time)
+                    if (distance_only and with_restrictions and tracker.pareto and last.flags & Label.dominated_arrival != 0) continue;
+                    const active: Status = if (distance_only and with_restrictions and tracker.pareto)
+                        .{ .label_plus_one = top.label + 1 }
+                    else if (with_restrictions and tracker.keep_time)
                         tracker.aliases.get(Restrictions.timedKey(last, context)) orelse Status{}
                     else if (partial_starts and last.flags & Label.excluded_start != 0)
                         fractions.?.get(last.edge).?.seed
@@ -750,7 +830,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     const prior = self.findStatus(tracker, @backingInt(next_id), next_context, next_phase);
                     const dominated = prior.label_plus_one != 0 and labels.items[prior.label_plus_one - 1].cost <= last.cost;
                     var targets = if (partial) query.targets.on(next_id) else {};
-                    if (dominated and (!partial or targets.index == 0)) continue;
+                    if (dominated and !observe_edges and (!partial or targets.index == 0)) continue;
                     const next = if (direction == .forward) outward else try self.view.edge(next_id);
                     const closed = kind == .closed or (phase == 0 and kind == .none and try self.edgeClosed(kernel, permission, next_id));
                     if (closed and next_phase == 0) continue;
@@ -793,12 +873,18 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                         if (next.cls.cold_checks != 0 and !try Self.slowAllowed(kernel, self.view, next_id, next, last, direction)) continue;
                     }
                     const traversal = try priceEdge(self.view, kernel, next_id, next, direction, time, false);
-                    const edge_cost = traversal.cost;
-                    if (edge_cost.cost == std.math.inf(f32)) continue;
+                    if (traversal.cost.cost == std.math.inf(f32)) continue;
+                    const edge_cost = distancePrice(traversal.cost, next, distance_only);
                     movement.measured_speed = if (direction == .forward) last.measuredSpeed() else traversal.measured_speed;
-                    const delay = try priceTurn(self.view, kernel, movement, last, direction, time);
+                    const delay = if (distance_only) costing.Cost{} else try priceTurn(self.view, kernel, movement, last, direction, time);
                     if (delay.cost == std.math.inf(f32)) continue;
                     const previous: costing.Cost = .{ .cost = last.cost, .secs = last.secs };
+                    if (observe_edges) try query.visitor.visitEdge(ExpansionEdgeVisit{
+                        .edge = next_id,
+                        .before = previous.add(delay),
+                        .full = edge_cost,
+                        .predecessor = top.label,
+                    });
                     if (partial) {
                         var count: usize = 0;
                         while (targets.next()) |candidate| : (count += 1) {
@@ -839,7 +925,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                         .tcost = delay.cost,
                         .ctx = next_context.value,
                         .flags = Label.contextFlags(next_context, access.state) | next_phase | traversal.flags(),
-                    }, null);
+                    }, null, distance_only);
                 }
             }
             try control.check();
@@ -869,7 +955,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             }
         }
 
-        fn seedNode(self: *Self, comptime direction: Direction, pool: *Pool, kernel: K, start: NodeId, target: ?NodeId, timing: Timing, labels: *std.ArrayList(Label), pending: *Q, potential: anytype, tracker: anytype, permission: base.Permission, has_exclusions: bool, bounds: anytype) !void {
+        fn seedNode(self: *Self, comptime direction: Direction, pool: *Pool, kernel: K, start: NodeId, target: ?NodeId, timing: Timing, labels: *std.ArrayList(Label), pending: *Q, potential: anytype, tracker: anytype, permission: base.Permission, has_exclusions: bool, bounds: anytype, visitor: anytype, comptime distance_only: bool) !void {
             const seeds = try self.view.outEdgeRange(start);
             const time: graph.time_info.TimeInfo = if (timed_costs) try timing.at(self.view, start, 0, direction) else .{};
             for (self.view.edges[seeds.first..seeds.end], seeds.first..) |*outward, index| {
@@ -883,15 +969,19 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     if (edge.cls.cold_checks != 0 and !try Self.slowAllowed(kernel, self.view, id, edge, null, direction)) continue;
                 }
                 const traversal = try priceEdge(self.view, kernel, id, edge, direction, time, false);
-                const edge_cost = traversal.cost;
-                if (edge_cost.cost == std.math.inf(f32)) continue;
-                if (@TypeOf(bounds) != @TypeOf(null) and !bounds.allows(edge_cost, edge.geom.len_m)) continue;
+                if (traversal.cost.cost == std.math.inf(f32)) continue;
+                const edge_cost = distancePrice(traversal.cost, edge, distance_only);
+                const within = @TypeOf(bounds) == @TypeOf(null) or bounds.allows(edge_cost, edge.geom.len_m);
+                const observe_edges = comptime (@TypeOf(visitor) != void and snap_edge.hasPolicy(@TypeOf(visitor), "visitEdge"));
+                if (!within and !observe_edges) continue;
                 const here: NodeId = @fromBackingInt(outward.head);
                 const access = if (@TypeOf(tracker) != @TypeOf(null) and (model_access or (tracker.access.check_access and edge.cls.cold_checks != 0)))
                     try tracker.access.evaluate(id, edge, start, .{}, .start)
                 else
                     base.AccessEvaluation{};
                 if (!access.allowed) continue;
+                if (observe_edges) try visitor.visitEdge(ExpansionEdgeVisit{ .edge = id, .full = edge_cost });
+                if (!within) continue;
                 const context: TurnContext = if (@TypeOf(tracker) == @TypeOf(null)) .{} else try tracker.advance(.{}, .{}, start, id);
                 const closure: u32 = if (closed) Label.origin_closure else 0;
                 try self.offer(pool, labels, pending, potential, target, here, self.findStatus(tracker, @backingInt(id), context, closure), tracker, context, .{
@@ -901,12 +991,14 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     .dist_m = edge.geom.len_m,
                     .ctx = context.value,
                     .flags = Label.contextFlags(context, access.state) | closure | traversal.flags(),
-                }, null);
+                }, null, distance_only);
             }
         }
 
         fn seedPartials(self: *Self, comptime direction: Direction, pool: *Pool, kernel: K, query: anytype, starts: []const endpoints.Candidate, labels: *std.ArrayList(Label), cuts: *std.ArrayList(Cut), pending: *Q, potential: anytype, tracker: anytype, fractions: ?*ExclusionFractions, permission: base.Permission, control: Control) !void {
             const expanding = @hasField(@TypeOf(query), "expansion");
+            const distance_only = comptime distanceObjective(@TypeOf(query));
+            const observe_edges = comptime observeEdges(@TypeOf(query));
             const a = pool.arena.allocator();
             var has_departure = false;
             if (expanding) {
@@ -941,25 +1033,32 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     @fromBackingInt(edge.head);
                 const time: graph.time_info.TimeInfo = if (price_at_time) try query.timing.at(self.view, tail, 0, direction) else .{};
                 const traversal = try priceEdge(self.view, kernel, id, edge, direction, time, true);
-                const full = traversal.cost;
-                if (full.cost == std.math.inf(f32)) continue;
+                if (traversal.cost.cost == std.math.inf(f32)) continue;
+                const full = distancePrice(traversal.cost, edge, distance_only);
                 const geometry = if (direction == .forward) edge else try self.view.edge(try self.view.oppEdge(id));
                 const node: NodeId = @fromBackingInt(geometry.head);
                 const portion: Cut = if (direction == .forward) .{ .begin = candidate.fraction } else .{ .end = candidate.fraction };
                 const fraction = portion.end - portion.begin;
-                const cost = scale(full, @max(fraction, std.math.floatEps(f32)), candidate.score);
+                const cost = scale(full, if (distance_only) fraction else @max(fraction, std.math.floatEps(f32)), candidate.score);
                 // Valhalla's Dijkstra seed stores the partial length in a
                 // uint32_t path distance, dropping any fractional metre.
                 const metres = if (expanding)
                     @as(u32, @intFromFloat(@as(f32, @floatFromInt(edge.geom.len_m)) * fraction))
                 else
                     fractionalLength(edge.geom.len_m, portion);
-                if (expanding and !query.expansion.bounds.allows(cost, metres)) continue;
+                const within = !expanding or query.expansion.bounds.allows(cost, metres);
+                if (!within and !observe_edges) continue;
                 const access = if (@TypeOf(tracker) != @TypeOf(null) and (model_access or check_limits))
                     try tracker.access.evaluate(id, edge, tail, .{}, .start)
                 else
                     base.AccessEvaluation{};
                 if (!access.allowed) continue;
+                if (observe_edges) try query.visitor.visitEdge(ExpansionEdgeVisit{
+                    .edge = id,
+                    .cut = portion,
+                    .full = full,
+                });
+                if (!within) continue;
                 try cuts.append(a, portion);
                 const context: TurnContext = if (@TypeOf(tracker) == @TypeOf(null)) .{} else try tracker.advance(.{}, .{}, node, id);
                 const closure: u32 = if (closed) Label.origin_closure else 0;
@@ -974,9 +1073,9 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 };
                 if (excluded) |entry| {
                     label.flags |= Label.excluded_start;
-                    try self.offer(pool, labels, pending, potential, null, node, entry.seed, tracker, context, label, &entry.seed);
+                    try self.offer(pool, labels, pending, potential, null, node, entry.seed, tracker, context, label, &entry.seed, distance_only);
                 } else {
-                    try self.offer(pool, labels, pending, potential, null, node, self.findStatus(tracker, @backingInt(id), context, closure), tracker, context, label, null);
+                    try self.offer(pool, labels, pending, potential, null, node, self.findStatus(tracker, @backingInt(id), context, closure), tracker, context, label, null, distance_only);
                 }
                 if (expanding) continue;
                 var dest = query.targets.on(id);
@@ -1092,14 +1191,19 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             return tracker.aliases.get(Restrictions.aliasKey(edge, context, closure)) orelse .{};
         }
 
-        fn offer(self: *Self, pool: *Pool, labels: *std.ArrayList(Label), pending: *Q, potential: anytype, target: ?NodeId, head: NodeId, status: Status, tracker: anytype, context: TurnContext, label: Label, seed_slot: anytype) !void {
+        fn offer(self: *Self, pool: *Pool, labels: *std.ArrayList(Label), pending: *Q, potential: anytype, target: ?NodeId, head: NodeId, status: Status, tracker: anytype, context: TurnContext, label: Label, seed_slot: anytype, comptime distance_only: bool) !void {
             const use_time = @TypeOf(tracker) != @TypeOf(null) and tracker.keep_time;
-            const key = if (use_time) Restrictions.timedKey(label, context) else undefined;
+            const pareto = if (distance_only and @TypeOf(tracker) != @TypeOf(null)) tracker.pareto else false;
+            var key: Restrictions.AliasKey = if (use_time) Restrictions.timedKey(label, context) else undefined;
+            if (pareto) key.elapsed = 0;
             const previous = if (use_time and status.label_plus_one != Status.exclusion)
                 tracker.aliases.get(key) orelse Status{}
             else
                 status;
-            if (previous.label_plus_one != 0 and labels.items[previous.label_plus_one - 1].cost <= label.cost) return;
+            if (pareto) {
+                if (previous.label_plus_one == Status.exclusion or
+                    try tracker.alreadyDominated(labels.items, previous.label_plus_one, label)) return;
+            } else if (previous.label_plus_one != 0 and labels.items[previous.label_plus_one - 1].cost <= label.cost) return;
             if (@backingInt(head) >= self.view.nodes.len) return error.InvalidEdgeHead;
             // A better label may reopen a state for an inconsistent, but
             // admissible, potential. Stale heap entries are skipped on pop.
@@ -1128,7 +1232,11 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             };
             try labels.append(a, record);
             try pending.push(a, queue.Entry.init(roundedDown(@as(f64, label.cost) + estimate), index));
-            slot.* = .{ .label_plus_one = index + 1 };
+            if (pareto) {
+                try tracker.replaceDominated(a, labels.items, &slot.label_plus_one, index);
+            } else {
+                slot.* = .{ .label_plus_one = index + 1 };
+            }
             @prefetch(&self.view.first_edge[@backingInt(head)], .{});
         }
     };
@@ -1140,6 +1248,10 @@ fn cutsExcluded(excluded: f32, endpoint: f32, origin: bool) bool {
 
 fn scale(cost: costing.Cost, portion: f32, score: f32) costing.Cost {
     return (costing.Cost{ .cost = cost.cost * portion, .secs = cost.secs * portion }).add(.{ .cost = score });
+}
+
+inline fn distancePrice(cost: costing.Cost, edge: *const EdgeHot, comptime distance_only: bool) costing.Cost {
+    return if (distance_only) .{ .cost = @floatFromInt(edge.geom.len_m), .secs = cost.secs } else cost;
 }
 
 fn fractionalLength(metres: u24, cut: Cut) u32 {
