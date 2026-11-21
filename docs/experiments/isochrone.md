@@ -359,6 +359,110 @@ tracks a more compact exact queue and label store, and [#261](https://github.com
 tracks graph-derived geometry reuse. [#251](https://github.com/zig-utils/zig-routing/issues/251)
 retains the original paired end-to-end gate.
 
+## Shared raster geometry
+
+[#261](https://github.com/zig-utils/zig-routing/issues/261) evaluates two
+immutable geometry tables derived from the existing bundle. The first
+precomputes the exact resampling output for the five cell widths,
+from 0.001 to 0.005 degrees. The second stores the decoded vertices and the exact
+single-precision segment distances used by the same sampler. The
+second uses the requested width during replay and shares one set of
+distances across widths.
+
+Both tables cover long painted edges. Opposing directions share a row
+when their stored geometry and rounded length match. The renderer
+keeps storage order during resampling and uses sweep direction during
+painting. It copies cached samples into request scratch only when an
+origin needs clipping. Short clipped origins use the original stored
+shape. Each request still aligns cells around its origin and applies
+the same padded bounds.
+
+Twelve trials ran each order of the three configurations twice on CPU 0
+in the same ARM64 Linux VM on an Apple M3 Pro. The same Zig ReleaseFast
+runner used the original Utrecht requests and the legacy Luxembourg
+bundle. Each full-grid time is the median of four-request totals.
+The isolated intervals use a separate series with unchanged stop
+bounds and replay the actual settled events in their original order.
+
+| Fixture | Geometry | Full grid | Traversal | Raster replay |
+| --- | --- | ---: | ---: | ---: |
+| Utrecht | Baseline | 35.209 ms | 20.765 ms | 12.942 ms |
+| Utrecht | Samples | 30.469 ms | 20.955 ms | 7.853 ms |
+| Utrecht | Distances | 30.356 ms | 21.341 ms | 9.057 ms |
+| Luxembourg | Baseline | 462.029 ms | 364.874 ms | 85.391 ms |
+| Luxembourg | Samples | 446.249 ms | 366.129 ms | 51.593 ms |
+| Luxembourg | Distances | 463.414 ms | 365.276 ms | 58.186 ms |
+
+| Fixture | Geometry | Build time | Graph table bytes | Full arena peak bytes | Raster arena peak bytes | Median peak RSS |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Utrecht | Baseline | 0 ms | 0 | 11,256,208 | 5,497,504 | 19,791,872 |
+| Utrecht | Samples | 5.544 ms | 3,008,672 | 11,250,272 | 5,493,616 | 22,675,456 |
+| Utrecht | Distances | 2.646 ms | 1,931,364 | 11,254,640 | 5,495,568 | 21,721,088 |
+| Luxembourg | Baseline | 0 ms | 0 | 36,431,624 | 8,271,264 | 69,992,448 |
+| Luxembourg | Samples | 91.356 ms | 32,426,144 | 36,417,928 | 8,261,584 | 105,906,176 |
+| Luxembourg | Distances | 27.723 ms | 21,878,020 | 36,428,008 | 8,264,656 | 95,420,416 |
+
+The graph table bytes count retained storage. Process peak RSS includes
+construction scratch. Six separate raster profiles sampled about one
+in 32 settled labels. Times are cumulative durations in sampled spans at each stage without
+scaling them to the full replay. Precomputed samples skip resampling.
+Short clipped origins still decode their original shape.
+
+| Fixture and geometry | Samples | Graph and visit setup | Decode | Resample | Paint |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Utrecht baseline | 4,484 | 0.148 ms | 0.087 ms | 0.123 ms | 0.121 ms |
+| Utrecht samples | 4,484 | 0.150 ms | 0.001 ms | 0 ms | 0.140 ms |
+| Utrecht distances | 4,484 | 0.159 ms | 0.001 ms | 0.060 ms | 0.122 ms |
+| Luxembourg baseline | 21,149 | 0.947 ms | 0.632 ms | 0.952 ms | 0.629 ms |
+| Luxembourg samples | 21,149 | 1.062 ms | 0.003 ms | 0 ms | 0.889 ms |
+| Luxembourg distances | 21,149 | 1.128 ms | 0.003 ms | 0.486 ms | 0.632 ms |
+
+Precomputed samples cut isolated raster time by 39.3% on Utrecht and
+39.6% on Luxembourg. The full-grid gain was 13.5% and 3.4% respectively.
+The distance table saves about one third of the sample table's bytes
+and gives the lowest Utrecht full-grid median, with a 0.3% increase
+on Luxembourg.
+Keep both tables opt-in for benchmarking. They expose a raster gain
+whose full-grid impact varies with the fixture, and their graph memory
+cost grows with the number and complexity of long roads.
+
+All three configurations produced byte-identical grids and the same
+819,969 extended label records in both directions on the large fixtures.
+The timed-access and multi-via fixtures also matched. Every warmed full
+and split replay made zero backing allocator calls. The Gurka fixture
+stores consecutive repeated coordinates and covers short and long
+origin cuts, both directions and shapes crossing multiple cells at
+each available cell width. It compares the raster bytes and grid bounds
+with the original renderer.
+
+All 39 native test steps passed, with 635 tests and two existing skips.
+Eleven Linux x86-64 test and CLI binaries cross-compiled. The release
+binary measures 14,440,928 bytes, up eight bytes, with five search
+instantiations and five costing kernels.
+
+### Raster geometry reproduction
+
+Build the pinned ReleaseFast runner and use the [Utrecht replay](#reproduction)
+and [Luxembourg corpus](#movement-layout-reproduction). Repeat all six orders
+of the three variants twice on the same Linux CPU. Use a separate series
+with `--stages` for the bounded sweep and raster replay. Add
+`--raster-profile` to record a separate instrumented replay. After the
+stage and memory columns, it appends the sample count and sampled
+nanoseconds for graph setup, decoding, resampling and painting.
+The layout construction time and graph table bytes go to stderr.
+
+```sh
+taskset -c 0 ./bench-isochrone BUNDLE requests.jsonl /dev/null --memory --rss
+taskset -c 0 ./bench-isochrone BUNDLE requests.jsonl /dev/null --memory --rss --geometry
+taskset -c 0 ./bench-isochrone BUNDLE requests.jsonl /dev/null --memory --rss --geometry-distances
+taskset -c 0 ./bench-isochrone BUNDLE requests.jsonl base.grid base.trace --trace-states --stages
+taskset -c 0 ./bench-isochrone BUNDLE requests.jsonl test.grid test.trace --trace-states --stages --geometry
+cmp base.grid test.grid
+cmp base.trace test.trace
+```
+
+Repeat the byte comparison with `--geometry-distances`.
+
 ## Reproduction
 
 Set `mjolnir.hierarchy` and `mjolnir.shortcuts` to `false` in a Valhalla

@@ -27,13 +27,21 @@ const Row = struct {
 
 const Visit = routing.search.expand.Visit;
 
-fn LayoutObserver(comptime Observer: type) type {
+fn LayoutObserver(comptime Movement: type, comptime Geometry: type, comptime Observer: type) type {
     return struct {
-        layout: *const iso.MovementLayout,
+        movements: Movement,
+        geometry: Geometry,
         observer: Observer,
 
-        pub fn movementLayout(self: @This()) *const iso.MovementLayout {
-            return self.layout;
+        pub const movementLayout = if (Movement != void) getMovements else {};
+        pub const rasterGeometry = if (Geometry != void) getGeometry else {};
+
+        fn getMovements(self: @This()) *const iso.MovementLayout {
+            return self.movements;
+        }
+
+        fn getGeometry(self: @This()) *const iso.GeometryLayout {
+            return self.geometry;
         }
 
         pub fn observe(self: @This(), event: Visit) !void {
@@ -42,8 +50,9 @@ fn LayoutObserver(comptime Observer: type) type {
     };
 }
 
-fn observed(layout: anytype, observer: anytype) if (@TypeOf(layout) == void) @TypeOf(observer) else LayoutObserver(@TypeOf(observer)) {
-    return if (@TypeOf(layout) == void) observer else .{ .layout = layout, .observer = observer };
+fn observed(movements: anytype, geometry: anytype, observer: anytype) if (@TypeOf(movements) == void and @TypeOf(geometry) == void) @TypeOf(observer) else LayoutObserver(@TypeOf(movements), @TypeOf(geometry), @TypeOf(observer)) {
+    if (@TypeOf(movements) == void and @TypeOf(geometry) == void) return observer;
+    return .{ .movements = movements, .geometry = geometry, .observer = observer };
 }
 
 const Replay = struct {
@@ -123,53 +132,69 @@ const Trace = struct {
     }
 };
 
-const StageClock = struct {
-    const Stage = routing.search.search.ExpansionStage;
-    phase: Stage = .queue,
-    active: bool = false,
-    started: u64 = 0,
-    samples: usize = 0,
-    read_overhead: u64 = 0,
-    totals: std.EnumArray(Stage, u64) = .initFill(0),
+const ExpansionClock = StageClock(routing.search.search.ExpansionStage, .queue);
+const RasterClock = StageClock(iso.RasterStage, .graph);
 
-    fn init() StageClock {
-        var overhead: u64 = std.math.maxInt(u64);
-        for (0..8) |_| {
-            const start = io.monotonicNs();
-            for (0..63) |_| _ = io.monotonicNs();
-            overhead = @min(overhead, (io.monotonicNs() - start) / 64);
+fn StageClock(comptime Phase: type, comptime first: Phase) type {
+    return struct {
+        const Self = @This();
+        const Stage = Phase;
+        phase: Stage = first,
+        active: bool = false,
+        started: u64 = 0,
+        samples: usize = 0,
+        read_overhead: u64 = 0,
+        totals: std.EnumArray(Stage, u64) = .initFill(0),
+
+        fn init() Self {
+            var overhead: u64 = std.math.maxInt(u64);
+            for (0..8) |_| {
+                const start = io.monotonicNs();
+                for (0..63) |_| _ = io.monotonicNs();
+                overhead = @min(overhead, (io.monotonicNs() - start) / 64);
+            }
+            return .{ .read_overhead = overhead };
         }
-        return .{ .read_overhead = overhead };
-    }
 
-    pub fn observe(_: *StageClock, _: routing.search.expand.Visit) !void {}
+        pub fn observe(_: *Self, _: Visit) !void {}
 
-    pub fn expansionSample(self: *StageClock, popped: usize) void {
-        self.finish();
-        // Sample about one in 32 labels without locking to periodic queue traffic.
-        const mixed = @as(u64, popped) *% 0x9e3779b97f4a7c15;
-        self.active = (mixed >> 48) & 31 == 0;
-        if (self.active) {
-            self.samples += 1;
-            self.phase = .queue;
-            self.started = io.monotonicNs();
+        pub const expansionSample = sample;
+        pub const expansionStage = stage;
+        pub const rasterSample = sample;
+        pub const rasterStage = stage;
+
+        fn sample(self: *Self, ordinal: usize) void {
+            self.finish();
+            // Sample about one in 32 labels without locking to periodic queue traffic.
+            const mixed = @as(u64, ordinal) *% 0x9e3779b97f4a7c15;
+            self.active = (mixed >> 48) & 31 == 0;
+            if (self.active) {
+                self.samples += 1;
+                self.phase = first;
+                self.started = io.monotonicNs();
+            }
         }
-    }
 
-    pub fn expansionStage(self: *StageClock, phase: Stage) void {
-        if (!self.active or phase == self.phase) return;
-        const now = io.monotonicNs();
-        self.totals.getPtr(self.phase).* += (now - self.started) -| self.read_overhead;
-        self.started = now;
-        self.phase = phase;
-    }
+        fn stage(self: *Self, phase: Stage) void {
+            if (!self.active or phase == self.phase) return;
+            const now = io.monotonicNs();
+            self.totals.getPtr(self.phase).* += (now - self.started) -| self.read_overhead;
+            self.started = now;
+            self.phase = phase;
+        }
 
-    fn finish(self: *StageClock) void {
-        if (!self.active) return;
-        self.totals.getPtr(self.phase).* += (io.monotonicNs() - self.started) -| self.read_overhead;
-        self.active = false;
-    }
-};
+        fn finish(self: *Self) void {
+            if (!self.active) return;
+            self.totals.getPtr(self.phase).* += (io.monotonicNs() - self.started) -| self.read_overhead;
+            self.active = false;
+        }
+
+        fn write(self: Self, writer: *std.Io.Writer) !void {
+            try writer.print("\t{d}", .{self.samples});
+            for (std.enums.values(Stage)) |phase| try writer.print("\t{d}", .{self.totals.get(phase)});
+        }
+    };
+}
 
 const Measurement = struct {
     view: *const View,
@@ -182,31 +207,35 @@ const Measurement = struct {
     trace_states: bool,
     profile: bool,
     stages: bool,
+    raster_profile: bool,
     measure_memory: bool,
     scratch: std.mem.Allocator,
     layout: ?*const iso.MovementLayout,
+    geometry: ?*const iso.GeometryLayout,
 
     fn run(self: Measurement, engine: anytype, kernel: anytype, request: iso.Request) !void {
-        if (self.layout) |layout|
-            try self.measure(engine, kernel, request, layout)
+        if (self.geometry) |geometry|
+            try self.measure(engine, kernel, request, {}, geometry)
+        else if (self.layout) |layout|
+            try self.measure(engine, kernel, request, layout, {})
         else
-            try self.measure(engine, kernel, request, {});
+            try self.measure(engine, kernel, request, {}, {});
     }
 
-    fn measure(self: Measurement, engine: anytype, kernel: anytype, request: iso.Request, layout: anytype) !void {
+    fn measure(self: Measurement, engine: anytype, kernel: anytype, request: iso.Request, layout: anytype, geometry: anytype) !void {
         const arena = self.arena;
         const backing = self.backing;
         arena.reset();
-        _ = try engine.runObserved(arena, kernel, request, observed(layout, {}), .{});
+        _ = try engine.runObserved(arena, kernel, request, observed(layout, geometry, {}), .{});
         backing.resetCounts();
         arena.reset();
         arena.high_water = 0;
-        var clock: StageClock = if (self.profile and !self.stages) .init() else .{};
+        var clock: ExpansionClock = if (self.profile and !self.stages) .init() else .{};
         const start = io.monotonicNs();
         const result = if (self.profile and !self.stages)
             try engine.runObserved(arena, kernel, request, &clock, .{})
         else
-            try engine.runObserved(arena, kernel, request, observed(layout, {}), .{});
+            try engine.runObserved(arena, kernel, request, observed(layout, geometry, {}), .{});
         const elapsed = io.monotonicNs() - start;
         const full_bytes = @max(arena.high_water, arena.used);
         clock.finish();
@@ -220,28 +249,29 @@ const Measurement = struct {
         });
         if (self.measure_memory) try self.log.print("\t{d}", .{full_bytes});
         try self.grids.writeAll(std.mem.sliceAsBytes(result.grid.data));
+        var raster_clock: RasterClock = .{};
         if (self.stages) {
             const expected = try self.scratch.dupe(u8, std.mem.sliceAsBytes(result.grid.data));
             arena.reset();
             var replay: Replay = .{ .a = self.scratch };
-            const recorded = try engine.runTraversal(arena, kernel, request, observed(layout, &replay), .{});
+            const recorded = try engine.runTraversal(arena, kernel, request, observed(layout, {}, &replay), .{});
             if (!std.meta.eql(result.stats, recorded)) return error.DifferentBoundedTraversal;
             backing.resetCounts();
             arena.reset();
             arena.high_water = 0;
             const traversal_start = io.monotonicNs();
-            const traversal = try engine.runTraversal(arena, kernel, request, observed(layout, {}), .{});
+            const traversal = try engine.runTraversal(arena, kernel, request, observed(layout, {}, {}), .{});
             const traversal_ns = io.monotonicNs() - traversal_start;
             const traversal_bytes = @max(arena.high_water, arena.used);
             if (backing.calls() != 0) return error.TraversalAllocatedAfterWarmup;
             if (!std.meta.eql(result.stats, traversal)) return error.DifferentBoundedTraversal;
             arena.reset();
-            _ = try iso.rasterize(self.view, arena, request, replay.events.items, .{});
+            _ = try iso.rasterizeObserved(self.view, arena, request, replay.events.items, geometry, {}, .{});
             arena.reset();
             backing.resetCounts();
             arena.high_water = 0;
             const raster_start = io.monotonicNs();
-            const raster = try iso.rasterize(self.view, arena, request, replay.events.items, .{});
+            const raster = try iso.rasterizeObserved(self.view, arena, request, replay.events.items, geometry, {}, .{});
             const raster_ns = io.monotonicNs() - raster_start;
             const raster_bytes = @max(arena.high_water, arena.used);
             if (backing.calls() != 0) return error.RasterAllocatedAfterWarmup;
@@ -255,16 +285,22 @@ const Measurement = struct {
                 if (!std.meta.eql(result.stats, profiled)) return error.DifferentBoundedTraversal;
                 clock.finish();
             }
+            if (self.raster_profile) {
+                arena.reset();
+                raster_clock = .init();
+                const profiled = try iso.rasterizeObserved(self.view, arena, request, replay.events.items, geometry, &raster_clock, .{});
+                raster_clock.finish();
+                if (backing.calls() != 0) return error.RasterAllocatedAfterWarmup;
+                if (!std.mem.eql(u8, expected, std.mem.sliceAsBytes(profiled.data))) return error.DifferentRasterReplay;
+            }
         }
-        if (self.profile) {
-            try self.log.print("\t{d}", .{clock.samples});
-            for (std.enums.values(StageClock.Stage)) |stage| try self.log.print("\t{d}", .{clock.totals.get(stage)});
-        }
+        if (self.profile) try clock.write(self.log);
+        if (self.raster_profile) try raster_clock.write(self.log);
         try self.log.writeByte('\n');
         if (self.traces) |file| {
             arena.reset();
             var trace: Trace = .{ .a = self.scratch, .labels = if (self.trace_states) .{ .state = .empty } else .{ .basic = .empty } };
-            _ = try engine.runObserved(arena, kernel, request, observed(layout, &trace), .{});
+            _ = try engine.runObserved(arena, kernel, request, observed(layout, geometry, &trace), .{});
             try trace.write(file);
         }
     }
@@ -315,6 +351,8 @@ pub fn main(init: std.process.Init) !void {
     var trace_states = false;
     var profile = false;
     var stages = false;
+    var raster_profile = false;
+    var geometry_mode: ?iso.GeometryLayout.Mode = null;
     var prepare_layout = false;
     var prepare_headings = false;
     var rss = false;
@@ -325,6 +363,12 @@ pub fn main(init: std.process.Init) !void {
             profile = true;
         } else if (std.mem.eql(u8, arg, "--stages") and !stages) {
             stages = true;
+        } else if (std.mem.eql(u8, arg, "--raster-profile") and !raster_profile) {
+            raster_profile = true;
+        } else if (std.mem.eql(u8, arg, "--geometry") and geometry_mode == null) {
+            geometry_mode = .samples;
+        } else if (std.mem.eql(u8, arg, "--geometry-distances") and geometry_mode == null) {
+            geometry_mode = .distances;
         } else if (std.mem.eql(u8, arg, "--layout") and !prepare_layout) {
             prepare_layout = true;
         } else if (std.mem.eql(u8, arg, "--headings-only") and !prepare_headings) {
@@ -341,7 +385,8 @@ pub fn main(init: std.process.Init) !void {
             trace_path = arg;
         } else return error.InvalidArguments;
     }
-    if ((profile and (prepare_layout or prepare_headings)) or (prepare_layout and prepare_headings) or
+    if ((profile and (prepare_layout or prepare_headings or geometry_mode != null)) or (prepare_layout and prepare_headings) or
+        (geometry_mode != null and (prepare_layout or prepare_headings)) or (raster_profile and !stages) or
         (trace_states and trace_path == null)) return error.InvalidArguments;
     const input = try io.File.open(input_path, .read_only);
     defer input.close();
@@ -374,8 +419,17 @@ pub fn main(init: std.process.Init) !void {
         break :blk ready;
     } else null;
     defer if (layout) |ready| ready.deinit(init.gpa);
+    const geometry: ?iso.GeometryLayout = if (geometry_mode) |mode| blk: {
+        const start = io.monotonicNs();
+        const ready = try iso.GeometryLayout.init(init.gpa, view, mode, .none);
+        std.debug.print("geometry_ns={d} geometry_bytes={d} shapes={d} points={d}\n", .{
+            io.monotonicNs() - start, ready.residentBytes(), ready.rows.len, ready.points.len,
+        });
+        break :blk ready;
+    } else null;
+    defer if (geometry) |ready| ready.deinit(init.gpa);
     switch (traversal orelse .baseline) {
-        inline else => |variant| try runCorpus(variant, init, view, data, grids, traces, trace_states, profile, stages, measure_memory, if (layout) |*ready| ready else null),
+        inline else => |variant| try runCorpus(variant, init, view, data, grids, traces, trace_states, profile, stages, raster_profile, measure_memory, if (layout) |*ready| ready else null, if (geometry) |*ready| ready else null),
     }
     if (rss) std.debug.print("peak_rss_bytes={d}\n", .{try io.peakRssBytes()});
 }
@@ -390,8 +444,10 @@ fn runCorpus(
     trace_states: bool,
     profile: bool,
     stages: bool,
+    raster_profile: bool,
     measure_memory: bool,
     layout: ?*const iso.MovementLayout,
+    geometry: ?*const iso.GeometryLayout,
 ) !void {
     const Q = switch (traversal) {
         .baseline => queue.RadixQueue,
@@ -460,9 +516,11 @@ fn runCorpus(
             .trace_states = trace_states,
             .profile = profile,
             .stages = stages,
+            .raster_profile = raster_profile,
             .measure_memory = measure_memory,
             .scratch = a,
             .layout = layout,
+            .geometry = geometry,
         };
         switch (row.costing) {
             .auto => try measurement.run(&motorist, Auto{ .profile = drive.profile(), .tables = drive.tables(), .arena = request_memory.allocator() }, request),

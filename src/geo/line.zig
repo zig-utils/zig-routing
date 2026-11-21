@@ -274,6 +274,36 @@ pub fn resamplePolyline(gpa: Allocator, polyline: []const PointLL, length_m: f32
 }
 
 pub fn resamplePolylineWithDeadline(gpa: Allocator, polyline: []const PointLL, length_m: f32, resolution: f32, out: *std.ArrayList(PointLL), deadline: Deadline) (Allocator.Error || error{DeadlineExceeded})!void {
+    return resamplePolylineImpl(gpa, polyline, length_m, resolution, out, {}, deadline);
+}
+
+/// Store the segment distances used by the sampler. A distance is indexed
+/// by its starting vertex. The final vertex has no segment.
+pub fn prepareResamplingDistances(polyline: []const PointLL, distances: []f32, deadline: Deadline) error{DeadlineExceeded}!void {
+    std.debug.assert(polyline.len == distances.len);
+    if (polyline.len == 0) return;
+    var endpoint: ?point.DistanceEndpoint = null;
+    for (polyline[0 .. polyline.len - 1], polyline[1..], distances[0 .. distances.len - 1], 0..) |p0, p1, *distance, i| {
+        if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+        distance.* = if (p0.eql(p1)) 0 else resamplingSegmentLength(p0, p1, &endpoint);
+    }
+    distances[distances.len - 1] = 0;
+}
+
+pub fn resamplePolylineWithDistances(gpa: Allocator, polyline: []const PointLL, length_m: f32, resolution: f32, out: *std.ArrayList(PointLL), distances: []const f32, deadline: Deadline) (Allocator.Error || error{DeadlineExceeded})!void {
+    std.debug.assert(polyline.len == distances.len);
+    return resamplePolylineImpl(gpa, polyline, length_m, resolution, out, distances, deadline);
+}
+
+inline fn resamplingSegmentLength(p0: PointLL, p1: PointLL, endpoint: *?point.DistanceEndpoint) f32 {
+    const a = endpoint.* orelse point.DistanceEndpoint.init(p0, libm);
+    const b = point.DistanceEndpoint.init(p1, libm);
+    const distance: f32 = @floatCast(a.distance(b, libm));
+    endpoint.* = b;
+    return distance;
+}
+
+fn resamplePolylineImpl(gpa: Allocator, polyline: []const PointLL, length_m: f32, resolution: f32, out: *std.ArrayList(PointLL), distances: anytype, deadline: Deadline) (Allocator.Error || error{DeadlineExceeded})!void {
     if (polyline.len == 0) return;
     const base = out.items.len;
     try out.append(gpa, polyline[0]);
@@ -285,10 +315,7 @@ pub fn resamplePolylineWithDeadline(gpa: Allocator, polyline: []const PointLL, l
         if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
         if (out.items.len - base == n) break;
         if (p0.eql(p1)) continue;
-        const a = endpoint orelse point.DistanceEndpoint.init(p0, libm);
-        const b = point.DistanceEndpoint.init(p1, libm);
-        const d: f32 = @floatCast(a.distance(b, libm));
-        endpoint = b;
+        const d = if (@TypeOf(distances) == void) resamplingSegmentLength(p0, p1, &endpoint) else distances[i];
         if (d + accumulated_d > sample_distance) {
             const dlon: f32 = @floatCast(p1.lng - p0.lng);
             const dlat: f32 = @floatCast(p1.lat - p0.lat);

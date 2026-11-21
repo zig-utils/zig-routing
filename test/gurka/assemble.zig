@@ -1418,16 +1418,22 @@ test "Gurka isochrone paints clipped origins and reaches partway along a long ed
     var arena = routing.infra.arena.Arena.init(counting.allocator(), .{});
     defer arena.deinit();
     {
-        const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates("A-B-C", 2000), &.{
-            .{ .label = "ABC", .tags = road },
+        var layout = try gurka.mapToCoordinates("A-B-C", 2000);
+        layout.points['D'] = layout.points['C'];
+        layout.points['C'] = layout.points['B'];
+        const fixture = try gurka.Map.init(a, layout, &.{
+            .{ .label = "ABCD", .tags = road },
         }, &.{}, &.{});
         var built = try Built.assemble(fixture.osm, 1);
         defer built.deinit();
         const view = &built.bundle.view;
         const left = fixture.findNode("A").?.location;
         const middle = fixture.findNode("B").?.location;
-        const right = fixture.findNode("C").?.location;
-        const east = try directedBetween(view, &fixture, "A", "C");
+        const right = fixture.findNode("D").?.location;
+        const east = try directedBetween(view, &fixture, "A", "D");
+        const stored = try view.shape(east, a);
+        try testing.expectEqual(4, stored.len);
+        try testing.expectEqualDeep(stored[1], stored[2]);
         const west = try view.oppEdge(east);
         const seeds = [_]Candidate{
             .{ .edge = east, .fraction = 0.5, .score = 0, .begin_node = false, .end_node = false },
@@ -1449,6 +1455,57 @@ test "Gurka isochrone paints clipped origins and reaches partway along a long ed
             try testing.expect((grid.dataAt(grid.tiles.tileIdOf(end), iso.time_metric) orelse iso.nodata) > 10);
         }
         arena.reset();
+
+        const GeometryProbe = struct {
+            layout: *const iso.GeometryLayout,
+
+            pub fn rasterGeometry(self: @This()) *const iso.GeometryLayout {
+                return self.layout;
+            }
+
+            pub fn observe(_: @This(), _: routing.search.expand.Visit) !void {}
+        };
+        const cached = try iso.GeometryLayout.init(testing.allocator, view, .samples, .none);
+        defer cached.deinit(testing.allocator);
+        const cached_distances = try iso.GeometryLayout.init(testing.allocator, view, .distances, .none);
+        defer cached_distances.deinit(testing.allocator);
+        try testing.expectEqual(1, cached.rows.len);
+        try testing.expectEqual(1, cached_distances.rows.len);
+        const cuts = [_]Candidate{
+            .{ .edge = east, .fraction = 0.999, .score = 0, .begin_node = false, .end_node = false },
+            .{ .edge = west, .fraction = 0.001, .score = 0, .begin_node = false, .end_node = false },
+        };
+        const origins: []const iso.Origin = &.{
+            .{ .location = middle, .seed = .{ .edges = &seeds } },
+            .{ .location = left.pointAlongSegment(right, 0.999), .seed = .{ .edges = &cuts } },
+        };
+        for ([_]f32{ 1, 57, 90, 124, 157 }, 1..) |distance, cell| {
+            for ([_]search.Direction{ .forward, .reverse }) |direction| {
+                const request: iso.Request = .{
+                    .origins = origins,
+                    .direction = direction,
+                    .contours = &.{.{ .metric = iso.distance_metric, .value = distance }},
+                    .mode = .pedestrian,
+                };
+                const expected = try engine.run(&arena, .{}, request, .{});
+                try testing.expectEqual(@as(f32, @floatFromInt(cell)) * 0.001, expected.grid.tiles.tilesize);
+                const mark = arena.mark();
+                for ([_]*const iso.GeometryLayout{ &cached, &cached_distances }) |geometry| {
+                    const probe: GeometryProbe = .{ .layout = geometry };
+                    const computed = try engine.runObserved(&arena, .{}, request, probe, .{});
+                    try testing.expectEqualDeep(expected.stats, computed.stats);
+                    try testing.expectEqualDeep(expected.grid.tiles, computed.grid.tiles);
+                    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected.grid.data), std.mem.sliceAsBytes(computed.grid.data));
+                    arena.rewind(mark);
+                    counting.resetCounts();
+                    _ = try engine.runObserved(&arena, .{}, request, probe, .{});
+                    try testing.expectEqual(0, counting.calls());
+                    arena.rewind(mark);
+                }
+                arena.reset();
+            }
+        }
+        try testing.expectError(error.Cancelled, iso.GeometryLayout.init(testing.allocator, view, .samples, .{ .at_ns = 0 }));
     }
     {
         const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates(

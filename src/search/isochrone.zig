@@ -10,6 +10,9 @@ const flags = @import("paged.zig");
 const queue = @import("queue.zig");
 const compact = @import("compact_movements.zig");
 pub const MovementLayout = compact.Layout;
+const geometry = @import("isochrone_geometry.zig");
+pub const GeometryLayout = geometry.Layout;
+pub const RasterStage = enum { graph, decode, resample, paint };
 const hasPolicy = @import("../snap/edge.zig").hasPolicy;
 
 const Allocator = std.mem.Allocator;
@@ -17,7 +20,6 @@ const View = graph.reader.View;
 const NodeId = graph.format.NodeId;
 const EdgeId = graph.format.EdgeId;
 const Point = geo.PointLL;
-const Use = graph.constants.Use;
 const units = geo.constants;
 
 pub const Grid = geo.gridded.Grid(2);
@@ -81,6 +83,8 @@ pub fn IsochroneWithQueue(comptime K: type, comptime Q: type) type {
             try control.check();
             if (request.mode == .multimodal) return error.UnsupportedMultimodalIsochrone;
             const limits = try Limits.fromContours(request.contours, control);
+            const cached_geometry = if (comptime hasGeometry(@TypeOf(observer))) observer.rasterGeometry() else {};
+            if (@TypeOf(cached_geometry) != void and cached_geometry.view != self.view) return error.InvalidRasterGeometry;
             const a = arena.allocator();
             var grid = try constructGrid(a, request, limits, control);
             errdefer grid.deinit();
@@ -94,6 +98,7 @@ pub fn IsochroneWithQueue(comptime K: type, comptime Q: type) type {
                 const Observed = struct {
                     rasterizer: *Rasterizer,
                     observer: @TypeOf(observer),
+                    geometry_layout: @TypeOf(cached_geometry),
 
                     const profiled = @TypeOf(observer) != void and hasPolicy(@TypeOf(observer), "expansionStage");
                     pub const expansionStage = if (profiled) stage else {};
@@ -114,10 +119,10 @@ pub fn IsochroneWithQueue(comptime K: type, comptime Q: type) type {
 
                     pub fn visit(adapter: *@This(), event: expansion.Visit) !expansion.Decision {
                         try adapter.observer.observe(event);
-                        return adapter.rasterizer.visit(event);
+                        return adapter.rasterizer.visitMeasured(event, adapter.geometry_layout, {});
                     }
                 };
-                var observed: Observed = .{ .rasterizer = &visitor, .observer = observer };
+                var observed: Observed = .{ .rasterizer = &visitor, .observer = observer, .geometry_layout = cached_geometry };
                 break :blk try self.engine.run(arena, kernel, sweep, &observed, control);
             };
             return .{ .grid = grid, .stats = stats };
@@ -164,6 +169,12 @@ pub fn IsochroneWithQueue(comptime K: type, comptime Q: type) type {
     };
 }
 
+fn hasGeometry(comptime Observer: type) bool {
+    if (Observer == void or !hasPolicy(Observer, "rasterGeometry")) return false;
+    const T = if (@typeInfo(Observer) == .pointer) @typeInfo(Observer).pointer.child else Observer;
+    return @TypeOf(T.rasterGeometry) != void;
+}
+
 fn prepareSweep(a: Allocator, request: Request, control: core.Control) !expansion.Request {
     const nodes = try a.alloc(NodeId, request.origins.len);
     const groups = try a.alloc([]const Candidate, request.origins.len);
@@ -195,6 +206,19 @@ fn prepareSweep(a: Allocator, request: Request, control: core.Control) !expansio
 
 /// Paint recorded settled events in their original order.
 pub fn rasterize(view: *const View, arena: *memory.Arena, request: Request, events: []const expansion.Visit, control: core.Control) !Grid {
+    return rasterizeObserved(view, arena, request, events, {}, {}, control);
+}
+
+pub fn rasterizeObserved(
+    view: *const View,
+    arena: *memory.Arena,
+    request: Request,
+    events: []const expansion.Visit,
+    layout: anytype,
+    observer: anytype,
+    control: core.Control,
+) !Grid {
+    if (@TypeOf(layout) != void and layout.view != view) return error.InvalidRasterGeometry;
     const a = arena.allocator();
     const limits = try Limits.fromContours(request.contours, control);
     var grid = try constructGrid(a, request, limits, control);
@@ -204,7 +228,8 @@ pub fn rasterize(view: *const View, arena: *memory.Arena, request: Request, even
     var painter = try Rasterizer.init(view, a, request.direction, &grid, limits, control);
     for (events, 0..) |event, i| {
         if (i % 1024 == 0) try control.check();
-        _ = try painter.visit(event);
+        if (@TypeOf(observer) != void) observer.rasterSample(i);
+        _ = try painter.visitMeasured(event, layout, observer);
     }
     return grid;
 }
@@ -309,6 +334,7 @@ const Rasterizer = struct {
     grid: *Grid,
     bounds: Bounds,
     shape_interval: f32,
+    cell_index: usize,
     settled_words: []u64,
     settled: flags.Array(u64, 0) = .{},
     vertices: std.ArrayList(Point) = .empty,
@@ -322,12 +348,18 @@ const Rasterizer = struct {
             .control = control,
             .grid = grid,
             .bounds = limits.bounds(),
-            .shape_interval = grid.tiles.tilesize * @as(f32, units.meters_per_degree_lat) * 0.25,
+            .shape_interval = geometry.shapeInterval(grid.tiles.tilesize),
+            .cell_index = geometry.cellIndex(grid.tiles.tilesize),
             .settled_words = try settledWords(a, view.edges.len),
         };
     }
 
     pub fn visit(self: *Rasterizer, event: expansion.Visit) !expansion.Decision {
+        return self.visitMeasured(event, {}, {});
+    }
+
+    fn visitMeasured(self: *Rasterizer, event: expansion.Visit, layout: anytype, observer: anytype) !expansion.Decision {
+        const profiled = @TypeOf(observer) != void;
         const edge = event.label.edgeId();
         const opposite = try self.view.oppEdge(edge);
         const outward = if (self.direction == .forward) edge else opposite;
@@ -344,45 +376,81 @@ const Rasterizer = struct {
         const origin = self.direction == .forward and event.previous == null;
         if (reverse_settled and !origin) return .expand;
         const hot = try self.view.edge(outward);
-        const use = (try self.view.class(hot.cls.class_id)).category.use;
-        if (use == @backingInt(Use.ferry) or use == @backingInt(Use.rail) or use == @backingInt(Use.bus)) return .expand;
+        if (!geometry.paints((try self.view.class(hot.cls.class_id)).category.use)) return .expand;
 
         const end = (try self.view.coordinate(event.node)).toTilePoint();
         const traversed: f32 = @floatFromInt(if (origin) event.label.dist_m else hot.geom.len_m);
         const end_metres: f32 = @floatFromInt(event.label.dist_m);
         if (traversed < self.shape_interval * 1.5) {
-            const start = if (origin and event.cut.begin != 0)
-                (try self.originSuffix(try self.decodeShape(try self.view.coldRecordWithDeadline(outward, self.control.deadline), false), traversed))[0]
-            else
-                (try self.view.coordinate(@fromBackingInt((try self.view.edge(behind)).head))).toTilePoint();
+            const start = if (origin and event.cut.begin != 0) blk: {
+                if (profiled) observer.rasterStage(.decode);
+                const points = try self.decodeShape(try self.view.coldRecordWithDeadline(outward, self.control.deadline), false);
+                if (profiled) observer.rasterStage(.paint);
+                break :blk (try self.originSuffix(points, traversed))[0];
+            } else (try self.view.coordinate(@fromBackingInt((try self.view.edge(behind)).head))).toTilePoint();
+            if (profiled) observer.rasterStage(.paint);
             _ = try self.markSegment(start, end, self.grid.tiles.tileIdOf(start), self.grid.tiles.tileIdOf(end), event.label.secs, end_metres);
             return .expand;
         }
-        const record = try self.view.coldRecordWithDeadline(outward, self.control.deadline);
-        const shape = try self.decodeShape(record, record.reverse);
+        const cached = if (@TypeOf(layout) != void) layout.shape(outward, self.cell_index) else null;
         self.samples.clearRetainingCapacity();
-        try geo.line.resamplePolylineWithDeadline(self.allocator, shape, @floatFromInt(hot.geom.len_m), self.shape_interval, &self.samples, self.control.deadline);
-        // Valhalla resamples in the stored direction, then paints in the
-        // direction of expansion.
-        if (record.reverse) {
-            const samples = self.samples.items;
-            for (samples[0 .. samples.len / 2], 0..) |*point, i| {
-                if (i % 256 == 0) try self.control.check();
-                std.mem.swap(Point, point, &samples[samples.len - 1 - i]);
+        const reversed = if (cached) |shape| reversed: {
+            if (shape.distances) |distances| {
+                if (profiled) observer.rasterStage(.resample);
+                try geo.line.resamplePolylineWithDistances(self.allocator, shape.points, @floatFromInt(hot.geom.len_m), self.shape_interval, &self.samples, distances, self.control.deadline);
+            } else {
+                if (profiled) observer.rasterStage(.paint);
+                if (!origin) return if (shape.reverse)
+                    self.paintSamples(true, shape.points, previous.secs, event.label.secs, start_metres, end_metres)
+                else
+                    self.paintSamples(false, shape.points, previous.secs, event.label.secs, start_metres, end_metres);
+                try self.samples.appendSlice(self.allocator, shape.points);
             }
-        }
+            break :reversed shape.reverse;
+        } else reversed: {
+            if (profiled) observer.rasterStage(.decode);
+            const record = try self.view.coldRecordWithDeadline(outward, self.control.deadline);
+            const shape = try self.decodeShape(record, record.reverse);
+            if (profiled) observer.rasterStage(.resample);
+            try geo.line.resamplePolylineWithDeadline(self.allocator, shape, @floatFromInt(hot.geom.len_m), self.shape_interval, &self.samples, self.control.deadline);
+            break :reversed record.reverse;
+        };
+        // Valhalla resamples in storage order before orienting the samples.
+        if (reversed) try self.reverseSamples();
+        if (profiled) observer.rasterStage(.paint);
         const points = if (origin) try self.originSuffix(self.samples.items, traversed) else self.samples.items;
+        return self.paintSamples(false, points, previous.secs, event.label.secs, start_metres, end_metres);
+    }
+
+    fn reverseSamples(self: *Rasterizer) !void {
+        const samples = self.samples.items;
+        for (samples[0 .. samples.len / 2], 0..) |*point, i| {
+            if (i % 256 == 0) try self.control.check();
+            std.mem.swap(Point, point, &samples[samples.len - 1 - i]);
+        }
+    }
+
+    fn paintSamples(
+        self: *Rasterizer,
+        comptime reverse: bool,
+        points: []const Point,
+        start_seconds: f32,
+        end_seconds: f32,
+        start_metres: f32,
+        end_metres: f32,
+    ) !expansion.Decision {
         const count: f32 = @floatFromInt(points.len - 1);
-        const delta_seconds = (event.label.secs - previous.secs) / count;
+        const delta_seconds = (end_seconds - start_seconds) / count;
         const delta_metres = (end_metres - start_metres) / count;
         const nondecreasing = delta_seconds >= 0 and delta_metres >= 0;
-        var seconds = previous.secs;
+        var seconds = start_seconds;
         var metres = start_metres;
-        var from = points[0];
+        var from = points[if (reverse) points.len - 1 else 0];
         var from_cell = self.grid.tiles.tileIdOf(from);
         var from_marked = false;
-        for (points[1..], 0..) |to, i| {
-            if (i % 256 == 0) try self.control.check();
+        for (1..points.len) |i| {
+            if ((i - 1) % 256 == 0) try self.control.check();
+            const to = points[if (reverse) points.len - 1 - i else i];
             seconds += delta_seconds;
             metres += delta_metres;
             const to_cell = self.grid.tiles.tileIdOf(to);
