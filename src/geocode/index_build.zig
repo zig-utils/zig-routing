@@ -169,7 +169,7 @@ const Worker = struct {
         };
         const entry: Posting = .{ .id = id, .importance = core.attr.importance };
         const iso = try self.data.countryIso(core.hierarchy.country);
-        const options = defaultOptions(iso);
+        const options = analysis.Options.forIso(iso);
         try self.addNames(a, .name, core.names, options, entry);
         if (document.kind == .street) try self.addNames(a, .street, core.names, options, entry);
         if (document.kind == .address) {
@@ -290,18 +290,6 @@ fn sortRuns(
             @memcpy(values[start..end], source[start..end]);
         }
     }
-}
-
-fn defaultOptions(iso: []const u8) analysis.Options {
-    const country = analysis.Country.fromIso(iso);
-    return .{
-        .country = country,
-        .language = switch (country) {
-            .us, .ca, .gb => .en,
-            .de, .at, .ch, .li => .de,
-            else => .und,
-        },
-    };
 }
 
 fn merge(a: Allocator, runs: []const Worker, writer: *index_writer.Writer, deadline: io.Deadline) !void {

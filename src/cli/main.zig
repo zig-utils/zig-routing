@@ -177,6 +177,21 @@ fn createCommands(a: Allocator) !*Command {
         option("threads", "Number of parallel analysis workers", .int),
         option("timeout", "Time limit for building the index", .string),
     }, &.{arg("BUNDLE", "Geocoding bundle directory")});
+    _ = try command(geocode_cmd, "search", "Search an indexed geocoding bundle", searchGeocode, &.{
+        option("name", "Name to match", .string),
+        option("street", "Street to match", .string),
+        option("city", "City to match", .string),
+        option("postcode", "Postcode to match", .string),
+        option("house-number", "House number to match", .string),
+        option("country", "Country name or ISO code", .string),
+        option("language", "Preferred result language", .string),
+        option("near", "Bias point as longitude,latitude", .string),
+        option("bbox", "Filter by west,south,east,north", .string),
+        option("layer", "Result layer: place, street, address or poi", .string).withRepeatable(true),
+        option("limit", "Maximum results (default 10)", .int),
+        option("exact", "Require exact tokens and their aliases", .bool),
+        option("timeout", "Time limit for opening the bundle and searching", .string),
+    }, &.{ arg("BUNDLE", "Geocoding bundle directory"), arg("TEXT", "Free text query").withRequired(false) });
     _ = try command(geocode_cmd, "postcode", "Look up postcode centroids and extents", lookupGeocodePostcodes, &.{
         option("timeout", "Time limit for bundle verification and lookup", .string),
     }, &.{
@@ -724,6 +739,63 @@ fn buildGeocodeIndex(ctx: *Context) !u8 {
     const report = try routing.geocode.index_build.build(std.heap.c_allocator, ctx.getArgument(0).?, workers, deadline);
     try ctx.writeJson(report);
     return 0;
+}
+
+fn searchGeocode(ctx: *Context) !u8 {
+    const geocode = routing.geocode.query;
+    const a = App.from(ctx).arena;
+    const structured: geocode.Structured = .{
+        .name = ctx.getOption("name") orelse "",
+        .street = ctx.getOption("street") orelse "",
+        .city = ctx.getOption("city") orelse "",
+        .postcode = ctx.getOption("postcode") orelse "",
+        .house_number = ctx.getOption("house-number") orelse "",
+        .country = ctx.getOption("country") orelse "",
+    };
+    const has_fields = structured.byteCount() != 0;
+    const text: geocode.Text = if (ctx.getArgument(1)) |value| text: {
+        if (has_fields) return badOption(ctx, "choose free text or structured query fields");
+        break :text .{ .free = value };
+    } else if (has_fields) .{ .structured = structured } else return badOption(ctx, "provide query text or structured fields");
+
+    var filters: geocode.Filters = .{ .language = ctx.getOption("language") orelse "" };
+    if (ctx.getOption("near")) |raw| {
+        const point = geocodeNumbers(2, raw) catch return badOption(ctx, "--near expects longitude,latitude");
+        filters.near = .init(point[0], point[1]);
+    }
+    if (ctx.getOption("bbox")) |raw| {
+        const box = geocodeNumbers(4, raw) catch return badOption(ctx, "--bbox expects west,south,east,north");
+        filters.bounds = .{ .west = box[0], .south = box[1], .east = box[2], .north = box[3] };
+    }
+    const layers = ctx.getOptionValues("layer");
+    if (layers.len != 0) {
+        filters.layers = .empty;
+        for (layers) |name| filters.layers.insert(std.meta.stringToEnum(geocode.Layer, name) orelse
+            return badOption(ctx, "--layer expects place, street, address or poi"));
+    }
+    const limit = (try unsigned(ctx, usize, "limit")) orelse 10;
+    const deadline: io.Deadline = if (try duration(ctx, "timeout")) |ns| .fromNow(ns) else .none;
+    var engine = try geocode.Engine.open(std.heap.page_allocator, ctx.getArgument(0).?, deadline);
+    defer engine.close();
+    const found = try engine.search(a, .{
+        .text = text,
+        .filters = filters,
+        .limit = limit,
+        .typos = !std.mem.eql(u8, ctx.getOption("exact") orelse "false", "true"),
+    }, deadline);
+    try ctx.writeJson(found);
+    return 0;
+}
+
+fn geocodeNumbers(comptime count: usize, text: []const u8) ![count]f64 {
+    var values: [count]f64 = undefined;
+    var parts = std.mem.splitScalar(u8, text, ',');
+    for (&values) |*value| {
+        const part = parts.next() orelse return error.InvalidGeocodeCoordinates;
+        value.* = try std.fmt.parseFloat(f64, std.mem.trim(u8, part, " \t"));
+    }
+    if (parts.next() != null) return error.InvalidGeocodeCoordinates;
+    return values;
 }
 
 fn lookupGeocodePostcodes(ctx: *Context) !u8 {

@@ -21,7 +21,7 @@
 //! `motor-tags` (motor vehicle access and unit normalization), `admin-index`
 //! (stored administrative boundaries), `timezone-geojson`, `timezone-rules`,
 //! `datetime`, `time-domain`, `lane-tags`, `name-tags`, `geocode-bundle` and
-//! `geocode-address`, `geocode-analysis` and `geocode-index`.
+//! `geocode-address`, `geocode-analysis`, `geocode-index` and `geocode-query`.
 //!
 //! The contract for every parser: malformed input returns an error, never
 //! panics, overflows or reads out of bounds. The fuzz step builds ReleaseSafe
@@ -598,6 +598,107 @@ test "fuzz geocode-index" {
         "\x05\x03\x00\x03oak\x01\x09\x02\x01t\x02\x02\x00\x00" ++ std.mem.asBytes(&block).*;
     const inputs = &.{ "", "\x01ZRGIDX01", valid };
     try std.testing.fuzz({}, fuzzGeocodeIndex, .{ .corpus = try seeds(arena.allocator(), inputs) });
+}
+
+fn fuzzGeocodeQuery(engine: *const routing.geocode.query.Engine, s: *Smith) !void {
+    const query = routing.geocode.query;
+    var input: [query.max_input_bytes + 2]u8 = undefined;
+    const bytes = draw(s, &input, 0x67717279);
+    if (bytes.len == 0) return;
+    const value = bytes[1..];
+    const text: query.Text = if (bytes[0] & 1 == 0) .{ .free = value } else structured: {
+        var parts = std.mem.splitScalar(u8, value, 0);
+        break :structured .{ .structured = .{
+            .name = parts.next() orelse "",
+            .street = parts.next() orelse "",
+            .city = parts.next() orelse "",
+            .postcode = parts.next() orelse "",
+            .house_number = parts.next() orelse "",
+            .country = parts.next() orelse "",
+        } };
+    };
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const results = engine.search(arena.allocator(), .{
+        .text = text,
+        .limit = 3,
+        .typos = bytes[0] & 2 == 0,
+    }, .none) catch |err| switch (err) {
+        error.InvalidUtf8, error.InvalidGeocodePostcode, error.GeocodeQueryTooLong, error.TooManyGeocodeTokens => return,
+        else => return err,
+    };
+    try std.testing.expect(results.len <= 1);
+    for (results) |result| {
+        try std.testing.expectEqual(123, result.osm_id);
+        try std.testing.expect(result.bounds.contains(result.coordinate));
+    }
+}
+
+test "fuzz geocode-query" {
+    const geocode = routing.geocode;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const data: geocode.bundle.Data = .{
+        .text = "TestlandGardenTown",
+        .admins = &.{.{ .osm_id = 321, .names = .{ .len = 1 }, .attr = .{ .division = .country, .level = 2 } }},
+        .names = &.{ .{ .language = .{}, .text = .{ .len = 8 } }, .{ .language = .{}, .text = .{ .first = 8, .len = 6 } } },
+        .places = &.{.{
+            .record = .{
+                .osm_id = 123,
+                .coordinate = .{ .lng = 0, .lat = 0 },
+                .names = .{ .first = 1, .len = 1 },
+                .hierarchy = .{ .country = @fromBackingInt(1) },
+                .attr = .{ .source = .node, .importance = 250 },
+            },
+            .kind = .{ .first = 14, .len = 4 },
+        }},
+    };
+    const engine_index: geocode.index.View = .{
+        .header = .{
+            .dataset_uuid = @splat(2),
+            .longest_term = 6,
+            .terms = 1,
+            .postings = 1,
+            .analyzed_bytes = 6,
+            .postings_bytes = 0,
+            .dictionary_bytes = 10,
+            .blocks = 1,
+            .payload_hash = 0,
+            .records = .{ .place = 1 },
+            .field_blocks = .{
+                .{ .len = 1 },
+                .{ .first = 1 },
+                .{ .first = 1 },
+                .{ .first = 1 },
+                .{ .first = 1 },
+            },
+        },
+        .dictionary = "\x00\x06garden\x01\x00",
+        .postings_bytes = &.{},
+        .blocks = &.{.{ .dictionary = 0, .postings = 0, .attr = .{ .terms = 1 } }},
+    };
+    var engine: geocode.query.Engine = .{
+        .bundle = .{ .uuid = @splat(2), .data = data, .mappings = @splat(null) },
+        .index = .{ .view = engine_index, .mapping = .{ .bytes = &.{} } },
+        .country_memory = .init(a),
+        .regions = &.{.{ .id = @fromBackingInt(1), .iso = "" }},
+        .aliases = &.{.{
+            .region = .{ .id = @fromBackingInt(1), .iso = "" },
+            .terms = &.{.{ .text = "testland" }},
+        }},
+    };
+    defer engine.close();
+    const input = &.{
+        "",
+        "\x00Garden, Testland",
+        "\x00Gadren",
+        "\x01Garden\x00\x00\x00\x00\x00Testland",
+        "\x01\x00Main Street\x00Town\x0001234\x0012A\x00US",
+        "\x00Νέα Πόλη 12½",
+        "\x00\xf0\xa0",
+    };
+    try std.testing.fuzz(@as(*const geocode.query.Engine, &engine), fuzzGeocodeQuery, .{ .corpus = try seeds(a, input) });
 }
 
 fn fuzzLaneTags(_: void, s: *Smith) !void {

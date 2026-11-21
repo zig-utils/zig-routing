@@ -158,6 +158,49 @@ test "geocode bundle keeps multilingual labels and merges streets by municipalit
     try testing.expectEqualStrings("1234", (try postal.next(.none)).?.text);
     var house_number = try parallel.view.prefix(.house_number, "10", &index_scratch, .none);
     try testing.expectEqualStrings("10a", (try house_number.next(.none)).?.text);
+
+    const query = geocode.query;
+    var engine = try query.Engine.open(a, output, .none);
+    defer engine.close();
+    var requests: std.heap.ArenaAllocator = .init(a);
+    defer requests.deinit();
+    const request_memory = requests.allocator();
+    const street_filter: query.Filters = .{ .layers = .initOne(.street) };
+    const no_bias = try engine.search(request_memory, .{ .text = .{ .free = "Main Street" }, .filters = street_filter }, .none);
+    try testing.expectEqual(2, no_bias.len);
+    try testing.expectEqual(104, no_bias[0].osm_id);
+    try testing.expectEqual(1.0, no_bias[0].bounds.west);
+    try testing.expectEqual(2.0, no_bias[0].bounds.east);
+    try testing.expectEqual(2.0, no_bias[0].bounds.north);
+    var near_east = street_filter;
+    near_east.near = .init(4.5, 1);
+    const biased = try engine.search(request_memory, .{ .text = .{ .free = "Main Street" }, .filters = near_east }, .none);
+    try testing.expectEqual(106, biased[0].osm_id);
+    var bounded = street_filter;
+    bounded.bounds = .{ .west = 3, .south = 0, .east = 6, .north = 2 };
+    const inside = try engine.search(request_memory, .{ .text = .{ .free = "Main Street" }, .filters = bounded }, .none);
+    try testing.expectEqual(1, inside.len);
+    try testing.expectEqual(106, inside[0].osm_id);
+    const address = try engine.search(request_memory, .{ .text = .{ .structured = .{
+        .house_number = "10A",
+        .street = "Main Street",
+        .postcode = "1234",
+        .city = "West",
+        .country = "Land",
+    } } }, .none);
+    try testing.expectEqual(1, address.len);
+    try testing.expectEqual(12, address[0].osm_id);
+    try testing.expectEqualStrings("10a Main Street, 1234 West, Land", address[0].formatted_address);
+    const localized = try engine.search(request_memory, .{ .text = .{ .free = "West" }, .filters = .{ .language = "fr" } }, .none);
+    try testing.expectEqualStrings("Ouest", localized[0].name);
+    const fuzzy = try engine.search(request_memory, .{ .text = .{ .free = "Prmiary School" } }, .none);
+    try testing.expectEqual(205, fuzzy[0].osm_id);
+    const exact = try engine.search(request_memory, .{ .text = .{ .free = "Prmiary School" }, .typos = false }, .none);
+    try testing.expectEqual(0, exact.len);
+    const trailing_country = try engine.search(request_memory, .{ .text = .{ .free = "Main Street West Land" }, .filters = street_filter }, .none);
+    try testing.expectEqual(1, trailing_country.len);
+    try testing.expectEqual(104, trailing_country[0].osm_id);
+    try testing.expectError(error.DeadlineExceeded, engine.search(request_memory, .{ .text = .{ .free = "West" } }, .fromNow(0)));
 }
 
 fn addressTags(allocator: std.mem.Allocator, number: []const u8) !gurka.Tags {

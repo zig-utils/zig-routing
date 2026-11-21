@@ -17,6 +17,18 @@ pub const Kind = lexicon.Kind;
 pub const Options = struct {
     language: Language = .und,
     country: Country = .unknown,
+
+    pub fn forIso(iso: []const u8) Options {
+        const country = Country.fromIso(iso);
+        return .{
+            .country = country,
+            .language = switch (country) {
+                .us, .ca, .gb => .en,
+                .de, .at, .ch, .li => .de,
+                else => .und,
+            },
+        };
+    }
 };
 
 pub const Token = extern struct {
