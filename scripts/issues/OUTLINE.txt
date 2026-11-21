@@ -8,7 +8,7 @@ P0.01 | Scaffold the build, pin the Zig toolchain, verify the zig-* dependencies
 P0.02 | CI: build, test and fmt on Linux and macOS with the pinned toolchain | infra | infra | S | P0.01
 P0.03 | Read-only inventory of the production routing box (Valhalla version, config, tiles, DEM, RSS, request mix) | infra | infra | S | - | needs-human
 P0.04 | Docker Valhalla oracle: pinned 3.9.3 image, test extracts and a pruning check | infra | infra | M | P0.01
-P0.13 | Build the Germany and US+DACH Valhalla oracle datasets | infra | infra | M | P0.03 P0.04 | needs-human
+P0.13 | Build the Germany and US+DACH Valhalla oracle datasets | infra | infra | M | P0.03 P0.04
 P0.05 | Request corpora: upstream test_requests, de_benchmark_routes and a production-shaped corpus | cli | test | M | P0.04 P0.13
 P0.06 | zr bench: load generator with latency histograms and machine-readable results | cli | new | M | P0.01
 P0.07 | zr diff: replay a corpus against two servers and score parity | cli | new | M | P0.06

@@ -33,8 +33,12 @@ oracle_compose() {
 }
 
 build_key() {
+  local row tiles
+  row=$(dataset_row "$1") || return
+  IFS=$'\t' read -r _ _ _ tiles _ <<<"$row"
   {
-    dataset_row "$1"
+    printf '%s\n' "$row"
+    dataset_dem_list "$tiles" || return
     echo "$ORACLE_PLATFORM"
     shasum -a 256 < "$ORACLE_DIR/compose.yaml"
     shasum -a 256 < "$ORACLE_DIR/build-tiles.sh"
@@ -58,13 +62,32 @@ dataset_row() {
   echo "$row"
 }
 
+dataset_dem_list() {
+  local tiles="$1" entry
+  if [[ "$tiles" == @* ]]; then
+    local manifest="${tiles#@}"
+    [[ "$manifest" =~ ^[a-z0-9-]+\.sha256$ ]] || die "invalid elevation manifest '$manifest'"
+    [ -s "$ORACLE_DIR/elevation/$manifest" ] || die "missing elevation manifest '$manifest'"
+    cat "$ORACLE_DIR/elevation/$manifest"
+    return
+  fi
+  local entries
+  IFS=',' read -ra entries <<<"$tiles"
+  for entry in "${entries[@]}"; do
+    printf '%s  %s\n' "${entry#*=}" "${entry%%=*}"
+  done
+}
+
 sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
 
 fetch_checked() {
-  local url="$1" dest="$2" want="$3"
+  local url="$1" dest="$2" want="$3" seconds="${4:-180}"
+  [[ "$want" =~ ^[0-9a-f]{64}$ ]] || die "invalid SHA-256 for $url"
   if [ -f "$dest" ] && [ "$(sha256 "$dest")" = "$want" ]; then return 0; fi
-  if ! curl -sSfL --connect-timeout 15 --max-time 180 --retry 4 --retry-all-errors --retry-delay 5 -o "$dest.part" "$url"; then
-    rm -f "$dest.part"
+  local args=(--connect-timeout 15 --max-time "$seconds" --retry 4 --retry-all-errors --retry-delay 5)
+  if [ "$seconds" -gt 180 ]; then args+=(--continue-at -); else rm -f "$dest.part"; fi
+  if ! curl -sSfL "${args[@]}" -o "$dest.part" "$url"; then
+    if [ "$seconds" -le 180 ]; then rm -f "$dest.part"; fi
     die "download failed: $url"
   fi
   local got
