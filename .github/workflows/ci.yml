@@ -82,6 +82,25 @@ jobs:
             "$work/luxembourg.osm.pbf" \
             d8f3e1dabb4d9d5489500c35432eb393089c32222cfff8cf50706852f0696a80
           zig build check-assembly -Doptimize=ReleaseFast -- "$work/luxembourg.osm.pbf" "$work/luxembourg" "$work" 4 right --sub-byte-turns --spatial-budget
+          zig-out/bin/zr geocode build "$work/luxembourg.osm.pbf" "$work/geocoder" --threads 4
+          zig-out/bin/zr geocode index "$work/geocoder" --threads 4
+          zig-out/bin/zr bench "$work/geocoder" --autocomplete --dataset luxembourg-260101 --threads 8 --duration 5s --out "$work/autocomplete.json"
+          python3 - "$work/autocomplete.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          result = json.loads(Path(sys.argv[1]).read_text())
+          budget = json.loads(Path("bench/budgets/autocomplete.json").read_text())
+          assert result["dataset"] == budget["dataset"] and result["threads"] == budget["threads"], result
+          assert result["one_character_requests"] > 0 and result["two_character_requests"] > 0, result
+          for metric in ("p50_ns", "p99_ns", "short_p99_ns"):
+              assert result[metric] < budget[metric], f"{metric}: {result[metric]} >= {budget[metric]}"
+          for metric in ("one_character_p99_ns", "two_character_p99_ns"):
+              assert result[metric] < budget["short_p99_ns"], f"{metric}: {result[metric]} >= {budget['short_p99_ns']}"
+          assert result["requests_per_second"] >= budget["requests_per_second"], result
+          assert result["steady_state_heap_calls"] == budget["steady_state_heap_calls"], result
+          PY
       - uses: actions/checkout@v6
         if: matrix.os == 'ubuntu-latest'
         with:

@@ -1,0 +1,9 @@
+{
+  "dataset": "luxembourg-260101",
+  "threads": 8,
+  "p50_ns": 1000000,
+  "p99_ns": 5000000,
+  "short_p99_ns": 1000000,
+  "requests_per_second": 10000,
+  "steady_state_heap_calls": 0
+}

@@ -33,6 +33,7 @@ pub const Term = struct {
     text: []const u8,
     latin: []const u8 = "",
     kind: analysis.Kind = .word,
+    prefix: bool = false,
     /// A structured field is a constraint. Free text can match several roles.
     field: ?format.Field = null,
 };
@@ -99,6 +100,7 @@ fn analyze(
         .text = try token.text.get(bytes),
         .latin = try token.latin.get(bytes),
         .kind = token.attr.kind,
+        .prefix = token.attr.prefix,
         .field = field,
     };
 }

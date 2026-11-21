@@ -13,10 +13,12 @@ pub const analyze = @import("analyze.zig");
 pub const index = @import("index.zig");
 pub const index_build = @import("index_build.zig");
 pub const query = @import("query.zig");
+pub const autocomplete = @import("autocomplete.zig");
 
 test {
     std.testing.refAllDecls(@This());
     _ = @import("tags.zig");
     _ = @import("index_postings.zig");
     _ = @import("query_edit.zig");
+    _ = @import("query_retrieve.zig");
 }

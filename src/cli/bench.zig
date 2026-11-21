@@ -713,7 +713,7 @@ pub fn writeResult(gpa: Allocator, out: *std.ArrayList(u8), meta: Meta, opts: Op
     try w.endObject();
 }
 
-fn cpuModel(buf: []u8) []const u8 {
+pub fn cpuModel(buf: []u8) []const u8 {
     if (builtin.os.tag.isDarwin()) {
         var len: usize = buf.len;
         if (std.c.sysctlbyname("machdep.cpu.brand_string", buf.ptr, &len, null, 0) == 0 and len > 0) {

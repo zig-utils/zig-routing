@@ -10,6 +10,7 @@ const config = routing.infra.config;
 const http = routing.server.http;
 const service = routing.api.service;
 const bench = routing.cli.bench;
+const bench_autocomplete = routing.cli.bench_autocomplete;
 const diff = routing.cli.diff;
 const inspect = routing.cli.inspect;
 const traffic = routing.cli.traffic;
@@ -118,8 +119,9 @@ fn createCommands(a: Allocator) !*Command {
         option("action", "Valhalla action (default route)", .string),
         option("file", "Read the request JSON from a file", .string),
     }, &.{arg("JSON", "Inline request JSON").withRequired(false)});
-    _ = try command(root, "bench", "Benchmark an HTTP server or compare results", benchmark, &.{
+    _ = try command(root, "bench", "Benchmark a server or geocoder, or compare results", benchmark, &.{
         option("compare", "Compare two benchmark result files", .bool),
+        option("autocomplete", "Benchmark keystrokes on a local indexed geocode bundle", .bool),
         option("corpus", "Request corpus file", .string),
         option("endpoint", "Default path for requests (default /route)", .string),
         option("connections", "Keep-alive connections (default 16)", .int),
@@ -133,7 +135,7 @@ fn createCommands(a: Allocator) !*Command {
         option("dataset", "Dataset name recorded in the result", .string),
         option("commit", "Server commit recorded in the result", .string),
         option("label", "Label recorded in the result", .string),
-    }, &.{ arg("URL|A.json", "HTTP server or first result file"), arg("B.json", "Second result file").withRequired(false) });
+    }, &.{ arg("URL|BUNDLE|A.json", "HTTP server, geocode bundle, or first result file"), arg("B.json", "Second result file").withRequired(false) });
     _ = try command(root, "diff", "Compare API servers or graph edge keys", compareServers, &.{
         option("edge-keys", "Compare the stable edge keys of two graph bundles", .bool),
         option("corpus", "Request corpus file for HTTP comparison", .string),
@@ -177,21 +179,29 @@ fn createCommands(a: Allocator) !*Command {
         option("threads", "Number of parallel analysis workers", .int),
         option("timeout", "Time limit for building the index", .string),
     }, &.{arg("BUNDLE", "Geocoding bundle directory")});
-    _ = try command(geocode_cmd, "search", "Search an indexed geocoding bundle", searchGeocode, &.{
+    const geocode_filters = [_]cli.Option{
+        option("language", "Preferred result language", .string),
+        option("near", "Bias point as longitude,latitude", .string),
+        option("bbox", "Filter by west,south,east,north", .string),
+        option("layer", "Result layer: place, street, address or poi", .string).withRepeatable(true),
+        option("limit", "Maximum results (default 10)", .int),
+        option("timeout", "Time limit for opening the bundle and searching", .string),
+    };
+    const geocode_fields = [_]cli.Option{
         option("name", "Name to match", .string),
         option("street", "Street to match", .string),
         option("city", "City to match", .string),
         option("postcode", "Postcode to match", .string),
         option("house-number", "House number to match", .string),
         option("country", "Country name or ISO code", .string),
-        option("language", "Preferred result language", .string),
-        option("near", "Bias point as longitude,latitude", .string),
-        option("bbox", "Filter by west,south,east,north", .string),
-        option("layer", "Result layer: place, street, address or poi", .string).withRepeatable(true),
-        option("limit", "Maximum results (default 10)", .int),
         option("exact", "Require exact tokens and their aliases", .bool),
-        option("timeout", "Time limit for opening the bundle and searching", .string),
-    }, &.{ arg("BUNDLE", "Geocoding bundle directory"), arg("TEXT", "Free text query").withRequired(false) });
+    };
+    _ = try command(geocode_cmd, "search", "Search an indexed geocoding bundle", searchGeocode, &(geocode_fields ++ geocode_filters), &.{
+        arg("BUNDLE", "Geocoding bundle directory"), arg("TEXT", "Free text query").withRequired(false),
+    });
+    _ = try command(geocode_cmd, "suggest", "Match an unfinished geocoding query", suggestGeocode, &geocode_filters, &.{
+        arg("BUNDLE", "Geocoding bundle directory"), arg("TEXT", "Text typed so far"),
+    });
     _ = try command(geocode_cmd, "postcode", "Look up postcode centroids and extents", lookupGeocodePostcodes, &.{
         option("timeout", "Time limit for bundle verification and lookup", .string),
     }, &.{
@@ -451,6 +461,8 @@ fn workerCount(ctx: *Context) !?usize {
 
 fn benchmark(ctx: *Context) !u8 {
     const target = ctx.getArgument(0).?;
+    if (std.mem.eql(u8, ctx.getOption("autocomplete") orelse "false", "true"))
+        return benchmarkAutocomplete(ctx, target);
     if (std.mem.eql(u8, ctx.getOption("compare") orelse "false", "true")) {
         const other = ctx.getArgument(1) orelse return badOption(ctx, "--compare requires two JSON files");
         try bench.compareFiles(std.heap.c_allocator, target, other, ctx.wantsJson());
@@ -478,6 +490,26 @@ fn benchmark(ctx: *Context) !u8 {
         .commit = ctx.getOption("commit") orelse "",
         .label = ctx.getOption("label") orelse "",
     }, ctx.getOption("endpoint") orelse "/route", ctx.getOption("out"), ctx.wantsJson());
+    return 0;
+}
+
+fn benchmarkAutocomplete(ctx: *Context, path: []const u8) !u8 {
+    if (ctx.getArgument(1) != null or std.mem.eql(u8, ctx.getOption("compare") orelse "false", "true"))
+        return badOption(ctx, "--autocomplete expects one bundle argument");
+    if (ctx.getOption("rate") != null or ctx.getOption("endpoint") != null or ctx.getOption("connections") != null)
+        return badOption(ctx, "--autocomplete uses local workers with --threads");
+    var opts: bench_autocomplete.Options = .{
+        .dataset = ctx.getOption("dataset") orelse "",
+        .commit = ctx.getOption("commit") orelse build_options.commit,
+        .label = ctx.getOption("label") orelse "",
+        .measure_counters = std.mem.eql(u8, ctx.getOption("counters") orelse "false", "true"),
+    };
+    opts.threads = (try workerCount(ctx)) orelse opts.threads;
+    opts.duration_ns = (try duration(ctx, "duration")) orelse opts.duration_ns;
+    opts.warmup_ns = (try duration(ctx, "warmup")) orelse opts.warmup_ns;
+    opts.timeout_ns = (try duration(ctx, "timeout")) orelse opts.timeout_ns;
+    opts.requests = try unsigned(ctx, u64, "requests");
+    try bench_autocomplete.run(App.from(ctx).arena, path, ctx.getOption("corpus"), opts, ctx.getOption("out"));
     return 0;
 }
 
@@ -758,21 +790,7 @@ fn searchGeocode(ctx: *Context) !u8 {
         break :text .{ .free = value };
     } else if (has_fields) .{ .structured = structured } else return badOption(ctx, "provide query text or structured fields");
 
-    var filters: geocode.Filters = .{ .language = ctx.getOption("language") orelse "" };
-    if (ctx.getOption("near")) |raw| {
-        const point = geocodeNumbers(2, raw) catch return badOption(ctx, "--near expects longitude,latitude");
-        filters.near = .init(point[0], point[1]);
-    }
-    if (ctx.getOption("bbox")) |raw| {
-        const box = geocodeNumbers(4, raw) catch return badOption(ctx, "--bbox expects west,south,east,north");
-        filters.bounds = .{ .west = box[0], .south = box[1], .east = box[2], .north = box[3] };
-    }
-    const layers = ctx.getOptionValues("layer");
-    if (layers.len != 0) {
-        filters.layers = .empty;
-        for (layers) |name| filters.layers.insert(std.meta.stringToEnum(geocode.Layer, name) orelse
-            return badOption(ctx, "--layer expects place, street, address or poi"));
-    }
+    const filters = try geocodeFilters(ctx);
     const limit = (try unsigned(ctx, usize, "limit")) orelse 10;
     const deadline: io.Deadline = if (try duration(ctx, "timeout")) |ns| .fromNow(ns) else .none;
     var engine = try geocode.Engine.open(std.heap.page_allocator, ctx.getArgument(0).?, deadline);
@@ -785,6 +803,40 @@ fn searchGeocode(ctx: *Context) !u8 {
     }, deadline);
     try ctx.writeJson(found);
     return 0;
+}
+
+fn suggestGeocode(ctx: *Context) !u8 {
+    const filters = try geocodeFilters(ctx);
+    const limit = (try unsigned(ctx, usize, "limit")) orelse 10;
+    const deadline: io.Deadline = if (try duration(ctx, "timeout")) |ns| .fromNow(ns) else .none;
+    var engine = try routing.geocode.autocomplete.Engine.open(std.heap.page_allocator, ctx.getArgument(0).?, deadline);
+    defer engine.close();
+    const found = try engine.suggest(App.from(ctx).arena, .{
+        .text = ctx.getArgument(1).?,
+        .filters = filters,
+        .limit = limit,
+    }, deadline);
+    try ctx.writeJson(found);
+    return 0;
+}
+
+fn geocodeFilters(ctx: *Context) !routing.geocode.query.Filters {
+    var filters: routing.geocode.query.Filters = .{ .language = ctx.getOption("language") orelse "" };
+    if (ctx.getOption("near")) |raw| {
+        const point = geocodeNumbers(2, raw) catch return badOption(ctx, "--near expects longitude,latitude");
+        filters.near = .init(point[0], point[1]);
+    }
+    if (ctx.getOption("bbox")) |raw| {
+        const box = geocodeNumbers(4, raw) catch return badOption(ctx, "--bbox expects west,south,east,north");
+        filters.bounds = .{ .west = box[0], .south = box[1], .east = box[2], .north = box[3] };
+    }
+    const layers = ctx.getOptionValues("layer");
+    if (layers.len != 0) {
+        filters.layers = .empty;
+        for (layers) |name| filters.layers.insert(std.meta.stringToEnum(routing.geocode.query.Layer, name) orelse
+            return badOption(ctx, "--layer expects place, street, address or poi"));
+    }
+    return filters;
 }
 
 fn geocodeNumbers(comptime count: usize, text: []const u8) ![count]f64 {

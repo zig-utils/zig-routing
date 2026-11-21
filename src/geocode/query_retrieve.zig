@@ -30,7 +30,7 @@ pub const weights = struct {
     pub const max_layer = 18;
 };
 
-fn fieldWeight(term: parse.Term, field: format.Field) ?u16 {
+pub fn fieldWeight(term: parse.Term, field: format.Field) ?u16 {
     if (term.field) |required| return if (required == field) weights.structured else null;
     return switch (field) {
         .name => weights.name,
@@ -85,28 +85,50 @@ const Stream = struct {
     fn advance(self: *Stream, target: u64, data: bundle.Data, counts: format.RecordCounts, deadline: io.Deadline) !void {
         while (self.current) |hit| {
             if (hit.order() >= target) return;
-            if (deadline.expired()) return error.DeadlineExceeded;
             const ordinal = self.cursor.ordinal;
-            if (ordinal % postings.checkpoint_stride == 0 and self.cursor.list.count - ordinal > postings.checkpoint_stride) {
-                // Compare the next restart before paying to decode the current group.
-                var probe = self.*;
-                try probe.cursor.seek(ordinal + postings.checkpoint_stride);
-                try probe.step(data, counts);
-                if (probe.current.?.order() <= target) {
-                    self.* = probe;
-                    continue;
-                }
+            if (ordinal % postings.checkpoint_stride == 0) {
+                if (deadline.expired()) return error.DeadlineExceeded;
+                if (try self.jump(target, data, counts)) continue;
             }
             try self.step(data, counts);
         }
+    }
+
+    fn jump(self: *Stream, target: u64, data: bundle.Data, counts: format.RecordCounts) !bool {
+        const stride = postings.checkpoint_stride;
+        // Skip the current group when the following restart still precedes
+        // the target. The binary search then avoids every intermediate group.
+        var low = self.cursor.ordinal / stride + 1;
+        var high = (self.cursor.list.count - 1) / stride + 1;
+        if (low >= high) return false;
+        var best = try self.probe(low * stride, data, counts);
+        if (best.current.?.order() > target) return false;
+        while (low + 1 < high) {
+            const middle = low + (high - low) / 2;
+            const tested = try self.probe(middle * stride, data, counts);
+            if (tested.current.?.order() <= target) {
+                best = tested;
+                low = middle;
+            } else high = middle;
+        }
+        self.* = best;
+        return true;
+    }
+
+    fn probe(self: Stream, ordinal: u32, data: bundle.Data, counts: format.RecordCounts) !Stream {
+        var probe_stream = self;
+        try probe_stream.cursor.seek(ordinal);
+        try probe_stream.step(data, counts);
+        return probe_stream;
     }
 };
 
 pub const Clause = struct {
     streams: std.ArrayList(Stream) = .empty,
     max_strength: u16 = 0,
+    size: u64 = 0,
 
-    fn add(self: *Clause, a: Allocator, list: postings.List, strength: u16) !void {
+    pub fn add(self: *Clause, a: Allocator, list: postings.List, strength: u16) !void {
         // Alternate spellings can reach the same term. Keep its best score.
         for (self.streams.items) |*stream| {
             if (stream.cursor.list.bytes.ptr == list.bytes.ptr) {
@@ -115,8 +137,17 @@ pub const Clause = struct {
                 return;
             }
         }
+        try self.append(a, list, strength);
+    }
+
+    fn append(self: *Clause, a: Allocator, list: postings.List, strength: u16) !void {
         try self.streams.append(a, .{ .cursor = list.iterator(), .strength = strength });
         self.max_strength = @max(self.max_strength, strength);
+        self.size += list.count;
+    }
+
+    pub fn smaller(_: void, a: Clause, b: Clause) bool {
+        return a.size < b.size;
     }
 
     fn first(self: Clause) ?Hit {
@@ -155,6 +186,20 @@ pub fn exact(
         }
     }
     return clause;
+}
+
+pub fn addPrefix(
+    a: Allocator,
+    clause: *Clause,
+    view: index.View,
+    field: format.Field,
+    text: []const u8,
+    strength: u16,
+    scratch: []u8,
+    deadline: io.Deadline,
+) !void {
+    var cursor = try view.prefix(field, text, scratch, deadline);
+    while (try cursor.next(deadline)) |term| try clause.append(a, term.list, strength);
 }
 
 fn addExact(
@@ -209,6 +254,7 @@ pub const Intersection = struct {
     data: bundle.Data,
     counts: format.RecordCounts,
     previous: ?Hit = null,
+    checks: u8 = 0,
 
     pub fn start(self: *Intersection, deadline: io.Deadline) !void {
         for (self.clauses) |clause| for (clause.streams.items) |*stream| {
@@ -224,7 +270,8 @@ pub const Intersection = struct {
         if (self.clauses.len == 0) return null;
         var target: u64 = if (self.previous) |prior| prior.order() + 1 else 0;
         while (true) {
-            if (deadline.expired()) return error.DeadlineExceeded;
+            if (self.checks % 64 == 0 and deadline.expired()) return error.DeadlineExceeded;
+            self.checks +%= 1;
             const before = target;
             for (self.clauses) |clause| {
                 for (clause.streams.items) |*stream| try stream.advance(target, self.data, self.counts, deadline);
@@ -241,3 +288,41 @@ pub const Intersection = struct {
         }
     }
 };
+
+test "intersection jumps to sparse hits across importance-ordered restart groups" {
+    const t = std.testing;
+    const a = t.allocator;
+    var places: [512]model.Place = undefined;
+    for (&places, 0..) |*place, i| {
+        place.* = .{ .kind = .{}, .record = .{
+            .osm_id = @intCast(i),
+            .coordinate = .{ .lng = 0, .lat = 0 },
+            .attr = .{ .source = .node, .importance = if (i % 2 == 1) 7 else 3 },
+        } };
+    }
+    const data: bundle.Data = .{ .places = &places };
+    const counts: format.RecordCounts = .{ .place = places.len };
+    var all: std.ArrayList(u8) = .empty;
+    defer all.deinit(a);
+    var writer = try postings.Writer.init(a, &all, places.len);
+    for (0..2) |pass| for (0..places.len / 2) |i| {
+        try writer.append(@intCast(i * 2 + 1 - pass));
+    };
+    const expected = [_]format.RecordId{ 125, 491, 260, 500 };
+    var sparse: std.ArrayList(u8) = .empty;
+    defer sparse.deinit(a);
+    var sparse_writer = try postings.Writer.init(a, &sparse, expected.len);
+    for (expected) |id| try sparse_writer.append(id);
+    var clauses: [2]Clause = @splat(.{});
+    defer for (&clauses) |*clause| clause.streams.deinit(a);
+    try clauses[0].add(a, try postings.List.init(try sparse_writer.finish(), expected.len), 10);
+    try clauses[1].add(a, try postings.List.init(try writer.finish(), places.len), 50);
+    var matches: Intersection = .{ .clauses = &clauses, .data = data, .counts = counts };
+    try matches.start(.none);
+    for (expected) |id| {
+        const match = (try matches.next(.none)).?;
+        try t.expectEqual(id, match.hit.id);
+        try t.expectEqual(60, match.text_score);
+    }
+    try t.expectEqual(null, try matches.next(.none));
+}

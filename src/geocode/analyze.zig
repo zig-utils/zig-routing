@@ -17,6 +17,7 @@ pub const Kind = lexicon.Kind;
 pub const Options = struct {
     language: Language = .und,
     country: Country = .unknown,
+    prefix_last: bool = false,
 
     pub fn forIso(iso: []const u8) Options {
         const country = Country.fromIso(iso);
@@ -36,7 +37,8 @@ pub const Token = extern struct {
     latin: Span = .{},
     attr: packed struct(u32) {
         kind: Kind,
-        reserved: u24 = 0,
+        prefix: bool = false,
+        reserved: u23 = 0,
     },
 };
 
@@ -87,6 +89,12 @@ pub const Scratch = struct {
             if (group == .separator) {
                 offset += scalar.len;
                 continue;
+            }
+            if (options.prefix_last and try wordEnd(folded, offset + scalar.len, group, deadline) == folded.len) {
+                const kind: Kind = if (scalar.cp >= '0' and scalar.cp <= '9') .house_number else .word;
+                try self.emitWord(allocator, folded[offset..], kind, deadline);
+                self.tokens.items[self.tokens.items.len - 1].attr.prefix = true;
+                break;
             }
             if (scalar.cp < 0x80 and options.country != .unknown) {
                 if (try postal.match(options.country, folded[offset..], self.tokens.items.len == 0, deadline)) |code| {
@@ -387,4 +395,23 @@ test "word classes expansions and aliases share one result" {
     try t.expectEqualStrings("한글", worlds.text(worlds.tokens[5]));
     try t.expectError(error.InvalidUtf8, scratch.analyze(a, "a\xff", .{}, .none));
     try t.expectError(error.DeadlineExceeded, scratch.analyze(a, "valid", .{}, .fromNow(0)));
+}
+
+test "autocomplete preserves an unfinished token and expands completed tokens" {
+    const t = std.testing;
+    const a = t.allocator;
+    var scratch: Scratch = .{};
+    defer scratch.deinit(a);
+    const opts: Options = .{ .language = .en, .country = .us, .prefix_last = true };
+    const partial = try scratch.analyze(a, "12 N Main St", opts, .none);
+    try t.expectEqual(4, partial.tokens.len);
+    try t.expectEqualStrings("north", partial.text(partial.tokens[1]));
+    try t.expectEqualStrings("st", partial.text(partial.tokens[3]));
+    try t.expect(partial.tokens[3].attr.prefix);
+    const complete = try scratch.analyze(a, "12 N Main St ", opts, .none);
+    try t.expectEqualStrings("street", complete.text(complete.tokens[3]));
+    try t.expect(!complete.tokens[3].attr.prefix);
+    const unicode_prefix = try scratch.analyze(a, "Αθήνα Μό", opts, .none);
+    try t.expectEqualStrings("mo", unicode_prefix.latin(unicode_prefix.tokens[1]));
+    try t.expect(unicode_prefix.tokens[1].attr.prefix);
 }

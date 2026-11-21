@@ -38,10 +38,14 @@ const CountryAlias = struct {
     terms: []const parse.Term,
 };
 
-const Hypothesis = struct {
-    terms: []const parse.Term,
+pub const Scope = struct {
     country: model.AdminId = .unknown,
     country_score: u32 = 0,
+};
+
+const Hypothesis = struct {
+    terms: []const parse.Term,
+    scope: Scope = .{},
 };
 
 pub const Engine = struct {
@@ -104,11 +108,7 @@ pub const Engine = struct {
     /// Allocations and formatted display strings live in the request arena.
     /// The other result strings borrow the opened bundle.
     pub fn search(self: *const Engine, arena: Allocator, request: Request, deadline: io.Deadline) ![]Result {
-        if (deadline.expired()) return error.DeadlineExceeded;
-        if (request.limit == 0 or request.limit > max_results) return error.InvalidGeocodeResultLimit;
-        if (request.filters.language.len > 63) return error.InvalidGeocodeLanguage;
-        if (request.filters.near) |point| if (!point.inRange()) return error.InvalidGeocodeBiasPoint;
-        if (request.filters.bounds) |bounds| if (!bounds.valid()) return error.InvalidGeocodeBounds;
+        try validate(request.filters, request.limit, deadline);
         try parse.checkText(request.text);
         if (request.filters.layers.count() == 0) return &.{};
         var analyzer: analysis.Scratch = .{};
@@ -124,7 +124,7 @@ pub const Engine = struct {
             clauses.* = try arena.alloc(retrieve.Clause, hypothesis.terms.len);
             for (hypothesis.terms, clauses.*) |term, *clause|
                 clause.* = try retrieve.exact(arena, self.index.view, term, scratch, deadline);
-            try self.evaluate(hypothesis, clauses.*, request.filters, &top, deadline);
+            try self.collect(hypothesis.scope, clauses.*, request.filters, &top, deadline);
         }
         if (top.len == 0 and request.typos) {
             for (hypotheses, prepared[0..hypotheses.len]) |hypothesis, clauses| {
@@ -137,19 +137,18 @@ pub const Engine = struct {
                         try retrieve.addEdits(arena, clause, self.index.view, term, scratch, deadline);
                     }
                 }
-                if (!all_found) try self.evaluate(hypothesis, clauses, request.filters, &top, deadline);
+                if (!all_found) try self.collect(hypothesis.scope, clauses, request.filters, &top, deadline);
                 if (top.len != 0) continue;
                 for (hypothesis.terms, clauses, had_exact[0..clauses.len]) |term, *clause, had|
                     if (had) try retrieve.addEdits(arena, clause, self.index.view, term, scratch, deadline);
-                try self.evaluate(hypothesis, clauses, request.filters, &top, deadline);
+                try self.collect(hypothesis.scope, clauses, request.filters, &top, deadline);
             }
         }
-        const results = try arena.alloc(Result, top.len);
-        for (top.entries[0..top.len], results) |candidate, *result| {
-            if (deadline.expired()) return error.DeadlineExceeded;
-            result.* = try rank.assemble(arena, self.bundle.data, candidate, request.filters.language, deadline);
-        }
-        return results;
+        return rank.assembleAll(arena, self.bundle.data, top, request.filters.language, deadline);
+    }
+
+    pub fn defaultIso(self: *const Engine) []const u8 {
+        return if (self.regions.len == 1) self.regions[0].iso else "";
     }
 
     fn interpret(
@@ -160,13 +159,13 @@ pub const Engine = struct {
         out: *[2]Hypothesis,
         deadline: io.Deadline,
     ) ![]const Hypothesis {
-        const default_iso = if (self.regions.len == 1) self.regions[0].iso else "";
+        const default_iso = self.defaultIso();
         switch (request.text) {
             .structured => |fields| {
                 const region = if (fields.country.len == 0) Region{ .id = .unknown, .iso = default_iso } else (try self.resolveCountry(a, fields.country, scratch, deadline) orelse return out[0..0]);
                 out[0] = .{
                     .terms = try parse.parse(a, request.text, options(request.filters.language, region.iso), region.iso, scratch, deadline),
-                    .country = region.id,
+                    .scope = .{ .country = region.id },
                 };
                 return out[0..1];
             },
@@ -177,14 +176,14 @@ pub const Engine = struct {
                         const locale = options(request.filters.language, region.iso);
                         out[0] = .{
                             .terms = try parse.parse(a, .{ .free = value[0..comma] }, locale, region.iso, scratch, deadline),
-                            .country = region.id,
+                            .scope = .{ .country = region.id },
                         };
                         if (std.ascii.eqlIgnoreCase(suffix, region.iso)) return out[0..1];
                         // Country names such as Luxembourg can also be cities.
                         // Keep the city-qualified interpretation inside that country.
                         const full = try parse.parse(a, request.text, locale, region.iso, scratch, deadline);
-                        out[0].country_score = @as(u32, @intCast(full.len -| out[0].terms.len)) * retrieve.weights.city;
-                        out[1] = .{ .terms = full, .country = region.id };
+                        out[0].scope.country_score = @as(u32, @intCast(full.len -| out[0].terms.len)) * retrieve.weights.city;
+                        out[1] = .{ .terms = full, .scope = .{ .country = region.id } };
                         return out[0..2];
                     }
                 }
@@ -199,8 +198,10 @@ pub const Engine = struct {
                     consumed = alias.terms.len;
                     out[1] = .{
                         .terms = terms[0..remaining],
-                        .country = alias.region.id,
-                        .country_score = @as(u32, @intCast(consumed)) * retrieve.weights.city,
+                        .scope = .{
+                            .country = alias.region.id,
+                            .country_score = @as(u32, @intCast(consumed)) * retrieve.weights.city,
+                        },
                     };
                 }
                 return out[0..if (consumed == 0) 1 else 2];
@@ -222,9 +223,9 @@ pub const Engine = struct {
         return null;
     }
 
-    fn evaluate(
+    pub fn collect(
         self: *const Engine,
-        hypothesis: Hypothesis,
+        scope: Scope,
         clauses: []retrieve.Clause,
         filters: Filters,
         top: *rank.Top,
@@ -233,19 +234,19 @@ pub const Engine = struct {
         const data = self.bundle.data;
         const counts = self.index.view.header.records;
         if (clauses.len == 0) {
-            if (hypothesis.country == .unknown) return;
+            if (scope.country == .unknown) return;
             for (0..counts.total()) |i| {
                 if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
                 const id: format.RecordId = @intCast(i);
                 const document = counts.document(id).?;
                 const source = retrieve.record(data, document);
                 const hit: retrieve.Hit = .{ .id = id, .importance = source.attr.importance };
-                if (try rank.evaluate(data, counts, hit, hypothesis.country_score, hypothesis.country, filters, deadline)) |candidate|
+                if (try rank.evaluate(data, counts, hit, scope.country_score, scope.country, filters, deadline)) |candidate|
                     top.add(candidate);
             }
             return;
         }
-        var upper: u32 = hypothesis.country_score + rank.maxBonus(filters);
+        var upper: u32 = scope.country_score + rank.maxBonus(filters);
         for (clauses) |clause| {
             if (clause.streams.items.len == 0) return;
             upper += clause.max_strength;
@@ -254,13 +255,21 @@ pub const Engine = struct {
         try matches.start(deadline);
         while (try matches.next(deadline)) |match| {
             if (!top.canImprove(upper + rank.importance(match.hit.importance))) return;
-            if (try rank.evaluate(data, counts, match.hit, match.text_score + hypothesis.country_score, hypothesis.country, filters, deadline)) |candidate|
+            if (try rank.evaluate(data, counts, match.hit, match.text_score + scope.country_score, scope.country, filters, deadline)) |candidate|
                 top.add(candidate);
         }
     }
 };
 
-fn options(language: []const u8, iso: []const u8) analysis.Options {
+pub fn validate(filters: Filters, limit: usize, deadline: io.Deadline) !void {
+    if (deadline.expired()) return error.DeadlineExceeded;
+    if (limit == 0 or limit > max_results) return error.InvalidGeocodeResultLimit;
+    if (filters.language.len > 63) return error.InvalidGeocodeLanguage;
+    if (filters.near) |point| if (!point.inRange()) return error.InvalidGeocodeBiasPoint;
+    if (filters.bounds) |bounds| if (!bounds.valid()) return error.InvalidGeocodeBounds;
+}
+
+pub fn options(language: []const u8, iso: []const u8) analysis.Options {
     var locale = analysis.Options.forIso(iso);
     const requested = analysis.Language.fromTag(language);
     if (requested != .und) locale.language = requested;

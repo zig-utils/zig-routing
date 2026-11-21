@@ -504,8 +504,9 @@ fn fuzzGeocodeAnalysis(_: void, s: *Smith) !void {
     const bytes = draw(s, &input, 0x616e616c);
     if (bytes.len < 2) return;
     const options: analyzer.Options = .{
-        .language = std.enums.values(analyzer.Language)[bytes[0] % std.enums.values(analyzer.Language).len],
+        .language = std.enums.values(analyzer.Language)[(bytes[0] & 0x7f) % std.enums.values(analyzer.Language).len],
         .country = std.enums.values(analyzer.Country)[bytes[1] % std.enums.values(analyzer.Country).len],
+        .prefix_last = bytes[0] & 0x80 != 0,
     };
     const a = std.testing.allocator;
     var scratch: analyzer.Scratch = .{};
@@ -514,12 +515,13 @@ fn fuzzGeocodeAnalysis(_: void, s: *Smith) !void {
         error.InvalidUtf8 => return,
         else => return err,
     };
-    for (result.tokens) |token| {
+    for (result.tokens, 0..) |token, i| {
         const text = try token.text.get(result.bytes);
         const latin = try token.latin.get(result.bytes);
         try std.testing.expect(text.len != 0 and std.unicode.utf8ValidateSlice(text));
         for (latin) |byte| try std.testing.expect(std.ascii.isAscii(byte));
         try std.testing.expectEqual(0, token.attr.reserved);
+        if (token.attr.prefix) try std.testing.expect(options.prefix_last and i + 1 == result.tokens.len);
     }
 }
 
@@ -533,6 +535,8 @@ test "fuzz geocode-analysis" {
         "\x00\x00" ++ "Αθήνα Москва 東京タワー 한글",
         "\x00\x00\xf0\x80",
         "\x01\x03" ++ "London SW1A 2AA",
+        "\x81\x01" ++ "12 Main St",
+        "\x80\x00" ++ "Αθήνα Μο",
     };
     try std.testing.fuzz({}, fuzzGeocodeAnalysis, .{ .corpus = try seeds(arena.allocator(), inputs) });
 }

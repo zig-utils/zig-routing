@@ -58,7 +58,7 @@ pub const Ranked = struct {
     document: format.Document,
     score: u32,
 
-    fn before(self: Ranked, other: Ranked) bool {
+    pub fn before(self: Ranked, other: Ranked) bool {
         if (self.score != other.score) return self.score > other.score;
         if (self.hit.importance != other.hit.importance) return self.hit.importance > other.hit.importance;
         return self.hit.id < other.hit.id;
@@ -100,6 +100,10 @@ pub fn maxBonus(filters: Filters) u32 {
         @as(u32, if (filters.language.len != 0) weights.language else 0);
 }
 
+pub fn nearBonus(distance: f64) u32 {
+    return @intFromFloat(weights.near / (1.0 + distance / weights.near_scale_m));
+}
+
 pub fn evaluate(
     data: bundle.Data,
     counts: format.RecordCounts,
@@ -116,7 +120,7 @@ pub fn evaluate(
     const point = feature.coordinate.toPoint();
     if (filters.bounds) |bounds| if (!bounds.contains(point)) return null;
     var score = text_score + importance(hit.importance) + weights.layers[@backingInt(document.kind)];
-    if (filters.near) |near| score += @intFromFloat(weights.near / (1.0 + near.distance(point) / weights.near_scale_m));
+    if (filters.near) |near| score += nearBonus(near.distance(point));
     if (filters.language.len != 0 and (try selectName(data, feature.names, filters.language, deadline)).preferred)
         score += weights.language;
     return .{ .hit = hit, .document = document, .score = score };
@@ -131,14 +135,13 @@ fn selectName(data: bundle.Data, span: model.Span, language: []const u8, deadlin
     const base = baseLanguage(language);
     var fallback: []const u8 = "";
     var localized: []const u8 = "";
-    for (try span.get(data.names)) |label| {
-        if (deadline.expired()) return error.DeadlineExceeded;
-        const text = try label.text.get(data.text);
+    for (try span.get(data.names), 0..) |label, i| {
+        if (i % 32 == 0 and deadline.expired()) return error.DeadlineExceeded;
+        if (fallback.len == 0 or label.language.len == 0) fallback = try label.text.get(data.text);
+        if (label.language.len == 0 or language.len == 0) continue;
         const tag = try label.language.get(data.text);
-        if (fallback.len == 0 or tag.len == 0) fallback = text;
-        if (tag.len == 0 or language.len == 0) continue;
-        if (std.ascii.eqlIgnoreCase(language, tag)) return .{ .text = text, .preferred = true };
-        if (localized.len == 0 and std.ascii.eqlIgnoreCase(base, baseLanguage(tag))) localized = text;
+        if (std.ascii.eqlIgnoreCase(language, tag)) return .{ .text = try label.text.get(data.text), .preferred = true };
+        if (localized.len == 0 and std.ascii.eqlIgnoreCase(base, baseLanguage(tag))) localized = try label.text.get(data.text);
     }
     return if (localized.len != 0) .{ .text = localized, .preferred = true } else .{ .text = fallback };
 }
@@ -150,6 +153,15 @@ fn baseLanguage(tag: []const u8) []const u8 {
 fn adminName(data: bundle.Data, id: model.AdminId, language: []const u8, deadline: io.Deadline) ![]const u8 {
     const admin = try data.admin(id) orelse return "";
     return (try selectName(data, admin.names, language, deadline)).text;
+}
+
+pub fn assembleAll(a: Allocator, data: bundle.Data, top: Top, language: []const u8, deadline: io.Deadline) ![]Result {
+    const results = try a.alloc(Result, top.len);
+    for (top.entries[0..top.len], results) |candidate, *result| {
+        if (deadline.expired()) return error.DeadlineExceeded;
+        result.* = try assemble(a, data, candidate, language, deadline);
+    }
+    return results;
 }
 
 pub fn assemble(a: Allocator, data: bundle.Data, candidate: Ranked, language: []const u8, deadline: io.Deadline) !Result {

@@ -201,6 +201,31 @@ test "geocode bundle keeps multilingual labels and merges streets by municipalit
     try testing.expectEqual(1, trailing_country.len);
     try testing.expectEqual(104, trailing_country[0].osm_id);
     try testing.expectError(error.DeadlineExceeded, engine.search(request_memory, .{ .text = .{ .free = "West" } }, .fromNow(0)));
+
+    var autocomplete = try geocode.autocomplete.Engine.open(a, output, .none);
+    defer autocomplete.close();
+    var counted = routing.infra.arena.CountingAllocator.init(a);
+    var typing = routing.infra.arena.Arena.init(counted.allocator(), .{});
+    defer typing.deinit();
+    const pass: []const []const u8 = &.{ "M", "Ma", "Main St", "Main Stre" };
+    for (0..2) |round| {
+        counted.resetCounts();
+        for (pass) |prefix| {
+            typing.reset();
+            const suggestions = try autocomplete.suggest(typing.allocator(), .{ .text = prefix, .filters = street_filter }, .none);
+            try testing.expectEqual(2, suggestions.len);
+            try testing.expectEqual(104, suggestions[0].osm_id);
+            try testing.expectEqual(106, suggestions[1].osm_id);
+        }
+        if (round == 1) try testing.expectEqual(0, counted.calls());
+    }
+    const near_prefix = try autocomplete.suggest(request_memory, .{ .text = "Ma", .filters = near_east }, .none);
+    try testing.expectEqual(106, near_prefix[0].osm_id);
+    const unfinished_first = try autocomplete.suggest(request_memory, .{ .text = "Mai Street", .filters = street_filter }, .none);
+    try testing.expectEqual(0, unfinished_first.len);
+    const french_prefix = try autocomplete.suggest(request_memory, .{ .text = "Ou", .filters = .{ .language = "fr" } }, .none);
+    try testing.expectEqualStrings("Ouest", french_prefix[0].name);
+    try testing.expectError(error.DeadlineExceeded, autocomplete.suggest(request_memory, .{ .text = "Ma" }, .fromNow(0)));
 }
 
 fn addressTags(allocator: std.mem.Allocator, number: []const u8) !gurka.Tags {
