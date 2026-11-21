@@ -121,6 +121,40 @@
     ]
   },
   {
+    "key": "P9.05b",
+    "goal": "Keep exact scheduled routing within the production request arena on the shared Brockton graph.",
+    "upstream": ["src/thor/multimodal_transit.cc", "valhalla/sif/edgelabel.h"],
+    "scope": [
+      "Profile the request arena for fixed-cut cases 9, 35 and 46",
+      "Reduce dominant label, queue or state storage while preserving feasible departures, nondominated labels and the exact weighted objective",
+      "Replay the full seeded corpus with the existing cancellation and warm-arena checks"
+    ],
+    "out_of_scope": ["Arena cap increases", "Changes to the P9.05 itinerary threshold"],
+    "accept": [
+      "All 100 fixed-cut Brockton requests complete within the existing production arena",
+      "The 97 successful baseline routes retain their minimum cost and the overtaking fixture selects the cheaper departure",
+      "Before and after peak request memory and cancellation overrun are reported",
+      "Warmed search uses zero backing allocator calls and zig build test is green"
+    ]
+  },
+  {
+    "key": "P9.05c",
+    "goal": "Identify fixed-cut itinerary differences caused by costing, feasibility or stock search decisions.",
+    "upstream": ["src/thor/multimodal_transit.cc", "src/sif/transitcost.cc", "src/baldr/graphtile.cc"],
+    "scope": [
+      "Reprice both returned paths with Valhalla costing, shared graph records and exact departure instants",
+      "Verify moves and transfers and identify the first remaining costing or feasibility difference",
+      "Reproduce stock departure or label decisions that miss verified cheaper routes"
+    ],
+    "out_of_scope": ["Changes to the P9.05 stock match threshold", "Shipping the oracle"],
+    "accept": [
+      "Every discrepancy in the 100-request corpus has two verified costs or a diagnosed first difference",
+      "The report records the stock match rate, verified cheaper routes and ties, and native misses",
+      "At least one real case and the overtaking fixture explain a stock search decision",
+      "Native regressions and the oracle replay pass"
+    ]
+  },
+  {
     "key": "P9.06",
     "goal": "Transit maneuvers and instructions in every locale, and transit info in the Valhalla and OSRM serializers, so multimodal responses are complete.",
     "upstream": ["src/odin/maneuversbuilder.cc", "src/odin/narrativebuilder.cc", "src/tyr/route_serializer_valhalla.cc", "locales/"],
