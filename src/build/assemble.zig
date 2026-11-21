@@ -2228,6 +2228,7 @@ const ElevationJob = struct {
         };
         defer tiles.deinit();
         var sampler: dem.hgt.Sampler = .{ .tiles = &tiles };
+        defer sampler.deinit();
         try self.emit(&sampler);
     }
 

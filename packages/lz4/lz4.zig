@@ -325,13 +325,29 @@ pub const DecodeResult = struct {
     consumed: usize,
 };
 
+const NoDeadline = struct {
+    inline fn expired(_: NoDeadline) bool {
+        return false;
+    }
+};
+
 /// Decompresses every frame in `src` (concatenated frames and skippable
 /// frames are supported) into `dst`. Verifies block and content checksums
 /// when present.
 pub fn decompressFrames(src: []const u8, dst: []u8) Error!DecodeResult {
+    return decompressFramesUntil(src, dst, NoDeadline{}) catch |err| switch (err) {
+        error.DeadlineExceeded => unreachable,
+        else => |decode_error| decode_error,
+    };
+}
+
+/// Checks the deadline between bounded frame blocks. The caller owns `dst`
+/// and must discard its partial output on error.
+pub fn decompressFramesUntil(src: []const u8, dst: []u8, deadline: anytype) (Error || error{DeadlineExceeded})!DecodeResult {
     var ip: usize = 0;
     var op: usize = 0;
     while (ip < src.len) {
+        if (deadline.expired()) return error.DeadlineExceeded;
         if (src.len - ip < 4) return error.Truncated;
         const magic = std.mem.readInt(u32, src[ip..][0..4], .little);
         if (magic & skippable_magic_mask == skippable_magic) {
@@ -341,7 +357,7 @@ pub fn decompressFrames(src: []const u8, dst: []u8) Error!DecodeResult {
             ip += 8 + len;
             continue;
         }
-        const r = try decompressFrame(src[ip..], dst[op..]);
+        const r = try decompressFrameUntil(src[ip..], dst[op..], deadline);
         ip += r.consumed;
         op += r.written;
     }
@@ -350,10 +366,18 @@ pub fn decompressFrames(src: []const u8, dst: []u8) Error!DecodeResult {
 
 /// Decompresses the single frame at the start of `src` into `dst`.
 pub fn decompressFrame(src: []const u8, dst: []u8) Error!DecodeResult {
+    return decompressFrameUntil(src, dst, NoDeadline{}) catch |err| switch (err) {
+        error.DeadlineExceeded => unreachable,
+        else => |decode_error| decode_error,
+    };
+}
+
+fn decompressFrameUntil(src: []const u8, dst: []u8, deadline: anytype) (Error || error{DeadlineExceeded})!DecodeResult {
     const info = try readFrameHeader(src);
     var ip = info.header_len;
     var op: usize = 0;
     while (true) {
+        if (deadline.expired()) return error.DeadlineExceeded;
         if (src.len - ip < 4) return error.Truncated;
         const word = std.mem.readInt(u32, src[ip..][0..4], .little);
         ip += 4;
@@ -521,6 +545,26 @@ test "decompresses frames made by the reference lz4 tool" {
     try expectFrame(@embedFile("fixtures/hgt_rows.default.lz4"), fixtures.hgt_rows);
     try expectFrame(@embedFile("fixtures/hgt_rows.b5_nocrc.lz4"), fixtures.hgt_rows);
     try expectFrame(@embedFile("fixtures/empty.default.lz4"), fixtures.empty);
+}
+
+test "deadline interrupts a frame between blocks" {
+    const block_len = 64 * 1024;
+    const z = try compressAlloc(testing.allocator, fixtures.text, .{ .block_max_code = 4 });
+    defer testing.allocator.free(z);
+    const out = try testing.allocator.alloc(u8, fixtures.text.len);
+    defer testing.allocator.free(out);
+    const Deadline = struct {
+        remaining_checks: usize = 2,
+
+        fn expired(self: *@This()) bool {
+            if (self.remaining_checks == 0) return true;
+            self.remaining_checks -= 1;
+            return false;
+        }
+    };
+    var deadline: Deadline = .{};
+    try testing.expectError(error.DeadlineExceeded, decompressFramesUntil(z, out, &deadline));
+    try testing.expectEqualSlices(u8, fixtures.text[0..block_len], out[0..block_len]);
 }
 
 test "frame header is parsed and checked" {

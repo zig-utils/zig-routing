@@ -111,7 +111,7 @@ const HeightSink = struct {
             try self.ranges.append(self.arena, range);
         }
         try self.points.append(self.arena, point);
-        try self.heights.append(self.arena, self.sampler.get(point));
+        try self.heights.append(self.arena, try self.sampler.getUntil(point, self.deadline));
     }
 };
 
@@ -131,6 +131,7 @@ fn sampleResampled(limits: service.Limits, deadline: io.Deadline, source: dem.So
         .max_shape = limits.skadi_max_shape,
         .with_range = options.range,
     };
+    defer sink.sampler.deinit();
     geo.line.visitResampledSpherical(points, distance, false, &sink) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.DeadlineExceeded => return timedOut(res),
@@ -364,7 +365,8 @@ test "bulk /height reaches no allocator after warm-up" {
     elevation.mkdir(dir);
     defer elevation.rmTree(dir);
     try elevation.writeTile(gpa, dir, "N47E008.hgt.lz4", .lz4);
-    var tiles = try elevation.Tiles.init(gpa, dir);
+    var tiles_backing = arena_mod.CountingAllocator.init(gpa);
+    var tiles = try elevation.Tiles.init(tiles_backing.allocator(), dir);
     defer tiles.deinit();
     var source: dem.Source = .{ .tiles = &tiles };
     var svc: service.Service = .{ .state = &source };
@@ -396,7 +398,10 @@ test "bulk /height reaches no allocator after warm-up" {
         "{\"encoded_polyline\":\"_lmhH_a~p@_ibE_ibE\",\"range\":true}",
         "{\"shape\":[{\"lat\":47.2,\"lon\":8.3},{\"lat\":47.25,\"lon\":8.35}],\"resample_distance\":40,\"height_precision\":2}",
     };
+    try testing.expect(source.get(.{ .lng = 8.3, .lat = 47.2 }) != elevation.no_data_value);
+    tiles_backing.resetCounts();
     try arena_mod.expectNoSteadyStateAlloc(SteadyState, .{ .svc = &svc, .bodies = &bodies }, SteadyState.run);
+    try testing.expectEqual(@as(usize, 0), tiles_backing.calls());
 
     var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();

@@ -48,15 +48,17 @@ pub const Source = union(enum) {
 
     pub fn getAllBatchedUntil(self: Source, scratch: Allocator, pts: []const PointLL, out: []f64, deadline: io.Deadline) (Allocator.Error || error{DeadlineExceeded})!void {
         const n = pts.len;
-        if (n < 64) {
-            if (deadline.expired()) return error.DeadlineExceeded;
-            return self.getAll(pts, out);
-        }
         if (self == .tiles) {
+            if (n < 64) return hgt.getAllUntil(self.tiles, pts, out, deadline);
             var cursor: hgt.Sampler = .{ .tiles = self.tiles };
+            defer cursor.deinit();
             return hgt.sampleAll(&cursor, pts, out, deadline);
         }
         const pack = self.pack;
+        if (n < 64) {
+            if (deadline.expired()) return error.DeadlineExceeded;
+            return pack.getAll(pts, out);
+        }
         var changes: usize = 0;
         var prev: u64 = std.math.maxInt(u64);
         for (pts, 0..) |p, i| {
@@ -94,9 +96,17 @@ pub const Sampler = union(enum) {
     tiles: hgt.Sampler,
     pack: @"packed".Sampler,
 
+    pub fn deinit(self: *Sampler) void {
+        if (self.* == .tiles) self.tiles.deinit();
+    }
+
     pub fn get(self: *Sampler, point: PointLL) f64 {
+        return self.getUntil(point, .none) catch unreachable;
+    }
+
+    pub fn getUntil(self: *Sampler, point: PointLL, deadline: io.Deadline) error{DeadlineExceeded}!f64 {
         return switch (self.*) {
-            .tiles => |*tiles| tiles.get(point),
+            .tiles => |*tiles| tiles.getUntil(point, deadline),
             .pack => |*pack| pack.get(point),
         };
     }

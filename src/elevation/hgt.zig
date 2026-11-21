@@ -87,22 +87,41 @@ pub fn parseName(path: []const u8) ?ParsedName {
 const Slot = struct {
     format: Format = .unknown,
     map: ?io.Mapping = null,
-    /// Decompressed samples for gzip/lz4 tiles (owned).
-    unpacked: ?[]align(2) u8 = null,
-    /// LRU stamp for unpacked tiles.
-    used_at: u64 = 0,
+    cached: ?u8 = null,
     failed: bool = false,
 };
 
+const CacheEntry = struct {
+    tile: ?u32 = null,
+    buffer: ?[]align(2) u8 = null,
+    used_at: u64 = 0,
+    readers: usize = 0,
+    loading: bool = false,
+};
+
+/// Keep the sample bytes valid until deinit. A raw mapping needs no cache pin.
+pub const Lease = struct {
+    data: []const u8,
+    pin: ?struct { tiles: *Tiles, entry: u8 } = null,
+
+    pub fn deinit(self: *Lease) void {
+        if (self.pin) |pin| pin.tiles.release(pin.entry);
+        self.* = undefined;
+    }
+};
+
 /// Index of the tiles under a data directory, with lazy decompression.
-/// Thread-safe: lookups of raw tiles take no lock; decompression of a
-/// compressed tile is serialized by a mutex.
+/// Raw lookups take no lock. A mutex protects cache entries and their leases,
+/// and one reader at a time fills each missing compressed tile.
 pub const Tiles = struct {
     gpa: Allocator,
     slots: []Slot,
-    mutex: std.atomic.Mutex = .unlocked,
+    mutex: io.Mutex = .{},
+    changed: std.atomic.Value(u32) = .init(0),
+    waiters: usize = 0,
+    cache: [unpacked_tiles_max]CacheEntry = @splat(.{}),
+    cache_capacity: u8 = unpacked_tiles_max,
     clock: u64 = 0,
-    unpacked_count: usize = 0,
     count: usize = 0,
     owns_mappings: bool = true,
 
@@ -152,7 +171,7 @@ pub const Tiles = struct {
     pub fn borrowMappings(self: *const Tiles, gpa: Allocator, deadline: io.Deadline) !Tiles {
         const slots = try gpa.alloc(Slot, self.slots.len);
         errdefer gpa.free(slots);
-        for (slots, self.slots, 0..) |*out, slot, i| {
+        for (slots, self.slots, 0..) |*out, *slot, i| {
             if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
             out.* = .{ .format = slot.format, .map = slot.map };
         }
@@ -162,7 +181,7 @@ pub const Tiles = struct {
     pub fn fingerprint(self: *const Tiles, deadline: io.Deadline) ![32]u8 {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("zr-hgt-v1");
-        for (self.slots, 0..) |slot, i| {
+        for (self.slots, 0..) |*slot, i| {
             if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
             const map = slot.map orelse continue;
             var header: [13]u8 = undefined;
@@ -194,10 +213,13 @@ pub const Tiles = struct {
     }
 
     pub fn deinit(self: *Tiles) void {
-        for (self.slots) |*s| {
-            if (self.owns_mappings) if (s.map) |m| m.unmap();
-            if (s.unpacked) |u| self.gpa.free(u);
+        for (&self.cache) |*entry| {
+            std.debug.assert(!entry.loading and entry.readers == 0);
+            if (entry.buffer) |buf| self.gpa.free(buf);
         }
+        if (self.owns_mappings) for (self.slots) |*slot| {
+            if (slot.map) |m| m.unmap();
+        };
         self.gpa.free(self.slots);
     }
 
@@ -237,6 +259,11 @@ pub const Tiles = struct {
     /// without touching the shared cache, so callers can decode tiles in
     /// parallel. False when the tile is absent or does not decode.
     pub fn readTile(self: *const Tiles, index: u32, out: []u8) bool {
+        return self.readTileUntil(index, out, .none) catch unreachable;
+    }
+
+    fn readTileUntil(self: *const Tiles, index: u32, out: []u8, deadline: io.Deadline) error{DeadlineExceeded}!bool {
+        if (deadline.expired()) return error.DeadlineExceeded;
         if (index >= tile_count or out.len != hgt_bytes) return false;
         const slot = &self.slots[index];
         return switch (slot.format) {
@@ -245,9 +272,12 @@ pub const Tiles = struct {
                 @memcpy(out, slot.map.?.bytes);
                 break :blk true;
             },
-            .gzip => inflateGzip(slot.map.?.bytes, out),
+            .gzip => inflateGzip(slot.map.?.bytes, out, deadline),
             .lz4 => blk: {
-                const r = lz4.decompressFrames(slot.map.?.bytes, out) catch break :blk false;
+                const r = lz4.decompressFramesUntil(slot.map.?.bytes, out, deadline) catch |err| switch (err) {
+                    error.DeadlineExceeded => return error.DeadlineExceeded,
+                    else => break :blk false,
+                };
                 break :blk r.written == hgt_bytes;
             },
         };
@@ -256,71 +286,128 @@ pub const Tiles = struct {
     /// Indices of the tiles found, ascending.
     pub fn indices(self: *const Tiles, gpa: Allocator) Allocator.Error![]u32 {
         var list: std.ArrayList(u32) = .empty;
-        for (self.slots, 0..) |s, i| if (s.format != .unknown) try list.append(gpa, @intCast(i));
+        for (self.slots, 0..) |*s, i| if (s.format != .unknown) try list.append(gpa, @intCast(i));
         return list.toOwnedSlice(gpa);
     }
 
-    /// Samples of a tile as big-endian int16 bytes, or null without data.
-    pub fn samples(self: *Tiles, index: u32) ?[]const u8 {
+    /// Borrow a tile's big-endian int16 bytes, or return null without data.
+    pub fn acquire(self: *Tiles, index: u32, deadline: io.Deadline) error{DeadlineExceeded}!?Lease {
         if (index >= tile_count) return null;
         const slot = &self.slots[index];
-        switch (slot.format) {
-            .unknown => return null,
-            .raw => return slot.map.?.bytes,
-            .gzip, .lz4 => {},
-        }
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
-        defer self.mutex.unlock();
-        self.clock += 1;
-        if (slot.unpacked) |u| {
-            slot.used_at = self.clock;
-            return u;
-        }
-        if (slot.failed) return null;
-        const buf = self.takeBuffer() orelse return null;
-        const ok = switch (slot.format) {
-            .gzip => inflateGzip(slot.map.?.bytes, buf),
-            .lz4 => blk: {
-                const r = lz4.decompressFrames(slot.map.?.bytes, buf) catch break :blk false;
-                break :blk r.written == hgt_bytes;
-            },
-            else => unreachable,
+        return switch (slot.format) {
+            .unknown => null,
+            .raw => .{ .data = slot.map.?.bytes },
+            .gzip, .lz4 => self.acquireCompressed(index, slot, deadline),
         };
-        if (!ok) {
-            self.gpa.free(buf);
-            self.unpacked_count -= 1;
-            slot.failed = true;
-            return null;
-        }
-        slot.unpacked = buf;
-        slot.used_at = self.clock;
-        return buf;
     }
 
-    /// A buffer for one unpacked tile: a new one under the limit, otherwise
-    /// the least recently used tile's.
-    fn takeBuffer(self: *Tiles) ?[]align(2) u8 {
-        if (self.unpacked_count < unpacked_tiles_max) {
-            const buf = self.gpa.alignedAlloc(u8, .@"2", hgt_bytes) catch return null;
-            self.unpacked_count += 1;
-            return buf;
+    noinline fn acquireCompressed(self: *Tiles, index: u32, slot: *Slot, deadline: io.Deadline) error{DeadlineExceeded}!?Lease {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (true) {
+            if (deadline.expired()) return error.DeadlineExceeded;
+            if (slot.failed) return null;
+            if (slot.cached) |entry| {
+                if (!self.cache[entry].loading) return self.pin(entry);
+            } else if (self.reusableEntry()) |entry| {
+                return self.load(index, slot, entry, deadline);
+            }
+            self.waitForChange(deadline);
         }
-        var oldest: ?*Slot = null;
-        for (self.slots) |*s| if (s.unpacked != null and (oldest == null or s.used_at < oldest.?.used_at)) {
-            oldest = s;
-        };
-        const victim = oldest orelse return null;
-        const buf = victim.unpacked.?;
-        victim.unpacked = null;
-        return buf;
+    }
+
+    /// Called with the cache locked. The entry stays reserved while decoding.
+    fn load(self: *Tiles, index: u32, slot: *Slot, entry_index: u8, deadline: io.Deadline) error{DeadlineExceeded}!?Lease {
+        const entry = &self.cache[entry_index];
+        const buf = entry.buffer orelse self.gpa.alignedAlloc(u8, .@"2", hgt_bytes) catch return null;
+        if (entry.tile) |previous| self.slots[previous].cached = null;
+        entry.* = .{ .tile = index, .buffer = buf, .loading = true };
+        slot.cached = entry_index;
+        self.mutex.unlock();
+        const decoded = self.readTileUntil(index, buf, deadline);
+        self.mutex.lock();
+        entry.loading = false;
+        defer self.notifyWaiters();
+        if (decoded catch false) {
+            if (deadline.expired()) return error.DeadlineExceeded;
+            return self.pin(entry_index);
+        }
+        slot.cached = null;
+        entry.tile = null;
+        _ = try decoded; // A deadline leaves the tile eligible for another load.
+        slot.failed = true;
+        return null;
+    }
+
+    fn pin(self: *Tiles, entry_index: u8) Lease {
+        const entry = &self.cache[entry_index];
+        self.clock += 1;
+        entry.used_at = self.clock;
+        entry.readers += 1;
+        return .{ .data = entry.buffer.?, .pin = .{ .tiles = self, .entry = entry_index } };
+    }
+
+    noinline fn release(self: *Tiles, entry_index: u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const entry = &self.cache[entry_index];
+        entry.readers -= 1;
+        if (entry.readers == 0) self.notifyWaiters();
+    }
+
+    fn reusableEntry(self: *const Tiles) ?u8 {
+        var oldest: ?u8 = null;
+        for (self.cache[0..self.cache_capacity], 0..) |*entry, i| {
+            if (entry.tile == null) return @intCast(i);
+            if (entry.loading or entry.readers != 0) continue;
+            if (oldest == null or entry.used_at < self.cache[oldest.?].used_at) oldest = @intCast(i);
+        }
+        return oldest;
+    }
+
+    fn waitForChange(self: *Tiles, deadline: io.Deadline) void {
+        self.waiters += 1;
+        const previous = self.changed.load(.monotonic);
+        self.mutex.unlock();
+        io.waitAtomic(&self.changed, previous, deadline);
+        self.mutex.lock();
+        self.waiters -= 1;
+    }
+
+    fn notifyWaiters(self: *Tiles) void {
+        if (self.waiters == 0) return;
+        _ = self.changed.fetchAdd(1, .release);
+        io.wakeAtomic(&self.changed);
     }
 };
 
-fn inflateGzip(src: []const u8, dst: []u8) bool {
-    var in: std.Io.Reader = .fixed(src);
+fn inflateGzip(src: []const u8, dst: []u8, deadline: io.Deadline) error{DeadlineExceeded}!bool {
+    const Input = struct {
+        remaining: []const u8,
+        deadline: io.Deadline,
+
+        pub fn read(self: *@This(), out: []u8) error{DeadlineExceeded}!usize {
+            if (self.deadline.expired()) return error.DeadlineExceeded;
+            const len = @min(self.remaining.len, out.len);
+            @memcpy(out[0..len], self.remaining[0..len]);
+            self.remaining = self.remaining[len..];
+            return len;
+        }
+    };
+    var input_buffer: [16 * 1024]u8 = undefined;
+    var input = io.BufferedReader(Input).init(.{ .remaining = src, .deadline = deadline }, &input_buffer);
     var window: [std.compress.flate.max_window_len]u8 = undefined;
-    var d = std.compress.flate.Decompress.init(&in, .gzip, &window);
-    d.reader.readSliceAll(dst) catch return false;
+    var d = std.compress.flate.Decompress.init(&input.interface, .gzip, &window);
+    var rest = dst;
+    while (rest.len != 0) {
+        if (deadline.expired()) return error.DeadlineExceeded;
+        const len = @min(rest.len, 256 * 1024);
+        d.reader.readSliceAll(rest[0..len]) catch {
+            if (input.failure != null) return error.DeadlineExceeded;
+            return false;
+        };
+        rest = rest[len..];
+    }
     return true;
 }
 
@@ -441,27 +528,42 @@ fn scalarBatch(src: anytype, points: *const [batch_width]GridPosition) [batch_wi
 pub const Sampler = struct {
     tiles: *Tiles,
     index: u32 = std.math.maxInt(u32),
-    data: ?[]const u8 = null,
+    lease: ?Lease = null,
+
+    pub fn deinit(self: *Sampler) void {
+        if (self.lease) |*lease| lease.deinit();
+        self.lease = null;
+        self.index = std.math.maxInt(u32);
+    }
 
     pub fn select(self: *Sampler, index: u32) bool {
+        return self.selectUntil(index, .none) catch unreachable;
+    }
+
+    pub fn selectUntil(self: *Sampler, index: u32, deadline: io.Deadline) error{DeadlineExceeded}!bool {
         if (index != self.index) {
+            self.deinit();
+            self.lease = try self.tiles.acquire(index, deadline);
             self.index = index;
-            self.data = self.tiles.samples(index);
         }
-        return self.data != null;
+        return self.lease != null;
     }
 
     pub fn sample(self: *const Sampler, p: GridPosition) f64 {
-        return interpolate(self.data.?, p.u, p.v);
+        return interpolate(self.lease.?.data, p.u, p.v);
     }
 
     pub fn sampleBatch(self: *const Sampler, points: *const [batch_width]GridPosition) [batch_width]f64 {
-        return interpolateBatch(BigEndianPosts{ .data = self.data.? }, points);
+        return interpolateBatch(BigEndianPosts{ .data = self.lease.?.data }, points);
     }
 
     pub fn get(self: *Sampler, point: PointLL) f64 {
+        return self.getUntil(point, .none) catch unreachable;
+    }
+
+    pub fn getUntil(self: *Sampler, point: PointLL, deadline: io.Deadline) error{DeadlineExceeded}!f64 {
         const p = GridPosition.at(point);
-        return if (self.select(p.tile)) self.sample(p) else no_data_value;
+        return if (try self.selectUntil(p.tile, deadline)) self.sample(p) else no_data_value;
     }
 };
 
@@ -475,7 +577,10 @@ pub fn sampleAll(sampler: anytype, pts: []const PointLL, out: []f64, deadline: i
             next_check = i + 1024;
         }
         const first = GridPosition.at(pts[i]);
-        const available = sampler.select(first.tile);
+        const available = if (comptime @hasDecl(@TypeOf(sampler.*), "selectUntil"))
+            try sampler.selectUntil(first.tile, deadline)
+        else
+            sampler.select(first.tile);
         var positions: [batch_width]GridPosition = undefined;
         positions[0] = first;
         var n: usize = 1;
@@ -497,34 +602,25 @@ pub fn sampleAll(sampler: anytype, pts: []const PointLL, out: []f64, deadline: i
 
 /// Elevation at a point (skadi `sample::get`), or `no_data_value`.
 pub fn get(tiles: *Tiles, p: PointLL) f64 {
-    const index = tileIndex(p);
-    const data = tiles.samples(index) orelse return no_data_value;
-    const lon = @floor(p.lng);
-    const lat = @floor(p.lat);
-    const u = (p.lng - lon) * (hgt_dim - 1);
-    const v = (1.0 - (p.lat - lat)) * (hgt_dim - 1);
-    return interpolate(data, u, v);
+    var sampler: Sampler = .{ .tiles = tiles };
+    defer sampler.deinit();
+    return sampler.get(p);
 }
 
 /// Elevations of many points (skadi `sample::get_all`), written to `out`.
-/// Consecutive points in the same tile reuse its sample pointer.
+/// Consecutive points in the same tile reuse its lease.
 pub fn getAll(tiles: *Tiles, pts: []const PointLL, out: []f64) void {
+    getAllUntil(tiles, pts, out, .none) catch unreachable;
+}
+
+pub fn getAllUntil(tiles: *Tiles, pts: []const PointLL, out: []f64, deadline: io.Deadline) error{DeadlineExceeded}!void {
     std.debug.assert(out.len >= pts.len);
-    var cur_index: u32 = std.math.maxInt(u32);
-    var cur: ?[]const u8 = null;
-    for (pts, out[0..pts.len]) |p, *o| {
-        const index = tileIndex(p);
-        if (index != cur_index) {
-            cur_index = index;
-            cur = tiles.samples(index);
-        }
-        const data = cur orelse {
-            o.* = no_data_value;
-            continue;
-        };
-        const lon = @floor(p.lng);
-        const lat = @floor(p.lat);
-        o.* = interpolate(data, (p.lng - lon) * (hgt_dim - 1), (1.0 - (p.lat - lat)) * (hgt_dim - 1));
+    if (deadline.expired()) return error.DeadlineExceeded;
+    var sampler: Sampler = .{ .tiles = tiles };
+    defer sampler.deinit();
+    for (pts, out[0..pts.len], 0..) |p, *o, i| {
+        if (i != 0 and i & 1023 == 0 and deadline.expired()) return error.DeadlineExceeded;
+        o.* = try sampler.getUntil(p, deadline);
     }
 }
 
@@ -648,6 +744,101 @@ test "sampling raw and lz4 tiles, no-data handling and edges" {
     try testing.expectEqual(no_data_value, out[2]);
 }
 
+test "compressed tile leases survive eviction and bound the full cache" {
+    const gpa = testing.allocator;
+    var dir_buf: [256]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "/tmp/zig-routing-hgt-lease-{d}", .{std.c.getpid()});
+    mkdir(dir);
+    defer rmTree(dir);
+
+    const raw = try gpa.alloc(u8, hgt_bytes);
+    defer gpa.free(raw);
+    for ([_][]const u8{ "N47E008", "N47E009", "N47E010" }, 1..) |name, value| {
+        @memset(raw, @intCast(value));
+        const encoded = try lz4.compressAlloc(gpa, raw, .{});
+        defer gpa.free(encoded);
+        var path_buf: [512]u8 = undefined;
+        try io.writeFile(try std.fmt.bufPrint(&path_buf, "{s}/{s}.hgt.lz4", .{ dir, name }), encoded);
+    }
+
+    var counting = @import("../infra/arena.zig").CountingAllocator.init(gpa);
+    var tiles = try Tiles.init(counting.allocator(), dir);
+    defer tiles.deinit();
+    tiles.cache_capacity = 2;
+    const catalog_bytes = counting.bytes_live;
+    const a = tileIndexAt(8, 47);
+    const b = tileIndexAt(9, 47);
+    const c = tileIndexAt(10, 47);
+
+    var reader: Sampler = .{ .tiles = &tiles };
+    defer reader.deinit();
+    try testing.expect(reader.select(a));
+    const position: GridPosition = .{ .tile = a, .u = 800, .v = 1600 };
+    try testing.expectEqual(257, reader.sample(position));
+    const other = struct {
+        fn sample(t: *Tiles, index: u32) f64 {
+            var cursor: Sampler = .{ .tiles = t };
+            defer cursor.deinit();
+            if (!(cursor.selectUntil(index, .fromNowMs(5000)) catch return no_data_value)) return no_data_value;
+            return cursor.sample(.{ .tile = index, .u = 800, .v = 1600 });
+        }
+
+        fn pressure(t: *Tiles, first: u32, next: u32, heights: *[2]f64) void {
+            heights.* = .{ sample(t, first), sample(t, next) };
+        }
+    };
+    var heights: [2]f64 = undefined;
+    const worker = try std.Thread.spawn(.{}, other.pressure, .{ &tiles, b, c, &heights });
+    worker.join();
+    try testing.expectEqual([2]f64{ 514, 771 }, heights);
+    try testing.expectEqual(null, tiles.slots[b].cached);
+    try testing.expectEqual(@as([batch_width]f64, @splat(257)), reader.sampleBatch(&@as([batch_width]GridPosition, @splat(position))));
+
+    var shared = (try tiles.acquire(a, .none)).?;
+    defer shared.deinit();
+    try testing.expectEqual(reader.lease.?.data.ptr, shared.data.ptr);
+    var held: Sampler = .{ .tiles = &tiles };
+    defer held.deinit();
+    try testing.expect(held.select(c));
+    try testing.expectError(error.DeadlineExceeded, tiles.acquire(b, .fromNowMs(15)));
+    try testing.expectEqual(771, held.sample(.{ .tile = c, .u = position.u, .v = position.v }));
+
+    const Pending = struct {
+        tiles: *Tiles,
+        index: u32,
+        lease: ?Lease = null,
+
+        fn run(self: *@This()) void {
+            self.lease = self.tiles.acquire(self.index, .fromNowMs(5000)) catch null;
+        }
+    };
+    var pending: Pending = .{ .tiles = &tiles, .index = b };
+    const waiter = try std.Thread.spawn(.{}, Pending.run, .{&pending});
+    const wait_limit: io.Deadline = .fromNowMs(5000);
+    var waiting = false;
+    while (!wait_limit.expired()) {
+        tiles.mutex.lock();
+        waiting = tiles.waiters != 0;
+        tiles.mutex.unlock();
+        if (waiting) break;
+        io.sleepMs(1);
+    }
+    held.deinit();
+    const concurrent = tiles.acquire(b, .fromNowMs(5000));
+    waiter.join();
+    defer if (pending.lease) |*lease| lease.deinit();
+    var same = (try concurrent) orelse return error.TestUnexpectedResult;
+    defer same.deinit();
+    try testing.expect(waiting);
+    try testing.expectEqual(same.data.ptr, pending.lease.?.data.ptr);
+    try testing.expectEqual(514, interpolate(same.data, position.u, position.v));
+
+    reader.deinit();
+    try testing.expectEqual(257, interpolate(shared.data, position.u, position.v));
+    try testing.expectEqual(catalog_bytes + 2 * hgt_bytes, counting.bytes_peak);
+    try testing.expectEqual(@as(usize, 3), counting.allocs);
+}
+
 test "build catalog selects duplicate tiles deterministically and fingerprints contents" {
     const root = try io.Directory.open(".");
     defer root.close();
@@ -681,7 +872,9 @@ test "build catalog selects duplicate tiles deterministically and fingerprints c
     var first = try Tiles.initBuild(testing.allocator, &left.name, .none);
     defer first.deinit();
     try testing.expectEqual(@as(usize, 1), first.count);
-    try testing.expectEqualSlices(u8, &.{ 0, 1 }, first.samples(index).?[0..2]);
+    var first_lease = (try first.acquire(index, .none)).?;
+    defer first_lease.deinit();
+    try testing.expectEqualSlices(u8, &.{ 0, 1 }, first_lease.data[0..2]);
     const digest = try first.fingerprint(.none);
     {
         var second = try Tiles.initBuild(testing.allocator, &right.name, .none);
@@ -689,7 +882,9 @@ test "build catalog selects duplicate tiles deterministically and fingerprints c
         try testing.expectEqual(digest, try second.fingerprint(.none));
         var borrower = try second.borrowMappings(testing.allocator, .none);
         borrower.deinit();
-        try testing.expectEqualSlices(u8, &.{ 0, 1 }, second.samples(index).?[0..2]);
+        var second_lease = (try second.acquire(index, .none)).?;
+        defer second_lease.deinit();
+        try testing.expectEqualSlices(u8, &.{ 0, 1 }, second_lease.data[0..2]);
     }
     try Sparse.write(right.dir, name, 3);
     var changed = try Tiles.initBuild(testing.allocator, &right.name, .none);

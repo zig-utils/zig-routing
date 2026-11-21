@@ -162,7 +162,7 @@ pub const Work = struct {
 
             pub fn emit(sink: *const @This(), point: geo.PointLL) !void {
                 if (sink.work.heights.items.len % 256 == 0) try sink.check();
-                const height = if (sink.interpolate) no_data else sink.sampler.get(point);
+                const height = if (sink.interpolate) no_data else try sampleHeight(sink.sampler, point, sink.work.deadline);
                 try sink.work.heights.append(sink.work.allocator, height);
             }
         };
@@ -172,8 +172,8 @@ pub const Work = struct {
         const heights = self.heights.items;
 
         if (interpolate) {
-            const first = sampler.get(self.points.items[0]);
-            const last = sampler.get(self.points.items[self.points.items.len - 1]);
+            const first = try sampleHeight(sampler, self.points.items[0], self.deadline);
+            const last = try sampleHeight(sampler, self.points.items[self.points.items.len - 1], self.deadline);
             heights[0] = first;
             heights[heights.len - 1] = last;
             if (first != no_data and last != no_data) {
@@ -198,6 +198,15 @@ pub const Work = struct {
         if (self.deadline.expired()) return error.DeadlineExceeded;
     }
 };
+
+inline fn sampleHeight(sampler: anytype, point: geo.PointLL, deadline: io.Deadline) error{DeadlineExceeded}!f64 {
+    const Sampler = switch (@typeInfo(@TypeOf(sampler))) {
+        .pointer => |ptr| ptr.child,
+        else => @TypeOf(sampler),
+    };
+    if (comptime @hasDecl(Sampler, "getUntil")) return sampler.getUntil(point, deadline);
+    return sampler.get(point);
+}
 
 pub fn tileKey(first: geo.FixedLL) u32 {
     return @min(dem.hgt.tile_count, dem.hgt.tileIndex(first.toTilePoint()));
