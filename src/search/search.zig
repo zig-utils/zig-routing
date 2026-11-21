@@ -15,6 +15,7 @@ const paged = @import("paged.zig");
 const queue = @import("queue.zig");
 const endpoints = @import("endpoints.zig");
 const automaton = @import("../graph/restriction_automaton.zig");
+const compact = @import("compact_movements.zig");
 const EdgeId = graph.format.EdgeId;
 const EdgeHot = graph.format.EdgeHot;
 const EdgeClass = graph.class_table.EdgeClass;
@@ -221,6 +222,7 @@ pub const Transition = struct {
     edge_range: ?View.EdgeRange = null,
     incoming_class: ?*const EdgeClass = null,
     outgoing_class: ?*const EdgeClass = null,
+    compact_movement: ?compact.Movement = null,
 
     pub inline fn nodeRecord(self: Transition, view: *const View) !*const NodeHot {
         return self.node_record orelse try view.node(self.node);
@@ -481,7 +483,7 @@ pub const Restrictions = struct {
         else
             null;
         const allowed = if (self.linear_costs) |costs| costs.allows(id) else false;
-        return self.advanceKnown(context, previous, node, id, class, predecessor, allowed);
+        return self.advanceKnown(context, previous, node, id, class, predecessor, allowed, null);
     }
 
     fn hasRestrictions(self: *const Restrictions) bool {
@@ -489,13 +491,13 @@ pub const Restrictions = struct {
         return self.modes != 0 and (self.states.len != 0 or simple);
     }
 
-    inline fn advanceKnown(self: *const Restrictions, context: TurnContext, previous: Label, node: NodeId, id: EdgeId, class: *const EdgeClass, predecessor: ?EdgeId, allowed: bool) !TurnContext {
+    inline fn advanceKnown(self: *const Restrictions, context: TurnContext, previous: Label, node: NodeId, id: EdgeId, class: *const EdgeClass, predecessor: ?EdgeId, allowed: bool, prohibited_modes: ?u12) !TurnContext {
         if (class.flags.node_connector) {
             if (context.present()) return context;
             return if (predecessor != null) .{ .value = previous.edge, .alias = true } else .{};
         }
         if (predecessor) |prior| {
-            if (!allowed and self.simpleBlocked(prior, id)) return .forbidden;
+            if (!allowed and (if (prohibited_modes) |modes| modes & self.modes != 0 else self.simpleBlocked(prior, id))) return .forbidden;
         }
         if (self.states.len == 0) return .{};
         var parent = context.value;
@@ -855,6 +857,11 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             }
 
             const observer = if (comptime expanding and hasExpansionStages(@TypeOf(query.visitor))) query.visitor else {};
+            const layout = if (comptime expanding and compact.hasLayout(@TypeOf(query.visitor)))
+                query.visitor.movementLayout()
+            else {};
+            const compact_moves = @TypeOf(layout) != void;
+            if (compact_moves and layout.view != self.view) return error.InvalidMovementLayout;
             const profiled = @TypeOf(observer) != void;
             var popped: usize = 0;
             var settled: usize = 0;
@@ -892,7 +899,12 @@ pub fn Search(comptime K: type, comptime Q: type) type {
 
                 const previous_id = last.edgeId();
                 const previous_edge = &self.view.edges[last.edge];
-                const geometry = if (direction == .forward) previous_edge else try self.view.edge(try self.view.oppEdge(previous_id));
+                const geometry = if (direction == .forward)
+                    previous_edge
+                else if (compact_moves)
+                    &self.view.edges[@backingInt(layout.opposite[last.edge])]
+                else
+                    try self.view.edge(try self.view.oppEdge(previous_id));
                 const at: NodeId = @fromBackingInt(geometry.head);
                 const visits = expanding and @TypeOf(query.visitor) != void;
                 const time: graph.time_info.TimeInfo = if (timed_costs or (visits and query.timing.start.valid))
@@ -935,13 +947,19 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     break :dead_end geometry_class.flags.dead_end or (!expanding and exits.count() == 1);
                 };
                 const restrict = with_restrictions and tracker.hasRestrictions();
-                const restriction_predecessor = if (restrict) tracker.simplePredecessor(context, last, node) else null;
-                const forward_row = if (direction == .forward) try self.view.turnRowAt(node, exits.count(), geometry.cls.opp_local) else &.{};
+                const restriction_predecessor: ?EdgeId = if (restrict) tracker.simplePredecessor(context, last, node) else null;
+                const forward_row = if (direction == .forward and !compact_moves) try self.view.turnRowAt(node, exits.count(), geometry.cls.opp_local) else &.{};
+                const movement_offset = if (compact_moves) layout.node_offsets[@backingInt(at)] else 0;
                 for (self.view.edges[exits.first..exits.end], exits.first.., 0..) |*outward, index, local| {
                     if (profiled) observer.expansionStage(.successors);
                     if (partial_starts and last.flags & Label.forbid_uturn != 0 and local == geometry.cls.opp_local) continue;
                     const local_id: EdgeId = @fromBackingInt(@as(u32, @intCast(index)));
-                    const next_id = if (direction == .forward) local_id else try self.view.opposingId(outward);
+                    const next_id = if (direction == .forward)
+                        local_id
+                    else if (compact_moves)
+                        layout.opposite[index]
+                    else
+                        try self.view.opposingId(outward);
                     const next = if (direction == .forward) outward else try self.view.edge(next_id);
                     // A full traversal at this distance cannot improve a
                     // destination. A destination cut on the arc still can.
@@ -951,9 +969,16 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     const restrict_class = if (restrict) try self.view.class(next.cls.class_id) else null;
                     const feature = if (features) |costs| costs.get(next_id) else null;
                     const allowed = feature != null and feature.?.allow;
+                    const packed_move = if (compact_moves)
+                        if (direction == .forward)
+                            layout.get(movement_offset, exits.count(), geometry.cls.opp_local, @intCast(local))
+                        else
+                            layout.get(movement_offset, exits.count(), outward.cls.local, geometry.cls.opp_local)
+                    else {};
+                    const cached_modes: ?u12 = if (compact_moves and restriction_predecessor == @as(?EdgeId, previous_id)) packed_move.prohibited_modes else null;
                     if (profiled) observer.expansionStage(.restrictions);
                     const next_context: TurnContext = if (restrict)
-                        try tracker.advanceKnown(context, last, at, next_id, restrict_class.?, restriction_predecessor, allowed)
+                        try tracker.advanceKnown(context, last, at, next_id, restrict_class.?, restriction_predecessor, allowed, cached_modes)
                     else
                         .{};
                     if (with_restrictions and next_context.value == no_index) continue;
@@ -999,7 +1024,9 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                         if (!endpoint_access.allowed) continue;
                     }
                     const previous_access: base.AccessState = if (with_restrictions) last.accessState() else .{};
-                    const row = if (direction == .forward)
+                    const row = if (compact_moves)
+                        packed_move.row
+                    else if (direction == .forward)
                         forward_row[local]
                     else blk: {
                         const reverse_row = try self.view.turnRowAt(node, exits.count(), outward.cls.local);
@@ -1020,6 +1047,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                         .edge_range = exits,
                         .incoming_class = if (direction == .forward) previous_class else next_class,
                         .outgoing_class = if (direction == .forward) next_class else previous_class,
+                        .compact_movement = if (compact_moves) packed_move else null,
                     };
                     if (comptime @hasDecl(K, "allowedTurn")) {
                         if (!allowed and !try kernel.allowedTurn(self.view, movement, last, direction)) continue;

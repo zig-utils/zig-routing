@@ -163,6 +163,75 @@ four requests, that is about 50 ns per settled label including the
 queue, traversal and grid work. [#251](https://github.com/zig-utils/zig-routing/issues/251)
 keeps the original end-to-end gate.
 
+## Compact turn movements
+
+[#258](https://github.com/zig-utils/zig-routing/issues/258) tests an immutable
+layout with a 32-bit opposing edge ID per directed edge, a 32-bit matrix offset
+per junction, and a 32-bit word per local movement. The word holds the existing
+turn byte, side flags, simple restriction modes and motor turn geometry. The
+matrix is keyed by physical junction because the bundle can share identical
+turn rows across different junctions. Simple restrictions still resolve the
+actual predecessor across junction aliases. Conditional policy and clock
+evaluation run in the search.
+
+The pinned Zig ReleaseFast runners used CPU 0 in the same six-vCPU ARM64 Linux
+VM on an Apple M3 Pro. Eighteen trials per dataset rotated through all six
+orders of three configurations. The matched Utrecht trial included Valhalla
+3.9.3. The larger Luxembourg fixture used the same existing 475,336-edge
+bundle in all configurations and included a headings-only control.
+
+| Dataset and request | Settled / popped | Native base | Compact layout | Control |
+| --- | ---: | ---: | ---: | ---: |
+| Utrecht auto, 9.1 min | 41,128 / 42,301 | 10.883 ms | 10.263 ms | 11.038 ms |
+| Utrecht auto, two origins, 2 min | 40,436 / 41,631 | 10.660 ms | 10.023 ms | 10.472 ms |
+| Utrecht pedestrian, 12 min and 1.4 km | 35,503 / 35,984 | 6.919 ms | 6.968 ms | 7.296 ms |
+| Utrecht auto, reverse, 1 min | 26,322 / 27,168 | 7.134 ms | 6.740 ms | 7.139 ms |
+| **Utrecht median total per trial** | **143,389 / 147,084** | **36.054 ms** | **33.853 ms** | **35.857 ms** |
+| Luxembourg auto, 18 min | 198,072 / 200,835 | 160.353 ms | 67.661 ms | 69.068 ms |
+| Luxembourg auto, two origins, 12 min | 175,062 / 177,561 | 133.251 ms | 60.888 ms | 62.665 ms |
+| Luxembourg pedestrian, 18 min and 3 km | 130,003 / 132,836 | 29.508 ms | 29.716 ms | 29.533 ms |
+| Luxembourg auto, reverse, 14 min | 173,443 / 177,141 | 133.766 ms | 61.450 ms | 63.271 ms |
+| **Luxembourg median total per trial** | **676,580 / 688,373** | **457.304 ms** | **219.948 ms** | **224.812 ms** |
+
+Twelve separate pairs measured a traversal-only sweep and replayed its settled
+events through the same rasterizer. Both apply the same padded stopping rule.
+Recording happens outside the timed intervals. The split runs have their own
+cache state, so the sums can differ from the paired full runs.
+
+| Dataset | Layout | Full grid | Traversal | Raster replay |
+| --- | --- | ---: | ---: | ---: |
+| Utrecht | Base | 35.948 ms | 21.565 ms | 12.835 ms |
+| Utrecht | Compact | 34.632 ms | 19.842 ms | 12.836 ms |
+| Luxembourg | Base | 456.157 ms | 364.517 ms | 82.812 ms |
+| Luxembourg | Compact | 218.459 ms | 119.541 ms | 84.231 ms |
+
+| Fixture and layout | Construction median | Additional resident table bytes | Median process peak RSS |
+| --- | ---: | ---: | ---: |
+| Utrecht base | - | - | 19,791,872 |
+| Utrecht compact | 1.747 ms | 1,510,304 | 21,086,208 |
+| Luxembourg base | - | - | 69,861,376 |
+| Luxembourg headings only | 86.516 ms | 475,336 | 73,924,608 |
+| Luxembourg compact | 96.576 ms | 8,030,296 | 81,588,224 |
+
+The compact layout reduces Utrecht full time by 6.1%. On Luxembourg the
+headings-only control captures most of the improvement by computing each
+edge heading once. The full layout saves a further 2.2% there for another
+7,554,960 table bytes. Keep the layout as an opt-in benchmark. Utrecht's
+fivefold gate is 7.171 ms at this oracle median, below either isolated
+stage's current time.
+
+All eight grids and 819,969 settled label records match byte for byte, and
+the split replays reproduce the full grid bytes. Every warmed run makes
+zero backing allocator calls. The timed-access and multi-via fixtures also
+match in both directions. A separate full sweep of the small timed-turn
+fixture returns `OutOfMemory` in both runners. The bounded timed-turn tests
+compare the accepted movement and arrival cost with active and inactive
+conditions, including an advancing request clock.
+
+All 39 native test steps passed. The Linux x86-64 ReleaseFast binary is
+14,385,776 bytes, 568 bytes above the base, with five search instantiations
+and five costing kernels.
+
 ## Reproduction
 
 Set `mjolnir.hierarchy` and `mjolnir.shortcuts` to `false` in a Valhalla
@@ -221,3 +290,38 @@ taskset -c 0 ./bench-isochrone-new BUNDLE requests.jsonl new-grid.bin new-trace.
 cmp base-grid.bin new-grid.bin
 cmp base-trace.bin new-trace.bin
 ```
+
+### Movement layout reproduction
+
+Use the original Utrecht requests above. For Luxembourg, use the legacy
+187,650-node bundle in [the E1 pilot](E1.md). To rebuild it, use the pinned
+Luxembourg PBF from E1 with `zr build --output BUNDLE LUXEMBOURG.osm.pbf` at
+`8a82c29` and verify dataset ID `f32e9b177f9b82c38156e61eaf518b9c`.
+Save these four lines as `luxembourg.jsonl`.
+
+```jsonl
+{"costing":"auto","locations":[{"lat":49.61166,"lon":6.13193}],"contours":[{"time":18}]}
+{"costing":"auto","locations":[{"lat":49.60411,"lon":6.13489},{"lat":49.63014,"lon":6.17236}],"contours":[{"time":12}]}
+{"costing":"pedestrian","locations":[{"lat":49.60983,"lon":6.12984}],"contours":[{"time":18},{"distance":3}]}
+{"costing":"auto","locations":[{"lat":49.61971,"lon":6.10644}],"contours":[{"time":14}],"reverse":true}
+```
+
+Run the same executable with and without `--layout`. Use the pinned oracle
+as the third runner for Utrecht and `--headings-only` for Luxembourg. Run each
+of the six orders three times, with `/dev/null` for the grid and `--rss` for
+the native peak RSS. Layout construction time and resident table bytes go to
+stderr, outside request timing.
+
+```sh
+taskset -c 0 ./bench-isochrone BUNDLE requests.jsonl /dev/null --rss > base.tsv
+taskset -c 0 ./bench-isochrone BUNDLE requests.jsonl /dev/null --layout --rss > layout.tsv
+taskset -c 0 ./bench-isochrone LUX_BUNDLE luxembourg.jsonl /dev/null --headings-only --rss > headings.tsv
+```
+
+For stage timing, repeat the native pair twelve times, alternating the runner
+order and adding `--stages`. The TSV appends traversal and replay nanoseconds.
+Use separate runs with grid and trace paths for the byte comparisons.
+The timed-access and multi-via corpora use the first location in each pinned
+route replay for forward and the last for reverse. Use a six-minute contour
+and set `date_time_utc` to the fixture's route timestamp.
+[Build and import the restriction fixtures](../../oracle/README.md#timed-access-and-turn-restrictions).

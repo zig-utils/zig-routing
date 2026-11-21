@@ -8,6 +8,9 @@ const expansion = @import("expand.zig");
 const Candidate = @import("endpoints.zig").Candidate;
 const flags = @import("paged.zig");
 const queue = @import("queue.zig");
+const compact = @import("compact_movements.zig");
+pub const MovementLayout = compact.Layout;
+const hasPolicy = @import("../snap/edge.zig").hasPolicy;
 
 const Allocator = std.mem.Allocator;
 const View = graph.reader.View;
@@ -79,43 +82,8 @@ pub fn Isochrone(comptime K: type) type {
             errdefer grid.deinit();
             const scratch = arena.mark();
             defer arena.rewind(scratch);
-            const nodes = try a.alloc(NodeId, request.origins.len);
-            const groups = try a.alloc([]const Candidate, request.origins.len);
-            var node_count: usize = 0;
-            var group_count: usize = 0;
-            for (request.origins) |origin| {
-                try control.check();
-                switch (origin.seed) {
-                    .node => |node| {
-                        nodes[node_count] = node;
-                        node_count += 1;
-                    },
-                    .edges => |group| {
-                        if (group.len == 0) return error.NoCandidates;
-                        groups[group_count] = group;
-                        group_count += 1;
-                    },
-                }
-            }
-            var visitor: Rasterizer = .{
-                .view = self.view,
-                .allocator = a,
-                .direction = request.direction,
-                .control = control,
-                .grid = &grid,
-                .max_seconds = limits.seconds(),
-                .max_metres = limits.metres(),
-                .shape_interval = grid.tiles.tilesize * @as(f32, units.meters_per_degree_lat) * 0.25,
-                .settled_words = try settledWords(a, self.view.edges.len),
-            };
-            const sweep: expansion.Request = .{
-                .origins = nodes[0..node_count],
-                .partial_origins = groups[0..group_count],
-                .direction = request.direction,
-                .timing = request.timing,
-                .excluded = request.excluded,
-                .unit_size = request.unit_size,
-            };
+            const sweep = try prepareSweep(a, request, control);
+            var visitor = try Rasterizer.init(self.view, a, request.direction, &grid, limits, control);
             const stats = if (@TypeOf(observer) == void)
                 try self.engine.run(arena, kernel, sweep, &visitor, control)
             else blk: {
@@ -123,9 +91,14 @@ pub fn Isochrone(comptime K: type) type {
                     rasterizer: *Rasterizer,
                     observer: @TypeOf(observer),
 
-                    const profiled = @import("../snap/edge.zig").hasPolicy(@TypeOf(observer), "expansionStage");
+                    const profiled = hasPolicy(@TypeOf(observer), "expansionStage");
                     pub const expansionStage = if (profiled) stage else {};
                     pub const expansionSample = if (profiled) sample else {};
+                    pub const movementLayout = if (compact.hasLayout(@TypeOf(observer))) layout else {};
+
+                    fn layout(adapter: *@This()) *const MovementLayout {
+                        return adapter.observer.movementLayout();
+                    }
 
                     fn stage(adapter: *@This(), phase: core.ExpansionStage) void {
                         adapter.observer.expansionStage(phase);
@@ -145,8 +118,91 @@ pub fn Isochrone(comptime K: type) type {
             };
             return .{ .grid = grid, .stats = stats };
         }
+
+        /// Measure the exact bounded sweep independently of its grid writer.
+        pub fn runTraversal(self: *Self, arena: *memory.Arena, kernel: K, request: Request, observer: anytype, control: core.Control) !expansion.Stats {
+            try control.check();
+            if (request.mode == .multimodal) return error.UnsupportedMultimodalIsochrone;
+            const limits = try Limits.fromContours(request.contours, control);
+            const scratch = arena.mark();
+            defer arena.rewind(scratch);
+            const sweep = try prepareSweep(arena.allocator(), request, control);
+            const Traversal = struct {
+                bounds: Bounds,
+                observer: @TypeOf(observer),
+
+                pub const movementLayout = if (compact.hasLayout(@TypeOf(observer))) layout else {};
+
+                fn layout(adapter: *@This()) *const MovementLayout {
+                    return adapter.observer.movementLayout();
+                }
+
+                pub fn visit(adapter: *@This(), event: expansion.Visit) !expansion.Decision {
+                    if (@TypeOf(observer) != void) try adapter.observer.observe(event);
+                    return if (adapter.bounds.prunes(event.previous orelse .{})) .prune else .expand;
+                }
+            };
+            var visitor: Traversal = .{ .bounds = limits.bounds(), .observer = observer };
+            return self.engine.run(arena, kernel, sweep, &visitor, control);
+        }
     };
 }
+
+fn prepareSweep(a: Allocator, request: Request, control: core.Control) !expansion.Request {
+    const nodes = try a.alloc(NodeId, request.origins.len);
+    const groups = try a.alloc([]const Candidate, request.origins.len);
+    var node_count: usize = 0;
+    var group_count: usize = 0;
+    for (request.origins) |origin| {
+        try control.check();
+        switch (origin.seed) {
+            .node => |node| {
+                nodes[node_count] = node;
+                node_count += 1;
+            },
+            .edges => |group| {
+                if (group.len == 0) return error.NoCandidates;
+                groups[group_count] = group;
+                group_count += 1;
+            },
+        }
+    }
+    return .{
+        .origins = nodes[0..node_count],
+        .partial_origins = groups[0..group_count],
+        .direction = request.direction,
+        .timing = request.timing,
+        .excluded = request.excluded,
+        .unit_size = request.unit_size,
+    };
+}
+
+/// Paint recorded settled events in their original order.
+pub fn rasterize(view: *const View, arena: *memory.Arena, request: Request, events: []const expansion.Visit, control: core.Control) !Grid {
+    const a = arena.allocator();
+    const limits = try Limits.fromContours(request.contours, control);
+    var grid = try constructGrid(a, request, limits, control);
+    errdefer grid.deinit();
+    const scratch = arena.mark();
+    defer arena.rewind(scratch);
+    var painter = try Rasterizer.init(view, a, request.direction, &grid, limits, control);
+    for (events, 0..) |event, i| {
+        if (i % 1024 == 0) try control.check();
+        _ = try painter.visit(event);
+    }
+    return grid;
+}
+
+const Bounds = struct {
+    seconds: f32,
+    metres: f32,
+
+    fn prunes(self: Bounds, previous: core.Label) bool {
+        // Paint the last crossing edge from inside the padded limits. A
+        // mixed request continues while either metric can still contribute.
+        return previous.secs > self.seconds and @as(f32, @floatFromInt(previous.dist_m)) > self.metres;
+    }
+};
 
 const Limits = struct {
     minutes: ?f32 = null,
@@ -174,6 +230,10 @@ const Limits = struct {
 
     fn metres(self: Limits) f32 {
         return if (self.km) |value| value * units.meters_per_km else std.math.floatMin(f32);
+    }
+
+    fn bounds(self: Limits) Bounds {
+        return .{ .seconds = self.seconds(), .metres = self.metres() };
     }
 };
 
@@ -231,13 +291,25 @@ const Rasterizer = struct {
     direction: core.Direction,
     control: core.Control,
     grid: *Grid,
-    max_seconds: f32,
-    max_metres: f32,
+    bounds: Bounds,
     shape_interval: f32,
     settled_words: []u64,
     settled: flags.Array(u64, 0) = .{},
     vertices: std.ArrayList(Point) = .empty,
     samples: std.ArrayList(Point) = .empty,
+
+    fn init(view: *const View, a: Allocator, direction: core.Direction, grid: *Grid, limits: Limits, control: core.Control) !Rasterizer {
+        return .{
+            .view = view,
+            .allocator = a,
+            .direction = direction,
+            .control = control,
+            .grid = grid,
+            .bounds = limits.bounds(),
+            .shape_interval = grid.tiles.tilesize * @as(f32, units.meters_per_degree_lat) * 0.25,
+            .settled_words = try settledWords(a, view.edges.len),
+        };
+    }
 
     pub fn visit(self: *Rasterizer, event: expansion.Visit) !expansion.Decision {
         const edge = event.label.edgeId();
@@ -250,9 +322,7 @@ const Rasterizer = struct {
 
         const previous = event.previous orelse core.Label{};
         const start_metres: f32 = @floatFromInt(previous.dist_m);
-        // Paint the last crossing edge from inside the padded limits. A
-        // mixed request continues while either metric can still contribute.
-        if (previous.secs > self.max_seconds and start_metres > self.max_metres) return .prune;
+        if (self.bounds.prunes(previous)) return .prune;
         // Valhalla marks forward seeds as origin edges and reverse seeds
         // as ordinary opposing edges.
         const origin = self.direction == .forward and event.previous == null;

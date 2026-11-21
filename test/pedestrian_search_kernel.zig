@@ -51,8 +51,13 @@ pub const Foot = struct {
         const from = try movement.incomingClass(view);
         const to = try movement.outgoingClass(view);
         const node = try movement.nodeRecord(view);
-        const degree = (try movement.edgeRange(view)).count();
-        const turn = try pedestrian.Turn.fromRow(view, movement.node, node, degree, movement.incoming, movement.outgoing, movement.incoming_edge.cls.opp_local, movement.outgoing_edge.cls.local, movement.row);
+        const turn = if (movement.compact_movement) |cached|
+            try pedestrian.Turn.fromIntersection(view, node, movement.incoming, movement.outgoing, .{
+                .base_turn = .{ .row = cached.row },
+                .sides = cached.sides,
+            })
+        else
+            try pedestrian.Turn.fromRow(view, movement.node, node, (try movement.edgeRange(view)).count(), movement.incoming, movement.outgoing, movement.incoming_edge.cls.opp_local, movement.outgoing_edge.cls.local, movement.row);
         return pedestrian.Kernel.turnCost(self.profile, node, from, to, turn);
     }
 };

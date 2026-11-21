@@ -1634,6 +1634,8 @@ test "Gurka timed turn conditions switch the legal movement only within the wind
         try testing.expect(view.restriction_conditions != null);
         try testing.expectEqual(1, built.stats.simple_turns.resolved);
         try testing.expectEqual(0, built.stats.simple_turns.deferred);
+        const layout = try LayoutExpansionProbe.Layout.init(testing.allocator, view, .none);
+        defer layout.deinit(testing.allocator);
         const a = try at(view, fixture.findNode("A").?.location.toFixed());
         const finish = try at(view, fixture.findNode(if (only) "D" else "F").?.location.toFixed());
         const first = try directedBetween(view, &fixture, "A", "B");
@@ -1661,7 +1663,25 @@ test "Gurka timed turn conditions switch the legal movement only within the wind
                     else
                         &.{ "AB", "BC", "CF" };
                     try expectWayPath(view, &fixture, result, direction, path);
+                    const expected_cost = result.best().cost;
                     arena.reset();
+                    if (!invariant and request.timing.start.valid) {
+                        const forward = direction == .forward;
+                        const sweep: search.ExpansionRequest = .{
+                            .origins = &.{if (forward) a else finish},
+                            .direction = direction,
+                            .timing = request.timing,
+                            .limit = 128,
+                        };
+                        var probe: ExpansionProbe = .{ .target = if (forward) finish else a };
+                        const baseline = try engine.expand(&arena, .{}, sweep, &probe, .{});
+                        try testing.expectEqual(@as(?f32, expected_cost), probe.cost);
+                        arena.reset();
+                        var cached: LayoutExpansionProbe = .{ .layout = &layout, .probe = .{ .target = probe.target } };
+                        try testing.expectEqualDeep(baseline, try engine.expand(&arena, .{}, sweep, &cached, .{}));
+                        try testing.expectEqualDeep(probe, cached.probe);
+                        arena.reset();
+                    }
                     if (!only) {
                         const endpoints = routing.search.endpoints;
                         const options: endpoints.Options = .{ .costing = .auto, .direction = direction, .timing = request.timing };
@@ -2025,6 +2045,20 @@ const ExpansionProbe = struct {
     }
 };
 
+const LayoutExpansionProbe = struct {
+    const Layout = routing.search.isochrone.MovementLayout;
+    layout: *const Layout,
+    probe: ExpansionProbe,
+
+    pub fn movementLayout(self: *@This()) *const Layout {
+        return self.layout;
+    }
+
+    pub fn visit(self: *@This(), event: search.ExpansionVisit) !search.ExpansionDecision {
+        return self.probe.visit(event);
+    }
+};
+
 fn checkTimedDeadEnd(view: *const graph.reader.View, fixture: *const gurka.Map) !void {
     const tu = try directedBetween(view, fixture, "T", "U");
     const ut = try view.oppEdge(tu);
@@ -2035,6 +2069,8 @@ fn checkTimedDeadEnd(view: *const graph.reader.View, fixture: *const gurka.Map) 
     defer arena.deinit();
     var engine = try RestrictionSearch.init(testing.allocator, view);
     defer engine.deinit();
+    const layout = try LayoutExpansionProbe.Layout.init(testing.allocator, view, .none);
+    defer layout.deinit(testing.allocator);
     const origin = try at(view, fixture.findNode("R").?.location.toFixed());
     const destination = try at(view, fixture.findNode("U").?.location.toFixed());
     for ([_]search.Direction{ .forward, .reverse }) |direction| {
@@ -2046,8 +2082,12 @@ fn checkTimedDeadEnd(view: *const graph.reader.View, fixture: *const gurka.Map) 
         arena.reset();
         var blocked: ExpansionProbe = .{ .target = to };
         const expansion_request: search.ExpansionRequest = .{ .origins = &.{from}, .direction = direction, .timing = request.timing };
-        _ = try engine.expand(&arena, .{}, expansion_request, &blocked, .{});
+        const closed_stats = try engine.expand(&arena, .{}, expansion_request, &blocked, .{});
         try testing.expectEqual(@as(?f32, null), blocked.cost);
+        arena.reset();
+        var compact_blocked: LayoutExpansionProbe = .{ .layout = &layout, .probe = .{ .target = to } };
+        try testing.expectEqualDeep(closed_stats, try engine.expand(&arena, .{}, expansion_request, &compact_blocked, .{}));
+        try testing.expectEqualDeep(blocked, compact_blocked.probe);
         arena.reset();
         request.timing = try restrictionTiming("2026-01-12T08:00", false);
         const open = try engine.run(&arena, .{}, request, search.Zero{}, .{});
@@ -2057,8 +2097,12 @@ fn checkTimedDeadEnd(view: *const graph.reader.View, fixture: *const gurka.Map) 
         var reachable: ExpansionProbe = .{ .target = to };
         var timed = expansion_request;
         timed.timing = request.timing;
-        _ = try engine.expand(&arena, .{}, timed, &reachable, .{});
+        const open_stats = try engine.expand(&arena, .{}, timed, &reachable, .{});
         try testing.expectEqual(expected, reachable.cost.?);
+        arena.reset();
+        var compact_reachable: LayoutExpansionProbe = .{ .layout = &layout, .probe = .{ .target = to } };
+        try testing.expectEqualDeep(open_stats, try engine.expand(&arena, .{}, timed, &compact_reachable, .{}));
+        try testing.expectEqualDeep(reachable, compact_reachable.probe);
         arena.reset();
         try testing.expectError(error.Cancelled, engine.expand(&arena, .{}, timed, &reachable, .{ .deadline = .{ .at_ns = 0 } }));
     }
@@ -2223,6 +2267,8 @@ test "turn restriction history crosses junction aliases without steady-state hea
         const view = &built.bundle.view;
         try testing.expectEqual(1, built.stats.connectors);
         try testing.expect(if (node_via) view.turn_restrictions != null else view.restriction_automaton != null);
+        const layout = try LayoutExpansionProbe.Layout.init(testing.allocator, view, .none);
+        defer layout.deinit(testing.allocator);
         const origin = try at(view, nodes[1].location.toFixed());
         const destination = try at(view, nodes[nodes.len - 1].location.toFixed());
         var counting = routing.infra.arena.CountingAllocator.init(testing.allocator);
@@ -2241,8 +2287,12 @@ test "turn restriction history crosses junction aliases without steady-state hea
                     .direction = direction,
                 };
                 var probe: ExpansionProbe = .{ .target = if (direction == .forward) destination else origin };
-                _ = try engine.expand(&arena, .{}, expansion_request, &probe, .{});
+                const normal = try engine.expand(&arena, .{}, expansion_request, &probe, .{});
                 try testing.expectEqual(@as(?f32, null), probe.cost);
+                arena.reset();
+                var compact_probe: LayoutExpansionProbe = .{ .layout = &layout, .probe = .{ .target = probe.target } };
+                try testing.expectEqualDeep(normal, try engine.expand(&arena, .{}, expansion_request, &compact_probe, .{}));
+                try testing.expectEqualDeep(probe, compact_probe.probe);
                 arena.reset();
                 _ = try engine.expand(&arena, .{ .ignore = true }, expansion_request, &probe, .{});
                 try testing.expect(probe.cost != null);

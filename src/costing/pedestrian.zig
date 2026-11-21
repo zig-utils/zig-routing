@@ -277,17 +277,17 @@ pub const Turn = struct {
 
     /// Uses the incoming opposing local even during reverse traversal.
     pub fn read(view: *const graph.reader.View, node: graph.format.NodeId, incoming: graph.format.EdgeId, outgoing: graph.format.EdgeId) !Turn {
-        return withLevels(view, try view.node(node), incoming, outgoing, try base.IntersectionTurn.read(view, node, incoming, outgoing));
+        return fromIntersection(view, try view.node(node), incoming, outgoing, try base.IntersectionTurn.read(view, node, incoming, outgoing));
     }
 
     pub fn fromRow(view: *const graph.reader.View, node: graph.format.NodeId, record: *const NodeHot, degree: u32, incoming: graph.format.EdgeId, outgoing: graph.format.EdgeId, from: u5, to: u5, row: graph.format.TurnEntry) !Turn {
-        return withLevels(view, record, incoming, outgoing, .{
+        return fromIntersection(view, record, incoming, outgoing, .{
             .base_turn = .{ .row = row },
             .sides = try view.turnSidesAtDegree(node, degree, from, to),
         });
     }
 
-    fn withLevels(view: *const graph.reader.View, node: *const NodeHot, incoming: graph.format.EdgeId, outgoing: graph.format.EdgeId, common: base.IntersectionTurn) !Turn {
+    pub fn fromIntersection(view: *const graph.reader.View, node: *const NodeHot, incoming: graph.format.EdgeId, outgoing: graph.format.EdgeId, common: base.IntersectionTurn) !Turn {
         return .{
             .base_turn = common.base_turn,
             .sides = common.sides,

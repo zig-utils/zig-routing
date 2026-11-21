@@ -151,13 +151,17 @@ pub const Turn = struct {
     }
 
     fn heading(view: *const graph.reader.View, id: graph.format.EdgeId, arena: std.mem.Allocator, deadline: Deadline) !u16 {
-        if (view.headings) |headings| return graph.headings.decode(headings[@backingInt(id)]);
+        return graph.headings.decode(try encodedHeading(view, id, arena, deadline));
+    }
+
+    pub fn encodedHeading(view: *const graph.reader.View, id: graph.format.EdgeId, arena: std.mem.Allocator, deadline: Deadline) !u8 {
+        if (view.headings) |headings| return headings[@backingInt(id)];
         const edge = try view.edge(id);
         const class = try view.class(edge.cls.class_id);
         if (class.flags.node_connector) return 0;
         const points = try view.shapeWithDeadline(id, arena, deadline);
         defer arena.free(points);
-        return graph.headings.decode(graph.headings.encode(try graph.headings.sample(points, true, class, deadline)));
+        return graph.headings.encode(try graph.headings.sample(points, true, class, deadline));
     }
 };
 

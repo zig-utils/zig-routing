@@ -20,6 +20,37 @@ const Row = struct {
     contours: []const Contour,
     costing: Mode,
     reverse: bool = false,
+    date_time_utc: ?[]const u8 = null,
+};
+
+const Visit = routing.search.expand.Visit;
+
+fn LayoutObserver(comptime Observer: type) type {
+    return struct {
+        layout: *const iso.MovementLayout,
+        observer: Observer,
+
+        pub fn movementLayout(self: @This()) *const iso.MovementLayout {
+            return self.layout;
+        }
+
+        pub fn observe(self: @This(), event: Visit) !void {
+            if (Observer != void) try self.observer.observe(event);
+        }
+    };
+}
+
+fn observed(layout: anytype, observer: anytype) if (@TypeOf(layout) == void) @TypeOf(observer) else LayoutObserver(@TypeOf(observer)) {
+    return if (@TypeOf(layout) == void) observer else .{ .layout = layout, .observer = observer };
+}
+
+const Replay = struct {
+    a: std.mem.Allocator,
+    events: std.ArrayList(Visit) = .empty,
+
+    pub fn observe(self: *Replay, event: Visit) !void {
+        try self.events.append(self.a, event);
+    }
 };
 
 const Trace = struct {
@@ -95,10 +126,8 @@ const StageClock = struct {
     }
 };
 
-fn measure(
-    engine: anytype,
-    kernel: anytype,
-    request: iso.Request,
+const Measurement = struct {
+    view: *const View,
     arena: *memory.Arena,
     backing: *memory.CountingAllocator,
     index: usize,
@@ -106,43 +135,80 @@ fn measure(
     grids: io.File,
     traces: ?io.File,
     profile: bool,
+    stages: bool,
     scratch: std.mem.Allocator,
-) !void {
-    arena.reset();
-    _ = try engine.run(arena, kernel, request, .{});
-    backing.resetCounts();
-    arena.reset();
-    var clock: StageClock = if (profile) .init() else .{};
-    const start = io.monotonicNs();
-    const result = if (profile)
-        try engine.runObserved(arena, kernel, request, &clock, .{})
-    else
-        try engine.run(arena, kernel, request, .{});
-    const elapsed = io.monotonicNs() - start;
-    clock.finish();
-    if (backing.calls() != 0) return error.IsochroneAllocatedAfterWarmup;
-    const tiles = result.grid.tiles;
-    const bounds = tiles.bounds;
-    try log.print("{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}", .{
-        index,               elapsed,     tiles.ncolumns, tiles.nrows, @as(f64, tiles.tilesize),
-        bounds.minx,         bounds.miny, bounds.maxx,    bounds.maxy, result.stats.settled,
-        result.stats.popped,
-    });
-    if (profile) {
-        try log.print("\t{d}", .{clock.samples});
-        for (std.enums.values(StageClock.Stage)) |stage| try log.print("\t{d}", .{clock.totals.get(stage)});
+    layout: ?*const iso.MovementLayout,
+
+    fn run(self: Measurement, engine: anytype, kernel: anytype, request: iso.Request) !void {
+        if (self.layout) |layout|
+            try self.measure(engine, kernel, request, layout)
+        else
+            try self.measure(engine, kernel, request, {});
     }
-    try log.writeByte('\n');
-    try grids.writeAll(std.mem.sliceAsBytes(result.grid.data));
-    if (traces) |file| {
+
+    fn measure(self: Measurement, engine: anytype, kernel: anytype, request: iso.Request, layout: anytype) !void {
+        const arena = self.arena;
+        const backing = self.backing;
         arena.reset();
-        var trace: Trace = .{ .a = scratch };
-        _ = try engine.runObserved(arena, kernel, request, &trace, .{});
-        const count: u32 = @intCast(trace.labels.items.len);
-        try file.writeAll(std.mem.asBytes(&count));
-        try file.writeAll(std.mem.sliceAsBytes(trace.labels.items));
+        _ = try engine.runObserved(arena, kernel, request, observed(layout, {}), .{});
+        backing.resetCounts();
+        arena.reset();
+        var clock: StageClock = if (self.profile) .init() else .{};
+        const start = io.monotonicNs();
+        const result = if (self.profile)
+            try engine.runObserved(arena, kernel, request, &clock, .{})
+        else
+            try engine.runObserved(arena, kernel, request, observed(layout, {}), .{});
+        const elapsed = io.monotonicNs() - start;
+        clock.finish();
+        if (backing.calls() != 0) return error.IsochroneAllocatedAfterWarmup;
+        const tiles = result.grid.tiles;
+        const bounds = tiles.bounds;
+        try self.log.print("{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}", .{
+            self.index,          elapsed,     tiles.ncolumns, tiles.nrows, @as(f64, tiles.tilesize),
+            bounds.minx,         bounds.miny, bounds.maxx,    bounds.maxy, result.stats.settled,
+            result.stats.popped,
+        });
+        if (self.profile) {
+            try self.log.print("\t{d}", .{clock.samples});
+            for (std.enums.values(StageClock.Stage)) |stage| try self.log.print("\t{d}", .{clock.totals.get(stage)});
+        }
+        try self.grids.writeAll(std.mem.sliceAsBytes(result.grid.data));
+        if (self.stages) {
+            const expected = try self.scratch.dupe(u8, std.mem.sliceAsBytes(result.grid.data));
+            arena.reset();
+            var replay: Replay = .{ .a = self.scratch };
+            const recorded = try engine.runTraversal(arena, kernel, request, observed(layout, &replay), .{});
+            if (!std.meta.eql(result.stats, recorded)) return error.DifferentBoundedTraversal;
+            backing.resetCounts();
+            arena.reset();
+            const traversal_start = io.monotonicNs();
+            const traversal = try engine.runTraversal(arena, kernel, request, observed(layout, {}), .{});
+            const traversal_ns = io.monotonicNs() - traversal_start;
+            if (backing.calls() != 0) return error.TraversalAllocatedAfterWarmup;
+            if (!std.meta.eql(result.stats, traversal)) return error.DifferentBoundedTraversal;
+            arena.reset();
+            _ = try iso.rasterize(self.view, arena, request, replay.events.items, .{});
+            arena.reset();
+            backing.resetCounts();
+            const raster_start = io.monotonicNs();
+            const raster = try iso.rasterize(self.view, arena, request, replay.events.items, .{});
+            const raster_ns = io.monotonicNs() - raster_start;
+            if (backing.calls() != 0) return error.RasterAllocatedAfterWarmup;
+            if (!std.mem.eql(u8, expected, std.mem.sliceAsBytes(raster.data))) return error.DifferentRasterReplay;
+            try self.log.print("\t{d}\t{d}", .{ traversal_ns, raster_ns });
+        }
+        try self.log.writeByte('\n');
+        if (self.traces) |file| {
+            arena.reset();
+            var trace: Trace = .{ .a = self.scratch };
+            _ = try engine.runObserved(arena, kernel, request, observed(layout, &trace), .{});
+            const count: u32 = @intCast(trace.labels.items.len);
+            try file.writeAll(std.mem.asBytes(&count));
+            try file.writeAll(std.mem.sliceAsBytes(trace.labels.items));
+        }
     }
-}
+};
 
 fn correlate(view: *const View, a: std.mem.Allocator, row: Row) ![]const iso.Origin {
     const access: snap.Access = .{ .mask = switch (row.costing) {
@@ -167,6 +233,18 @@ fn correlate(view: *const View, a: std.mem.Allocator, row: Row) ![]const iso.Ori
     return origins;
 }
 
+fn prepareHeadings(view: *const View, allocator: std.mem.Allocator) ![]const u8 {
+    const headings = try allocator.alloc(u8, view.edges.len);
+    errdefer allocator.free(headings);
+    var scratch = memory.Arena.init(allocator, .{});
+    defer scratch.deinit();
+    for (headings, 0..) |*heading, i| {
+        heading.* = try auto.Turn.encodedHeading(view, @fromBackingInt(@as(u32, @intCast(i))), scratch.allocator(), .none);
+        scratch.reset();
+    }
+    return headings;
+}
+
 pub fn main(init: std.process.Init) !void {
     var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.skip();
@@ -175,13 +253,26 @@ pub fn main(init: std.process.Init) !void {
     const output_path = args.next() orelse return error.MissingGridOutput;
     var trace_path: ?[]const u8 = null;
     var profile = false;
+    var stages = false;
+    var prepare_layout = false;
+    var prepare_headings = false;
+    var rss = false;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--profile") and !profile) {
             profile = true;
+        } else if (std.mem.eql(u8, arg, "--stages") and !stages) {
+            stages = true;
+        } else if (std.mem.eql(u8, arg, "--layout") and !prepare_layout) {
+            prepare_layout = true;
+        } else if (std.mem.eql(u8, arg, "--headings-only") and !prepare_headings) {
+            prepare_headings = true;
+        } else if (std.mem.eql(u8, arg, "--rss") and !rss) {
+            rss = true;
         } else if (trace_path == null) {
             trace_path = arg;
         } else return error.InvalidArguments;
     }
+    if ((profile and (stages or prepare_layout or prepare_headings)) or (prepare_layout and prepare_headings)) return error.InvalidArguments;
     const input = try io.File.open(input_path, .read_only);
     defer input.close();
     const data = try init.arena.allocator().alloc(u8, @intCast(try input.size()));
@@ -193,7 +284,26 @@ pub fn main(init: std.process.Init) !void {
 
     var bundle = try routing.graph.reader.Bundle.open(graph_path);
     defer bundle.close();
-    const view = &bundle.view;
+    var graph_view = bundle.view;
+    const view = &graph_view;
+    const headings = if (prepare_headings) blk: {
+        if (view.headings != null) return error.BundleAlreadyHasHeadings;
+        const start = io.monotonicNs();
+        const ready = try prepareHeadings(view, init.gpa);
+        std.debug.print("headings_ns={d} headings_bytes={d}\n", .{ io.monotonicNs() - start, ready.len });
+        break :blk ready;
+    } else null;
+    defer if (headings) |ready| init.gpa.free(ready);
+    if (headings) |ready| view.headings = ready;
+    const layout: ?iso.MovementLayout = if (prepare_layout) blk: {
+        const start = io.monotonicNs();
+        const ready = try iso.MovementLayout.init(init.gpa, view, .none);
+        std.debug.print("layout_ns={d} layout_bytes={d} edges={d} movements={d}\n", .{
+            io.monotonicNs() - start, ready.residentBytes(), ready.opposite.len, ready.movements.len,
+        });
+        break :blk ready;
+    } else null;
+    defer if (layout) |ready| ready.deinit(init.gpa);
     var backing = memory.CountingAllocator.init(init.gpa);
     var walker = try iso.Isochrone(Foot).init(backing.allocator(), view);
     defer walker.deinit();
@@ -231,6 +341,10 @@ pub fn main(init: std.process.Init) !void {
             .origins = origins,
             .contours = contours.items,
             .direction = if (row.reverse) .reverse else .forward,
+            .timing = .{ .start = if (row.date_time_utc) |value|
+                try routing.graph.time_info.TimeInfo.fromLocal(null, value, routing.graph.timezone.utc, routing.graph.timezone.utc, 0, .none)
+            else
+                .{} },
             .mode = switch (row.costing) {
                 .auto => .motor,
                 .pedestrian => .pedestrian,
@@ -240,10 +354,24 @@ pub fn main(init: std.process.Init) !void {
                 .pedestrian => walk.tables().unit_size,
             },
         };
+        const measurement: Measurement = .{
+            .view = view,
+            .arena = &request_memory,
+            .backing = &backing,
+            .index = index,
+            .log = &output.interface,
+            .grids = grids,
+            .traces = traces,
+            .profile = profile,
+            .stages = stages,
+            .scratch = a,
+            .layout = if (layout) |*ready| ready else null,
+        };
         switch (row.costing) {
-            .auto => try measure(&motorist, Auto{ .profile = drive.profile(), .tables = drive.tables(), .arena = request_memory.allocator() }, request, &request_memory, &backing, index, &output.interface, grids, traces, profile, a),
-            .pedestrian => try measure(&walker, Foot{ .profile = walk.profile(), .tables = walk.tables() }, request, &request_memory, &backing, index, &output.interface, grids, traces, profile, a),
+            .auto => try measurement.run(&motorist, Auto{ .profile = drive.profile(), .tables = drive.tables(), .arena = request_memory.allocator() }, request),
+            .pedestrian => try measurement.run(&walker, Foot{ .profile = walk.profile(), .tables = walk.tables() }, request),
         }
     }
     try output.interface.flush();
+    if (rss) std.debug.print("peak_rss_bytes={d}\n", .{try io.peakRssBytes()});
 }
