@@ -280,10 +280,15 @@ pub fn resamplePolylineWithDeadline(gpa: Allocator, polyline: []const PointLL, l
     const n: usize = @intFromFloat(@round(length_m / resolution));
     const sample_distance: f32 = length_m / @as(f32, @floatFromInt(n));
     var accumulated_d: f32 = 0;
+    var endpoint: ?point.DistanceEndpoint = null;
     for (polyline[0 .. polyline.len - 1], polyline[1..], 0..) |p0, p1, i| {
         if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
         if (out.items.len - base == n) break;
-        const d: f32 = @floatCast(p0.distance(p1));
+        if (p0.eql(p1)) continue;
+        const a = endpoint orelse point.DistanceEndpoint.init(p0, libm);
+        const b = point.DistanceEndpoint.init(p1, libm);
+        const d: f32 = @floatCast(a.distance(b, libm));
+        endpoint = b;
         if (d + accumulated_d > sample_distance) {
             const dlon: f32 = @floatCast(p1.lng - p0.lng);
             const dlat: f32 = @floatCast(p1.lat - p0.lat);
@@ -701,12 +706,17 @@ test "uniform resample gives exactly n points ending at the last vertex" {
 }
 
 test "planar resample ends at the last vertex" {
-    const line = [_]PointLL{ P(8.0, 47.0), P(8.001, 47.0), P(8.002, 47.0) };
+    const line = [_]PointLL{ P(8.0, 47.0), P(8.001, 47.0001), P(8.002, 47.0) };
     var out: std.ArrayList(PointLL) = .empty;
     defer out.deinit(testing.allocator);
-    try resamplePolyline(testing.allocator, &line, @floatCast(length(&line)), 20, &out);
+    const metres: f32 = @floatCast(length(&line));
+    try resamplePolyline(testing.allocator, &line, metres, 20, &out);
     try testing.expect(out.items[out.items.len - 1].eql(line[2]));
     try testing.expect(out.items.len >= 7);
+    var duplicates: std.ArrayList(PointLL) = .empty;
+    defer duplicates.deinit(testing.allocator);
+    try resamplePolyline(testing.allocator, &.{ line[0], line[0], line[1], line[1], line[2] }, metres, 20, &duplicates);
+    try testing.expectEqualSlices(PointLL, out.items, duplicates.items);
 }
 
 test "douglas peucker (upstream polyline2 Generalize)" {

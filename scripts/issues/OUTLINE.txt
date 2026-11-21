@@ -183,8 +183,9 @@ P7.04 | Experiment E6: urban 50x50 and regional 200x200 matrices on v1 | search 
 P7.05 | Matrix v2: turn-aware multilevel overlay on the separator tree, customised per metric | accel | new | L | P7.04 P4.05
 P7.06 | Matrix v2 queries: one-to-many sweeps, many-to-many, memory budget | search | new | L | P7.05
 P7.07 | Isochrone expansion into the grid with multiple time and distance contours | search | port | M | P7.01 P1.06 P3.34a P7.07a
-P7.07a | Reach the exact isochrone expansion performance target | search | perf | L | P7.01 P1.06 P3.34a P7.07b
+P7.07a | Reach the exact isochrone expansion performance target | search | perf | L | P7.01 P1.06 P3.34a P7.07b P7.07c
 P7.07b | Reduce per-label work in exact isochrone expansion | search | perf | L | P7.01 P1.06 P3.34a
+P7.07c | Evaluate a compact turn-movement layout for exact isochrones | search | experiment | L | P7.07b
 P7.08 | /isochrone API: polygons, lines, denoise, generalize, reverse, GeoJSON | api | port | M | P7.07
 P7.09 | /expansion endpoint | api | port | S | P7.01 P3.33 P7.03 P7.08
 P7.10 | /centroid | search | port | M | P7.01 P6.13

@@ -123,20 +123,7 @@ pub const PointLL = extern struct {
 
     pub fn distanceWith(self: PointLL, other: PointLL, comptime math: type) f64 {
         if (self.eql(other)) return 0;
-        const phi1 = self.lat * k.rad_per_deg_d;
-        const phi2 = other.lat * k.rad_per_deg_d;
-        const dphi = phi2 - phi1;
-        const lambda1 = self.lng * k.rad_per_deg_d;
-        const lambda2 = other.lng * k.rad_per_deg_d;
-        const dlambda = lambda2 - lambda1;
-        const c1 = math.cosF(phi1);
-        const c2 = math.cosF(phi2);
-        const sdphi2 = math.sinF(dphi / 2.0);
-        const sdlmb2 = math.sinF(dlambda / 2.0);
-        var h = sdphi2 * sdphi2 + c1 * c2 * sdlmb2 * sdlmb2;
-        h = @min(1.0, @max(0.0, h));
-        const d = 2.0 * math.asinF(@sqrt(h));
-        return k.rad_earth_meters_d * d;
+        return DistanceEndpoint.init(self, math).distance(DistanceEndpoint.init(other, math), math);
     }
 
     /// Approximate squared distance in metres squared (DistanceApproximator
@@ -286,6 +273,30 @@ pub const PointLL = extern struct {
     /// > 0 when this point is left of the line a->b, < 0 right, 0 on it.
     pub fn isLeft(self: PointLL, a: PointLL, b: PointLL) f64 {
         return (b.lng - a.lng) * (self.lat - a.lat) - (self.lng - a.lng) * (b.lat - a.lat);
+    }
+};
+
+/// A point's reusable terms for great-circle distances to adjacent vertices.
+pub const DistanceEndpoint = struct {
+    latitude: f64,
+    longitude: f64,
+    cosine: f64,
+
+    pub fn init(p: PointLL, comptime math: type) DistanceEndpoint {
+        const latitude = p.lat * k.rad_per_deg_d;
+        return .{
+            .latitude = latitude,
+            .longitude = p.lng * k.rad_per_deg_d,
+            .cosine = math.cosF(latitude),
+        };
+    }
+
+    pub fn distance(a: DistanceEndpoint, b: DistanceEndpoint, comptime math: type) f64 {
+        const sin_lat = math.sinF((b.latitude - a.latitude) / 2.0);
+        const sin_lng = math.sinF((b.longitude - a.longitude) / 2.0);
+        const h = sin_lat * sin_lat + a.cosine * b.cosine * sin_lng * sin_lng;
+        const d = 2.0 * math.asinF(@sqrt(@min(1.0, @max(0.0, h))));
+        return k.rad_earth_meters_d * d;
     }
 };
 

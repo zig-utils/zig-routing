@@ -129,6 +129,40 @@ rasterization. For each request, multiply each stage sample by popped
 labels divided by sample count. Summing the four requests gives each
 trial's stage estimates.
 
+## Grouped radix buckets and raster arithmetic
+
+The radix queue partitions keys by the highest differing four-bit digit
+and caches each bucket's minimum. A redistribution moves each entry past
+at least one digit. Single-entry buckets can return the entry directly,
+and tied costs still use label order. The rasterizer uses a dense bitset
+up to 64 KiB and sparse pages for larger graphs. Tile lookup divides
+both axes together with the same floating-point arithmetic, and shape
+resampling reuses the latitude cosine and radians of adjacent vertices.
+
+Eighteen uninstrumented trials rotated all six runner orders on CPU 0
+of the same ARM64 Linux VM with the matched Utrecht tiles and four
+requests. The native baseline used `c10e357`.
+
+| Request | Settled / popped | Native baseline | Native candidate | Valhalla 3.9.3 |
+| --- | ---: | ---: | ---: | ---: |
+| Auto, 9.1 minutes | 41,128 / 42,301 | 11.397 ms | 10.680 ms | 11.115 ms |
+| Auto, two origins, 2 minutes | 40,436 / 41,631 | 11.105 ms | 10.596 ms | 10.329 ms |
+| Pedestrian, 12 minutes and 1.4 km | 35,503 / 35,984 | 7.128 ms | 6.719 ms | 7.268 ms |
+| Auto, reverse, 1 minute | 26,322 / 27,168 | 7.220 ms | 6.878 ms | 7.276 ms |
+| Median total per trial | 143,389 / 147,084 | 37.021 ms | 35.176 ms | 36.271 ms |
+
+Native elapsed time fell 5.0%. All four grids and all 143,389 settled
+label records were byte-identical. Every warmed request made zero
+backing allocator calls. In twelve separate profiled pairs using the
+same sampler, the median raster stage estimate fell from 16.338 ms to
+15.875 ms. The queue stage estimate was roughly flat at 8.021 and
+8.134 ms under instrumentation.
+
+The fivefold target requires 7.254 ms at this oracle median. Across the
+four requests, that is about 50 ns per settled label including the
+queue, traversal and grid work. [#251](https://github.com/zig-utils/zig-routing/issues/251)
+keeps the original end-to-end gate.
+
 ## Reproduction
 
 Set `mjolnir.hierarchy` and `mjolnir.shortcuts` to `false` in a Valhalla

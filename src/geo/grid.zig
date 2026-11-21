@@ -85,7 +85,13 @@ pub const Tiles = struct {
     /// Tile containing (y, x), or -1 outside the bounds.
     pub fn tileId(self: Tiles, y: f64, x: f64) i32 {
         if (y < self.bounds.miny or x < self.bounds.minx or y > self.bounds.maxy or x > self.bounds.maxx) return -1;
-        return self.row(y) * self.ncolumns + self.col(x);
+        const size: @Vector(2, f64) = @splat(self.tilesize);
+        const pos: @Vector(2, f64) = .{ x, y };
+        const origin: @Vector(2, f64) = .{ self.bounds.minx, self.bounds.miny };
+        const cell = (pos - origin) / size;
+        const r: i32 = if (y == self.bounds.maxy) self.nrows - 1 else @intFromFloat(cell[1]);
+        const c: i32 = if (cell[0] >= @as(f64, @floatFromInt(self.ncolumns))) self.ncolumns - 1 else @intFromFloat(cell[0]);
+        return r * self.ncolumns + c;
     }
 
     pub fn tileIdColRow(self: Tiles, c: i32, r: i32) i32 {

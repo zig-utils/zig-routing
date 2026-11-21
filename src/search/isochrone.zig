@@ -106,6 +106,7 @@ pub fn Isochrone(comptime K: type) type {
                 .max_seconds = limits.seconds(),
                 .max_metres = limits.metres(),
                 .shape_interval = grid.tiles.tilesize * @as(f32, units.meters_per_degree_lat) * 0.25,
+                .settled_words = try settledWords(a, self.view.edges.len),
             };
             const sweep: expansion.Request = .{
                 .origins = nodes[0..node_count],
@@ -233,6 +234,7 @@ const Rasterizer = struct {
     max_seconds: f32,
     max_metres: f32,
     shape_interval: f32,
+    settled_words: []u64,
     settled: flags.Array(u64, 0) = .{},
     vertices: std.ArrayList(Point) = .empty,
     samples: std.ArrayList(Point) = .empty,
@@ -244,9 +246,7 @@ const Rasterizer = struct {
         const behind = if (self.direction == .forward) opposite else edge;
         const id = @backingInt(outward);
         const reverse_id = @backingInt(behind);
-        const reverse_bit = @as(u64, 1) << @as(u6, @truncate(reverse_id));
-        const reverse_settled = self.settled.get(reverse_id / 64) & reverse_bit != 0;
-        (try self.settled.at(self.allocator, id / 64)).* |= @as(u64, 1) << @as(u6, @truncate(id));
+        const reverse_settled = try self.markSettled(id, reverse_id);
 
         const previous = event.previous orelse core.Label{};
         const start_metres: f32 = @floatFromInt(previous.dist_m);
@@ -310,6 +310,19 @@ const Rasterizer = struct {
         return .expand;
     }
 
+    fn markSettled(self: *Rasterizer, id: u32, reverse_id: u32) !bool {
+        const reverse_bit = @as(u64, 1) << @as(u6, @truncate(reverse_id));
+        const bit = @as(u64, 1) << @as(u6, @truncate(id));
+        if (self.settled_words.len != 0) {
+            const reverse_settled = self.settled_words[reverse_id / 64] & reverse_bit != 0;
+            self.settled_words[id / 64] |= bit;
+            return reverse_settled;
+        }
+        const reverse_settled = self.settled.get(reverse_id / 64) & reverse_bit != 0;
+        (try self.settled.at(self.allocator, id / 64)).* |= bit;
+        return reverse_settled;
+    }
+
     fn decodeShape(self: *Rasterizer, record: graph.cold.Record, stored_reverse: bool) ![]Point {
         try self.vertices.resize(self.allocator, record.header.point_count);
         var shape = record;
@@ -356,6 +369,15 @@ const Rasterizer = struct {
         cells.flush();
     }
 };
+
+fn settledWords(a: Allocator, edge_count: usize) ![]u64 {
+    // Bound request initialization independently of the size of the graph.
+    const max_bytes = 64 * 1024;
+    if (edge_count > max_bytes * 8) return &.{};
+    const words = try a.alloc(u64, (edge_count + 63) / 64);
+    @memset(words, 0);
+    return words;
+}
 
 const SegmentCells = struct {
     grid: *Grid,

@@ -575,7 +575,8 @@
     "notes": [
       "The parity-corrected arm64 Linux pilot measured 45.175 ms native and 36.343 ms in Valhalla.",
       "The radix queue, turn-row reuse and grid changes measured 37.280 ms native, 42.922 ms native baseline and 34.742 ms Valhalla. See docs/experiments/isochrone.md.",
-      "P7.07b tracks the remaining per-label work. The end-to-end 5x gate stays here."
+      "P7.07b reused graph operands. Grouped radix buckets and raster arithmetic subsequently reduced the native median from 37.021 ms to 35.176 ms, compared with 36.271 ms in Valhalla.",
+      "P7.07c measures a compact turn-movement layout. The end-to-end 5x gate stays here."
     ],
     "accept": [
       "At least 5x faster than Valhalla 3.9.3 over the matched expansion corpus.",
@@ -597,6 +598,20 @@
       "Total expansion time falls on the matched Utrecht workload.",
       "Arrival grids and settled label traces match byte for byte. Forward, reverse, timed and cancelled requests pass.",
       "Warmed runs make zero backing allocator calls. The full tests and binary budget pass."
+    ]
+  },
+  {
+    "key": "P7.07c",
+    "goal": "Measure whether a compact turn-movement layout can reduce the cost of exact isochrone traversal enough to advance the fivefold target in P7.07a.",
+    "scope": [
+      "Time traversal and rasterization separately with the same search stopping rule. Keep the full search and grid in the end-to-end comparison.",
+      "Prototype a compact graph-side layout for static successor, simple turn and costing inputs. Measure runtime, construction time and resident bytes on Utrecht and a larger existing fixture.",
+      "Keep actual predecessor contexts, conditional access, traffic clocks, options, exclusions and bounded expansion exact. Derive static data from the graph independently of requests. Retain support for existing bundles."
+    ],
+    "accept": [
+      "Before and after timings and memory costs are reproducible on the same Linux hardware, including a larger graph and the original four Utrecht requests.",
+      "Forward and reverse arrival grids and settled label traces match byte for byte. Timed and restricted cases pass and warmed runs make zero backing allocator calls.",
+      "Record the speedup and memory tradeoff and whether the layout merits adoption. The full suite and binary budget pass for any retained source changes."
     ]
   },
   {

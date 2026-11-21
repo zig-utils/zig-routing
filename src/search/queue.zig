@@ -161,11 +161,25 @@ pub const BucketQueue = struct {
 /// Radix heap for Dijkstra walks with nondecreasing popped costs.
 /// Positive float bit patterns sort in the same order as their values.
 pub const RadixQueue = struct {
-    buckets: [32]std.ArrayList(Entry) = @splat(.empty),
+    const empty_key = std.math.maxInt(u32);
+    const digit_bits = 4;
+    const digit_count = 32 / digit_bits;
+    const slots_per_digit = 1 << digit_bits;
+    const Digit = u3;
+    const Slot = u4;
+    const Index = u7;
+
+    const Bucket = struct {
+        entries: std.ArrayList(Entry) = .empty,
+        minimum: u32 = empty_key,
+    };
+
+    buckets: [digit_count * slots_per_digit]Bucket = @splat(.{}),
     equal: Heap = .{},
-    nonempty: u32 = 0,
+    slots: [digit_count]u16 = @splat(0),
+    digits: u8 = 0,
     minimum: u32 = 0,
-    redistributing: ?u5 = null,
+    redistributing: ?Index = null,
 
     pub fn init(unit_size: u32) !RadixQueue {
         if (unit_size == 0) return error.InvalidBucketWidth;
@@ -174,43 +188,70 @@ pub const RadixQueue = struct {
 
     pub fn push(self: *RadixQueue, arena: std.mem.Allocator, entry: Entry) !void {
         if (entry.key < self.minimum) return error.NonmonotonePriority;
+        return self.insert(arena, entry);
+    }
+
+    fn insert(self: *RadixQueue, arena: std.mem.Allocator, entry: Entry) !void {
         const differing = entry.key ^ self.minimum;
         if (differing == 0) return self.equal.push(arena, entry);
-        const index: u5 = @intCast(31 - @clz(differing));
-        try self.buckets[index].append(arena, entry);
-        self.nonempty |= @as(u32, 1) << index;
+        const digit: Digit = @intCast((31 - @clz(differing)) / digit_bits);
+        const shift: u5 = @as(u5, digit) * digit_bits;
+        const slot: Slot = @truncate(entry.key >> shift);
+        const bucket = &self.buckets[bucketIndex(digit, slot)];
+        try bucket.entries.append(arena, entry);
+        bucket.minimum = @min(bucket.minimum, entry.key);
+        if (bucket.entries.items.len == 1) {
+            self.slots[digit] |= @as(u16, 1) << slot;
+            self.digits |= @as(u8, 1) << digit;
+        }
     }
 
     pub fn popWithin(self: *RadixQueue, arena: std.mem.Allocator, control: anytype) !?Entry {
         if (self.redistributing != null) {
             try self.redistribute(arena, control);
         } else if (self.equal.items.items.len == 0) {
-            if (self.nonempty == 0) return null;
-            const index: u5 = @intCast(@ctz(self.nonempty));
-            var minimum: u32 = std.math.maxInt(u32);
-            for (self.buckets[index].items, 0..) |entry, i| {
-                if (i % 256 == 0) try control.check();
-                minimum = @min(minimum, entry.key);
+            if (self.digits == 0) return null;
+            const digit: Digit = @intCast(@ctz(self.digits));
+            const slot: Slot = @intCast(@ctz(self.slots[digit]));
+            const index = bucketIndex(digit, slot);
+            const bucket = &self.buckets[index];
+            if (bucket.entries.items.len == 1) {
+                const entry = bucket.entries.pop().?;
+                self.minimum = entry.key;
+                self.clearBucket(index);
+                return entry;
             }
-            self.minimum = minimum;
+            self.minimum = bucket.minimum;
             self.redistributing = index;
             try self.redistribute(arena, control);
         }
         return self.equal.pop();
     }
 
+    fn bucketIndex(digit: Digit, slot: Slot) Index {
+        return @as(Index, digit) * slots_per_digit + slot;
+    }
+
+    fn clearBucket(self: *RadixQueue, index: Index) void {
+        const digit: Digit = @intCast(index / slots_per_digit);
+        const slot: Slot = @truncate(index);
+        self.slots[digit] &= ~(@as(u16, 1) << slot);
+        if (self.slots[digit] == 0) self.digits &= ~(@as(u8, 1) << digit);
+        self.buckets[index].minimum = empty_key;
+    }
+
     noinline fn redistribute(self: *RadixQueue, arena: std.mem.Allocator, control: anytype) !void {
         const index = self.redistributing.?;
-        const bucket = &self.buckets[index];
+        const bucket = &self.buckets[index].entries;
         var moved: usize = 0;
         while (bucket.last()) |entry| : (moved += 1) {
             if (moved % 256 == 0) try control.check();
-            // Lowering the differing bit puts every moved entry in a
-            // strictly lower bucket. Keep its original copy until push succeeds.
-            try self.push(arena, entry);
+            // All entries in the selected bucket share the new minimum's
+            // leading digits. Keep the original copy until insertion succeeds.
+            try self.insert(arena, entry);
             _ = bucket.pop();
         }
-        self.nonempty &= ~(@as(u32, 1) << index);
+        self.clearBucket(index);
         self.redistributing = null;
     }
 };
@@ -349,19 +390,21 @@ test "radix queue retains entries across interrupted redistribution" {
     var pending = try RadixQueue.init(1);
     for (0..1024) |label| try pending.push(a, Entry.init(300, @intCast(label)));
 
-    const CancelAfterFiveChecks = struct {
-        remaining: usize = 5,
+    const CancelAfterFirstCheck = struct {
+        checked: bool = false,
 
         fn check(self: *@This()) error{Cancelled}!void {
-            if (self.remaining == 0) return error.Cancelled;
-            self.remaining -= 1;
+            if (self.checked) return error.Cancelled;
+            self.checked = true;
         }
     };
-    var control: CancelAfterFiveChecks = .{};
+    var control: CancelAfterFirstCheck = .{};
     try t.expectError(error.Cancelled, pending.popWithin(a, &control));
     try t.expect(pending.redistributing != null);
+    try pending.push(a, Entry.init(300.25, 1024));
     for (0..1024) |label| {
         try t.expectEqual(@as(?Entry, Entry.init(300, @intCast(label))), try pending.popWithin(a, Uncancelled{}));
     }
+    try t.expectEqual(@as(?Entry, Entry.init(300.25, 1024)), try pending.popWithin(a, Uncancelled{}));
     try t.expectEqual(@as(?Entry, null), try pending.popWithin(a, Uncancelled{}));
 }
