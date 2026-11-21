@@ -220,7 +220,7 @@ pub const Path = struct {
 
 pub const ReplayStep = union(enum) {
     walk: endpoints.Segment,
-    ride: struct { line: u32, trip: u32, board_minute: i64 },
+    ride: struct { line: u32, trip: u32, board_time: i64 },
 };
 
 pub const ReplayResult = union(enum) {
@@ -434,7 +434,7 @@ pub const Search = struct {
     }
 
     /// Check and price a fixed sequence with the same walking and boarding
-    /// transitions as search. Boarding minutes identify the displayed ride.
+    /// transitions as search. Exact boarding instants identify the rides.
     pub fn reprice(self: *const Search, a: Allocator, from: endpoints.Candidate, to: endpoints.Candidate, steps: []const ReplayStep, options: endpoints.Options, control: Control) !ReplayResult {
         if (options.direction != .forward or options.timing.invariant or !options.timing.start.valid)
             return error.UnsupportedTransitDateTime;
@@ -517,7 +517,7 @@ const ReplaySink = struct {
             .ride => |expected| {
                 const run = ride orelse return;
                 if (run.departure.line != expected.line or run.departure.trip != expected.trip or
-                    @divFloor(run.departure_time, 60) != expected.board_minute) return;
+                    run.departure_time != expected.board_time) return;
             },
         }
         if (self.matched != null) return error.AmbiguousTransitReplay;

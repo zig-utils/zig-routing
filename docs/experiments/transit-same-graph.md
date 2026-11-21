@@ -61,16 +61,19 @@ geometry.
 
 The 100 requests supplied 506 directed cuts. Valhalla returned 100
 itineraries and native returned 97. Three native searches reached the
-request arena limit. Forty itineraries had equal ordered stop sequences.
-Thirteen also matched the route IDs and displayed boarding times.
+request arena limit. Forty itineraries matched the routes, ordered stops
+and exact timetable instants. Thirty-nine also matched the displayed
+boarding times. Case 34 boards the same trip at 21:32:44, but the displays
+show 21:32 and 21:33 because the approaches arrive at different times.
 
 The report records both weighted costs and the native price of both fixed
-paths. All 97 native paths reproduced their search costs exactly. Of 87
-itinerary discrepancies, 36 Valhalla paths could be replayed and each cost
-more than the corresponding native path under native costing. The other
-51 Valhalla paths reached a boarding step that the native replay could
-not take at the indicated trip and minute. The report gives the first
-rejected step for each. These counts describe the shared topology replay.
+paths. All 97 native paths reproduced their search costs exactly. All 61
+Valhalla paths in itinerary discrepancy cases could be replayed. In each
+of the 58 cases with both routes, the native route cost less under its
+own costing. The report identifies the first rejected step if an engine's
+path cannot be replayed. Repricing uses the exact timetable instant. The
+trip-leg display rounds the waiting duration and can show a later minute.
+These counts describe the shared topology replay.
 The independent [itinerary parity gate][gate] still uses its original
 threshold.
 
@@ -99,15 +102,16 @@ zig build check-transit-itineraries -Doptimize=ReleaseFast -- FIXTURE_BUNDLE FIX
 python3 oracle/transit-same-graph.py check-fixture reference.jsonl native.jsonl
 ```
 
-Both tables offer trip 1 first at 07:01, arriving at 07:21. Trip 2 departs
-at 07:03 and arrives at 07:04. The runner prices both departures from
-the same starting time and along the same walking approaches in each
-engine.
+Both tables offer trip 1 first at 07:01:45, arriving at 07:21:45. Trip 2
+departs at 07:03:45 and arrives at 07:04:45. The reference displays its
+selected boarding time as 07:02 and native displays 07:04. The runner
+prices both departures from the same starting time and along the same
+walking approaches in each engine.
 
 | Engine | First offer cost | Later offer cost | Selected trip |
 | --- | ---: | ---: | ---: |
-| Valhalla 3.9.3 | 9,437.293 | 994.627 | 1 |
-| zig-routing | 9,443.126 | 1,000.460 | 2 |
+| Valhalla 3.9.3 | 9,482.293 | 1,039.627 | 1 |
+| zig-routing | 9,488.126 | 1,045.460 | 2 |
 
 [streets]: https://download.geofabrik.de/north-america/us/massachusetts/massachusetts-261119.osm.pbf
 [feed]: https://data.trilliumtransit.com/gtfs/brockton-ma-us/brockton-ma-us.zip

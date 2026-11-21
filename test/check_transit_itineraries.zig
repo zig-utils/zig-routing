@@ -54,7 +54,7 @@ const InputStep = struct {
     edge: ?u32 = null,
     line: ?u32 = null,
     trip: ?u32 = null,
-    board_minute: ?i64 = null,
+    board_time: ?i64 = null,
 };
 
 const Reference = struct {
@@ -77,6 +77,7 @@ const OutputStep = struct {
     origin: ?[]const u8 = null,
     destination: ?[]const u8 = null,
     board: ?[]const u8 = null,
+    board_time: ?i64 = null,
     elapsed: f32,
     cost: f32,
 };
@@ -162,7 +163,9 @@ fn check(view: *const graph.reader.View, arena: *routing.infra.arena.Arena, body
             const path = success.paths[0];
             result.cost = path.total.cost;
             result.elapsed = path.total.secs;
-            result.steps = try describe(a, view, path, control);
+            const legs = try success.trip(a, view, options, control);
+            if (legs.len != 1) return error.ExpectedOneLeg;
+            result.steps = try describe(a, view, path, &legs[0], control);
             emitted = success;
         },
     } else |err| {
@@ -176,11 +179,11 @@ fn check(view: *const graph.reader.View, arena: *routing.infra.arena.Arena, body
     return result;
 }
 
-fn describe(a: Allocator, view: *const graph.reader.View, path: search.multimodal.Path, control: Control) ![]const OutputStep {
+fn describe(a: Allocator, view: *const graph.reader.View, path: search.multimodal.Path, leg: *const api.trip.TripLeg, control: Control) ![]const OutputStep {
     const table = view.transit_index orelse return error.MissingTransitSection;
+    if (leg.node.len != path.steps.len + 1) return error.UnexpectedTripLegNodes;
     const output = try a.alloc(OutputStep, path.steps.len);
-    const rules = if (view.tz_rules) |*present| present else null;
-    for (path.steps, output) |step, *item| {
+    for (path.steps, output, leg.node[0..path.steps.len]) |step, *item, node| {
         try control.check();
         item.* = .{ .elapsed = step.elapsed.secs, .cost = step.elapsed.cost };
         switch (step.movement) {
@@ -198,12 +201,9 @@ fn describe(a: Allocator, view: *const graph.reader.View, path: search.multimoda
                 item.route = try table.text(table.routes[line.route].one_stop_id);
                 item.origin = try table.text(from.one_stop_id);
                 item.destination = try table.text(to.one_stop_id);
-                const zone = try view.nodeTimezone(@fromBackingInt(from.graph_node));
-                const time: graph.time_info.TimeInfo = .{ .valid = true, .zone = zone, .unix_time = ride.departure_time };
-                const buffer = try a.alloc(u8, 22);
-                if (try time.display(rules, buffer)) |display| {
-                    item.board = buffer[0 .. display.date_time.len + display.time_zone_offset.len];
-                }
+                const platform = node.transit_platform_info orelse return error.MissingTransitPlatformInfo;
+                item.board = platform.departure_date_time;
+                item.board_time = ride.departure_time;
             },
         }
     }
@@ -234,7 +234,7 @@ fn reprice(a: Allocator, view: *const graph.reader.View, options: *const api.req
             } } else .{ .ride = .{
                 .line = item.line orelse return error.InvalidOracleRide,
                 .trip = item.trip orelse return error.InvalidOracleRide,
-                .board_minute = item.board_minute orelse return error.InvalidOracleRide,
+                .board_time = item.board_time orelse return error.MissingOracleBoardingTime,
             } };
         }
         result.oracle_recost = price(&engine, a, from, to, steps, query, control);
@@ -249,7 +249,7 @@ fn reprice(a: Allocator, view: *const graph.reader.View, options: *const api.req
                 .ride => |ride| .{ .ride = .{
                     .line = ride.departure.line,
                     .trip = ride.departure.trip,
-                    .board_minute = @divFloor(ride.departure_time, 60),
+                    .board_time = ride.departure_time,
                 } },
             };
         }
@@ -290,7 +290,7 @@ fn fixtureOffers(engine: *const search.multimodal.Search, a: Allocator, from: se
         if (!try table.scheduleActive(offer.departure.schedule, day, weekday) or
             !try engine.kernel.allowsDeparture(engine.view, offer.departure)) continue;
         const instant = try rules.toUtc(zone, midnight + offer.time, control.deadline) orelse return error.InvalidFixtureDepartureTime;
-        steps[i] = .{ .ride = .{ .line = line, .trip = offer.departure.trip, .board_minute = @divFloor(instant, 60) } };
+        steps[i] = .{ .ride = .{ .line = line, .trip = offer.departure.trip, .board_time = instant } };
         const cost = price(engine, a, from, to, steps, query, control);
         try offers.append(a, .{ .trip = offer.departure.trip, .start = offer.time, .duration = offer.departure.elapsed_time, .cost = cost.cost orelse return error.BlockedFixtureDeparture });
     }

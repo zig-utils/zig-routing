@@ -34,8 +34,8 @@ def fixture(args):
         "trips": "route_id,service_id,trip_id,trip_headsign\nR,S,slow,Slow\nR,S,fast,Fast\n",
         "stop_times": (
             "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
-            "slow,07:01:00,07:01:00,B,1\nslow,07:21:00,07:21:00,C,2\n"
-            "fast,07:03:00,07:03:00,B,1\nfast,07:04:00,07:04:00,C,2\n"
+            "slow,07:01:45,07:01:45,B,1\nslow,07:21:45,07:21:45,C,2\n"
+            "fast,07:03:45,07:03:45,B,1\nfast,07:04:45,07:04:45,C,2\n"
         ),
     }
     for name, rows in tables.items():
@@ -125,17 +125,13 @@ def translate(args):
                 raw = step["edge"]
                 if "trip" in step:
                     step["line"] = rides[raw]
-                    board = datetime.fromisoformat(step["board"])
-                    if board.tzinfo is None:
-                        raise ValueError("Expected a displayed boarding time with a timezone")
-                    step["board_minute"] = int(board.timestamp()) // 60
                     del step["edge"]
                 else:
                     step["edge"] = edge_id(raw)
             out.write(json.dumps(result, separators=(",", ":")) + "\n")
 
 
-def itinerary(steps):
+def itinerary(steps, boarding="board"):
     """Group adjacent rides on the same trip into an ordered stop sequence."""
     result = []
     prior_trip = None
@@ -149,7 +145,7 @@ def itinerary(steps):
             result.append({
                 "route": step["route"],
                 "stops": [step["origin"], step["destination"]],
-                "board": step["board"],
+                "board": step.get(boarding),
             })
         prior_trip = step["trip"]
     return result
@@ -177,12 +173,15 @@ def score(args):
             if expected is not None and actual is not None:
                 counts["matching_itineraries"] += expected == actual
                 counts["matching_ordered_stops"] += [r["stops"] for r in expected] == [r["stops"] for r in actual]
+                counts["matching_exact_itineraries"] += itinerary(a["steps"], "board_time") == itinerary(b["steps"], "board_time")
             if actual is not None:
                 own_recost = b.get("native_recost", {})
                 if "cost" not in own_recost or not math.isclose(b["cost"], own_recost["cost"], abs_tol=0.01):
                     raise ValueError(f"Native fixed path did not reproduce its search cost in case {index}")
             if expected != actual:
                 recost = b.get("oracle_recost")
+                if expected is not None and (recost is None or "failure" in recost):
+                    counts["oracle_path_reprice_errors"] += 1
                 if recost is not None:
                     counts["oracle_paths_repriced"] += "cost" in recost
                     counts["oracle_paths_blocked"] += "blocked_at" in recost
@@ -229,10 +228,14 @@ def check_fixture(args):
             raise ValueError("The later departure should arrive first")
         if later["cost"] >= first["cost"]:
             raise ValueError(f"The later departure should cost less in {name}")
-        selected, = [step["trip"] for step in row["steps"] if "trip" in step]
+        ride, = [step for step in row["steps"] if "trip" in step]
+        selected = ride["trip"]
         expected = first if name == "oracle" else later
         if selected != expected["trip"] or not math.isclose(row["cost"], expected["cost"], abs_tol=0.01):
             raise ValueError(f"Unexpected itinerary selection in {name}")
+        displayed = datetime.fromisoformat(ride["board"])
+        if int(displayed.timestamp()) // 60 != ride["board_time"] // 60 + 1:
+            raise ValueError(f"Expected distinct timetable and display minutes in {name}")
         result[name] = {"first_offered": first, "lowest_cost": later, "selected_trip": selected}
     print(json.dumps(result, sort_keys=True))
 
