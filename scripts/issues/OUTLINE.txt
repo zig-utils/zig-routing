@@ -206,7 +206,8 @@ P8.03 | Viterbi search and top-k | match | port | L | P8.02
 P8.04 | Match results to a path: match_route, discontinuities, edge walking | match | port | M | P8.03
 P8.05 | /trace_route API with shape_match modes and trace options | api | port | M | P8.04 P6.13
 P8.06 | /trace_attributes API with attribute filters | api | port | M | P8.04 P6.05 P6.09a
-P8.07 | Port the mapmatch tests, throughput target and byte-bounded memory | match | test | M | P8.05 P8.06
+P8.06a | Reconcile OfflineMatch alternate path admission and scores | match | port | M | P8.06
+P8.07 | Port the mapmatch tests, throughput target and byte-bounded memory | match | test | M | P8.05 P8.06 P8.06a
 P8.08 | Phase 8 gate: parity gate G on the trace corpus | match | gate | S | P8.07
 
 ## P9 | P9 Transit and multimodal | GTFS, schedules, multimodal search, bike share.

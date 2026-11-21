@@ -1021,6 +1021,23 @@
     ]
   },
   {
+    "key": "P8.06a",
+    "goal": "Reconcile full OfflineMatch alternate-path selection and scoring with the Valhalla 3.9.3 action.",
+    "upstream": ["src/meili/map_matcher.cc", "src/meili/match_route.cc", "valhalla/meili/match_result.h"],
+    "scope": [
+      "Compare action-level top-k results and stitched edge sequences with the pinned oracle.",
+      "Reconcile redundant candidate removal and shared-edge aliases with exact directed transitions.",
+      "Verify raw and confidence scores, invalid alternatives and both alternates and best_paths at the action boundary."
+    ],
+    "notes": ["#182 records higher-rank differences that the state-sequence comparator from #179 does not exercise."],
+    "accept": [
+      "Record all Utrecht ranked results and audit every remaining stock difference against directed costing.",
+      "Port pinned fixtures for repeated geometry, stationary endpoint cuts, disconnected candidates and repeated nodes.",
+      "Preserve the primary paths, filter and RSS results from #182.",
+      "`zig build test` green."
+    ]
+  },
+  {
     "key": "P8.07",
     "goal": "Upstream's map matching tests run against our port, and the map matching scoreboard row is measured: throughput target met and memory bounded in bytes.",
     "upstream": ["test/mapmatch.cc", "test/", "run_route_scripts/"],
