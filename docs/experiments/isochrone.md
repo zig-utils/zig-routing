@@ -75,6 +75,60 @@ total of 6.948 ms and remains open. A trial cache for resampled shapes saved
 2.6% in a separate paired run and required about 2.3 MiB per worker. The
 measured candidate uses the original request-local geometry buffers.
 
+## Reusing graph operands during expansion
+
+[#255](https://github.com/zig-utils/zig-routing/issues/255) reads the
+junction record and predecessor class once per expanded label. Successor
+checks share the directed edge, class and local turn row. Complex turn
+history and conditional access still use the exact predecessor state
+and request clock.
+
+Eighteen uninstrumented trials rotated the three runners on CPU 0 of
+the same ARM64 Linux VM. All used the earlier Utrecht graph and four
+requests. The native baseline used `c332d60`.
+
+| Request | Settled / popped | Native baseline | Native candidate | Valhalla 3.9.3 |
+| --- | ---: | ---: | ---: | ---: |
+| Auto, 9.1 minutes | 41,128 / 42,301 | 11.584 ms | 11.276 ms | 11.075 ms |
+| Auto, two origins, 2 minutes | 40,436 / 41,631 | 11.682 ms | 11.109 ms | 10.168 ms |
+| Pedestrian, 12 minutes and 1.4 km | 35,503 / 35,984 | 7.674 ms | 7.139 ms | 7.201 ms |
+| Auto, reverse, 1 minute | 26,322 / 27,168 | 7.841 ms | 7.321 ms | 7.135 ms |
+| Median total per trial | 143,389 / 147,084 | 38.775 ms | 36.906 ms | 36.355 ms |
+
+Total native time fell 4.8%. All four grids and the settled label
+trace were byte-identical. Each warmed request made zero backing
+allocator calls.
+
+Twelve separate trials alternated the profiled native runners.
+The stage observer samples roughly one in 32 popped labels and
+subtracts the measured baseline clock read cost from its intervals.
+The table extrapolates the samples to the full four-request trace.
+Use the uninstrumented trials for end-to-end time. Stage estimates
+include probe overhead and should be compared stage by stage.
+
+| Sampled stage | Native baseline estimate | Native candidate estimate |
+| --- | ---: | ---: |
+| Queue operations | 8.021 ms | 8.026 ms |
+| Successor enumeration and label handling | 18.867 ms | 20.128 ms |
+| Restriction and access checks | 12.674 ms | 10.545 ms |
+| Edge costing | 3.342 ms | 3.160 ms |
+| Turn costing | 6.475 ms | 6.583 ms |
+| Rasterization | 16.293 ms | 16.187 ms |
+
+Successor enumeration now includes graph reads previously repeated in
+the restriction and costing calls. The before and after probes use the
+same instrumentation, introduced at `ab68938`.
+
+```sh
+taskset -c 0 ./bench-isochrone BUNDLE requests.jsonl /dev/null --profile > stages.tsv
+```
+
+The profiled TSV appends sample count, then sampled nanoseconds for
+queue, successors, restrictions, edge costing, turn costing and
+rasterization. For each request, multiply each stage sample by popped
+labels divided by sample count. Summing the four requests gives each
+trial's stage estimates.
+
 ## Reproduction
 
 Set `mjolnir.hierarchy` and `mjolnir.shortcuts` to `false` in a Valhalla

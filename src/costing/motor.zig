@@ -129,7 +129,10 @@ pub const Turn = struct {
 
     /// Price a movement whose local turn row has already been read by search.
     pub fn fromRow(view: *const graph.reader.View, node: graph.format.NodeId, from: u5, to: u5, row: graph.format.TurnEntry, arena: std.mem.Allocator, deadline: Deadline) !Turn {
-        const range = try view.outEdgeRange(node);
+        return fromRange(view, node, try view.outEdgeRange(node), from, to, row, arena, deadline);
+    }
+
+    pub fn fromRange(view: *const graph.reader.View, node: graph.format.NodeId, range: graph.reader.View.EdgeRange, from: u5, to: u5, row: graph.format.TurnEntry, arena: std.mem.Allocator, deadline: Deadline) !Turn {
         const movement: base.IntersectionTurn = .{
             .base_turn = .{ .row = row },
             .sides = try view.turnSidesAtDegree(node, range.count(), from, to),

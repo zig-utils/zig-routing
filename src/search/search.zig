@@ -17,6 +17,8 @@ const endpoints = @import("endpoints.zig");
 const automaton = @import("../graph/restriction_automaton.zig");
 const EdgeId = graph.format.EdgeId;
 const EdgeHot = graph.format.EdgeHot;
+const EdgeClass = graph.class_table.EdgeClass;
+const NodeHot = graph.format.NodeHot;
 const NodeId = graph.format.NodeId;
 const TurnEntry = graph.format.TurnEntry;
 const View = graph.reader.View;
@@ -215,9 +217,30 @@ pub const Transition = struct {
     measured_speed: bool = false,
     predecessor_dead_end: ?bool = null,
 
+    node_record: ?*const NodeHot = null,
+    edge_range: ?View.EdgeRange = null,
+    incoming_class: ?*const EdgeClass = null,
+    outgoing_class: ?*const EdgeClass = null,
+
+    pub inline fn nodeRecord(self: Transition, view: *const View) !*const NodeHot {
+        return self.node_record orelse try view.node(self.node);
+    }
+
+    pub inline fn edgeRange(self: Transition, view: *const View) !View.EdgeRange {
+        return self.edge_range orelse try view.outEdgeRange(self.node);
+    }
+
+    pub inline fn incomingClass(self: Transition, view: *const View) !*const EdgeClass {
+        return self.incoming_class orelse try view.class(self.incoming_edge.cls.class_id);
+    }
+
+    pub inline fn outgoingClass(self: Transition, view: *const View) !*const EdgeClass {
+        return self.outgoing_class orelse try view.class(self.outgoing_edge.cls.class_id);
+    }
+
     pub fn predecessorAtDeadEnd(self: Transition, view: *const View, previous: *const graph.class_table.EdgeClass) !bool {
         if (self.predecessor_dead_end) |stored| return stored;
-        return previous.flags.dead_end or (try view.outEdgeRange(self.node)).count() == 1;
+        return previous.flags.dead_end or (try self.edgeRange(view)).count() == 1;
     }
 };
 
@@ -376,7 +399,10 @@ pub const PathAccess = struct {
     }
 
     inline fn evaluateWith(self: PathAccess, id: EdgeId, edge: *const EdgeHot, node: NodeId, previous: Label, position: Position, limits: anytype) !base.AccessEvaluation {
-        const class = try self.view.class(edge.cls.class_id);
+        return self.evaluateClass(id, edge, try self.view.class(edge.cls.class_id), node, previous, position, limits);
+    }
+
+    inline fn evaluateClass(self: PathAccess, id: EdgeId, edge: *const EdgeHot, class: *const EdgeClass, node: NodeId, previous: Label, position: Position, limits: anytype) !base.AccessEvaluation {
         // The directed not_thru bit is Valhalla's search hint. Admission
         // here follows the edge's access rules on the first search.
         const restricted = self.permission.destinationOnly(class);
@@ -429,22 +455,36 @@ pub const Restrictions = struct {
     arrivals: std.ArrayList(u32) = .empty,
     aliases: AliasStatus = .empty,
 
+    fn simplePredecessor(self: *const Restrictions, context: TurnContext, previous: Label, node: *const NodeHot) ?EdgeId {
+        const rows = self.access.view.turn_restrictions orelse return null;
+        if (rows.len == 0 or previous.edge == no_index or !node.attr.has_turn_restrictions) return null;
+        return @fromBackingInt(if (context.alias) context.value else if (context.present()) self.states[context.value].edge else previous.edge);
+    }
+
     pub noinline fn advance(self: *const Restrictions, context: TurnContext, previous: Label, node: NodeId, id: EdgeId) !TurnContext {
-        if (self.modes == 0) return .{};
-        const simple = if (self.access.view.turn_restrictions) |rows| rows.len != 0 else false;
-        if (!simple and self.states.len == 0) return .{};
+        if (!self.hasRestrictions()) return .{};
         const edge = try self.access.view.edge(id);
         const class = try self.access.view.class(edge.cls.class_id);
-        const flagged = simple and previous.edge != no_index and (try self.access.view.node(node)).attr.has_turn_restrictions;
+        const predecessor = if (previous.edge != no_index and self.access.view.turn_restrictions != null)
+            self.simplePredecessor(context, previous, try self.access.view.node(node))
+        else
+            null;
+        const allowed = if (self.linear_costs) |costs| costs.allows(id) else false;
+        return self.advanceKnown(context, previous, node, id, class, predecessor, allowed);
+    }
+
+    fn hasRestrictions(self: *const Restrictions) bool {
+        const simple = if (self.access.view.turn_restrictions) |rows| rows.len != 0 else false;
+        return self.modes != 0 and (self.states.len != 0 or simple);
+    }
+
+    inline fn advanceKnown(self: *const Restrictions, context: TurnContext, previous: Label, node: NodeId, id: EdgeId, class: *const EdgeClass, predecessor: ?EdgeId, allowed: bool) !TurnContext {
         if (class.flags.node_connector) {
             if (context.present()) return context;
-            return if (flagged) .{ .value = previous.edge, .alias = true } else .{};
+            return if (predecessor != null) .{ .value = previous.edge, .alias = true } else .{};
         }
-        const allowed = if (self.linear_costs) |costs| costs.allows(id) else false;
-        if (flagged and !allowed) {
-            const predecessor: EdgeId = @fromBackingInt(if (context.alias) context.value else if (context.present()) self.states[context.value].edge else previous.edge);
-            const modes = if (self.access.direction == .forward) self.access.view.turnRestrictionModes(predecessor, id) else self.access.view.turnRestrictionModes(id, predecessor);
-            if (modes & self.modes != 0) return .forbidden;
+        if (predecessor) |prior| {
+            if (!allowed and self.simpleBlocked(prior, id)) return .forbidden;
         }
         if (self.states.len == 0) return .{};
         var parent = context.value;
@@ -453,6 +493,18 @@ pub const Restrictions = struct {
             if (start & self.modes == 0) return .{};
             parent = if (self.access.direction == .forward) automaton.forward_root else automaton.reverse_root;
         }
+        return self.advanceState(parent, previous, node, id, allowed);
+    }
+
+    noinline fn simpleBlocked(self: *const Restrictions, previous: EdgeId, next: EdgeId) bool {
+        const modes = if (self.access.direction == .forward)
+            self.access.view.turnRestrictionModes(previous, next)
+        else
+            self.access.view.turnRestrictionModes(next, previous);
+        return modes & self.modes != 0;
+    }
+
+    noinline fn advanceState(self: *const Restrictions, parent: u32, previous: Label, node: NodeId, id: EdgeId, allowed: bool) !TurnContext {
         const next = automaton.advance(self.states, parent, @backingInt(id));
         const attributes = self.states[next].attr;
         if (attributes.forbidden & self.modes != 0 and !allowed) return .forbidden;
@@ -854,25 +906,36 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     if (decision == .prune) continue;
                 }
                 const exits = try self.view.outEdgeRange(at);
+                const node = try self.view.node(at);
+                const previous_class = if (@hasDecl(K, "allowedTurn") and self.view.classes != null)
+                    try self.view.class(previous_edge.cls.class_id)
+                else
+                    null;
                 const predecessor_dead_end: ?bool = dead_end: {
-                    if (!@hasDecl(K, "allowedTurn") or self.view.classes == null) break :dead_end null;
+                    if (previous_class == null) break :dead_end null;
                     if (!expanding and direction == .forward) break :dead_end null;
-                    // The stored bit describes the head of the directed
-                    // predecessor. Reverse labels keep the travel edge,
-                    // whose head is on the other side of this intersection.
-                    const stored = (try self.view.class(geometry.cls.class_id)).flags.dead_end;
-                    break :dead_end stored or (!expanding and exits.count() == 1);
+                    // Reverse labels keep the travel edge on the other side
+                    // of the intersection. Read the flag on the outward arc.
+                    const geometry_class = if (direction == .forward) previous_class.? else try self.view.class(geometry.cls.class_id);
+                    break :dead_end geometry_class.flags.dead_end or (!expanding and exits.count() == 1);
                 };
-                const forward_row = if (direction == .forward) try self.view.turnRow(at, geometry.cls.opp_local) else &.{};
+                const restrict = with_restrictions and tracker.hasRestrictions();
+                const restriction_predecessor = if (restrict) tracker.simplePredecessor(context, last, node) else null;
+                const forward_row = if (direction == .forward) try self.view.turnRowAt(node, exits.count(), geometry.cls.opp_local) else &.{};
                 for (self.view.edges[exits.first..exits.end], exits.first.., 0..) |*outward, index, local| {
                     if (profiled) observer.expansionStage(.successors);
                     if (partial_starts and last.flags & Label.forbid_uturn != 0 and local == geometry.cls.opp_local) continue;
                     const local_id: EdgeId = @fromBackingInt(@as(u32, @intCast(index)));
-                    const next_id = if (direction == .forward) local_id else try self.view.oppEdge(local_id);
+                    const next_id = if (direction == .forward) local_id else try self.view.opposingId(outward);
+                    const next = if (direction == .forward) outward else try self.view.edge(next_id);
+                    const restrict_class = if (restrict) try self.view.class(next.cls.class_id) else null;
                     const feature = if (features) |costs| costs.get(next_id) else null;
                     const allowed = feature != null and feature.?.allow;
                     if (profiled) observer.expansionStage(.restrictions);
-                    const next_context: TurnContext = if (with_restrictions) try tracker.advance(context, last, at, next_id) else .{};
+                    const next_context: TurnContext = if (restrict)
+                        try tracker.advanceKnown(context, last, at, next_id, restrict_class.?, restriction_predecessor, allowed)
+                    else
+                        .{};
                     if (with_restrictions and next_context.value == no_index) continue;
                     if (profiled) observer.expansionStage(.successors);
                     const terminal_edge: ClosureEdge = if (terminal_closures) |closures| closures.get(@backingInt(next_id)) else .none;
@@ -890,21 +953,27 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     const dominated = prior.label_plus_one != 0 and labels.items[prior.label_plus_one - 1].cost <= last.cost;
                     var targets = if (partial) query.targets.on(next_id) else {};
                     if (dominated and !observe_edges and (!partial or targets.index == 0)) continue;
-                    const next = if (direction == .forward) outward else try self.view.edge(next_id);
                     const closed = kind == .closed or (phase == 0 and kind == .none and try self.edgeClosed(kernel, permission, next_id));
                     if (closed and next_phase == 0) continue;
                     const head: NodeId = @fromBackingInt(outward.head);
+                    const needs_access = with_restrictions and (model_access or (check_access and next.cls.cold_checks != 0));
+                    const next_class: ?*const EdgeClass = if (restrict_class) |class|
+                        class
+                    else if ((@hasDecl(K, "allowedTurn") and self.view.classes != null) or needs_access)
+                        try self.view.class(next.cls.class_id)
+                    else
+                        null;
                     if (profiled) observer.expansionStage(.restrictions);
                     const access = if (allowed)
                         base.AccessEvaluation{ .state = last.accessState() }
-                    else if (with_restrictions and (model_access or (check_access and next.cls.cold_checks != 0)))
-                        try tracker.access.evaluateWith(next_id, next, at, last, if (target != null and head == target.?) .end else .middle, limits)
+                    else if (needs_access)
+                        try tracker.access.evaluateClass(next_id, next, next_class.?, at, last, if (target != null and head == target.?) .end else .middle, limits)
                     else
                         base.AccessEvaluation{};
                     if (!access.allowed) {
                         if (!partial or targets.index == 0 or permission.allow_destination_only) continue;
                         const endpoint_access = if (with_restrictions)
-                            try tracker.access.evaluateWith(next_id, next, at, last, .end, limits)
+                            try tracker.access.evaluateClass(next_id, next, next_class.?, at, last, .end, limits)
                         else
                             base.AccessEvaluation{};
                         if (!endpoint_access.allowed) continue;
@@ -913,7 +982,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     const row = if (direction == .forward)
                         forward_row[local]
                     else blk: {
-                        const reverse_row = try self.view.turnRow(at, outward.cls.local);
+                        const reverse_row = try self.view.turnRowAt(node, exits.count(), outward.cls.local);
                         if (geometry.cls.opp_local >= reverse_row.len) return error.InvalidLocalEdge;
                         break :blk reverse_row[geometry.cls.opp_local];
                     };
@@ -927,6 +996,10 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                         .incoming_access = if (direction == .forward) previous_access else access.state,
                         .outgoing_access = if (direction == .forward) access.state else previous_access,
                         .predecessor_dead_end = predecessor_dead_end,
+                        .node_record = node,
+                        .edge_range = exits,
+                        .incoming_class = if (direction == .forward) previous_class else next_class,
+                        .outgoing_class = if (direction == .forward) next_class else previous_class,
                     };
                     if (comptime @hasDecl(K, "allowedTurn")) {
                         if (!allowed and !try kernel.allowedTurn(self.view, movement, last, direction)) continue;
@@ -935,7 +1008,10 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                         if (!allowed and next.cls.cold_checks != 0 and !try Self.slowAllowed(kernel, self.view, next_id, next, last, direction)) continue;
                     }
                     if (profiled) observer.expansionStage(.edge_costing);
-                    const traversal = try priceEdge(self.view, kernel, next_id, next, direction, time, false);
+                    const traversal = if (@hasDecl(K, "edgeTraversalWithClass") and next_class != null)
+                        try kernel.edgeTraversalWithClass(self.view, next_id, next, next_class.?, direction, time)
+                    else
+                        try priceEdge(self.view, kernel, next_id, next, direction, time, false);
                     if (traversal.cost.cost == std.math.inf(f32)) continue;
                     const full = distancePrice(traversal.cost, next, distance_only);
                     const edge_cost = try priceCut(full, feature, .{}, 1, distance_only, control);

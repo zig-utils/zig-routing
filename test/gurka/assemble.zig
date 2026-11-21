@@ -2012,6 +2012,19 @@ test "Gurka conditional access distinguishes unknown time, modes and destination
     try checkTimedDeadEnd(view, &fixture);
 }
 
+const ExpansionProbe = struct {
+    target: format.NodeId,
+    edge: ?format.EdgeId = null,
+    cost: ?f32 = null,
+    arrivals: usize = 0,
+
+    pub fn visit(self: *ExpansionProbe, event: search.ExpansionVisit) !search.ExpansionDecision {
+        if (event.node == self.target and self.cost == null) self.cost = event.label.cost;
+        if (self.edge != null and self.edge.? == event.label.edgeId()) self.arrivals += 1;
+        return .expand;
+    }
+};
+
 fn checkTimedDeadEnd(view: *const graph.reader.View, fixture: *const gurka.Map) !void {
     const tu = try directedBetween(view, fixture, "T", "U");
     const ut = try view.oppEdge(tu);
@@ -2026,13 +2039,28 @@ fn checkTimedDeadEnd(view: *const graph.reader.View, fixture: *const gurka.Map) 
     const destination = try at(view, fixture.findNode("U").?.location.toFixed());
     for ([_]search.Direction{ .forward, .reverse }) |direction| {
         var request: search.Request = .{ .origin = origin, .destination = destination, .direction = direction };
+        const from = if (direction == .forward) origin else destination;
+        const to = if (direction == .forward) destination else origin;
         request.timing = try restrictionTiming("2026-03-09T06:00", false);
         try testing.expectError(error.NoPath, engine.run(&arena, .{}, request, search.Zero{}, .{}));
+        arena.reset();
+        var blocked: ExpansionProbe = .{ .target = to };
+        const expansion_request: search.ExpansionRequest = .{ .origins = &.{from}, .direction = direction, .timing = request.timing };
+        _ = try engine.expand(&arena, .{}, expansion_request, &blocked, .{});
+        try testing.expectEqual(@as(?f32, null), blocked.cost);
         arena.reset();
         request.timing = try restrictionTiming("2026-01-12T08:00", false);
         const open = try engine.run(&arena, .{}, request, search.Zero{}, .{});
         try expectWayPath(view, fixture, open, direction, &.{ "RS", "ST", "TU" });
+        const expected = open.best().cost;
         arena.reset();
+        var reachable: ExpansionProbe = .{ .target = to };
+        var timed = expansion_request;
+        timed.timing = request.timing;
+        _ = try engine.expand(&arena, .{}, timed, &reachable, .{});
+        try testing.expectEqual(expected, reachable.cost.?);
+        arena.reset();
+        try testing.expectError(error.Cancelled, engine.expand(&arena, .{}, timed, &reachable, .{ .deadline = .{ .at_ns = 0 } }));
     }
 }
 
@@ -2129,6 +2157,17 @@ test "Gurka split via ways preserve a more expensive legal label on the same edg
         while (at_label.pred != search.no_index and direction == .forward) at_label = &limited.labels[at_label.pred];
         try testing.expectEqual(ax, at_label.edgeId());
         arena.reset();
+        var probe: ExpansionProbe = .{
+            .target = if (direction == .forward) destination else origin,
+            .edge = if (direction == .forward) cd else null,
+        };
+        _ = try engine.expand(&arena, .{}, .{
+            .origins = &.{if (direction == .forward) origin else destination},
+            .direction = direction,
+        }, &probe, .{});
+        try testing.expectEqual(cost, probe.cost.?);
+        if (direction == .forward) try testing.expect(probe.arrivals >= 2);
+        arena.reset();
         const ignored = try engine.run(&arena, .{ .ignore = true }, request, search.Zero{}, .{});
         try testing.expect(ignored.best().cost < cost);
         arena.reset();
@@ -2196,6 +2235,17 @@ test "turn restriction history crosses junction aliases without steady-state hea
             for ([_]search.Direction{ .forward, .reverse }) |direction| {
                 const request: search.Request = .{ .origin = origin, .destination = destination, .direction = direction };
                 try testing.expectError(error.NoPath, engine.run(&arena, .{}, request, search.Zero{}, .{}));
+                arena.reset();
+                const expansion_request: search.ExpansionRequest = .{
+                    .origins = &.{if (direction == .forward) origin else destination},
+                    .direction = direction,
+                };
+                var probe: ExpansionProbe = .{ .target = if (direction == .forward) destination else origin };
+                _ = try engine.expand(&arena, .{}, expansion_request, &probe, .{});
+                try testing.expectEqual(@as(?f32, null), probe.cost);
+                arena.reset();
+                _ = try engine.expand(&arena, .{ .ignore = true }, expansion_request, &probe, .{});
+                try testing.expect(probe.cost != null);
                 arena.reset();
                 const path = try engine.run(&arena, .{ .ignore = true }, request, search.Zero{}, .{});
                 var label = path.best();

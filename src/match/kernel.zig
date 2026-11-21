@@ -11,6 +11,7 @@ const Cost = costing.compiled.Cost;
 const View = graph.reader.View;
 const Hot = graph.format.EdgeHot;
 const EdgeId = graph.format.EdgeId;
+const Class = graph.class_table.EdgeClass;
 
 pub const Traffic = struct {
     observations: traffic_live.Overlays = .{},
@@ -88,8 +89,15 @@ pub fn Motor(comptime model: type) type {
             return if (self.features) |features| features.allows(id) else false;
         }
 
+        pub fn edgeTraversalWithClass(self: Self, _: *const View, id: EdgeId, edge: *const Hot, class: *const Class, _: search.Direction, time: graph.time_info.TimeInfo) !search.Traversal {
+            return self.priceClass(id, edge, class, if (time.valid) graph.speed.Time.fromTimeInfo(time) else null);
+        }
+
         fn price(self: Self, view: *const View, id: EdgeId, edge: *const Hot, time: ?graph.speed.Time) !search.Traversal {
-            const class = try view.class(edge.cls.class_id);
+            return self.priceClass(id, edge, try view.class(edge.cls.class_id), time);
+        }
+
+        fn priceClass(self: Self, id: EdgeId, edge: *const Hot, class: *const Class, time: ?graph.speed.Time) search.Traversal {
             const permitted = self.linearAllows(id);
             if (!self.profile.allowedCandidate(class, .{}, .{}, permitted) or
                 class.category.use == @backingInt(graph.constants.Use.transit_connection)) return .{ .cost = .forbidden };
@@ -106,9 +114,9 @@ pub fn Motor(comptime model: type) type {
         }
 
         pub fn allowedTurn(self: Self, view: *const View, movement: search.Transition, previous: search.Label, _: search.Direction) !bool {
-            if (!self.allowedNode(try view.node(movement.node))) return false;
-            const from = try view.class(movement.incoming_edge.cls.class_id);
-            const to = try view.class(movement.outgoing_edge.cls.class_id);
+            if (!self.allowedNode(try movement.nodeRecord(view))) return false;
+            const from = try movement.incomingClass(view);
+            const to = try movement.outgoingClass(view);
             const turn: costing.base.Turn = .{ .row = movement.row };
             const check: model.PathCheck = .{
                 .backtrack = movement.incoming_edge.cls.opp_local == movement.outgoing_edge.cls.local,
@@ -123,11 +131,11 @@ pub fn Motor(comptime model: type) type {
         }
 
         pub fn turnCost(self: Self, view: *const View, movement: search.Transition, _: search.Label, _: search.Direction) !Cost {
-            const from = try view.class(movement.incoming_edge.cls.class_id);
-            const to = try view.class(movement.outgoing_edge.cls.class_id);
-            var turn = try model.Turn.fromRow(view, movement.node, movement.incoming_edge.cls.opp_local, movement.outgoing_edge.cls.local, movement.row, self.arena, self.control.deadline);
+            const from = try movement.incomingClass(view);
+            const to = try movement.outgoingClass(view);
+            var turn = try model.Turn.fromRange(view, movement.node, try movement.edgeRange(view), movement.incoming_edge.cls.opp_local, movement.outgoing_edge.cls.local, movement.row, self.arena, self.control.deadline);
             turn.measured_speed = movement.measured_speed;
-            return model.Kernel.turnCost(self.profile, try view.node(movement.node), from, to, turn);
+            return model.Kernel.turnCost(self.profile, try movement.nodeRecord(view), from, to, turn);
         }
     };
 }
@@ -161,7 +169,14 @@ pub fn Active(comptime model: type) type {
         }
 
         pub fn edgeCost(self: Self, view: *const View, id: EdgeId, edge: *const Hot, _: search.Direction) !Cost {
-            const class = try view.class(edge.cls.class_id);
+            return self.priceClass(id, edge, try view.class(edge.cls.class_id));
+        }
+
+        pub fn edgeTraversalWithClass(self: Self, _: *const View, id: EdgeId, edge: *const Hot, class: *const Class, _: search.Direction, _: graph.time_info.TimeInfo) !search.Traversal {
+            return .{ .cost = self.priceClass(id, edge, class) };
+        }
+
+        fn priceClass(self: Self, id: EdgeId, edge: *const Hot, class: *const Class) Cost {
             if (self.profile.may_allow_edges and !self.profile.pathClassAllowed(class)) {
                 const features = self.features orelse return .forbidden;
                 if (!features.allows(id)) return .forbidden;
@@ -173,9 +188,9 @@ pub fn Active(comptime model: type) type {
         }
 
         pub fn allowedTurn(self: Self, view: *const View, movement: search.Transition, previous: search.Label, _: search.Direction) !bool {
-            if (!self.allowedNode(try view.node(movement.node))) return false;
-            const from = try view.class(movement.incoming_edge.cls.class_id);
-            const to = try view.class(movement.outgoing_edge.cls.class_id);
+            if (!self.allowedNode(try movement.nodeRecord(view))) return false;
+            const from = try movement.incomingClass(view);
+            const to = try movement.outgoingClass(view);
             const backtrack = movement.incoming_edge.cls.opp_local == movement.outgoing_edge.cls.local;
             const deadend = try movement.predecessorAtDeadEnd(view, from);
             return if (model == costing.pedestrian)
@@ -194,10 +209,17 @@ pub fn Active(comptime model: type) type {
         }
 
         pub fn turnCost(self: Self, view: *const View, movement: search.Transition, _: search.Label, _: search.Direction) !Cost {
-            const from = try view.class(movement.incoming_edge.cls.class_id);
-            const to = try view.class(movement.outgoing_edge.cls.class_id);
-            const turn = try model.Turn.read(view, movement.node, movement.incoming, movement.outgoing);
-            return model.Kernel.turnCost(self.profile, try view.node(movement.node), from, to, turn);
+            const from = try movement.incomingClass(view);
+            const to = try movement.outgoingClass(view);
+            const node = try movement.nodeRecord(view);
+            const degree = (try movement.edgeRange(view)).count();
+            const from_local = movement.incoming_edge.cls.opp_local;
+            const to_local = movement.outgoing_edge.cls.local;
+            const turn: model.Turn = if (model == costing.pedestrian)
+                try model.Turn.fromRow(view, movement.node, node, degree, movement.incoming, movement.outgoing, from_local, to_local, movement.row)
+            else
+                .{ .base_turn = .{ .row = movement.row }, .sides = try view.turnSidesAtDegree(movement.node, degree, from_local, to_local) };
+            return model.Kernel.turnCost(self.profile, node, from, to, turn);
         }
     };
 }

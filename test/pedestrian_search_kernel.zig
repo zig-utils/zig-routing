@@ -1,5 +1,6 @@
 //! Static pedestrian kernel shared by the search diagnostics.
 const routing = @import("routing");
+const EdgeClass = routing.graph.class_table.EdgeClass;
 const pedestrian = routing.costing.pedestrian;
 const graph = routing.graph;
 const View = graph.reader.View;
@@ -19,14 +20,21 @@ pub const Foot = struct {
     }
 
     pub fn edgeCost(self: Foot, view: *const View, _: Edge, edge: *const Hot, _: search.Direction) !Cost {
-        const class = try view.class(edge.cls.class_id);
+        return self.classCost(try view.class(edge.cls.class_id), edge);
+    }
+
+    pub fn edgeTraversalWithClass(self: @This(), _: *const View, _: Edge, edge: *const Hot, class: *const EdgeClass, _: search.Direction, _: routing.graph.time_info.TimeInfo) !search.Traversal {
+        return .{ .cost = self.classCost(class, edge) };
+    }
+
+    fn classCost(self: @This(), class: *const EdgeClass, edge: *const Hot) Cost {
         return pedestrian.Kernel.edgeCost(self.profile, self.tables, class, edge.*, self.profile.untimedFerrySpeed(edge.*), .{});
     }
 
     pub fn allowedTurn(self: Foot, view: *const View, movement: search.Transition, previous: search.Label, direction: search.Direction) !bool {
-        if (!self.profile.allowedNode(try view.node(movement.node))) return false;
-        const from = try view.class(movement.incoming_edge.cls.class_id);
-        const to = try view.class(movement.outgoing_edge.cls.class_id);
+        if (!self.profile.allowedNode(try movement.nodeRecord(view))) return false;
+        const from = try movement.incomingClass(view);
+        const to = try movement.outgoingClass(view);
         const prior = if (direction == .forward) from else to;
         const check: pedestrian.PathCheck = .{
             .previous_distance = previous.dist_m,
@@ -40,9 +48,11 @@ pub const Foot = struct {
     }
 
     pub fn turnCost(self: Foot, view: *const View, movement: search.Transition, _: search.Label, _: search.Direction) !Cost {
-        const from = try view.class(movement.incoming_edge.cls.class_id);
-        const to = try view.class(movement.outgoing_edge.cls.class_id);
-        const turn = try pedestrian.Turn.read(view, movement.node, movement.incoming, movement.outgoing);
-        return pedestrian.Kernel.turnCost(self.profile, try view.node(movement.node), from, to, turn);
+        const from = try movement.incomingClass(view);
+        const to = try movement.outgoingClass(view);
+        const node = try movement.nodeRecord(view);
+        const degree = (try movement.edgeRange(view)).count();
+        const turn = try pedestrian.Turn.fromRow(view, movement.node, node, degree, movement.incoming, movement.outgoing, movement.incoming_edge.cls.opp_local, movement.outgoing_edge.cls.local, movement.row);
+        return pedestrian.Kernel.turnCost(self.profile, node, from, to, turn);
     }
 };

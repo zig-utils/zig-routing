@@ -588,7 +588,10 @@ pub const View = struct {
     }
 
     pub fn oppEdge(self: *const View, id: format.EdgeId) !format.EdgeId {
-        const original = try self.edge(id);
+        return self.opposingId(try self.edge(id));
+    }
+
+    pub inline fn opposingId(self: *const View, original: *const format.EdgeHot) !format.EdgeId {
         const range = try self.outEdgeRange(@fromBackingInt(@intCast(original.head)));
         if (original.cls.opp_local >= range.count()) return error.InvalidOpposingEdge;
         return @fromBackingInt(@intCast(range.first + original.cls.opp_local));
@@ -619,9 +622,12 @@ pub const View = struct {
     }
 
     pub fn turnRow(self: *const View, id: format.NodeId, in_local: u5) ![]const format.TurnEntry {
-        const degree = (try self.outEdgeRange(id)).count();
+        return self.turnRowAt(try self.node(id), (try self.outEdgeRange(id)).count(), in_local);
+    }
+
+    pub inline fn turnRowAt(self: *const View, record: *const format.NodeHot, degree: u32, in_local: u5) ![]const format.TurnEntry {
         if (in_local >= degree) return error.InvalidLocalEdge;
-        const turn_off: u64 = (try self.node(id)).turn_off;
+        const turn_off: u64 = record.turn_off;
         const start = turn_off + @as(u64, in_local) * degree;
         const end = start + degree;
         if (end > self.turns.len) return error.InvalidTurnOffset;
