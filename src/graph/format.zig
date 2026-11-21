@@ -63,6 +63,7 @@ pub const Slopes = struct {
     code: u16,
 
     pub const flat: Slopes = .{ .code = 0 };
+    pub const unavailable = std.math.maxInt(u16);
 
     pub fn init(up: u5, down: u5) Slopes {
         return .{ .code = @as(u16, up) | (@as(u16, down) << 5) };

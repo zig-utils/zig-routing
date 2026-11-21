@@ -21,12 +21,26 @@ const View = graph.reader.View;
 const Allocator = std.mem.Allocator;
 const Measurement = candidates.Measurement;
 
+pub const EndpointCorrelations = struct {
+    origin: []const snap.PathEdge,
+    target: []const snap.PathEdge,
+};
+
 pub const Options = struct {
     shape_match: ShapeMatch = .walk_or_snap,
     use_timestamps: bool = false,
+    require_timestamps: bool = true,
     best_paths: u32 = 1,
     interpolation_distance: f32 = 10,
     timing: core.Timing = .{},
+    correlated: ?EndpointCorrelations = null,
+    start_clock: ?StartClock = null,
+};
+
+pub const StartClock = struct {
+    date: ?[]const u8,
+    timestamp: f64,
+    now: i64,
 };
 
 pub const Match = struct {
@@ -123,18 +137,21 @@ pub fn resolve(
         if (!measurement.point.inRange() or !std.math.isFinite(measurement.epoch_time)) return error.InvalidMeasurement;
         has_timestamp = has_timestamp or measurement.epoch_time >= 0;
     }
-    if (options.use_timestamps and !has_timestamp) return error.MissingTraceTimestamps;
+    if (options.use_timestamps and options.require_timestamps and !has_timestamp) return error.MissingTraceTimestamps;
     const mark = arena.mark();
     errdefer arena.rewind(mark);
     if (options.shape_match != .map_snap) {
         const view = finder.view;
         const a = arena.allocator();
-        const origin = try snap.search(view, a, .{ .lat = trace[0].point.lat, .lng = trace[0].point.lng }, .{}, kernel, control.deadline);
-        const last = trace[trace.len - 1].point;
-        const target = try snap.search(view, a, .{ .lat = last.lat, .lng = last.lng }, .{}, kernel, control.deadline);
-        if (walking.find(view, arena, trace, origin.edges, target.edges, control)) |parts| {
+        const correlated = options.correlated orelse blk: {
+            const origin = try snap.search(view, a, .{ .lat = trace[0].point.lat, .lng = trace[0].point.lng }, .{}, kernel, control.deadline);
+            const last = trace[trace.len - 1].point;
+            const target = try snap.search(view, a, .{ .lat = last.lat, .lng = last.lng }, .{}, kernel, control.deadline);
+            break :blk EndpointCorrelations{ .origin = origin.edges, .target = target.edges };
+        };
+        if (walking.find(view, arena, trace, correlated.origin, correlated.target, control)) |parts| {
             const output = try a.alloc(Result, 1);
-            output[0] = try walked(a, view, kernel, trace, parts, options, control);
+            output[0] = try walked(a, view, kernel, trace, parts, correlated, options, control);
             return output;
         } else |err| {
             if (err != error.NoEdgeWalk or options.shape_match == .edge_walk) return err;
@@ -150,13 +167,72 @@ fn snapTrace(arena: *memory.Arena, finder: *candidates.Finder, router: anytype, 
     try columns.collect(a, finder, kernel, trace, options.interpolation_distance, control);
     var search = try columns.states.startSearch(arena, control);
     var costs = try viterbi.RoutingCosts(@TypeOf(kernel)).init(arena, &columns.states, router, kernel, observations, movements, control);
-    const paths = try search.bestPaths(arena, &costs, options.best_paths, control);
-    const results = try a.alloc(Result, paths.len);
-    for (paths, results) |path, *result| {
-        try control.check();
-        result.* = try stitch(arena, finder.view, kernel, trace, &columns, &costs, path, observations, movements, options, control);
+    const Collector = struct {
+        arena: *memory.Arena,
+        view: *const View,
+        kernel: @TypeOf(kernel),
+        trace: []const Measurement,
+        columns: *const Columns,
+        costs: *@TypeOf(costs),
+        observations: Emission,
+        movements: Transition,
+        options: Options,
+        results: std.ArrayList(Result) = .empty,
+        sequences: std.ArrayList([]const EdgeId) = .empty,
+
+        pub fn accept(self: *@This(), alloc: Allocator, path: viterbi.Path, work: core.Control) !bool {
+            const result = try stitch(self.arena, self.view, self.kernel, self.trace, self.columns, self.costs, path, self.observations, self.movements, self.options, work);
+            if (self.options.best_paths > 1 and result.segments.len != 0) {
+                const sequence = try edgeSequence(alloc, result.segments, work);
+                for (self.sequences.items) |prior| {
+                    if (try containsEdges(prior, sequence, work) or try containsEdges(sequence, prior, work)) return false;
+                }
+                try self.sequences.append(alloc, sequence);
+            }
+            try self.results.append(alloc, result);
+            return true;
+        }
+    };
+    var collector: Collector = .{
+        .arena = arena,
+        .view = finder.view,
+        .kernel = kernel,
+        .trace = trace,
+        .columns = &columns,
+        .costs = &costs,
+        .observations = observations,
+        .movements = movements,
+        .options = options,
+    };
+    try search.enumeratePaths(arena, &costs, options.best_paths, &collector, control);
+    return collector.results.items;
+}
+
+/// The public alternates describe distinct traversals. Adjacent cuts on
+/// one directed edge and zero-length end cuts do not distinguish routes.
+fn edgeSequence(a: Allocator, segments: []const Segment, control: core.Control) ![]const EdgeId {
+    var edges: std.ArrayList(EdgeId) = .empty;
+    for (segments, 0..) |segment, i| {
+        if (i % 256 == 0) try control.check();
+        if ((i == 0 and segment.path.begin == 1) or (i + 1 == segments.len and segment.path.end == 0)) continue;
+        if (edges.items.len != 0 and edges.items[edges.items.len - 1] == segment.path.edge) continue;
+        try edges.append(a, segment.path.edge);
     }
-    return results;
+    return edges.items;
+}
+
+fn containsEdges(path: []const EdgeId, candidate: []const EdgeId, control: core.Control) !bool {
+    if (candidate.len == 0) return path.len == 0;
+    if (candidate.len > path.len) return false;
+    for (0..path.len - candidate.len + 1) |start| {
+        if (start % 256 == 0) try control.check();
+        if (path[start] != candidate[0]) continue;
+        for (path[start..][0..candidate.len], candidate, 0..) |edge, wanted, i| {
+            if (i % 256 == 0) try control.check();
+            if (edge != wanted) break;
+        } else return true;
+    }
+    return false;
 }
 
 fn initialMatches(a: Allocator, trace: []const Measurement, control: core.Control) ![]Match {
@@ -168,7 +244,7 @@ fn initialMatches(a: Allocator, trace: []const Measurement, control: core.Contro
     return matches;
 }
 
-fn walked(a: Allocator, view: *const View, kernel: anytype, trace: []const Measurement, parts: []const walking.Part, options: Options, control: core.Control) !Result {
+fn walked(a: Allocator, view: *const View, kernel: anytype, trace: []const Measurement, parts: []const walking.Part, correlated: EndpointCorrelations, options: Options, control: core.Control) !Result {
     const matches = try initialMatches(a, trace, control);
     const segments = try a.alloc(Segment, parts.len);
     const last: u32 = @intCast(matches.len - 1);
@@ -202,6 +278,23 @@ fn walked(a: Allocator, view: *const View, kernel: anytype, trace: []const Measu
             matches[shape_index].edge = part.segment.edge;
             matches[shape_index].fraction = part.segment.begin + along * (part.segment.end - part.segment.begin);
             matches[shape_index].kind = .interpolated;
+        }
+    }
+    for (correlated.origin) |candidate| {
+        try control.check();
+        if (candidate.id == parts[0].segment.edge and candidate.percent_along == parts[0].segment.begin) {
+            matches[0].point = candidate.projected;
+            matches[0].distance = @floatCast(candidate.distance);
+            break;
+        }
+    }
+    const last_edge = parts[parts.len - 1].segment;
+    for (correlated.target) |candidate| {
+        try control.check();
+        if (candidate.id == last_edge.edge and candidate.percent_along == last_edge.end) {
+            matches[last].point = candidate.projected;
+            matches[last].distance = @floatCast(candidate.distance);
+            break;
         }
     }
     return .{
@@ -257,8 +350,8 @@ fn stitch(arena: *memory.Arena, view: *const View, kernel: anytype, trace: []con
         match.edge = direction.edge;
         match.fraction = direction.percent_along;
         match.kind = .matched;
-        match.begins_discontinuity = t < pair_paths.len and !departs;
-        match.ends_discontinuity = t != 0 and !arrives;
+        match.begins_discontinuity = t < pair_paths.len and !path.states[t + 1].valid();
+        match.ends_discontinuity = t != 0 and !path.states[t - 1].valid();
     }
 
     var segments: std.ArrayList(Segment) = .empty;
@@ -409,6 +502,7 @@ fn appendInterval(a: Allocator, matches: []const Match, segments: []const Segmen
             const previous = &output.items[output.items.len - 1];
             if (!previous.discontinuity and previous.path.edge == segment.path.edge and previous.path.end == segment.path.begin) {
                 previous.path.end = segment.path.end;
+                previous.first_match = previous.first_match orelse segment.first_match;
                 previous.last_match = segment.last_match orelse previous.last_match;
                 continue;
             }
@@ -428,6 +522,16 @@ fn formPaths(a: Allocator, view: *const View, kernel: anytype, matches: []const 
             break;
         }
     }
+    var initial_timing = options.timing;
+    if (!initial_timing.start.valid) if (options.start_clock) |clock| {
+        const first = try view.edge(segments[0].path.edge);
+        const node: graph.format.NodeId = @fromBackingInt(first.head);
+        if (clock.date) |date| {
+            initial_timing.start = try graph.time_info.TimeInfo.fromNode(view, node, date, clock.now, control.deadline);
+        } else if (clock.timestamp >= 0 and clock.timestamp < 253_402_300_800) {
+            initial_timing.start = try graph.time_info.TimeInfo.fromUnix(view, node, @intFromFloat(clock.timestamp), clock.now);
+        }
+    };
     const edges = try a.alloc(endpoints.Segment, segments.len);
     const steps = try a.alloc(route_legs.Recost.Step, segments.len);
     var legs: std.ArrayList(Leg) = .empty;
@@ -447,7 +551,7 @@ fn formPaths(a: Allocator, view: *const View, kernel: anytype, matches: []const 
         var timestamp_index = start_match;
         const epoch = matches[start_match].epoch_time;
         var recost: route_legs.Recost = .{};
-        var timing = options.timing;
+        var timing = initial_timing;
         if (elapsed > 0 and timing.start.valid) {
             const start_node: graph.format.NodeId = @fromBackingInt((try view.edge(try view.oppEdge(segments[first].path.edge))).head);
             timing.start = try timing.at(view, start_node, elapsed, .forward);
@@ -456,12 +560,12 @@ fn formPaths(a: Allocator, view: *const View, kernel: anytype, matches: []const 
             try control.check();
             edge.* = segment.path;
             step.* = try recost.addForward(view, kernel, edge.*, i + 1 == end, .{ .timing = timing, .control = control });
-            if (!use_timestamps or epoch < 0) continue;
+            if (!use_timestamps or (options.require_timestamps and epoch < 0)) continue;
             if (exact_walk) {
                 timestamp_index = segment.shape_end orelse return error.InvalidTracePath;
             } else if (segment.last_match) |index| timestamp_index = index;
             const timestamp = matches[timestamp_index].epoch_time;
-            if (timestamp < 0) continue;
+            if (options.require_timestamps and timestamp < 0) continue;
             step.elapsed.secs = @floatCast(timestamp - epoch);
             recost.elapsed.secs = step.elapsed.secs;
             recost.previous.secs = step.elapsed.secs;

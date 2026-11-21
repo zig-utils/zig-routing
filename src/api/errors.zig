@@ -14,6 +14,7 @@ pub const Failure = struct {
     code: u16,
     /// Appended to the message as ": extra" when not empty.
     extra: []const u8 = "",
+    trace_format: enum { json, osrm, pbf } = .json,
 
     pub fn entry(self: Failure) Entry {
         return lookup(self.code);

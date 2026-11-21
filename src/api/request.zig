@@ -48,6 +48,18 @@ pub const Format = enum { json, gpx, osrm, pbf, geotiff, mvt };
 pub const Units = enum { kilometers, miles };
 pub const DirectionsType = enum { instructions, none, maneuvers };
 pub const ShapeFormat = enum { polyline6, polyline5, geojson, no_shape };
+pub const ShapeMatch = @import("proto/options.zig").ShapeMatch;
+
+pub const TraceOptions = struct {
+    shape_match: ShapeMatch = .walk_or_snap,
+    use_timestamps: bool = false,
+    alternates: u32 = 0,
+    gps_accuracy: ?f32 = null,
+    search_radius: ?f32 = null,
+    breakage_distance: ?f32 = null,
+    interpolation_distance: ?f32 = null,
+    turn_penalty_factor: ?f32 = null,
+};
 pub const Costing = enum { auto, bicycle, bus, taxi, motor_scooter, multimodal, pedestrian, transit, truck, motorcycle, none, bikeshare, auto_pedestrian };
 const AutoAlias = enum(u8) { auto_shorter = 100, hov = 101, auto_data_fix = 102 };
 pub const DateTimeType = enum { no_time, current, depart_at, arrive_by, invariant };
@@ -150,6 +162,7 @@ pub const Options = struct {
     exclude_locations: []Location = &.{},
     exclude_polygons: []const exclusions.Ring = &.{},
     shape: []Location = &.{},
+    trace: TraceOptions = .{},
     encoded_polyline: ?[]const u8 = null,
     // /height
     /// The native handler needs only coordinates from a plain numeric shape.
@@ -242,6 +255,10 @@ fn parseHttpWith(arena: Allocator, path: []const u8, query: []const QueryParam, 
         if (!gop.found_existing) gop.value_ptr.* = .{ .string = q.value };
     }
     var result = try fromJsonWithin(arena, doc, action, deadline);
+    if (action == .trace_attributes and result == .failure) {
+        const format = json.get([]const u8, doc, "/format", "json");
+        result.failure.trace_format = std.meta.stringToEnum(@TypeOf(result.failure.trace_format), format) orelse .json;
+    }
     if (fast) |f| switch (result) {
         .ok => |*o| if (o.encoded_polyline == null) {
             if (o.locations.len == 0 and o.sources.len == 0 and o.targets.len == 0 and o.exclude_locations.len == 0) {
@@ -680,6 +697,7 @@ fn fromJsonWithin(arena: Allocator, doc: json.Value, action: Action, deadline: D
         var pts: std.ArrayList(Location) = .empty;
         var d = polyline.Decoder(.polyline).initPrecision(enc, precision);
         while (true) {
+            if (pts.items.len % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
             const p = (d.next() catch return fail(100)) orelse break;
             try pts.append(arena, .{ .lat = p.lat, .lng = p.lng, .type = .via, .time = -1 });
         }
@@ -690,6 +708,12 @@ fn fromJsonWithin(arena: Allocator, doc: json.Value, action: Action, deadline: D
         o.shape = pts.items;
     } else {
         if (try parseLocationField(arena, root, &o, "/shape", .shape, 134, deadline)) |failure| return failure;
+        if (o.shape.len == 0 and (action == .trace_attributes or action == .trace_route)) {
+            if (try parseLocationField(arena, root, &o, "/trace", .shape, 135, deadline)) |failure| return failure;
+        }
+    }
+    if (action == .trace_attributes or action == .trace_route) {
+        if (try parseTrace(arena, root, &o, deadline)) |failure| return failure;
     }
 
     if (json.array(root, "/recostings")) |items| {
@@ -713,6 +737,39 @@ fn fromJsonWithin(arena: Allocator, doc: json.Value, action: Action, deadline: D
     if (json.getOptional(f64, root, "/resample_distance")) |rd| o.resample_distance = rd;
 
     return .{ .ok = o };
+}
+
+fn parseTrace(a: Allocator, root: json.Value, options: *Options, deadline: Deadline) ParseError!?Result {
+    const trace = &options.trace;
+    if (json.getOptional([]const u8, root, "/shape_match")) |mode| {
+        trace.shape_match = parseEnum(ShapeMatch, mode) orelse return fail(445);
+    }
+    if (json.getOptional(u32, root, "/best_paths")) |best| {
+        trace.alternates = best -| 1;
+        try options.warnings.append(a, 103);
+    }
+    trace.alternates = json.get(u32, root, "/alternates", trace.alternates);
+    trace.gps_accuracy = json.getOptional(f32, root, "/trace_options/gps_accuracy");
+    trace.search_radius = json.getOptional(f32, root, "/trace_options/search_radius");
+    trace.breakage_distance = json.getOptional(f32, root, "/trace_options/breakage_distance");
+    trace.interpolation_distance = json.getOptional(f32, root, "/trace_options/interpolation_distance");
+    trace.turn_penalty_factor = json.getOptional(f32, root, "/trace_options/turn_penalty_factor");
+    trace.use_timestamps = json.get(bool, root, "/use_timestamps", false);
+    if (json.array(root, "/durations")) |durations| {
+        if (options.shape.len == 0 or durations.len != options.shape.len - 1) return fail(136);
+        var elapsed: f64 = @floatFromInt(json.get(u32, root, "/begin_time", 0));
+        options.shape[0].time = elapsed;
+        for (durations, options.shape[1..], 0..) |delta, *location, i| {
+            if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+            elapsed += json.convert(f64, delta) orelse return fail(136);
+            if (!std.math.isFinite(elapsed)) return fail(136);
+            location.time = elapsed;
+        }
+    }
+    // Valhalla marks every decoded shape point's time field present,
+    // using -1 when the request omits it.
+    if (trace.use_timestamps and options.shape.len == 0) return fail(159);
+    return null;
 }
 
 const LocationsResult = union(enum) { ok: []Location, failure: errors.Failure };
@@ -1182,13 +1239,14 @@ test "deprecated motor types normalize their flags and copy the alias options" {
 /// Whether two parse results are the same in every field a handler reads.
 pub fn resultsEqual(x: Result, y: Result) bool {
     switch (x) {
-        .failure => |f| return y == .failure and y.failure.code == f.code,
+        .failure => |f| return y == .failure and y.failure.code == f.code and y.failure.trace_format == f.trace_format,
         .ok => |a| {
             if (y != .ok) return false;
             const b = y.ok;
             if (a.action != b.action or a.format != b.format or a.units != b.units or a.directions_type != b.directions_type or
                 a.roundabout_exits != b.roundabout_exits or a.costing != b.costing or a.shape_format != b.shape_format or a.range != b.range or
                 a.height_precision != b.height_precision or a.verbose != b.verbose or a.filter_closures != b.filter_closures) return false;
+            if (!std.meta.eql(a.trace, b.trace)) return false;
             if (!std.meta.eql(a.resample_distance, b.resample_distance)) return false;
             if ((a.id == null) != (b.id == null) or (a.id != null and !std.mem.eql(u8, a.id.?, b.id.?))) return false;
             if ((a.encoded_polyline == null) != (b.encoded_polyline == null)) return false;

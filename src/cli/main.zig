@@ -360,6 +360,7 @@ const Runtime = struct {
         self.svc.register(.locate, routing.api.locate_action.handle);
         self.svc.register(.tile, routing.api.tile_action.handle);
         self.svc.register(.transit_available, routing.api.transit_available_action.handle);
+        self.svc.register(.trace_attributes, routing.api.trace_attributes_action.handle);
     }
 
     fn startWarmup(self: *Runtime, lock_hot: bool) void {
@@ -432,7 +433,7 @@ fn route(ctx: *Context) !u8 {
     defer runtime.close();
     try runtime.open(loaded.config.additional_data.elevation);
     const open_graph = switch (action) {
-        .locate, .tile, .transit_available => true,
+        .locate, .tile, .transit_available, .trace_attributes => true,
         .status => runtime.svc.allow_status_verbose,
         else => false,
     };
@@ -440,9 +441,12 @@ fn route(ctx: *Context) !u8 {
 
     var arena = routing.infra.arena.Arena.init(std.heap.c_allocator, .{ .cap_bytes = settings.arena_cap_bytes });
     defer arena.deinit();
+    var scratch = routing.infra.arena.Arena.init(std.heap.c_allocator, arena.options);
+    defer scratch.deinit();
     var worker: http.Ctx = .{
         .worker_id = 0,
         .arena = &arena,
+        .scratch = &scratch,
         .deadline = if (settings.request_timeout_ms) |ms| io.Deadline.fromNowMs(ms) else .none,
     };
     const path = try std.fmt.allocPrint(app.arena, "/{s}", .{@tagName(action)});
@@ -460,7 +464,7 @@ fn route(ctx: *Context) !u8 {
     if (response.body.items.len == 0 and response.status >= 400) return error.RequestFailed;
     const writer = if (response.status >= 400) app.stderr else ctx.out.?;
     try writer.writeAll(response.body.items);
-    if (action != .tile or response.status >= 400) try writer.writeByte('\n');
+    if (!std.mem.eql(u8, response.content_type, "application/x-protobuf") and (action != .tile or response.status >= 400)) try writer.writeByte('\n');
     return if (response.status >= 400) 1 else 0;
 }
 

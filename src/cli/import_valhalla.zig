@@ -200,7 +200,10 @@ const Layout = struct {
                 },
                 .speed = .{ raw.speed.base, raw.speed.free_flow, raw.speed.constrained_flow, raw.speed.truck },
             };
-            slope.* = format.Slopes.init(raw.access.max_up_slope, raw.access.max_down_slope).code;
+            slope.* = if (tile.header.tile.elevation)
+                format.Slopes.init(raw.access.max_up_slope, raw.access.max_down_slope).code
+            else
+                format.Slopes.unavailable;
         }
         for (self.first[0..self.nodes.len], self.first[1..], 0..) |begin, end, node| {
             if (node % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;

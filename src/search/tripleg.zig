@@ -29,6 +29,7 @@ pub const Input = struct {
     travel: Travel = .{ .drive = .kCar },
     locations: ?Locations = null,
     algorithms: []const []const u8 = &.{},
+    trace: bool = false,
     leg_id: u32 = 0,
     leg_count: u32 = 1,
 };
@@ -107,8 +108,8 @@ pub fn build(a: std.mem.Allocator, view: *const View, input: Input, control: Con
         if (attrs.has(.@"node.admin_index"))
             out.admin_index = try adminIndex(a, &admins, try view.nodeAdmin(from), control);
         if (street) |directed| {
-            if (attrs.hasAny("node.intersecting_edge."))
-                out.intersecting_edge = try intersections(a, view, from, edge.id, directed, previous, attrs, control);
+            if (attrs.hasAny("node.intersecting_edge.") or (input.trace and (attrs.hasAny("node.") or attrs.has(.@"edge.names"))))
+                out.intersecting_edge = try intersections(a, view, from, edge.id, directed, previous, input.trace, attrs, control);
             if (attrs.has(.@"node.stop_impact")) {
                 if (previous) |id| {
                     const incoming = try view.edge(id);
@@ -183,6 +184,27 @@ fn latLng(point: geo.PointLL) model.LatLng {
     return .{ .lat = point.lat, .lng = point.lng };
 }
 
+pub fn traceEndpoints(a: std.mem.Allocator, geometry: *const legs.Leg, requested: []const request.Location, path: []const Segment, origin_distance: f32, destination_distance: f32) ![]const model.Location {
+    const locations = try a.alloc(model.Location, 2);
+    const chosen = try a.alloc(model.PathEdge, 2);
+    const last = path.len - 1;
+    for (locations, chosen, [_]usize{ geometry.origin, geometry.destination }, [_]usize{ 0, last }, [_]f32{ path[0].begin, path[last].end }, [_]f32{ origin_distance, destination_distance }, [_]geo.PointLL{ geometry.shape[0], geometry.shape[geometry.shape.len - 1] }) |*out, *edge, index, part, fraction, distance, point| {
+        edge.* = .{
+            .graph_id = @backingInt(path[part].edge),
+            .percent_along = fraction,
+            .ll = latLng(point),
+            .distance = distance,
+        };
+        out.* = copyLocation(requested[index]);
+        out.correlation = .{
+            .edges = @as(*[1]model.PathEdge, @ptrCast(edge)),
+            .projected_ll = edge.ll,
+            .original_index = requested[index].original_index,
+        };
+    }
+    return locations;
+}
+
 fn projectLocations(a: std.mem.Allocator, input: Input, source: Locations, control: Control) ![]const model.Location {
     const origin = input.geometry.origin;
     const dest = input.geometry.destination;
@@ -223,7 +245,12 @@ fn projectLocations(a: std.mem.Allocator, input: Input, source: Locations, contr
             .inbound_reach = @intCast(@min(candidate.reach.inbound, std.math.maxInt(i32))),
             .heading = candidate.heading,
         };
-        out.* = copyLocation(source.requested[location], source.waypoints[location]);
+        const waypoint = source.waypoints[location];
+        out.* = copyLocation(source.requested[location]);
+        out.date_time = waypoint.date_time orelse out.date_time;
+        out.waiting_secs = waypoint.waiting_secs;
+        out.time_zone_offset = waypoint.time_zone_offset;
+        out.time_zone_name = waypoint.time_zone_name;
         if (first or location == dest) out.side_of_street = side;
         out.correlation = .{
             .edges = @as(*[1]model.PathEdge, @ptrCast(path_edge)),
@@ -249,7 +276,7 @@ fn selectedCandidate(correlation: snap.PathLocation, id: format.EdgeId, fraction
     return same_edge;
 }
 
-fn copyLocation(location: request.Location, waypoint: multi.Waypoint) model.Location {
+fn copyLocation(location: request.Location) model.Location {
     const filter = location.search_filter;
     return .{
         .ll = .{ .lat = location.lat, .lng = location.lng },
@@ -257,7 +284,7 @@ fn copyLocation(location: request.Location, waypoint: multi.Waypoint) model.Loca
         .heading = if (location.heading) |value| @bitCast(value) else null,
         .name = location.name orelse "",
         .street = location.street orelse "",
-        .date_time = waypoint.date_time orelse location.date_time orelse "",
+        .date_time = location.date_time orelse "",
         .heading_tolerance = if (location.heading_tolerance) |value| @bitCast(value) else null,
         .node_snap_tolerance = if (location.node_snap_tolerance) |value| @intFromFloat(@min(@max(value, 0), 4294967040)) else null,
         .minimum_reachability = location.minimum_reachability,
@@ -274,7 +301,7 @@ fn copyLocation(location: request.Location, waypoint: multi.Waypoint) model.Loca
         .street_side_tolerance = location.street_side_tolerance,
         .street_side_max_distance = location.street_side_max_distance,
         .preferred_layer = location.preferred_layer,
-        .waiting_secs = waypoint.waiting_secs,
+        .waiting_secs = location.waiting_secs,
         .street_side_cutoff = if (location.street_side_cutoff) |value| @fromBackingInt(@backingInt(value)) else null,
         .minimum_inbound_reachability = location.minimum_inbound_reachability,
         .minimum_outbound_reachability = location.minimum_outbound_reachability,
@@ -291,8 +318,6 @@ fn copyLocation(location: request.Location, waypoint: multi.Waypoint) model.Loca
             .exclude_restricted = filter.exclude_restricted,
             .level = if (filter.level == request.max_level) null else filter.level,
         },
-        .time_zone_offset = waypoint.time_zone_offset,
-        .time_zone_name = waypoint.time_zone_name,
     };
 }
 
@@ -455,11 +480,11 @@ fn buildEdge(a: std.mem.Allocator, view: *const View, from: format.NodeId, node:
     if (attrs.has(.@"edge.id")) result.id = @backingInt(edge.id);
     if (attrs.has(.@"edge.weighted_grade")) result.weighted_grade = (@as(f32, @floatFromInt(directed.geom.grade)) - 6) / 0.6;
     if (attrs.has(.@"edge.max_upward_grade") or attrs.has(.@"edge.max_downward_grade")) {
-        const slopes = try view.edgeSlopes(edge.id);
+        const slopes = try view.edgeSlopeData(edge.id);
         if (attrs.has(.@"edge.max_upward_grade"))
-            result.max_upward_grade = if (view.slopes != null) slopes.maxUp() else graph.cold.no_elevation;
+            result.max_upward_grade = if (slopes) |s| s.maxUp() else graph.cold.no_elevation;
         if (attrs.has(.@"edge.max_downward_grade"))
-            result.max_downward_grade = if (view.slopes != null) slopes.maxDown() else graph.cold.no_elevation;
+            result.max_downward_grade = if (slopes) |s| s.maxDown() else graph.cold.no_elevation;
     }
     if (attrs.has(.@"edge.lane_count")) result.lane_count = class.category.lanes;
     if (attrs.has(.@"edge.cycle_lane")) result.cycle_lane = @fromBackingInt(class.category.cycle_lane);
@@ -536,10 +561,15 @@ fn buildEdge(a: std.mem.Allocator, view: *const View, from: format.NodeId, node:
             try populateNamesAndLevels(a, view.cold_data.?, record, attrs, &result, control);
     }
 
-    if (attrs.hasAny("edge.sign.") and view.signs != null) {
-        const rows = try graph.signs.signsForEdge(view, edge.id);
-        const junctions = if (attrs.has(.@"edge.sign.junction_name")) try graph.signs.signsForNode(view, from) else &.{};
-        result.sign = try projectSigns(a, view, rows, junctions, attrs, control);
+    if (view.signs != null) {
+        if (attrs.hasAny("edge.sign.")) {
+            const rows = try graph.signs.signsForEdge(view, edge.id);
+            const junctions = if (attrs.has(.@"edge.sign.junction_name")) try graph.signs.signsForNode(view, from) else &.{};
+            result.sign = try projectSigns(a, view, rows, junctions, attrs, control);
+            if (input.trace and rows.len + junctions.len != 0 and result.sign == null) result.sign = .{};
+        } else if (input.trace and class.flags.sign and (try graph.signs.signsForEdge(view, edge.id)).len != 0) {
+            result.sign = .{};
+        }
     }
     if (class.flags.turnlanes) {
         const masks = try graph.lanes.turnLanes(view, edge.id);
@@ -696,9 +726,12 @@ fn laneString(a: std.mem.Allocator, mask: u64) ![]const u8 {
     return a.dupe(u8, text[0..len]);
 }
 
-fn intersections(a: std.mem.Allocator, view: *const View, from: format.NodeId, current: format.EdgeId, directed: *const format.EdgeHot, previous: ?format.EdgeId, attrs: Attributes, control: Control) ![]const model.IntersectingEdge {
+fn intersections(a: std.mem.Allocator, view: *const View, from: format.NodeId, current: format.EdgeId, directed: *const format.EdgeHot, previous: ?format.EdgeId, trace: bool, attrs: Attributes, control: Control) ![]const model.IntersectingEdge {
     const incoming = if (previous) |id| try view.edge(id) else null;
     const previous_opp = if (previous) |id| try view.oppEdge(id) else null;
+    // A trace gap changes the start node, but Valhalla's intersection
+    // enumeration still excludes the prior opposing local index.
+    const prior_local = if (trace and incoming != null) incoming.?.cls.opp_local else null;
     const want_previous = attrs.has(.@"node.intersecting_edge.from_edge_name_consistency");
     const want_current = attrs.has(.@"node.intersecting_edge.to_edge_name_consistency");
 
@@ -722,6 +755,7 @@ fn intersections(a: std.mem.Allocator, view: *const View, from: format.NodeId, c
             const id: format.EdgeId = @fromBackingInt(@as(u32, @intCast(slot)));
             if (id == current or id == previous_opp) continue;
             const edge = try view.edge(id);
+            if (node == from and prior_local == edge.cls.local) continue;
             const class = try view.class(edge.cls.class_id);
             if (class.flags.node_connector or class.category.use == @backingInt(graph.constants.Use.construction)) continue;
             const forward = class.forwardAccess();
@@ -755,8 +789,10 @@ fn intersections(a: std.mem.Allocator, view: *const View, from: format.NodeId, c
             if (want_previous and previous_opp != null) {
                 value.prev_name_consistency = if (previous_row) |row|
                     try nameFlag(row, edge.cls.local)
-                else
-                    try sameEdgeName(view, previous_opp.?, id, control);
+                else if (trace and node == from) blk: {
+                    const row = try view.turnRow(@fromBackingInt(incoming.?.head), incoming.?.cls.opp_local);
+                    break :blk edge.cls.local < row.len and try nameFlag(row, edge.cls.local);
+                } else try sameEdgeName(view, previous_opp.?, id, control);
             }
             if (want_current) {
                 value.curr_name_consistency = if (current_row) |row|

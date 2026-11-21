@@ -25,12 +25,49 @@ pub const Limits = struct {
     skadi_min_resample: f32 = 10.0,
     exclusions: exclusions.Limits = .{},
     tile: TileLimits = .{},
+    trace: TraceLimits = .{},
 };
 
 pub const TileLimits = struct {
     min_zoom: [8]u8 = .{ 7, 7, 8, 11, 11, 12, 13, 14 },
     max_age: []const u8 = "1800",
     allow_verbose: bool = false,
+};
+
+pub const TraceLimits = struct {
+    max_distance: f32 = 200_000,
+    max_gps_accuracy: f32 = 100,
+    max_search_radius: f32 = 100,
+    max_shape: usize = 16_000,
+    max_alternates: u32 = 3,
+    max_alternates_shape: usize = 100,
+};
+
+pub const TraceDefaults = struct {
+    sigma_z: f32 = @import("../match/emission.zig").Model.default_sigma_z,
+    gps_accuracy: f32 = 5,
+    beta: f32 = 3,
+    max_route_distance_factor: f32 = 5,
+    max_route_time_factor: f32 = 5,
+    max_search_radius: f32 = 100,
+    breakage_distance: f32 = 2000,
+    interpolation_distance: f32 = 10,
+    search_radius: f32 = 50,
+    turn_penalty_factor: f32 = 0,
+};
+
+pub const TraceSettings = struct {
+    default: TraceDefaults = .{},
+    customizable: []const []const u8 = &.{ "search_radius", "turn_penalty_factor", "gps_accuracy", "interpolation_distance" },
+
+    pub fn value(self: TraceSettings, comptime name: []const u8, override: ?f32) f32 {
+        if (override) |set| {
+            for (self.customizable) |key| {
+                if (std.mem.eql(u8, key, name)) return set;
+            }
+        }
+        return @field(self.default, name);
+    }
 };
 
 pub const Reply = struct {
@@ -56,6 +93,7 @@ pub const Service = struct {
     transit_coverage: ?*const @import("../graph/transit_coverage.zig").Index = null,
     tileset_last_modified: u32 = 0,
     allow_status_verbose: bool = false,
+    trace: TraceSettings = .{},
 
     pub fn register(self: *Service, action: Action, f: ActionFn) void {
         self.handlers[@backingInt(action)] = f;
@@ -97,7 +135,11 @@ pub const Service = struct {
             },
         };
         var options = switch (parsed) {
-            .failure => |f| return writeError(a, res, f, .json),
+            .failure => |f| return switch (f.trace_format) {
+                .json => writeError(a, res, f, .json),
+                .osrm => writeError(a, res, f, .osrm),
+                .pbf => writeTracePbfError(a, res, f),
+            },
             .ok => |o| o,
         };
         if (std.mem.indexOfScalar(Action, self.actions, options.action) == null)
@@ -117,6 +159,7 @@ pub const Service = struct {
         if (try f(self, ctx, &options, res)) |failure| {
             res.body.clearRetainingCapacity();
             res.extra_headers.clearRetainingCapacity();
+            if (options.action == .trace_attributes and options.format == .pbf) return writeTracePbfError(a, res, failure);
             return writeError(a, res, failure, options.format);
         }
         if (options.action == .tile and res.status == 200 and std.mem.eql(u8, res.content_type, mvt.mime_type)) {
@@ -189,6 +232,28 @@ pub fn writeError(a: Allocator, res: *http.Response, failure: errors.Failure, fo
     try w.field("status_code", @as(u64, e.http_code));
     try w.field("status", errors.httpReason(e.http_code));
     try w.endObject();
+}
+
+fn writeTracePbfError(a: Allocator, res: *http.Response, failure: errors.Failure) Allocator.Error!void {
+    const api = @import("proto/api.zig").Api;
+    const e = failure.entry();
+    const message = if (failure.extra.len > 0) try std.fmt.allocPrint(a, "{s}: {s}", .{ e.message, failure.extra }) else e.message;
+    const level = if (e.http_code >= 500) "error" else "warn";
+    const worker = switch (e.code) {
+        0...199, 300...399 => "loki",
+        400...500 => "thor",
+        else => "odin",
+    };
+    const key = try std.fmt.allocPrint(a, "trace_attributes.{s}.{s}.{s}", .{ level, worker, e.statsd_key });
+    const wire: api.Values = .{ .info = .{
+        .errors = &.{.{ .code = e.code, .description = message }},
+        .statistics = &.{.{ .key = key, .value = 1 }},
+    } };
+    const need = api.encodedSize(wire, io.Deadline.none) catch unreachable;
+    const buffer = try a.alloc(u8, need);
+    res.body = .fromOwnedSlice(api.encode(buffer, wire, io.Deadline.none) catch unreachable);
+    res.status = e.http_code;
+    res.content_type = "application/x-protobuf";
 }
 
 // ---------------------------------------------------------------------------

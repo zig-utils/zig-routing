@@ -40,6 +40,19 @@ pub const TimeInfo = struct {
         return fromLocal(rules, value, try view.nodeTimezone(node), timezone.utc, now, deadline);
     }
 
+    pub fn fromUnix(view: *const reader.View, node: NodeId, timestamp: i64, now: i64) !TimeInfo {
+        const rules = if (view.tz_rules) |*present| present else null;
+        const zone = try view.nodeTimezone(node);
+        const shift = (try offsetAt(rules, zone, timestamp)) orelse return .{};
+        return .{
+            .valid = true,
+            .zone = zone,
+            .unix_time = timestamp,
+            .second_of_week = datetime.secondOfWeek(timestamp, shift),
+            .seconds_from_now = try std.math.sub(i64, timestamp, now),
+        };
+    }
+
     pub fn fromLocal(
         rules: ?*const timezone.Rules,
         value: []const u8,

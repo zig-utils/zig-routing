@@ -59,6 +59,8 @@ pub const Response = struct {
 pub const Ctx = struct {
     worker_id: usize,
     arena: *arena_mod.Arena,
+    /// Scratch retained by the worker even while response memory is queued.
+    scratch: ?*arena_mod.Arena = null,
     stream: ?io.Stream = null,
     deadline: io.Deadline,
 
@@ -342,6 +344,7 @@ const Worker = struct {
     listener: ?io.Listener,
     poller: io.Poller,
     arena: arena_mod.Arena,
+    scratch: arena_mod.Arena,
     spare_arenas: std.ArrayList(arena_mod.Arena) = .empty,
     conns: std.ArrayList(?*Conn) = .empty,
     free_slots: std.ArrayList(usize) = .empty,
@@ -351,7 +354,15 @@ const Worker = struct {
         const poller = try io.Poller.init();
         errdefer poller.deinit();
         try poller.arm(listener.fd, listener_token, .read);
-        return .{ .server = server, .id = id, .listener = listener, .poller = poller, .arena = arena_mod.Arena.init(server.gpa, .{ .cap_bytes = server.config.arena_cap_bytes }) };
+        const memory: arena_mod.ArenaOptions = .{ .cap_bytes = server.config.arena_cap_bytes };
+        return .{
+            .server = server,
+            .id = id,
+            .listener = listener,
+            .poller = poller,
+            .arena = .init(server.gpa, memory),
+            .scratch = .init(server.gpa, memory),
+        };
     }
 
     fn deinit(self: *Worker) void {
@@ -361,6 +372,7 @@ const Worker = struct {
         if (self.listener) |l| l.close();
         self.poller.deinit();
         self.arena.deinit();
+        self.scratch.deinit();
         for (self.spare_arenas.items) |*arena| arena.deinit();
         self.spare_arenas.deinit(self.server.gpa);
     }
@@ -572,6 +584,7 @@ const Worker = struct {
 
     fn handleOne(self: *Worker, conn: *Conn, head: Head) !void {
         defer self.arena.reset();
+        defer self.scratch.reset();
         const a = self.arena.allocator();
         const buf = conn.in.items;
         const q = std.mem.indexOfScalar(u8, head.target, '?');
@@ -588,6 +601,7 @@ const Worker = struct {
         var ctx: Ctx = .{
             .worker_id = self.id,
             .arena = &self.arena,
+            .scratch = &self.scratch,
             .stream = conn.stream,
             .deadline = if (self.server.config.request_timeout_ms) |ms| io.Deadline.fromNowMs(ms) else .none,
         };

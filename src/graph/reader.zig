@@ -654,11 +654,16 @@ pub const View = struct {
     }
 
     pub fn edgeSlopes(self: *const View, id: format.EdgeId) !format.Slopes {
+        return (try self.edgeSlopeData(id)) orelse .flat;
+    }
+
+    pub fn edgeSlopeData(self: *const View, id: format.EdgeId) !?format.Slopes {
         _ = try self.edge(id);
-        const slopes = self.slopes orelse return format.Slopes.flat;
+        const slopes = self.slopes orelse return null;
         const value = slopes[@backingInt(id)];
+        if (value == format.Slopes.unavailable) return null;
         if (value >> 10 != 0) return error.InvalidSlopes;
-        return .{ .code = value };
+        return format.Slopes{ .code = value };
     }
 
     pub fn lbSpeed(self: *const View, id: format.EdgeId) !u8 {

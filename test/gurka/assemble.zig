@@ -5662,3 +5662,129 @@ test "Gurka exact trace revisits the same intersection later in the shape" {
         try testing.expectEqual(try directedBetween(view, &fixture, from, to), segment.path.edge);
     }
 }
+
+// Ported from test/gurka/test_trace_attributes.cc (Valhalla 3.9.3).
+test "Gurka trace attributes filters edge and match fields in JSON and PBF" {
+    const http = routing.server.http;
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    const fixture = try gurka.Map.init(a, try gurka.mapToCoordinates("A----B----C", 10), &.{
+        .{ .label = "AB", .tags = &.{
+            .{ .key = "highway", .value = "primary" },
+            .{ .key = "name", .value = "Main Street" },
+            .{ .key = "shoulder", .value = "both" },
+        } },
+        .{ .label = "BC", .tags = &.{
+            .{ .key = "highway", .value = "primary" },
+            .{ .key = "name", .value = "High Street" },
+        } },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const start = fixture.findNode("A").?.location;
+    const middle = fixture.findNode("B").?.location;
+    const end = fixture.findNode("C").?.location;
+    const measurements = [_]routing.geo.PointLL{ start.midpoint(middle), middle, middle.midpoint(end) };
+    var body: std.ArrayList(u8) = .empty;
+    var svc: routing.api.service.Service = .{ .graph = &built.bundle.view };
+    svc.register(.trace_attributes, routing.api.trace_attributes_action.handle);
+
+    var counting = routing.infra.arena.CountingAllocator.init(testing.allocator);
+    var arena = routing.infra.arena.Arena.init(counting.allocator(), .{});
+    defer arena.deinit();
+    var workspace = routing.infra.arena.Arena.init(counting.allocator(), .{});
+    defer workspace.deinit();
+    var ctx: http.Ctx = .{ .worker_id = 0, .arena = &arena, .scratch = &workspace, .deadline = .none };
+    var req: http.Request = .{
+        .method = .POST,
+        .target = "/trace_attributes",
+        .path = "/trace_attributes",
+        .query = &.{},
+        .headers = &.{},
+        .body = "",
+        .keep_alive = false,
+    };
+
+    const variants = [_]struct { format: []const u8, filters: []const u8 }{
+        .{ .format = "json", .filters = "" },
+        .{ .format = "osrm", .filters =
+        \\,"filters":{"action":"include","attributes":["edge.shoulder","edge.names","matched.type"]}
+        },
+        .{ .format = "json", .filters =
+        \\,"filters":{"action":"exclude","attributes":["edge.names","matched.distance_along_edge"]}
+        },
+        .{ .format = "pbf", .filters =
+        \\,"best_paths":2,"filters":{"action":"include","attributes":["matched.distance_from_trace_point"]}
+        },
+    };
+    for (variants, 0..) |variant, i| {
+        body.clearRetainingCapacity();
+        try body.print(a, "{{\"shape_match\":\"map_snap\",\"costing\":\"bicycle\",\"format\":\"{s}\",\"shape\":[", .{variant.format});
+        for (measurements, 0..) |location, j| {
+            if (j != 0) try body.append(a, ',');
+            try body.print(a, "{{\"lat\":{d},\"lon\":{d}}}", .{ location.lat + 0.00002, location.lng });
+        }
+        try body.print(a, "]{s}}}", .{variant.filters});
+        req.body = body.items;
+        arena.reset();
+        workspace.reset();
+        var res: http.Response = .{ .gpa = arena.allocator() };
+        svc.handle(&ctx, &req, &res);
+        try testing.expectEqual(200, res.status);
+        if (i == 3) {
+            try testing.expectEqualStrings("application/x-protobuf", res.content_type);
+            const api = try routing.api.proto.Api.decode(res.body.items, ctx.deadline);
+            const info = (try api.get("info", ctx.deadline)).?;
+            var warnings = try info.get("warnings", ctx.deadline);
+            const warning = (try warnings.next(ctx.deadline)).?;
+            try testing.expectEqual(103, try warning.get("code", ctx.deadline));
+            const trip = (try api.get("trip", ctx.deadline)).?;
+            var routes = try trip.get("routes", ctx.deadline);
+            const route = (try routes.next(ctx.deadline)).?;
+            var leg_list = try route.get("legs", ctx.deadline);
+            const leg = (try leg_list.next(ctx.deadline)).?;
+            var location_list = try leg.get("location", ctx.deadline);
+            const origin = (try location_list.next(ctx.deadline)).?;
+            const correlation = (try origin.get("correlation", ctx.deadline)).?;
+            var path_edges = try correlation.get("edges", ctx.deadline);
+            try testing.expect((try path_edges.next(ctx.deadline)) != null);
+            var points = try route.get("matched_points", ctx.deadline);
+            for (measurements) |_| {
+                const point = (try points.next(ctx.deadline)).?;
+                try testing.expectApproxEqAbs(2.22, (try point.get("distance_from_trace_point", ctx.deadline)).?, 0.05);
+                try testing.expectEqual(null, try point.get("latlng", ctx.deadline));
+            }
+            try testing.expectEqual(null, try points.next(ctx.deadline));
+            continue;
+        }
+        const result = (try std.json.parseFromSliceLeaky(std.json.Value, res.gpa, res.body.items, .{})).object;
+        const edges = result.get("edges").?.array.items;
+        const points = result.get("matched_points").?.array.items;
+        try testing.expectEqual(2, edges.len);
+        try testing.expectEqual(3, points.len);
+        try testing.expectEqual(true, edges[0].object.get("shoulder").?.bool);
+        try testing.expectEqual(false, edges[1].object.get("shoulder").?.bool);
+        if (i == 0) {
+            try testing.expectEqual(0, points[0].object.get("edge_index").?.integer);
+            try testing.expectEqual(1, points[2].object.get("edge_index").?.integer);
+        } else if (i == 1) {
+            try testing.expectEqualStrings("Main Street", edges[0].object.get("names").?.array.items[0].string);
+            try testing.expectEqual(null, edges[0].object.get("way_id"));
+            try testing.expectEqual(null, points[0].object.get("edge_index"));
+        } else {
+            try testing.expectEqual(null, edges[0].object.get("names"));
+            try testing.expectEqual(null, points[0].object.get("distance_along_edge"));
+        }
+    }
+
+    counting.resetCounts();
+    for (0..8) |_| {
+        arena.reset();
+        workspace.reset();
+        var res: http.Response = .{ .gpa = arena.allocator() };
+        svc.handle(&ctx, &req, &res);
+        try testing.expectEqual(200, res.status);
+    }
+    try testing.expectEqual(0, counting.calls());
+}

@@ -359,6 +359,21 @@ pub const Search = struct {
     /// alternatives. All state IDs in the result refer to original candidates.
     /// Use a fresh search for a separate top-k enumeration.
     pub fn bestPaths(self: *Search, output: *memory.Arena, model: anytype, k: u32, control: Control) ![]const Path {
+        const Collector = struct {
+            entries: std.ArrayList(Path) = .empty,
+            pub fn accept(collector: *@This(), a: Allocator, path: Path, _: Control) !bool {
+                try collector.entries.append(a, path);
+                return true;
+            }
+        };
+        var collector: Collector = .{};
+        try self.enumeratePaths(output, model, k, &collector, control);
+        return collector.entries.items;
+    }
+
+    /// Visit ranked paths until the collector has accepted k. Rejected paths
+    /// have their result allocations rewound before the next search starts.
+    pub fn enumeratePaths(self: *Search, output: *memory.Arena, model: anytype, k: u32, collector: anytype, control: Control) !void {
         try control.check();
         if (k == 0) return error.InvalidBestPathCount;
         const first_layer = self.layers.items.len;
@@ -372,11 +387,12 @@ pub const Search = struct {
         }
         const a = output.allocator();
         const scratch = try self.a.alloc(Index, self.columns.len);
-        var paths: std.ArrayList(Path) = .empty;
-        for (0..k) |i| {
+        var accepted: u32 = 0;
+        while (accepted < k) {
             try control.check();
             const result = try self.backtrack(scratch, model, control);
-            if (i != 0 and result.broken) break;
+            if (accepted != 0 and result.broken) break;
+            const mark = output.mark();
             const states = try a.alloc(StateId, scratch.len);
             var submatches: std.ArrayList(Path.Submatch) = .empty;
             for (states, scratch, 0..) |*state_id, slot, time| {
@@ -387,11 +403,14 @@ pub const Search = struct {
                     try submatches.append(a, .{ .first = @intCast(time), .count = 1 });
                 } else submatches.items[submatches.items.len - 1].count += 1;
             }
-            try paths.append(a, .{ .states = states, .submatches = submatches.items, .cost = result.cost, .broken = result.broken });
-            if (result.broken or scratch.len == 0 or i + 1 == k) break;
+            if (try collector.accept(a, .{ .states = states, .submatches = submatches.items, .cost = result.cost, .broken = result.broken }, control)) {
+                accepted += 1;
+            } else {
+                output.rewind(mark);
+            }
+            if (result.broken or scratch.len == 0 or accepted == k) break;
             try self.removePath(scratch, control);
         }
-        return paths.items;
     }
 };
 

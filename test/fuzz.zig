@@ -1942,6 +1942,7 @@ test "fuzz motor-costing" {
 }
 
 const request_seeds = [_][]const u8{
+    "\x07{\"costing\":\"auto\",\"trace\":[{\"lat\":52.09,\"lon\":5.1},{\"lat\":52.0901,\"lon\":5.1001}],\"durations\":[6.75],\"begin_time\":1,\"use_timestamps\":true,\"shape_match\":\"map_snap\",\"best_paths\":2,\"trace_options\":{\"gps_accuracy\":4,\"search_radius\":30},\"format\":\"pbf\"}",
     "\x0e{\"locations\":[{\"lat\":42.08,\"lon\":-71.04,\"radius\":-1},{\"lat\":90,\"lon\":180,\"radius\":2.6}]}",
     "\x8e{\"locations\":[{\"lat\":0,\"lon\":179.99,\"radius\":18446744073709551615},{\"lat\":0,\"lon\":-179.99,\"radius\":\"-2\"}]}",
     "\x00{\"costing\":\"multimodal\",\"costing_options\":{\"pedestrian\":{\"transit_transfer_max_distance\":805},\"transit\":{\"use_bus\":0.3,\"use_rail\":0.6,\"filters\":{\"stops\":{\"action\":\"include\",\"ids\":[\"x\",3,null]},\"operators\":{\"action\":\"exclude\",\"ids\":[\"op\"]}}}}}",

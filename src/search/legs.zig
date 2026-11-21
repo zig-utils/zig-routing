@@ -53,6 +53,64 @@ pub const Trip = struct {
     summary: Summary,
 };
 
+pub const ShapeCut = struct {
+    start: ?geo.PointLL = null,
+    end: ?geo.PointLL = null,
+    disconnected: bool = false,
+};
+
+/// Attach native geometry to already-priced trace edges. The supplied cuts
+/// also preserve the separate geometries on either side of a discontinuity.
+pub fn buildTrace(a: std.mem.Allocator, view: *const View, path: []const Segment, steps: []const Recost.Step, cuts: []const ShapeCut, origin: usize, destination: usize, control: search.Control) !Leg {
+    if (path.len == 0 or path.len != steps.len or path.len != cuts.len or origin >= destination) return error.InvalidRoute;
+    const edges = try a.alloc(Edge, path.len);
+    var fixed: std.ArrayList(geo.FixedLL) = .empty;
+    defer fixed.deinit(a);
+    var vertices: std.ArrayList(geo.PointLL) = .empty;
+    defer vertices.deinit(a);
+    var shape: std.ArrayList(geo.PointLL) = .empty;
+    var summary: Summary = .{ .bounds = undefined };
+    for (path, steps, cuts, edges) |segment, step, cut, *edge| {
+        try control.check();
+        const hot = try view.edge(segment.edge);
+        const class = try view.class(hot.cls.class_id);
+        try streetShape(a, view, segment.edge, &fixed, &vertices, control);
+        if (cut.start != null or cut.end != null or segment.begin != 0 or segment.end != 1) {
+            const metres: f32 = @floatFromInt(hot.geom.len_m);
+            const start = cut.start orelse vertices.items[0];
+            const end = cut.end orelse vertices.items[vertices.items.len - 1];
+            try geo.line.trimShapeWithDeadline(segment.begin * metres, start, segment.end * metres, end, &vertices, control.deadline);
+        }
+        const shape_begin = try appendShape(a, &shape, vertices.items, &summary.bounds, cut.disconnected, control);
+        edge.* = .{
+            .id = segment.edge,
+            .length_m = step.length_m,
+            .elapsed = step.elapsed,
+            .transition = step.transition,
+            .full_travel_secs = step.full_travel_secs,
+            .shape_begin = shape_begin,
+            .shape_end = shape.items.len - 1,
+        };
+        summary.length_m += step.length_m;
+        summary.has_toll = summary.has_toll or class.flags.toll;
+        summary.has_highway = summary.has_highway or class.category.road_class == @backingInt(graph.constants.RoadClass.motorway);
+        summary.has_ferry = summary.has_ferry or class.category.use == @backingInt(graph.constants.Use.ferry);
+    }
+    const elapsed = steps[steps.len - 1].elapsed;
+    summary.time = elapsed.secs;
+    summary.cost = elapsed.cost;
+    const encoded = try a.alloc(u8, geo.polyline.maxEncodedLen(.polyline, shape.items.len));
+    const size = try geo.polyline.encodeWithDeadline(.polyline, 6, shape.items, encoded, control.deadline);
+    return .{
+        .origin = origin,
+        .destination = destination,
+        .edges = edges,
+        .shape = shape.items,
+        .encoded_shape = encoded[0..size],
+        .summary = summary,
+    };
+}
+
 /// Recompute traversal and transition cost along a fixed directed path.
 pub const Recost = struct {
     elapsed: Cost = .{},
@@ -237,7 +295,7 @@ fn buildLeg(a: std.mem.Allocator, view: *const View, kernel: anytype, leg: multi
                 vertices.items[vertices.items.len - 1];
             try geo.line.trimShapeWithDeadline(segment.begin * metres, start, segment.end * metres, end, vertices, control.deadline);
         }
-        const shape_begin = try appendShape(a, &shape, vertices.items, &summary.bounds, control);
+        const shape_begin = try appendShape(a, &shape, vertices.items, &summary.bounds, false, control);
 
         output.* = .{
             .id = segment.edge,
@@ -280,9 +338,9 @@ fn streetShape(a: std.mem.Allocator, view: *const View, id: EdgeId, fixed: *std.
     }
 }
 
-fn appendShape(a: std.mem.Allocator, shape: *std.ArrayList(geo.PointLL), vertices: []const geo.PointLL, bounds: *geo.AABB, control: search.Control) !usize {
+fn appendShape(a: std.mem.Allocator, shape: *std.ArrayList(geo.PointLL), vertices: []const geo.PointLL, bounds: *geo.AABB, disconnected: bool, control: search.Control) !usize {
     if (vertices.len == 0) return error.IncompleteShape;
-    const joined = shape.items.len != 0 and shape.items[shape.items.len - 1].eql(vertices[0]);
+    const joined = !disconnected and shape.items.len != 0 and shape.items[shape.items.len - 1].eql(vertices[0]);
     const begin = shape.items.len - @intFromBool(joined);
     const points = vertices[@intFromBool(joined)..];
     if (shape.items.len == 0) bounds.* = geo.AABB.fromPoints(points[0], points[0]);
@@ -372,7 +430,7 @@ fn scheduledLeg(a: std.mem.Allocator, view: *const View, paths: []const multimod
                     vehicle_time = @floatFromInt(ride.arrival_time - ride.departure_time);
                 },
             }
-            const begin = try appendShape(a, &shape, vertices.items, &summary.bounds, control);
+            const begin = try appendShape(a, &shape, vertices.items, &summary.bounds, false, control);
             edges[index] = .{
                 .id = segment.edge,
                 .ride = if (step.movement == .ride) step.movement.ride else null,

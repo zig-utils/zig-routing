@@ -48,3 +48,30 @@ pub fn checkCoverage(comptime Model: type, comptime Schema: type) void {
         } else @compileError("missing native model for " ++ name);
     }
 }
+
+const Deadline = @import("../infra/io.zig").Deadline;
+
+/// Convert a native trip model to the generated wire values. Scalars and
+/// byte strings are borrowed, while nested lists use the request arena.
+pub fn values(a: std.mem.Allocator, input: anytype, deadline: Deadline) error{ OutOfMemory, DeadlineExceeded }!@TypeOf(input).Schema.Values {
+    const Schema = @TypeOf(input).Schema;
+    var result: Schema.Values = undefined;
+    inline for (Schema.schema) |field| {
+        const value = @field(input, field.name);
+        @field(result, field.name) = if (field.kind != .message) value else switch (field.presence) {
+            .required => try values(a, value, deadline),
+            .optional => if (value) |child| try values(a, child, deadline) else null,
+            .repeated => blk: {
+                if (value.len == 0) break :blk &.{};
+                const list = try a.alloc(field.message.Values, value.len);
+                for (value, list) |item, *out| {
+                    if (deadline.expired()) return error.DeadlineExceeded;
+                    out.* = try values(a, item, deadline);
+                }
+                break :blk list;
+            },
+            .implicit => unreachable,
+        };
+    }
+    return result;
+}

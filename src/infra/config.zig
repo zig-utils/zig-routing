@@ -21,6 +21,7 @@ pub const Config = struct {
         } = .{},
     } = .{},
     mjolnir: Mjolnir = .{},
+    meili: service.TraceSettings = .{},
     zig_routing: ZigRouting = .{},
 
     pub const Mjolnir = struct {
@@ -47,6 +48,7 @@ pub const Config = struct {
             min_resample: f32 = (service.Limits{}).skadi_min_resample,
         } = .{},
         tile: struct { allow_verbose: bool = false } = .{},
+        trace: service.TraceLimits = .{},
         status: struct { allow_verbose: bool = false } = .{},
     };
 
@@ -105,6 +107,7 @@ pub const Config = struct {
                     .max_exclude_polygons_length = self.service_limits.max_exclude_polygons_length,
                     .max_exclude_polygons_vertices = self.service_limits.max_exclude_polygons_vertices,
                 },
+                .trace = self.service_limits.trace,
                 .tile = .{
                     .min_zoom = self.loki.service_defaults.mvt_min_zoom_road_class,
                     .max_age = self.loki.service_defaults.mvt_max_age,
@@ -112,6 +115,7 @@ pub const Config = struct {
                 },
             },
             .actions = self.loki.actions,
+            .trace = self.meili,
             .allow_status_verbose = self.service_limits.status.allow_verbose,
         };
     }
@@ -144,6 +148,14 @@ pub fn decode(arena: std.mem.Allocator, bytes: []const u8, path: []const u8, env
         return error.InvalidSkadiMinResample;
     if (!std.math.isFinite(config.service_limits.max_exclude_polygons_length) or config.service_limits.max_exclude_polygons_length < 0)
         return error.InvalidExcludePolygonsLength;
+    const trace = config.service_limits.trace;
+    const matcher = config.meili.default;
+    for ([_]f32{ trace.max_distance, matcher.max_search_radius, matcher.sigma_z, matcher.beta, matcher.breakage_distance, matcher.interpolation_distance, matcher.max_route_distance_factor, matcher.max_route_time_factor }) |value| {
+        if (!(value > 0 and std.math.isFinite(value))) return error.InvalidTraceConfiguration;
+    }
+    for ([_]f32{ trace.max_gps_accuracy, trace.max_search_radius, matcher.gps_accuracy, matcher.search_radius, matcher.turn_penalty_factor }) |value| {
+        if (!(value >= 0 and std.math.isFinite(value))) return error.InvalidTraceConfiguration;
+    }
     const min_zoom = config.loki.service_defaults.mvt_min_zoom_road_class;
     if (min_zoom[7] > 30 or !std.sort.isSorted(u8, &min_zoom, {}, std.sort.asc(u8))) return error.InvalidTileMinZoom;
     const cache_age = config.loki.service_defaults.mvt_max_age;
