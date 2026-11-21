@@ -6,6 +6,8 @@ pub const reach = @import("reach.zig");
 pub const candidates = @import("search.zig");
 pub const exclusions = @import("exclusions.zig");
 
+pub const linear = @import("linear.zig");
+
 const std = @import("std");
 
 test {

@@ -7,6 +7,8 @@ const geo = @import("../geo/root.zig");
 const match = @import("../match/root.zig");
 const kernels = @import("../match/kernel.zig");
 const snap = @import("../snap/search.zig");
+const linear = @import("../costing/linear.zig");
+const linear_snap = @import("../snap/linear.zig");
 const http = @import("../server/http.zig");
 const Arena = @import("../infra/arena.zig").Arena;
 const io = @import("../infra/io.zig");
@@ -51,6 +53,18 @@ fn run(svc: *const service.Service, view: *const View, ctx: *http.Ctx, options: 
     const a = ctx.arena.allocator();
     const control: search.Control = .{ .deadline = ctx.deadline };
     if (try validate(a, options, svc.limits.trace, svc.trace.default.breakage_distance, control)) |failure| return failure;
+    const resolved: linear_snap.Resolved = if (options.linear_cost_factors.len == 0)
+        .{}
+    else blk: {
+        var local_scratch = Arena.init(ctx.arena.backing, ctx.arena.options);
+        defer local_scratch.deinit();
+        const scratch = ctx.scratch orelse &local_scratch;
+        switch (try linear_snap.resolve(view, a, scratch, options.linear_cost_factors, svc.limits.linear_costs, control)) {
+            .ok => |features| break :blk features,
+            .failure => |failure| return failure,
+        }
+    };
+    const features: ?*const linear.Table = if (options.linear_cost_factors.len == 0) null else &resolved.costs;
     const attrs = try options.tripAttributes(true, control.deadline);
     const values = options.costing_options orelse .null;
     const object = if (values == .object) values.object.get(@tagName(options.costing)) orelse .null else .null;
@@ -69,37 +83,48 @@ fn run(svc: *const service.Service, view: *const View, ctx: *http.Ctx, options: 
                 else => .auto,
             }, object, &warnings, control.deadline),
             if (mode == .bus) .kAutoBus else .kCar,
+            features,
             control,
         ),
-        .truck => try motorTrip(costing.truck, view, ctx, options, attrs, svc.trace, try costing.truck.parse(a, object, &warnings, control.deadline), .kTruck, control),
-        .motorcycle, .motor_scooter => |mode| try motorTrip(costing.motorcycle, view, ctx, options, attrs, svc.trace, try costing.motorcycle.parse(a, if (mode == .motorcycle) .motorcycle else .motor_scooter, object, &warnings, control.deadline), if (mode == .motorcycle) .kMotorcycle else .kMotorScooter, control),
+        .truck => try motorTrip(costing.truck, view, ctx, options, attrs, svc.trace, try costing.truck.parse(a, object, &warnings, control.deadline), .kTruck, features, control),
+        .motorcycle, .motor_scooter => |mode| try motorTrip(costing.motorcycle, view, ctx, options, attrs, svc.trace, try costing.motorcycle.parse(a, if (mode == .motorcycle) .motorcycle else .motor_scooter, object, &warnings, control.deadline), if (mode == .motorcycle) .kMotorcycle else .kMotorScooter, features, control),
         .bicycle => blk: {
-            const profile = try costing.bicycle.Model.canonicalize(try costing.bicycle.parse(a, object, &warnings, control.deadline));
+            var raw = try costing.bicycle.parse(a, object, &warnings, control.deadline);
+            if (features) |costs| raw.may_allow_edges = costs.has_allow;
+            const profile = try costing.bicycle.Model.canonicalize(raw);
             const tables = try compile(costing.bicycle, view, a, profile, control);
-            const kernel: kernels.Active(costing.bicycle) = .{ .profile = &profile, .tables = &tables };
+            const kernel: kernels.Active(costing.bicycle) = .{ .profile = &profile, .tables = &tables, .features = features };
             const travel: model.BicycleType = @fromBackingInt(@backingInt(profile.bicycle_type));
             break :blk try matchTrip(view, ctx, options, attrs, svc.trace, kernel, .{ .bicycle = travel }, control);
         },
         .pedestrian, .bikeshare, .transit => |mode| blk: {
             const walk_opts = if (values == .object) values.object.get("pedestrian") orelse .null else .null;
-            const profile = try costing.pedestrian.Model.canonicalize(try costing.pedestrian.parse(a, walk_opts, &warnings, control.deadline));
+            var raw = try costing.pedestrian.parse(a, walk_opts, &warnings, control.deadline);
+            if (features) |costs| raw.may_allow_edges = costs.has_allow;
+            const profile = try costing.pedestrian.Model.canonicalize(raw);
             const tables = try compile(costing.pedestrian, view, a, profile, control);
-            const kernel: kernels.Active(costing.pedestrian) = .{ .profile = &profile, .tables = &tables, .bikeshare = mode == .bikeshare };
+            const kernel: kernels.Active(costing.pedestrian) = .{ .profile = &profile, .tables = &tables, .bikeshare = mode == .bikeshare, .features = features };
             const travel: model.PedestrianType = @fromBackingInt(@backingInt(profile.transport));
             break :blk try matchTrip(view, ctx, options, attrs, svc.trace, kernel, .{ .pedestrian = travel }, control);
         },
         .multimodal => return .{ .code = 140, .extra = "trace_attributes" },
         .none => unreachable,
     };
-    const response_warnings = try a.alloc(Warning, options.warnings.items.len + warnings.items.len);
+    const standard_warnings = options.warnings.items.len + warnings.items.len;
+    const failed_lines = resolved.failed.len != 0;
+    const response_warnings = try a.alloc(Warning, standard_warnings + @intFromBool(failed_lines));
     for (options.warnings.items, response_warnings[0..options.warnings.items.len]) |code, *out| {
         try control.check();
         out.* = .{ .code = code, .description = errors.warningText(code) orelse "" };
     }
-    for (warnings.items, response_warnings[options.warnings.items.len..]) |warning, *out| {
+    for (warnings.items, response_warnings[options.warnings.items.len..standard_warnings]) |warning, *out| {
         try control.check();
         out.* = .{ .code = costing.base.Warning.code, .description = try warning.description(a) };
     }
+    if (failed_lines) response_warnings[standard_warnings] = .{
+        .code = 216,
+        .description = try std.fmt.allocPrint(a, "{s}{s}", .{ errors.warningText(216).?, resolved.failed }),
+    };
     if (options.format == .pbf) {
         const wire: Api.Values = .{
             .trip = try mirror.values(a, trip, control.deadline),
@@ -115,8 +140,10 @@ fn run(svc: *const service.Service, view: *const View, ctx: *http.Ctx, options: 
     return null;
 }
 
-fn motorTrip(comptime m: type, view: *const View, ctx: *http.Ctx, options: *const request.Options, attrs: Attributes, settings: service.TraceSettings, raw: m.Model.Options, vehicle: model.VehicleType, control: search.Control) !model.Trip {
+fn motorTrip(comptime m: type, view: *const View, ctx: *http.Ctx, options: *const request.Options, attrs: Attributes, settings: service.TraceSettings, options_raw: m.Model.Options, vehicle: model.VehicleType, features: ?*const linear.Table, control: search.Control) !model.Trip {
     const a = ctx.arena.allocator();
+    var raw = options_raw;
+    if (features) |costs| raw.may_allow_edges = costs.has_allow;
     const profile = try m.Model.canonicalize(raw);
     const tables = try compile(m, view, a, profile, control);
     const kernel: kernels.Motor(m) = .{
@@ -124,6 +151,7 @@ fn motorTrip(comptime m: type, view: *const View, ctx: *http.Ctx, options: *cons
         .tables = &tables,
         .arena = a,
         .control = control,
+        .features = features,
         .traffic = .{
             .observations = view.speedOverlays(@intCast(@max(0, io.wallSeconds())), traffic_live.default_max_age_seconds),
             .forecasts = view.predicted_traffic,

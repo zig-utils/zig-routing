@@ -136,7 +136,7 @@ pub const Profile = struct {
             self.permission.allowedCandidate(class, state, disallow);
     }
 
-    fn pathClassAllowed(self: *const Profile, class: *const EdgeClass) bool {
+    pub fn pathClassAllowed(self: *const Profile, class: *const EdgeClass) bool {
         return self.permission.accessibleClass(class) and class.category.surface <= @backingInt(self.surface_limit) and
             switch (class.category.use) {
                 @backingInt(Use.transit_connection), @backingInt(Use.egress_connection), @backingInt(Use.platform_connection) => false,
@@ -247,8 +247,8 @@ pub const Model = struct {
     /// The static part of BicycleCost::EdgeCost's roadway stress. The
     /// remaining speed and grade terms are read from each directed edge.
     pub fn classFactor(profile: Profile, class: EdgeClass) !f32 {
-        if (class.category.surface == @backingInt(Surface.impassable) or
-            (!profile.may_allow_edges and !profile.pathClassAllowed(&class))) return inf;
+        if (!profile.may_allow_edges and (class.category.surface == @backingInt(Surface.impassable) or
+            !profile.pathClassAllowed(&class))) return inf;
         if (profile.shared.shortest) return 1;
         const use = class.category.use;
         if (use == @backingInt(Use.steps)) return profile.steps_factor;

@@ -1,5 +1,7 @@
 //! Map matching: candidates, Viterbi, route matching (port of Valhalla meili).
 
+pub const kernel = @import("kernel.zig");
+
 const std = @import("std");
 pub const candidates = @import("candidates.zig");
 pub const emission = @import("emission.zig");

@@ -10,6 +10,8 @@ pub const pedestrian = @import("pedestrian.zig");
 pub const transit = @import("transit.zig");
 pub const truck = @import("truck.zig");
 
+pub const linear = @import("linear.zig");
+
 const std = @import("std");
 
 test {

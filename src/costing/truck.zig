@@ -171,13 +171,12 @@ pub const Profile = struct {
         return motor.speed_factors[self.top_speed] * self.min_linear_factor;
     }
 
-    fn pathClassAllowed(self: *const Profile, class: *const EdgeClass) bool {
+    pub fn pathClassAllowed(self: *const Profile, class: *const EdgeClass) bool {
         return class.category.surface != @backingInt(Surface.impassable) and self.permission.accessibleClass(class);
     }
 
     fn hasClassCost(self: *const Profile, class: *const EdgeClass) bool {
-        return class.category.surface != @backingInt(Surface.impassable) and
-            (self.may_allow_edges or self.pathClassAllowed(class));
+        return self.may_allow_edges or self.pathClassAllowed(class);
     }
 
     fn capSpeed(self: *const Profile, edge: EdgeHot, kph: u8) u8 {

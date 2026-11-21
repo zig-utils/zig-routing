@@ -1766,6 +1766,7 @@ fn fuzzMotorCosting(_: void, s: *Smith) !void {
     const input = draw(s, &raw, 0x6d6f_746f);
     var bytes: [43]u8 = @splat(0);
     @memcpy(bytes[0..input.len], input);
+    try fuzzLinearCosts(&bytes);
     var warnings: std.ArrayList(base.Warning) = .empty;
     defer warnings.deinit(std.testing.allocator);
     const model = bytes[0] % 6;
@@ -1923,6 +1924,44 @@ fn fuzzMotorCosting(_: void, s: *Smith) !void {
     try std.testing.expect(std.math.isFinite(turn.secs) and turn.secs >= 0);
 }
 
+fn fuzzLinearCosts(bytes: []const u8) !void {
+    const linear = routing.costing.linear;
+    const search = routing.search.search;
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const id: routing.graph.format.EdgeId = @fromBackingInt(0);
+    var table: linear.Table = .{};
+    // Every endpoint lies on a cell boundary, so this independent sum
+    // gives the exact integral even when all three ranges overlap.
+    var grid: [16]f64 = @splat(1);
+    for (0..3) |i| {
+        const start = bytes[i * 3] % 16;
+        const stop = bytes[i * 3 + 1] % 16;
+        const begin = @min(start, stop);
+        const end = @max(start, stop) + 1;
+        const units: u16 = 1 + @as(u16, bytes[i * 3 + 2]);
+        const factor = if (i == 1) 1 + @as(f64, @floatFromInt(units)) / 64 else @as(f64, @floatFromInt(units)) / 256;
+        const range: linear.Range = .{ .begin = @as(f32, @floatFromInt(begin)) / 16, .end = @as(f32, @floatFromInt(end)) / 16, .factor = factor };
+        try table.append(a, id, range, false);
+        for (grid[begin..end]) |*cell| cell.* += factor - 1;
+    }
+    try table.finish(.none);
+    const begin = @min(bytes[9] % 16, bytes[10] % 16);
+    const end = @max(bytes[9] % 16, bytes[10] % 16) + 1;
+    const cut: search.Cut = .{ .begin = @as(f32, @floatFromInt(begin)) / 16, .end = @as(f32, @floatFromInt(end)) / 16 };
+    const portion = cut.end - cut.begin;
+    var total: f64 = 0;
+    for (grid[begin..end]) |cell| total += cell;
+    const expected = @max(total / @as(f64, @floatFromInt(end - begin)), std.math.floatEps(f64));
+    const scale = @as(f64, portion) * expected;
+    const priced = try search.priceCut(.{ .cost = 1024, .secs = 64 }, table.get(id), cut, portion, false, .{});
+    try std.testing.expectApproxEqRel(@as(f32, @floatCast(1024 * scale)), priced.cost, 1e-6);
+    try std.testing.expect(priced.cost >= 1024 * portion * table.floor);
+    try std.testing.expect(priced.secs >= 64 * portion * table.floor);
+    try std.testing.expect(std.math.isFinite(priced.cost) and std.math.isFinite(priced.secs));
+}
+
 test "fuzz motor-costing" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
@@ -1942,6 +1981,9 @@ test "fuzz motor-costing" {
 }
 
 const request_seeds = [_][]const u8{
+    "\x00{\"costing\":\"auto\",\"linear_cost_factors\":[{\"type\":\"Feature\",\"geometry\":{\"coordinates\":[[0.0009,0],[0.0027,0]]},\"properties\":{\"factor\":0.5,\"allow_types\":[\"all\"]}},{\"shape\":\"???gE\",\"factor\":2}]}",
+    "\x00{\"linear_cost_factors\":[{\"shape\":\"???~\",\"factor\":1e1000}]}",
+    "\x00{\"linear_cost_factors\":[{\"type\":\"Feature\",\"geometry\":{\"coordinates\":[[]]}}]}",
     "\x07{\"costing\":\"auto\",\"trace\":[{\"lat\":52.09,\"lon\":5.1},{\"lat\":52.0901,\"lon\":5.1001}],\"durations\":[6.75],\"begin_time\":1,\"use_timestamps\":true,\"shape_match\":\"map_snap\",\"best_paths\":2,\"trace_options\":{\"gps_accuracy\":4,\"search_radius\":30},\"format\":\"pbf\"}",
     "\x0e{\"locations\":[{\"lat\":42.08,\"lon\":-71.04,\"radius\":-1},{\"lat\":90,\"lon\":180,\"radius\":2.6}]}",
     "\x8e{\"locations\":[{\"lat\":0,\"lon\":179.99,\"radius\":18446744073709551615},{\"lat\":0,\"lon\":-179.99,\"radius\":\"-2\"}]}",

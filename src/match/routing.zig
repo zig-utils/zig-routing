@@ -152,6 +152,7 @@ fn Collector(comptime K: type) type {
             if (self.limits.allows(event.label.cost, event.label.secs)) {
                 try self.node(event.node, .{ .metres = event.label.cost, .seconds = event.label.secs, .predecessor = event.index });
             }
+            if (core.linearCosts(self.kernel)) |costs| if (costs.has_allow) return .expand;
             return if (allowsNode(self.kernel, try self.view.node(event.node))) .expand else .prune;
         }
 
@@ -164,14 +165,17 @@ fn Collector(comptime K: type) type {
                 index = row.next;
                 if (row.fraction < event.cut.begin or row.fraction > event.cut.end) continue;
                 const portion = row.fraction - event.cut.begin;
-                const metres = event.before.cost + event.full.cost * portion;
-                const seconds = event.before.secs + event.full.secs * portion;
+                if (event.exclusion) |avoid| if (row.fraction >= avoid) continue;
+                const cut: core.Cut = .{ .begin = event.cut.begin, .end = row.fraction };
+                const traversal = try core.priceCut(event.full, event.feature, cut, portion, true, self.control);
+                const metres = event.before.cost + traversal.cost;
+                const seconds = event.before.secs + traversal.secs;
                 if (!self.limits.allows(metres, seconds)) continue;
                 self.record(row.slot, .{
                     .metres = metres,
                     .seconds = seconds,
                     .predecessor = event.predecessor,
-                    .tail = .{ .edge = event.edge, .cut = .{ .begin = event.cut.begin, .end = row.fraction } },
+                    .tail = .{ .edge = event.edge, .cut = cut },
                 });
             }
         }
@@ -286,6 +290,7 @@ pub fn Router(comptime K: type) type {
             const before = try self.view.edge(arrival);
             const after = try self.view.edge(next);
             if (forbidUturn(stop_type) and next == try self.view.oppEdge(arrival)) return false;
+            if (core.linearCosts(kernel)) |costs| if (costs.allows(next)) return true;
             if (comptime @hasDecl(K, "allowedTurn")) {
                 const node: NodeId = @fromBackingInt(before.head);
                 const row = try self.view.turnRow(node, before.cls.opp_local);

@@ -3,6 +3,7 @@ const std = @import("std");
 const costing = @import("../costing/root.zig");
 const graph = @import("../graph/root.zig");
 const search = @import("../search/search.zig");
+const linear = @import("../costing/linear.zig");
 const snap = @import("../snap/search.zig");
 const traffic_live = @import("../traffic/live.zig");
 const traffic_predicted = @import("../traffic/predicted.zig");
@@ -33,9 +34,14 @@ pub fn Motor(comptime model: type) type {
         arena: std.mem.Allocator,
         control: search.Control,
         traffic: Traffic = .{},
+        features: ?*const linear.Table = null,
+
+        pub fn linearCosts(self: Self) ?*const linear.Table {
+            return self.features;
+        }
 
         pub fn allowed(self: Self, directed: snap.DirectedEdge) bool {
-            return self.profile.allowedCandidate(directed.class, .{}, .{}, false);
+            return self.profile.allowedCandidate(directed.class, .{}, .{}, self.linearAllows(directed.id));
         }
 
         pub fn allowedNode(self: Self, node: *const graph.format.NodeHot) bool {
@@ -78,10 +84,19 @@ pub fn Motor(comptime model: type) type {
             return self.price(view, id, edge, graph.speed.Time.fromTimeInfo(time));
         }
 
+        fn linearAllows(self: Self, id: EdgeId) bool {
+            return if (self.features) |features| features.allows(id) else false;
+        }
+
         fn price(self: Self, view: *const View, id: EdgeId, edge: *const Hot, time: ?graph.speed.Time) !search.Traversal {
             const class = try view.class(edge.cls.class_id);
-            if (!self.profile.allowedCandidate(class, .{}, .{}, false) or
+            const permitted = self.linearAllows(id);
+            if (!self.profile.allowedCandidate(class, .{}, .{}, permitted) or
                 class.category.use == @backingInt(graph.constants.Use.transit_connection)) return .{ .cost = .forbidden };
+            // A permissive table contains weights for classes that are only
+            // routable on an explicitly permitted directed edge.
+            if (model != costing.motorcycle and self.profile.may_allow_edges and
+                !permitted and !self.profile.pathClassAllowed(class)) return .{ .cost = .forbidden };
             const hot = if (self.traffic.forecasts) |overlay| overlay.applyStatic(id, edge.*) else edge.*;
             const speed = if (time == null) self.profile.untimedSpeed(hot) else self.profile.resolvedSpeed(hot, id, time, self.traffic);
             return .{
@@ -123,8 +138,14 @@ pub fn Active(comptime model: type) type {
         profile: *const model.Profile,
         tables: *const costing.compiled.Compiled,
         bikeshare: bool = false,
+        features: ?*const linear.Table = null,
+
+        pub fn linearCosts(self: Self) ?*const linear.Table {
+            return self.features;
+        }
 
         pub fn allowed(self: Self, directed: snap.DirectedEdge) bool {
+            if (self.features) |features| if (features.allows(directed.id)) return true;
             return if (model == costing.pedestrian)
                 self.profile.allowedCandidate(directed.class, .{}, .{}, self.bikeshare)
             else
@@ -139,8 +160,12 @@ pub fn Active(comptime model: type) type {
             return self.profile.permission;
         }
 
-        pub fn edgeCost(self: Self, view: *const View, _: EdgeId, edge: *const Hot, _: search.Direction) !Cost {
+        pub fn edgeCost(self: Self, view: *const View, id: EdgeId, edge: *const Hot, _: search.Direction) !Cost {
             const class = try view.class(edge.cls.class_id);
+            if (self.profile.may_allow_edges and !self.profile.pathClassAllowed(class)) {
+                const features = self.features orelse return .forbidden;
+                if (!features.allows(id)) return .forbidden;
+            }
             return if (model == costing.pedestrian)
                 model.Kernel.edgeCost(self.profile, self.tables, class, edge.*, self.profile.untimedFerrySpeed(edge.*), .{})
             else

@@ -75,6 +75,18 @@ pub const Access = struct {
     }
 };
 
+/// Geometry-only correlation for NoCost and linear feature walking.
+pub const NoCost = struct {
+    pub fn allowed(_: NoCost, edge: DirectedEdge) bool {
+        const use = edge.class.category.use;
+        return use != @backingInt(Use.rail) and use != @backingInt(Use.bus);
+    }
+
+    pub fn allowedNode(_: NoCost, _: *const graph.format.NodeHot) bool {
+        return true;
+    }
+};
+
 pub const Projection = struct {
     point: geo.PointLL,
     squared: f64,

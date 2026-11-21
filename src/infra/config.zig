@@ -43,6 +43,8 @@ pub const Config = struct {
         max_exclude_locations: usize = 50,
         max_exclude_polygons_length: f32 = 10_000,
         max_exclude_polygons_vertices: usize = 100,
+        min_linear_cost_factor: f32 = (service.Limits{}).linear_costs.min_factor,
+        max_linear_cost_edges: usize = (service.Limits{}).linear_costs.max_edges,
         skadi: struct {
             max_shape: usize = (service.Limits{}).skadi_max_shape,
             min_resample: f32 = (service.Limits{}).skadi_min_resample,
@@ -107,6 +109,10 @@ pub const Config = struct {
                     .max_exclude_polygons_length = self.service_limits.max_exclude_polygons_length,
                     .max_exclude_polygons_vertices = self.service_limits.max_exclude_polygons_vertices,
                 },
+                .linear_costs = .{
+                    .min_factor = self.service_limits.min_linear_cost_factor,
+                    .max_edges = self.service_limits.max_linear_cost_edges,
+                },
                 .trace = self.service_limits.trace,
                 .tile = .{
                     .min_zoom = self.loki.service_defaults.mvt_min_zoom_road_class,
@@ -148,6 +154,8 @@ pub fn decode(arena: std.mem.Allocator, bytes: []const u8, path: []const u8, env
         return error.InvalidSkadiMinResample;
     if (!std.math.isFinite(config.service_limits.max_exclude_polygons_length) or config.service_limits.max_exclude_polygons_length < 0)
         return error.InvalidExcludePolygonsLength;
+    if (!std.math.isFinite(config.service_limits.min_linear_cost_factor) or config.service_limits.min_linear_cost_factor < 0)
+        return error.InvalidLinearCostFactor;
     const trace = config.service_limits.trace;
     const matcher = config.meili.default;
     for ([_]f32{ trace.max_distance, matcher.max_search_radius, matcher.sigma_z, matcher.beta, matcher.breakage_distance, matcher.interpolation_distance, matcher.max_route_distance_factor, matcher.max_route_time_factor }) |value| {

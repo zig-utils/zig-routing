@@ -24,6 +24,7 @@ pub const Limits = struct {
     skadi_max_shape: usize = 750_000,
     skadi_min_resample: f32 = 10.0,
     exclusions: exclusions.Limits = .{},
+    linear_costs: @import("../snap/linear.zig").Limits = .{},
     tile: TileLimits = .{},
     trace: TraceLimits = .{},
 };

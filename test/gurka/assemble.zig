@@ -5893,3 +5893,157 @@ test "Gurka historical traffic learns an interior edge and publishes an anonymou
     for (expected, 0..) |target, bucket|
         try testing.expectApproxEqAbs(target, decode.decodeBucket(&profile, @intCast(bucket)), 0.05 * target);
 }
+
+// Ported from test/gurka/test_linear_feature_factors.cc (Valhalla 3.9.3).
+test "Gurka linear features resolve directed cuts and price search and recost identically" {
+    const linear = routing.snap.linear;
+    const endpoints = routing.search.endpoints;
+    const Recost = routing.search.legs.Recost;
+    const auto = routing.costing.auto;
+    const Kernel = routing.match.kernel.Motor(auto);
+    const point = routing.geo.PointLL;
+    var storage = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer storage.deinit();
+    var workspace = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer workspace.deinit();
+    const a = storage.allocator();
+    const fixture = try @import("examples.zig").accessRegions(a);
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const ab = try directedBetween(view, &fixture, "A", "B");
+
+    const parsed = try routing.api.request.parseHttp(a, "/route", &.{},
+        \\{"costing":"auto","linear_cost_factors":[{"type":"Feature","geometry":{
+        \\"type":"LineString","coordinates":[[0.0008983120447446023,0],[0.002694936134233807,0]]},
+        \\"properties":{"factor":0.5}}]}
+    );
+    const features = parsed.ok.linear_cost_factors;
+    const resolved = (try linear.resolve(view, a, &workspace, features, .{}, .{})).ok;
+    try testing.expectEqualStrings("", resolved.failed);
+    const range = resolved.costs.get(ab).?.ranges.items[0];
+    try testing.expectApproxEqAbs(0.25, range.begin, 1e-4);
+    try testing.expectApproxEqAbs(0.75, range.end, 1e-4);
+    try testing.expectEqual(@as(f64, 0.5), range.factor);
+    try testing.expectEqual(@as(?*const routing.costing.linear.Edge, null), resolved.costs.get(try view.oppEdge(ab)));
+    try testing.expectApproxEqAbs(0.5, resolved.costs.floor, 1e-6);
+
+    var warnings: std.ArrayList(routing.costing.base.Warning) = .empty;
+    const raw = try auto.parse(a, .auto, .null, &warnings, .none);
+    const profile = try auto.Model.canonicalize(raw);
+    const classes = view.classes.?;
+    const tables = try routing.costing.compiled.compileInto(auto.Model, profile, classes, try a.alloc(f32, classes.len), .none);
+    const baseline: Kernel = .{ .profile = &profile, .tables = &tables, .arena = a, .control = .{} };
+    var kernel = baseline;
+    kernel.features = &resolved.costs;
+    var engine = try search.Search(Kernel, routing.search.queue.Heap).init(testing.allocator, view);
+    defer engine.deinit();
+
+    // Valhalla 3.9.3 reports -25% of the baseline on this cut.
+    // The actual overlap is 75% of the cut, so the result is 62.5%.
+    const plain = try baseline.edgeCost(view, ab, try view.edge(ab), .forward);
+    for ([_]search.Direction{ .forward, .reverse }) |direction| {
+        const begin: endpoints.Candidate = .{ .edge = ab, .fraction = 0.2, .score = 0, .begin_node = false, .end_node = false };
+        const end: endpoints.Candidate = .{ .edge = ab, .fraction = 0.4, .score = 0, .begin_node = false, .end_node = false };
+        const starts = if (direction == .forward) &.{begin} else &.{end};
+        const targets = try endpoints.Targets.init(a, if (direction == .forward) &.{end} else &.{begin}, direction, .{});
+        const result = try engine.runPartial(&workspace, kernel, .{ .direction = direction, .starts = starts, .targets = &targets }, search.Zero{}, .{});
+        const result_cut = result.best().cut(result.cuts);
+        try testing.expectApproxEqAbs(plain.cost * 0.125, result.best().cost, 1e-4);
+        try testing.expectApproxEqAbs(plain.secs * 0.125, result.best().secs, 1e-4);
+        const path: []const endpoints.Segment = &.{.{ .edge = ab, .begin = result_cut.begin, .end = result_cut.end }};
+        const priced = switch (direction) {
+            .forward => try Recost.walk(view, kernel, path, null, .forward, .{}),
+            .reverse => try Recost.walk(view, kernel, path, null, .reverse, .{}),
+        };
+        try testing.expectApproxEqAbs(priced.cost, result.best().cost, 1e-4);
+        try testing.expectApproxEqAbs(priced.secs, result.best().secs, 1e-4);
+        workspace.reset();
+    }
+
+    // Encoded polyline6, a tiny sliver before the first vertex, and the
+    // configured floor on a line that spans more than one path edge.
+    const b = fixture.findNode("B").?.location;
+    const c = fixture.findNode("C").?.location;
+    const near_b: point = .init(b.lng - 0.000004, b.lat);
+    var encoded: [84]u8 = undefined;
+    const n = try routing.geo.polyline.encode(.polyline, 6, &.{ near_b, b, c }, &encoded);
+    const body = try std.fmt.allocPrint(a, "{{\"linear_cost_factors\":[{{\"shape\":{f},\"factor\":0.25,\"allow_types\":[\"ignored\",\"all\"]}}]}}", .{std.json.fmt(encoded[0..n], .{})});
+    const encoded_features = (try routing.api.request.parseHttp(a, "/route", &.{}, body)).ok.linear_cost_factors;
+    const spanning = (try linear.resolve(view, a, &workspace, encoded_features, .{ .min_factor = 0.6 }, .{})).ok;
+    const bc = try directedBetween(view, &fixture, "B", "C");
+    try testing.expectEqualStrings("", spanning.failed);
+    try testing.expect(spanning.costs.allows(bc));
+    try testing.expect(!spanning.costs.allows(ab));
+    try testing.expectApproxEqAbs(0.6, spanning.costs.get(bc).?.full, 1e-6);
+
+    const exclude = (try linear.resolve(view, a, &workspace, &.{.{ .points = features[0].points, .factor = 0, .allow = true }}, .{}, .{})).ok;
+    try testing.expectEqual(1, exclude.costs.exclusions.items.len);
+    try testing.expectApproxEqAbs(0.25, exclude.costs.exclusionAt(ab).?, 1e-4);
+    try testing.expect(!exclude.costs.allows(ab));
+    kernel.features = &exclude.costs;
+    const from = try at(view, fixture.findNode("A").?.location.toFixed());
+    const to = try at(view, b.toFixed());
+    try testing.expectError(error.NoPath, engine.run(&workspace, kernel, .{ .origin = from, .destination = to }, search.Zero{}, .{}));
+    workspace.reset();
+    const cd = try directedBetween(view, &fixture, "C", "D");
+    const d = fixture.findNode("D").?.location;
+    const permission = (try linear.resolve(view, a, &workspace, &.{.{ .points = &.{ c, d }, .allow = true }}, .{}, .{})).ok;
+    try testing.expectEqualStrings("", permission.failed);
+    try testing.expect(permission.costs.allows(cd));
+    try testing.expectEqual(@as(f32, 0), permission.costs.floor);
+    var permissive_options = raw;
+    permissive_options.may_allow_edges = true;
+    const permissive_profile = try auto.Model.canonicalize(permissive_options);
+    const permissive_tables = try routing.costing.compiled.compileInto(auto.Model, permissive_profile, classes, try a.alloc(f32, classes.len), .none);
+    kernel = .{ .profile = &permissive_profile, .tables = &permissive_tables, .arena = a, .control = .{}, .features = &permission.costs };
+    const private_from = try at(view, c.toFixed());
+    const private_to = try at(view, d.toFixed());
+    const thru = try engine.run(&workspace, kernel, .{ .origin = private_from, .destination = private_to }, search.Zero{}, .{});
+    try testing.expectEqual(cd, thru.best().edgeId());
+    const recosted = try Recost.walk(view, kernel, &.{.{ .edge = cd, .begin = 0, .end = 1 }}, null, .forward, .{ .ignore_access = false });
+    try testing.expectApproxEqAbs(recosted.cost, thru.best().cost, 1e-4);
+
+    workspace.reset();
+    const de = try directedBetween(view, &fixture, "D", "E");
+    const ef = try directedBetween(view, &fixture, "E", "F");
+    const e = fixture.findNode("E").?.location;
+    const f = fixture.findNode("F").?.location;
+    const span = (try linear.resolve(view, a, &workspace, &.{
+        .{ .points = &.{ d.midpoint(e), e, e.midpoint(f) }, .factor = 0.5 },
+        .{ .points = &.{ d, e }, .factor = 2 },
+    }, .{ .min_factor = 0.001 }, .{})).ok;
+    try testing.expectEqualStrings("", span.failed);
+    try testing.expectApproxEqAbs(1.75, span.costs.get(de).?.full, 1e-4);
+    kernel = baseline;
+    kernel.features = &span.costs;
+    const begin: endpoints.Candidate = .{ .edge = de, .fraction = 0.2, .score = 0, .begin_node = false, .end_node = false };
+    const end: endpoints.Candidate = .{ .edge = ef, .fraction = 0.4, .score = 0, .begin_node = false, .end_node = false };
+    for ([_]search.Direction{ .forward, .reverse }) |direction| {
+        const rank_begin: endpoints.Ranked = .{ .all = &.{begin}, .preferred_count = 1, .ignored_filter = false };
+        const rank_end: endpoints.Ranked = .{ .all = &.{end}, .preferred_count = 1, .ignored_filter = false };
+        const result = try endpoints.routeRanked(&engine, &workspace, kernel, rank_begin, rank_end, .{ .direction = direction, .costing = .auto }, search.Zero{}, .{});
+        const path = result.segments;
+        try testing.expectEqual(2, path.len);
+        try testing.expectEqual(de, path[0].edge);
+        try testing.expectEqual(ef, path[1].edge);
+        const priced = switch (direction) {
+            .forward => try Recost.walk(view, kernel, path, null, .forward, .{}),
+            .reverse => try Recost.walk(view, kernel, path, null, .reverse, .{}),
+        };
+        try testing.expectApproxEqAbs(priced.cost, result.cost, 1e-4);
+        try testing.expectApproxEqAbs(priced.secs, result.secs, 1e-4);
+        workspace.reset();
+    }
+
+    const empty = try routing.api.request.parseHttp(a, "/route", &.{}, "{\"linear_cost_factors\":[{\"shape\":\"\"}]}");
+    try testing.expectEqual(@as(u16, 173), empty.failure.code);
+    try testing.expectEqualStrings("feature coordinates are empty", empty.failure.extra);
+    const wrong_type = try routing.api.request.parseHttp(a, "/route", &.{}, "{\"linear_cost_factors\":2}");
+    try testing.expectEqualSlices(u16, &.{212}, wrong_type.ok.warnings.items);
+    const missing = try linear.resolve(view, a, &workspace, &.{.{ .points = &.{ b, .init(9, 9) } }}, .{}, .{});
+    try testing.expectEqual(@as(u16, 173), missing.failure.code);
+    const failed = (try linear.resolve(view, a, &workspace, &.{.{ .points = &.{b} }}, .{}, .{})).ok;
+    try testing.expectEqualStrings("0", failed.failed);
+    try testing.expectEqual(@as(u16, 234), (try linear.resolve(view, a, &workspace, &.{.{ .points = &.{ b, c, d }, .factor = 2 }}, .{ .max_edges = 0 }, .{})).failure.code);
+}

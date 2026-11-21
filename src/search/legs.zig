@@ -169,8 +169,16 @@ pub const Recost = struct {
         const traversal = try search.priceEdge(view, kernel, segment.edge, edge, direction, time, false);
         if (traversal.cost.cost == std.math.inf(f32)) return error.InvalidRouteCost;
 
-        var access: base.AccessState = .{};
-        if (comptime @hasDecl(@TypeOf(kernel), "restrictionPermission")) {
+        const features = search.linearCosts(kernel);
+        const feature = if (features) |costs| costs.get(segment.edge) else null;
+        const allowed = feature != null and feature.?.allow;
+        if (!options.ignore_access) {
+            if (features) |costs| if (costs.exclusionAt(segment.edge)) |avoid| {
+                if (segment.begin <= avoid and avoid <= segment.end) return error.InvalidRouteAccess;
+            };
+        }
+        var access: base.AccessState = if (allowed) self.previous.accessState() else .{};
+        if (@hasDecl(@TypeOf(kernel), "restrictionPermission") and !allowed) {
             const permission = kernel.restrictionPermission();
             const policy: search.PathAccess = .{
                 .view = view,
@@ -207,7 +215,7 @@ pub const Recost = struct {
                 .measured_speed = if (direction == .forward) self.previous.measuredSpeed() else traversal.measured_speed,
             };
             if (comptime @hasDecl(@TypeOf(kernel), "allowedTurn")) {
-                if (!options.ignore_access and !try kernel.allowedTurn(view, movement, self.previous, direction)) return error.InvalidRouteAccess;
+                if (!allowed and !options.ignore_access and !try kernel.allowedTurn(view, movement, self.previous, direction)) return error.InvalidRouteAccess;
             }
             transition = try search.priceTurn(view, kernel, movement, self.previous, direction, time);
             if (transition.cost == std.math.inf(f32)) return error.InvalidRouteCost;
@@ -216,7 +224,7 @@ pub const Recost = struct {
         const fraction = segment.end - segment.begin;
         const scale = @max(fraction, std.math.floatEps(f32));
         const full = traversal.cost;
-        const step = transition.add(.{ .cost = full.cost * scale, .secs = full.secs * scale });
+        const step = transition.add(try search.priceCut(full, feature, .{ .begin = segment.begin, .end = segment.end }, scale, false, options.control));
         self.elapsed = self.elapsed.add(step);
         const pair = (Cost{ .cost = self.previous.cost, .secs = self.previous.secs }).add(step);
         const length = @as(f32, @floatFromInt(edge.geom.len_m)) * fraction;

@@ -55,10 +55,7 @@ const Profile = union(enum) {
 
     pub fn allowed(self: *const Profile, edge: snap.DirectedEdge) bool {
         return switch (self.*) {
-            .none => switch (@as(graph.constants.Use, @fromBackingInt(@intCast(edge.class.category.use)))) {
-                .rail, .bus => false,
-                else => true,
-            },
+            .none => (snap.NoCost{}).allowed(edge),
             inline .auto, .truck, .motorcycle => |*model| model.allowedCandidate(edge.class, .{}, .{}, false),
             .pedestrian => |*model| model.allowed(edge),
             .bikeshare => |*model| model.allowedCandidate(edge.class, .{}, .{}, true),

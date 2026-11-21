@@ -127,7 +127,7 @@ pub const Profile = struct {
             self.permission.allowedCandidate(edge, state, disallow);
     }
 
-    fn pathClassAllowed(self: *const Profile, edge: *const EdgeClass) bool {
+    pub fn pathClassAllowed(self: *const Profile, edge: *const EdgeClass) bool {
         return self.permission.accessibleClass(edge) and
             edge.category.surface <= @backingInt(self.surface_limit) and
             edge.category.sac_scale <= self.max_hiking_difficulty and

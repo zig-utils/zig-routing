@@ -7,6 +7,7 @@ const io = @import("../infra/io.zig");
 const memory = @import("../infra/arena.zig");
 const costing = @import("../costing/compiled.zig");
 const base = @import("../costing/base.zig");
+const linear = @import("../costing/linear.zig");
 const snap_edge = @import("../snap/edge.zig");
 const DirectedEdge = snap_edge.DirectedEdge;
 pub const ExcludedEdge = @import("../snap/exclusions.zig").Edge;
@@ -165,6 +166,8 @@ pub const ExpansionEdgeVisit = struct {
     cut: Cut = .{},
     before: costing.Cost = .{},
     full: costing.Cost,
+    feature: ?*const linear.Edge = null,
+    exclusion: ?f32 = null,
     predecessor: u32 = no_index,
 };
 
@@ -223,6 +226,31 @@ pub const Traversal = struct {
         return if (self.measured_speed) Label.measured_speed else 0;
     }
 };
+
+pub inline fn linearCosts(kernel: anytype) ?*const linear.Table {
+    if (comptime @hasDecl(@TypeOf(kernel), "linearCosts")) return kernel.linearCosts();
+    return null;
+}
+
+/// A whole edge's factor changes its search weight. Valhalla's partial
+/// pricing multiplies both cost and time for a fractional traversal.
+pub inline fn priceCut(full: costing.Cost, feature: ?*const linear.Edge, cut: Cut, portion: f32, comptime distance_only: bool, control: Control) !costing.Cost {
+    if (feature) |edge| return priceLinearCut(full, edge, cut, portion, distance_only, control.deadline);
+    return .{ .cost = full.cost * portion, .secs = full.secs * portion };
+}
+
+noinline fn priceLinearCut(full: costing.Cost, feature: *const linear.Edge, cut: Cut, portion: f32, distance_only: bool, deadline: io.Deadline) !costing.Cost {
+    const average = try feature.average(cut.begin, cut.end, deadline);
+    const scaled = average * portion;
+    return .{
+        .cost = if (distance_only) full.cost * portion else linearProduct(full.cost, scaled),
+        .secs = linearProduct(full.secs, if (cut.begin == 0 and cut.end == 1) portion else scaled),
+    };
+}
+
+fn linearProduct(value: f32, scale_by: f64) f32 {
+    return @floatCast(@min(@as(f64, value) * scale_by, std.math.floatMax(f32)));
+}
 
 pub inline fn priceEdge(view: *const View, kernel: anytype, id: EdgeId, edge: *const EdgeHot, comptime direction: Direction, time: graph.time_info.TimeInfo, comptime endpoint: bool) !Traversal {
     const K = @TypeOf(kernel);
@@ -394,6 +422,7 @@ pub const Restrictions = struct {
     has_exclusions: bool,
     keep_time: bool,
     pareto: bool = false,
+    linear_costs: ?*const linear.Table = null,
     arrivals: std.ArrayList(u32) = .empty,
     aliases: AliasStatus = .empty,
 
@@ -408,7 +437,8 @@ pub const Restrictions = struct {
             if (context.present()) return context;
             return if (flagged) .{ .value = previous.edge, .alias = true } else .{};
         }
-        if (flagged) {
+        const allowed = if (self.linear_costs) |costs| costs.allows(id) else false;
+        if (flagged and !allowed) {
             const predecessor: EdgeId = @fromBackingInt(if (context.alias) context.value else if (context.present()) self.states[context.value].edge else previous.edge);
             const modes = if (self.access.direction == .forward) self.access.view.turnRestrictionModes(predecessor, id) else self.access.view.turnRestrictionModes(id, predecessor);
             if (modes & self.modes != 0) return .forbidden;
@@ -422,13 +452,13 @@ pub const Restrictions = struct {
         }
         const next = automaton.advance(self.states, parent, @backingInt(id));
         const attributes = self.states[next].attr;
-        if (attributes.forbidden & self.modes != 0) return .forbidden;
+        if (attributes.forbidden & self.modes != 0 and !allowed) return .forbidden;
         const conditions = self.access.view.restriction_conditions orelse &.{};
         const threshold = self.access.permission.restriction_probability;
-        if (attributes.probable and threshold != 0 and
+        if (!allowed and attributes.probable and threshold != 0 and
             try automaton.blocksProbable(self.states, conditions, next, self.modes, threshold, self.access.control.deadline))
             return .forbidden;
-        if (attributes.timed) {
+        if (attributes.timed and !allowed) {
             if (try self.access.timing.local(self.access.view, node, previous.secs, self.access.direction)) |local| {
                 try self.access.control.check();
                 if (try automaton.blocksTimed(self.states, conditions, next, self.modes, threshold, local, self.access.control.deadline)) return .forbidden;
@@ -688,6 +718,10 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             const partial_starts = partial or expanding;
             const target = if (partial_starts) null else query.target;
             const limit = if (partial) std.math.maxInt(usize) else query.limit;
+            const features = linearCosts(kernel);
+            const linear_excluded = if (features) |costs| costs.exclusions.items else &.{};
+            const has_exclusions = query.excluded.len != 0 or linear_excluded.len != 0;
+            const floor = if (!distance_only and features != null) features.?.floor else 1;
             const a = arena.allocator();
             const terminal_closures = if (comptime partial and @hasDecl(K, "closed"))
                 try self.terminalClosures(a, kernel, direction, query.targets, permission, control)
@@ -715,19 +749,20 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 },
                 .states = self.view.restriction_automaton orelse &.{},
                 .modes = permission.restrictionModes(),
-                .has_exclusions = query.excluded.len != 0,
+                .has_exclusions = has_exclusions,
+                .linear_costs = features,
                 .keep_time = keep_time,
                 .pareto = distance_only and keep_time and !query.timing.start.valid,
             } else {};
             const tracker = if (with_restrictions) &restrictions else null;
             var fractions: ?*ExclusionFractions = null;
-            if (query.excluded.len != 0) {
+            if (has_exclusions) {
                 try labels.append(a, .{ .cost = -std.math.inf(f32) });
                 if (partial_starts) {
                     fractions = try a.create(ExclusionFractions);
                     fractions.?.* = .{};
                 }
-                try self.markExcluded(&pool, query.excluded, fractions, control);
+                try self.markExcluded(&pool, query.excluded, linear_excluded, fractions, control);
             }
             if (expanding) {
                 for (query.expansion.partial_origins) |candidates| {
@@ -736,12 +771,12 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 }
                 for (query.expansion.origins) |origin| {
                     try control.check();
-                    try self.seedNode(direction, &pool, kernel, origin, null, query.timing, &labels, &pending, potential, tracker, permission, query.excluded.len != 0, query.expansion.bounds, query.visitor, distance_only);
+                    try self.seedNode(direction, &pool, kernel, origin, null, query.timing, &labels, &pending, potential, tracker, permission, has_exclusions, query.expansion.bounds, query.visitor, distance_only, control);
                 }
             } else if (partial) {
                 try self.seedPartials(direction, &pool, kernel, query, query.starts, &labels, &cuts, &pending, potential, tracker, fractions, permission, control);
             } else {
-                try self.seedNode(direction, &pool, kernel, query.start, target, query.timing, &labels, &pending, potential, tracker, permission, query.excluded.len != 0, null, {}, false);
+                try self.seedNode(direction, &pool, kernel, query.start, target, query.timing, &labels, &pending, potential, tracker, permission, has_exclusions, null, {}, false, control);
             }
 
             var popped: usize = 0;
@@ -817,6 +852,8 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     if (partial_starts and last.flags & Label.forbid_uturn != 0 and local == geometry.cls.opp_local) continue;
                     const local_id: EdgeId = @fromBackingInt(@as(u32, @intCast(index)));
                     const next_id = if (direction == .forward) local_id else try self.view.oppEdge(local_id);
+                    const feature = if (features) |costs| costs.get(next_id) else null;
+                    const allowed = feature != null and feature.?.allow;
                     const next_context: TurnContext = if (with_restrictions) try tracker.advance(context, last, at, next_id) else .{};
                     if (with_restrictions and next_context.value == no_index) continue;
                     const terminal_edge: ClosureEdge = if (terminal_closures) |closures| closures.get(@backingInt(next_id)) else .none;
@@ -838,7 +875,9 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     const closed = kind == .closed or (phase == 0 and kind == .none and try self.edgeClosed(kernel, permission, next_id));
                     if (closed and next_phase == 0) continue;
                     const head: NodeId = @fromBackingInt(outward.head);
-                    const access = if (with_restrictions and (model_access or (check_access and next.cls.cold_checks != 0)))
+                    const access = if (allowed)
+                        base.AccessEvaluation{ .state = last.accessState() }
+                    else if (with_restrictions and (model_access or (check_access and next.cls.cold_checks != 0)))
                         try tracker.access.evaluateWith(next_id, next, at, last, if (target != null and head == target.?) .end else .middle, limits)
                     else
                         base.AccessEvaluation{};
@@ -870,14 +909,15 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                         .predecessor_dead_end = predecessor_dead_end,
                     };
                     if (comptime @hasDecl(K, "allowedTurn")) {
-                        if (!try kernel.allowedTurn(self.view, movement, last, direction)) continue;
-                    } else if (row & 0x80 != 0 and permission.restrictionModes() != 0) continue;
+                        if (!allowed and !try kernel.allowedTurn(self.view, movement, last, direction)) continue;
+                    } else if (!allowed and row & 0x80 != 0 and permission.restrictionModes() != 0) continue;
                     if (comptime @hasDecl(K, "slowAllowed")) {
-                        if (next.cls.cold_checks != 0 and !try Self.slowAllowed(kernel, self.view, next_id, next, last, direction)) continue;
+                        if (!allowed and next.cls.cold_checks != 0 and !try Self.slowAllowed(kernel, self.view, next_id, next, last, direction)) continue;
                     }
                     const traversal = try priceEdge(self.view, kernel, next_id, next, direction, time, false);
                     if (traversal.cost.cost == std.math.inf(f32)) continue;
-                    const edge_cost = distancePrice(traversal.cost, next, distance_only);
+                    const full = distancePrice(traversal.cost, next, distance_only);
+                    const edge_cost = try priceCut(full, feature, .{}, 1, distance_only, control);
                     movement.measured_speed = if (direction == .forward) last.measuredSpeed() else traversal.measured_speed;
                     const delay = if (distance_only) costing.Cost{} else try priceTurn(self.view, kernel, movement, last, direction, time);
                     if (delay.cost == std.math.inf(f32)) continue;
@@ -885,7 +925,9 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     if (observe_edges) try query.visitor.visitEdge(ExpansionEdgeVisit{
                         .edge = next_id,
                         .before = previous.add(delay),
-                        .full = edge_cost,
+                        .full = full,
+                        .feature = feature,
+                        .exclusion = if (prior.label_plus_one == Status.exclusion and fractions != null) fractions.?.get(@backingInt(next_id)).?.fraction else null,
                         .predecessor = top.label,
                     });
                     if (partial) {
@@ -896,7 +938,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                             if (fractions != null and prior.label_plus_one == Status.exclusion and
                                 cutsExcluded(fractions.?.get(@backingInt(next_id)).?.fraction, candidate.fraction, direction == .reverse)) continue;
                             const cut: Cut = if (direction == .forward) .{ .end = candidate.fraction } else .{ .begin = candidate.fraction };
-                            const step = scale(edge_cost, cut.end - cut.begin, 0);
+                            const step = try priceCut(full, feature, cut, cut.end - cut.begin, distance_only, control);
                             const ending = previous.add(delay).add(step).add(.{ .cost = candidate.score });
                             try addTerminal(a, &labels, &cuts, &pending, cut, .{
                                 .edge = @backingInt(next_id),
@@ -909,7 +951,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                             });
                         }
                     }
-                    if (dominated or !access.allowed) continue;
+                    if (prior.label_plus_one == Status.exclusion or dominated or !access.allowed) continue;
                     const total = if (partial)
                         previous.add(delay).add(edge_cost)
                     else if (expanding)
@@ -928,7 +970,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                         .tcost = delay.cost,
                         .ctx = next_context.value,
                         .flags = Label.contextFlags(next_context, access.state) | next_phase | traversal.flags(),
-                    }, null, distance_only);
+                    }, null, distance_only, floor);
                 }
             }
             try control.check();
@@ -936,16 +978,18 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             return error.NoPath;
         }
 
-        noinline fn markExcluded(self: *Self, pool: *Pool, edges: []const ExcludedEdge, fractions: ?*ExclusionFractions, control: Control) !void {
-            for (edges, 0..) |edge, i| {
-                if (i % 256 == 0) try control.check();
-                _ = try self.view.edge(edge.id);
-                if (!(0 <= edge.percent_along and edge.percent_along <= 1)) return error.InvalidExclusionFraction;
-                const id = @backingInt(edge.id);
-                const status = try self.status.at(pool, id);
-                if (status.label_plus_one == Status.exclusion) continue;
-                status.label_plus_one = Status.exclusion;
-                if (fractions) |table| (try table.at(pool.arena.allocator(), id)).* = .{ .fraction = edge.percent_along };
+        noinline fn markExcluded(self: *Self, pool: *Pool, edges: []const ExcludedEdge, linear_excluded: []const ExcludedEdge, fractions: ?*ExclusionFractions, control: Control) !void {
+            for ([_][]const ExcludedEdge{ edges, linear_excluded }) |list| {
+                for (list, 0..) |edge, i| {
+                    if (i % 256 == 0) try control.check();
+                    _ = try self.view.edge(edge.id);
+                    if (!(0 <= edge.percent_along and edge.percent_along <= 1)) return error.InvalidExclusionFraction;
+                    const id = @backingInt(edge.id);
+                    const status = try self.status.at(pool, id);
+                    if (status.label_plus_one == Status.exclusion) continue;
+                    status.label_plus_one = Status.exclusion;
+                    if (fractions) |table| (try table.at(pool.arena.allocator(), id)).* = .{ .fraction = edge.percent_along };
+                }
             }
             if (self.view.restriction_automaton) |states| {
                 const base_id: u32 = @intCast(self.view.edges.len);
@@ -958,7 +1002,9 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             }
         }
 
-        fn seedNode(self: *Self, comptime direction: Direction, pool: *Pool, kernel: K, start: NodeId, target: ?NodeId, timing: Timing, labels: *std.ArrayList(Label), pending: *Q, potential: anytype, tracker: anytype, permission: base.Permission, has_exclusions: bool, bounds: anytype, visitor: anytype, comptime distance_only: bool) !void {
+        fn seedNode(self: *Self, comptime direction: Direction, pool: *Pool, kernel: K, start: NodeId, target: ?NodeId, timing: Timing, labels: *std.ArrayList(Label), pending: *Q, potential: anytype, tracker: anytype, permission: base.Permission, has_exclusions: bool, bounds: anytype, visitor: anytype, comptime distance_only: bool, control: Control) !void {
+            const features = linearCosts(kernel);
+            const floor = if (!distance_only and features != null) features.?.floor else 1;
             const seeds = try self.view.outEdgeRange(start);
             const time: graph.time_info.TimeInfo = if (timed_costs) try timing.at(self.view, start, 0, direction) else .{};
             for (self.view.edges[seeds.first..seeds.end], seeds.first..) |*outward, index| {
@@ -966,24 +1012,27 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 const id = if (direction == .forward) geometry_id else try self.view.oppEdge(geometry_id);
                 if (has_exclusions and self.status.get(@backingInt(id)).label_plus_one == Status.exclusion) continue;
                 const edge = if (direction == .forward) outward else try self.view.edge(id);
+                const feature = if (features) |costs| costs.get(id) else null;
+                const allowed = feature != null and feature.?.allow;
                 const closed = try self.edgeClosed(kernel, permission, id);
                 if (closed and permission.filter_closures) continue;
                 if (comptime @hasDecl(K, "slowAllowed")) {
-                    if (edge.cls.cold_checks != 0 and !try Self.slowAllowed(kernel, self.view, id, edge, null, direction)) continue;
+                    if (!allowed and edge.cls.cold_checks != 0 and !try Self.slowAllowed(kernel, self.view, id, edge, null, direction)) continue;
                 }
                 const traversal = try priceEdge(self.view, kernel, id, edge, direction, time, false);
                 if (traversal.cost.cost == std.math.inf(f32)) continue;
-                const edge_cost = distancePrice(traversal.cost, edge, distance_only);
+                const full = distancePrice(traversal.cost, edge, distance_only);
+                const edge_cost = try priceCut(full, feature, .{}, 1, distance_only, control);
                 const within = @TypeOf(bounds) == @TypeOf(null) or bounds.allows(edge_cost, edge.geom.len_m);
                 const observe_edges = comptime (@TypeOf(visitor) != void and snap_edge.hasPolicy(@TypeOf(visitor), "visitEdge"));
                 if (!within and !observe_edges) continue;
                 const here: NodeId = @fromBackingInt(outward.head);
-                const access = if (@TypeOf(tracker) != @TypeOf(null) and (model_access or (tracker.access.check_access and edge.cls.cold_checks != 0)))
+                const access = if (!allowed and @TypeOf(tracker) != @TypeOf(null) and (model_access or (tracker.access.check_access and edge.cls.cold_checks != 0)))
                     try tracker.access.evaluate(id, edge, start, .{}, .start)
                 else
                     base.AccessEvaluation{};
                 if (!access.allowed) continue;
-                if (observe_edges) try visitor.visitEdge(ExpansionEdgeVisit{ .edge = id, .full = edge_cost });
+                if (observe_edges) try visitor.visitEdge(ExpansionEdgeVisit{ .edge = id, .full = full, .feature = feature });
                 if (!within) continue;
                 const context: TurnContext = if (@TypeOf(tracker) == @TypeOf(null)) .{} else try tracker.advance(.{}, .{}, start, id);
                 const closure: u32 = if (closed) Label.origin_closure else 0;
@@ -994,7 +1043,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     .dist_m = edge.geom.len_m,
                     .ctx = context.value,
                     .flags = Label.contextFlags(context, access.state) | closure | traversal.flags(),
-                }, null, distance_only);
+                }, null, distance_only, floor);
             }
         }
 
@@ -1002,6 +1051,8 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             const expanding = @hasField(@TypeOf(query), "expansion");
             const distance_only = comptime distanceObjective(@TypeOf(query));
             const observe_edges = comptime observeEdges(@TypeOf(query));
+            const features = linearCosts(kernel);
+            const floor = if (!distance_only and features != null) features.?.floor else 1;
             const a = pool.arena.allocator();
             var has_departure = false;
             if (expanding) {
@@ -1021,6 +1072,8 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 if (expanding and has_departure and at_node) continue;
                 const id = candidate.edge;
                 const edge = try self.view.edge(id);
+                const feature = if (features) |costs| costs.get(id) else null;
+                const allowed = feature != null and feature.?.allow;
                 const excluded: ?*PartialExclusion = if (fractions) |table| blk: {
                     if (table.get(@backingInt(id)) == null) break :blk null;
                     break :blk &(try table.at(a, @backingInt(id))).*.?;
@@ -1042,7 +1095,8 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 const node: NodeId = @fromBackingInt(geometry.head);
                 const portion: Cut = if (direction == .forward) .{ .begin = candidate.fraction } else .{ .end = candidate.fraction };
                 const fraction = portion.end - portion.begin;
-                const cost = scale(full, if (distance_only) fraction else @max(fraction, std.math.floatEps(f32)), candidate.score);
+                const step = try priceCut(full, feature, portion, if (distance_only) fraction else @max(fraction, std.math.floatEps(f32)), distance_only, control);
+                const cost = step.add(.{ .cost = candidate.score });
                 // Valhalla's Dijkstra seed stores the partial length in a
                 // uint32_t path distance, dropping any fractional metre.
                 const metres = if (expanding)
@@ -1051,7 +1105,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     fractionalLength(edge.geom.len_m, portion);
                 const within = !expanding or query.expansion.bounds.allows(cost, metres);
                 if (!within and !observe_edges) continue;
-                const access = if (@TypeOf(tracker) != @TypeOf(null) and (model_access or check_limits))
+                const access = if (!allowed and @TypeOf(tracker) != @TypeOf(null) and (model_access or check_limits))
                     try tracker.access.evaluate(id, edge, tail, .{}, .start)
                 else
                     base.AccessEvaluation{};
@@ -1060,6 +1114,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     .edge = id,
                     .cut = portion,
                     .full = full,
+                    .feature = feature,
                 });
                 if (!within) continue;
                 try cuts.append(a, portion);
@@ -1076,9 +1131,9 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 };
                 if (excluded) |entry| {
                     label.flags |= Label.excluded_start;
-                    try self.offer(pool, labels, pending, potential, null, node, entry.seed, tracker, context, label, &entry.seed, distance_only);
+                    try self.offer(pool, labels, pending, potential, null, node, entry.seed, tracker, context, label, &entry.seed, distance_only, floor);
                 } else {
-                    try self.offer(pool, labels, pending, potential, null, node, self.findStatus(tracker, @backingInt(id), context, closure), tracker, context, label, null, distance_only);
+                    try self.offer(pool, labels, pending, potential, null, node, self.findStatus(tracker, @backingInt(id), context, closure), tracker, context, label, null, distance_only, floor);
                 }
                 if (expanding) continue;
                 var dest = query.targets.on(id);
@@ -1092,7 +1147,8 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     else
                         .{ .begin = match.fraction, .end = candidate.fraction };
                     if (cut.end < cut.begin) continue;
-                    const direct = scale(full, @max(cut.end - cut.begin, std.math.floatEps(f32)), candidate.score + match.score);
+                    const partial_cost = try priceCut(full, feature, cut, @max(cut.end - cut.begin, std.math.floatEps(f32)), distance_only, control);
+                    const direct = partial_cost.add(.{ .cost = candidate.score + match.score });
                     try addTerminal(a, labels, cuts, pending, cut, .{
                         .edge = @backingInt(id),
                         .cost = direct.cost,
@@ -1194,7 +1250,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             return tracker.aliases.get(Restrictions.aliasKey(edge, context, closure)) orelse .{};
         }
 
-        fn offer(self: *Self, pool: *Pool, labels: *std.ArrayList(Label), pending: *Q, potential: anytype, target: ?NodeId, head: NodeId, status: Status, tracker: anytype, context: TurnContext, label: Label, seed_slot: anytype, comptime distance_only: bool) !void {
+        fn offer(self: *Self, pool: *Pool, labels: *std.ArrayList(Label), pending: *Q, potential: anytype, target: ?NodeId, head: NodeId, status: Status, tracker: anytype, context: TurnContext, label: Label, seed_slot: anytype, comptime distance_only: bool, floor: f32) !void {
             const use_time = @TypeOf(tracker) != @TypeOf(null) and tracker.keep_time;
             const pareto = if (distance_only and @TypeOf(tracker) != @TypeOf(null)) tracker.pareto else false;
             var key: Restrictions.AliasKey = if (use_time) Restrictions.timedKey(label, context) else undefined;
@@ -1213,11 +1269,12 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             const index = std.math.cast(u32, labels.items.len) orelse return error.TooManySearchLabels;
             if (index == no_index) return error.TooManySearchLabels;
             const done = target != null and head == target.?;
-            const estimate: f32 = if (done) 0 else if (comptime @hasDecl(@TypeOf(potential), "estimateAt"))
+            const base_estimate: f32 = if (done or floor == 0) 0 else if (comptime @hasDecl(@TypeOf(potential), "estimateAt"))
                 potential.estimateAt(head, label.cost)
             else
                 potential.estimate(head);
-            if (!std.math.isFinite(estimate) or estimate < 0) return error.InvalidPotential;
+            if (!std.math.isFinite(base_estimate) or base_estimate < 0) return error.InvalidPotential;
+            const estimate = if (floor == 1) base_estimate else roundedDown(@as(f64, base_estimate) * floor);
             var record = label;
             if (done) record.flags |= Label.target;
             const a = pool.arena.allocator();
@@ -1247,10 +1304,6 @@ pub fn Search(comptime K: type, comptime Q: type) type {
 
 fn cutsExcluded(excluded: f32, endpoint: f32, origin: bool) bool {
     return if (origin) excluded >= endpoint else excluded <= endpoint;
-}
-
-fn scale(cost: costing.Cost, portion: f32, score: f32) costing.Cost {
-    return (costing.Cost{ .cost = cost.cost * portion, .secs = cost.secs * portion }).add(.{ .cost = score });
 }
 
 inline fn distancePrice(cost: costing.Cost, edge: *const EdgeHot, comptime distance_only: bool) costing.Cost {

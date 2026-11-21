@@ -114,7 +114,7 @@ pub const Profile = struct {
             (flags.contains(.include_hot) and class.flags.toll);
     }
 
-    fn pathClassAllowed(self: *const Profile, class: *const EdgeClass) bool {
+    pub fn pathClassAllowed(self: *const Profile, class: *const EdgeClass) bool {
         return class.category.surface != @backingInt(Surface.impassable) and
             self.permission.accessibleClass(class) and self.hovAllowed(class);
     }
@@ -224,8 +224,7 @@ pub const Model = struct {
     }
 
     pub fn classFactor(profile: Profile, class: EdgeClass) !f32 {
-        if (class.category.surface == @backingInt(Surface.impassable) or
-            (!profile.may_allow_edges and !profile.pathClassAllowed(&class))) return std.math.inf(f32);
+        if (!profile.may_allow_edges and !profile.pathClassAllowed(&class)) return std.math.inf(f32);
         return if (profile.shared.shortest) 1 else profile.classWeight(&class, 0);
     }
 };

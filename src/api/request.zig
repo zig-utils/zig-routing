@@ -13,6 +13,7 @@ const std = @import("std");
 const json = @import("json.zig");
 const errors = @import("errors.zig");
 const exclusions = @import("exclusions.zig");
+const linear_shapes = @import("linear_shapes.zig");
 const attributes = @import("attributes.zig");
 const datetime = @import("../graph/datetime.zig");
 const Deadline = @import("../infra/io.zig").Deadline;
@@ -161,6 +162,7 @@ pub const Options = struct {
     targets: []Location = &.{},
     exclude_locations: []Location = &.{},
     exclude_polygons: []const exclusions.Ring = &.{},
+    linear_cost_factors: []const linear_shapes.Feature = &.{},
     shape: []Location = &.{},
     trace: TraceOptions = .{},
     encoded_polyline: ?[]const u8 = null,
@@ -730,6 +732,14 @@ fn fromJsonWithin(arena: Allocator, doc: json.Value, action: Action, deadline: D
         .failure => |failure| return .{ .failure = failure },
     }
 
+    if (root == .object) if (root.object.get("linear_cost_factors")) |value| {
+        switch (try linear_shapes.parse(arena, value, deadline)) {
+            .features => |features| o.linear_cost_factors = features,
+            .warning => try o.warnings.append(arena, 212),
+            .failure => |failure| return .{ .failure = failure },
+        }
+    };
+
     o.range = json.get(bool, root, "/range", false);
     if (json.getOptional(u32, root, "/height_precision")) |hp| if (hp <= max_height_precision) {
         o.height_precision = hp;
@@ -1251,6 +1261,11 @@ pub fn resultsEqual(x: Result, y: Result) bool {
             if ((a.id == null) != (b.id == null) or (a.id != null and !std.mem.eql(u8, a.id.?, b.id.?))) return false;
             if ((a.encoded_polyline == null) != (b.encoded_polyline == null)) return false;
             if (!std.mem.eql(u16, a.warnings.items, b.warnings.items)) return false;
+            if (a.linear_cost_factors.len != b.linear_cost_factors.len) return false;
+            for (a.linear_cost_factors, b.linear_cost_factors) |left, right| {
+                if (left.factor != right.factor or left.allow != right.allow or left.points.len != right.points.len) return false;
+                for (left.points, right.points) |p, q| if (!std.meta.eql(p, q)) return false;
+            }
             if (a.shapeCount() != b.shapeCount() or a.locations.len != b.locations.len) return false;
             if (a.height_points != null or b.height_points != null) {
                 for (0..a.shapeCount()) |i| if (!std.meta.eql(a.shapePoint(i), b.shapePoint(i))) return false;
