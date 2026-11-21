@@ -32,9 +32,16 @@ pub fn Motor(comptime model: type) type {
         const Self = @This();
         pub const UntimedEdge = struct {
             cost: Cost,
-            measured_speed: bool,
-            allowed: bool,
+            flags: packed struct(u32) {
+                measured_speed: bool,
+                allowed: bool,
+                allowed_turns: u30,
+            },
         };
+
+        comptime {
+            std.debug.assert(@sizeOf(UntimedEdge) == 12);
+        }
 
         profile: *const model.Profile,
         tables: *const costing.compiled.Compiled,
@@ -49,7 +56,7 @@ pub fn Motor(comptime model: type) type {
         }
 
         pub fn allowed(self: Self, directed: snap.DirectedEdge) bool {
-            if (self.untimed_edges) |edges| return edges[@backingInt(directed.id)].allowed;
+            if (self.untimed_edges) |edges| return edges[@backingInt(directed.id)].flags.allowed;
             return self.profile.allowedCandidate(directed.class, .{}, .{}, self.linearAllows(directed.id));
         }
 
@@ -65,11 +72,42 @@ pub fn Motor(comptime model: type) type {
                 const traversal = self.priceClass(id, edge, class, null);
                 entry.* = .{
                     .cost = traversal.cost,
-                    .measured_speed = traversal.measured_speed,
-                    .allowed = self.profile.allowedCandidate(class, .{}, .{}, self.linearAllows(id)),
+                    .flags = .{
+                        .allowed_turns = if (model == costing.auto) try self.prepareAllowedTurns(view, id, edge, class, control) else 0,
+                        .measured_speed = traversal.measured_speed,
+                        .allowed = self.profile.allowedCandidate(class, .{}, .{}, self.linearAllows(id)),
+                    },
                 };
             }
             return output;
+        }
+
+        fn prepareAllowedTurns(self: Self, view: *const View, incoming: EdgeId, edge: *const Hot, class: *const Class, control: search.Control) !u30 {
+            const at: graph.format.NodeId = @fromBackingInt(edge.head);
+            const node = try view.node(at);
+            if (!self.allowedNode(node)) return 0;
+            const range = try view.outEdgeRange(at);
+            const row = try view.turnRowAt(node, range.count(), edge.cls.opp_local);
+            var mask: u30 = 0;
+            for (view.edges[range.first..range.end], range.first.., row) |*outgoing, i, turn| {
+                try control.check();
+                if (outgoing.cls.local >= @bitSizeOf(u30)) continue;
+                const permitted = try self.allowedTurn(view, .{
+                    .node = at,
+                    .incoming = incoming,
+                    .incoming_edge = edge,
+                    .outgoing = @fromBackingInt(@as(u32, @intCast(i))),
+                    .outgoing_edge = outgoing,
+                    .row = turn,
+                    .predecessor_dead_end = class.flags.dead_end,
+                    .node_record = node,
+                    .edge_range = range,
+                    .incoming_class = class,
+                    .outgoing_class = try view.class(outgoing.cls.class_id),
+                }, .{}, .forward);
+                if (permitted) mask |= @as(u30, 1) << outgoing.cls.local;
+            }
+            return mask;
         }
 
         pub fn allowedNode(self: Self, node: *const graph.format.NodeHot) bool {
@@ -125,7 +163,7 @@ pub fn Motor(comptime model: type) type {
         inline fn preparedTraversal(self: Self, id: EdgeId) ?search.Traversal {
             const edges = self.untimed_edges orelse return null;
             const entry = edges[@backingInt(id)];
-            return .{ .cost = entry.cost, .measured_speed = entry.measured_speed };
+            return .{ .cost = entry.cost, .measured_speed = entry.flags.measured_speed };
         }
 
         fn price(self: Self, view: *const View, id: EdgeId, edge: *const Hot, time: ?graph.speed.Time) !search.Traversal {
@@ -163,6 +201,18 @@ pub fn Motor(comptime model: type) type {
             else
                 try model.Kernel.allowed(self.profile, from, to, turn, check, self.control.deadline);
             return access.allowed;
+        }
+
+        /// The forward distance sweep uses the local movement and dead-end
+        /// rule compiled with the untimed batch prices. Search evaluates
+        /// elapsed time and predecessor access separately.
+        pub inline fn cachedExpansionTurn(self: Self, incoming: EdgeId, local: u5) ?bool {
+            if (model == costing.auto and local < @bitSizeOf(u30)) {
+                if (self.untimed_edges) |edges| {
+                    return edges[@backingInt(incoming)].flags.allowed_turns & (@as(u30, 1) << local) != 0;
+                }
+            }
+            return null;
         }
 
         pub fn turnCost(self: Self, view: *const View, movement: search.Transition, _: search.Label, _: search.Direction) !Cost {

@@ -766,19 +766,15 @@ pub fn project(approx: geo.DistanceApproximator, shape: []const geo.PointLL, dea
 // behaviour, including coincident vertices and the antimeridian.
 fn projectBatch(comptime lanes: usize, approx: geo.DistanceApproximator, shape: *const [lanes + 1]geo.PointLL, base: usize, best: *Projection) void {
     const V = @Vector(lanes, f64);
-    var ax: V = undefined;
+    var a_longitude: V = undefined;
     var ay: V = undefined;
-    var bx: V = undefined;
+    var b_longitude: V = undefined;
     var by: V = undefined;
     inline for (0..lanes) |j| {
         const a = shape[j];
         const b = shape[j + 1];
-        const delta = geo.wrappedLongitudeDelta(b.lng, a.lng);
-        const midpoint = a.lng + 0.5 * delta;
-        const center = approx.center_lng;
-        const shift: f64 = if (midpoint - center > 180) -360 else if (midpoint - center < -180) 360 else 0;
-        ax[j] = a.lng + shift;
-        bx[j] = b.lng + shift + if (b.lng - a.lng > 180) @as(f64, -360) else if (a.lng - b.lng > 180) @as(f64, 360) else 0;
+        a_longitude[j] = a.lng;
+        b_longitude[j] = b.lng;
         ay[j] = a.lat;
         by[j] = b.lat;
     }
@@ -786,6 +782,16 @@ fn projectBatch(comptime lanes: usize, approx: geo.DistanceApproximator, shape: 
     const py: V = @splat(approx.center_lat);
     const scale: V = @splat(approx.lng_scale);
     const zero: V = @splat(0);
+    const half_turn: V = @splat(180);
+    const full_turn: V = @splat(360);
+    const delta = b_longitude - a_longitude;
+    const east = delta > half_turn;
+    const west = delta < -half_turn;
+    const unwrapped = @select(f64, east, delta - full_turn, @select(f64, west, delta + full_turn, delta));
+    const midpoint = a_longitude + @as(V, @splat(0.5)) * unwrapped - px;
+    const shift = @select(f64, midpoint > half_turn, -full_turn, @select(f64, midpoint < -half_turn, full_turn, zero));
+    const ax = a_longitude + shift;
+    const bx = b_longitude + shift + @select(f64, east, -full_turn, @select(f64, west, full_turn, zero));
     const dx = bx - ax;
     const dy = by - ay;
     const sx = dx * scale;
@@ -821,7 +827,10 @@ test "vector projection keeps the first equal segment and snaps across the seam"
     try testing.expectEqual(line_points[1], best.point);
     try testing.expectEqual(approx.distanceSquared(best.point), best.squared);
     const seam: geo.DistanceApproximator = .init(.init(-180, 47.001));
-    const crossing = try project(seam, &.{ .init(179.999, 47), .init(-179.999, 47) }, .none);
+    const crossing = try project(seam, &.{
+        .init(179.98, 47),   .init(179.99, 47),  .init(179.999, 47),
+        .init(-179.999, 47), .init(-179.99, 47), .init(-179.98, 47),
+    }, .none);
     try testing.expectEqual(@as(f64, 180), @abs(crossing.point.lng));
     try testing.expectEqual(@as(f64, 47), crossing.point.lat);
     try testing.expectEqual(seam.distanceSquared(.init(-180, 47)), crossing.squared);

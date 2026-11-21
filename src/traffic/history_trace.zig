@@ -184,26 +184,40 @@ fn readTrace(a: Allocator, row: []const u8, control: search.Control) ![]const ma
     return points;
 }
 
-const Job = struct {
+const Chunk = struct {
+    raw: []const u8,
+    samples: std.ArrayList(history.Sample) = .empty,
+    report: Report = .{},
+};
+
+const Work = struct {
     a: Allocator,
     view: *const View,
-    raw: []const u8,
     profile: *const costing.auto.Profile,
     tables: *const costing.compiled.Compiled,
     untimed_edges: ?[]const Kernel.UntimedEdge,
     control: search.Control,
-    samples: std.ArrayList(history.Sample) = .empty,
-    report: Report = .{},
-    failure: ?anyerror = null,
+    chunks: []Chunk,
+    next: std.atomic.Value(usize) = .init(0),
 
-    fn run(self: *Job) void {
+    fn run(self: *Work, failure: *?anyerror) void {
         self.collect() catch |err| {
-            self.failure = err;
+            failure.* = err;
         };
     }
 
-    fn collect(self: *Job) !void {
-        if (self.raw.len == 0) return;
+    fn nextChunk(self: *Work) !?*Chunk {
+        while (true) {
+            try self.control.check();
+            const index = self.next.fetchAdd(1, .monotonic);
+            if (index >= self.chunks.len) return null;
+            const chunk = &self.chunks[index];
+            if (chunk.raw.len != 0) return chunk;
+        }
+    }
+
+    fn collect(self: *Work) !void {
+        var chunk = (try self.nextChunk()) orelse return;
         var arena = Arena.init(self.a, .{});
         defer arena.deinit();
         var finder = match.candidates.Finder.init(self.view, self.a, .{});
@@ -219,41 +233,43 @@ const Job = struct {
         };
         const observations = try match.emission.Model.init(match.emission.Model.default_sigma_z);
         const movements = try match.transition.Model.init(.{ .turn_penalty_factor = 0 });
-        var rows = std.mem.tokenizeScalar(u8, self.raw, '\n');
-        while (rows.next()) |row| {
-            try self.control.check();
-            const line = std.mem.trim(u8, row, " \r\t");
-            if (line.len == 0) continue;
-            self.report.traces += 1;
-            arena.reset();
-            const points = readTrace(arena.allocator(), line, self.control) catch |err| switch (err) {
-                error.InvalidHistoricalTrace => {
-                    self.report.malformed_traces += 1;
+        while (true) : (chunk = (try self.nextChunk()) orelse return) {
+            var rows = std.mem.tokenizeScalar(u8, chunk.raw, '\n');
+            while (rows.next()) |row| {
+                try self.control.check();
+                const line = std.mem.trim(u8, row, " \r\t");
+                if (line.len == 0) continue;
+                chunk.report.traces += 1;
+                arena.reset();
+                const points = readTrace(arena.allocator(), line, self.control) catch |err| switch (err) {
+                    error.InvalidHistoricalTrace => {
+                        chunk.report.malformed_traces += 1;
+                        continue;
+                    },
+                    else => return err,
+                };
+                chunk.report.points += points.len;
+                const result = match.route.resolve(&arena, &finder, &router, kernel, points, observations, movements, .{}, self.control) catch |err| switch (err) {
+                    error.InvalidMeasurement, error.NoEdgeWalk, error.DisconnectedPath, error.InvalidTracePath, error.TransitionMemoryLimit => {
+                        chunk.report.unmatched_traces += 1;
+                        continue;
+                    },
+                    else => return err,
+                };
+                if (result.len == 0 or result[0].segments.len == 0) {
+                    chunk.report.unmatched_traces += 1;
                     continue;
-                },
-                else => return err,
-            };
-            self.report.points += points.len;
-            const result = match.route.resolve(&arena, &finder, &router, kernel, points, observations, movements, .{}, self.control) catch |err| switch (err) {
-                error.InvalidMeasurement, error.NoEdgeWalk, error.DisconnectedPath, error.InvalidTracePath, error.TransitionMemoryLimit => {
-                    self.report.unmatched_traces += 1;
-                    continue;
-                },
-                else => return err,
-            };
-            if (result.len == 0 or result[0].segments.len == 0) {
-                self.report.unmatched_traces += 1;
-                continue;
+                }
+                const count = attribute(self.view, result[0], arena.allocator(), &chunk.samples, self.a, self.control) catch |err| switch (err) {
+                    error.InvalidTracePath => {
+                        chunk.report.unmatched_traces += 1;
+                        continue;
+                    },
+                    else => return err,
+                };
+                if (count != 0) chunk.report.contributing_traces += 1;
+                chunk.report.samples += count;
             }
-            const count = attribute(self.view, result[0], arena.allocator(), &self.samples, self.a, self.control) catch |err| switch (err) {
-                error.InvalidTracePath => {
-                    self.report.unmatched_traces += 1;
-                    continue;
-                },
-                else => return err,
-            };
-            if (count != 0) self.report.contributing_traces += 1;
-            self.report.samples += count;
         }
     }
 };
@@ -279,60 +295,70 @@ pub fn collect(a: Allocator, view: *const View, raw: []const u8, workers: usize,
         null;
     defer if (prices) |entries| a.free(entries);
     const count = @min(workers, @max(1, raw.len));
-    const jobs = try a.alloc(Job, count);
-    defer a.free(jobs);
-    var jobs_initialized: usize = 0;
-    defer for (jobs[0..jobs_initialized]) |*job| job.samples.deinit(a);
+    const chunk_count = if (count == 1) 1 else @min(count *| 64, @max(count, raw.len / (64 * 1024)));
+    const chunks = try a.alloc(Chunk, chunk_count);
+    defer a.free(chunks);
+    var chunks_initialized: usize = 0;
+    defer for (chunks[0..chunks_initialized]) |*chunk| chunk.samples.deinit(a);
     const threads = try a.alloc(std.Thread, count - 1);
     defer a.free(threads);
     var spawned: usize = 0;
     var cancel: std.atomic.Value(bool) = .init(false);
+    const control: search.Control = .{ .deadline = deadline, .cancel = &cancel };
+    var begin: usize = 0;
+    for (chunks, 0..) |*chunk, i| {
+        try control.check();
+        var end = if (i + 1 == chunks.len) raw.len else @max(begin, raw.len / chunk_count * (i + 1));
+        while (end < raw.len and end > 0 and raw[end - 1] != '\n') : (end += 1) {
+            if (end % 256 == 0) try control.check();
+        }
+        chunk.* = .{ .raw = raw[begin..end] };
+        chunks_initialized += 1;
+        begin = end;
+    }
+    var work: Work = .{
+        .a = a,
+        .view = view,
+        .profile = &profile,
+        .tables = &tables,
+        .untimed_edges = prices,
+        .control = control,
+        .chunks = chunks,
+    };
+    const failures = try a.alloc(?anyerror, count);
+    defer a.free(failures);
+    @memset(failures, null);
     errdefer {
         cancel.store(true, .monotonic);
         for (threads[0..spawned]) |thread| thread.join();
     }
-    const control: search.Control = .{ .deadline = deadline, .cancel = &cancel };
-    var begin: usize = 0;
-    for (jobs, 0..) |*job, i| {
-        try control.check();
-        var end = if (i + 1 == jobs.len) raw.len else @max(begin, raw.len / count * (i + 1));
-        while (end < raw.len and end > 0 and raw[end - 1] != '\n') : (end += 1) {
-            if (end % 256 == 0) try control.check();
-        }
-        job.* = .{
-            .a = a,
-            .view = view,
-            .raw = raw[begin..end],
-            .profile = &profile,
-            .tables = &tables,
-            .untimed_edges = prices,
-            .control = control,
-        };
-        jobs_initialized += 1;
-        begin = end;
-        if (i < threads.len) {
-            threads[i] = try std.Thread.spawn(.{}, Job.run, .{job});
-            spawned += 1;
-        } else {
-            job.run();
-        }
+    for (threads, 0..) |*thread, i| {
+        thread.* = try std.Thread.spawn(.{}, Work.run, .{ &work, &failures[i] });
+        spawned += 1;
     }
+    work.run(&failures[count - 1]);
 
     for (threads) |thread| thread.join();
     spawned = 0;
-    var report: Report = .{};
-    for (jobs) |job| {
+    for (failures) |failure| {
         try control.check();
-        if (job.failure) |err| return err;
+        if (failure) |err| return err;
+    }
+    var report: Report = .{};
+    for (chunks) |chunk| {
+        try control.check();
         inline for (comptime std.meta.fieldNames(Report)) |name| {
-            @field(report, name) += @field(job.report, name);
+            @field(report, name) += @field(chunk.report, name);
         }
     }
     const combined = try a.alloc(history.Sample, std.math.cast(usize, report.samples) orelse return error.HistoricalBatchTooLarge);
+    errdefer a.free(combined);
     var written: usize = 0;
-    for (jobs) |job| {
-        @memcpy(combined[written..][0..job.samples.items.len], job.samples.items);
-        written += job.samples.items.len;
+    // Input order is also the stable order of equal keys in the fitter.
+    for (chunks) |chunk| {
+        try control.check();
+        @memcpy(combined[written..][0..chunk.samples.items.len], chunk.samples.items);
+        written += chunk.samples.items.len;
     }
     return .{ .samples = combined, .report = report };
 }

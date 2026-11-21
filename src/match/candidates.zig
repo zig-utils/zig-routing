@@ -72,6 +72,12 @@ const Window = struct {
     last: u32,
 };
 
+const WindowArc = struct {
+    edge: EdgeId,
+    shape: EdgeId,
+    geometry: ?*const Shape,
+};
+
 /// Request-local scratch and a byte-bounded cache of physical edge shapes.
 /// The spatial index is shared with routing and is never copied.
 pub const Finder = struct {
@@ -79,7 +85,7 @@ pub const Finder = struct {
     a: Allocator,
     options: Options,
     storage: memory.Arena,
-    shapes: std.AutoHashMapUnmanaged(EdgeId, Shape) = .empty,
+    shapes: std.AutoHashMapUnmanaged(EdgeId, *Shape) = .empty,
     uncached: std.AutoHashMapUnmanaged(EdgeId, void) = .empty,
     nodes: std.AutoHashMapUnmanaged(NodeId, void) = .empty,
     fixed: std.ArrayList(graph.format.Coordinate) = .empty,
@@ -89,7 +95,7 @@ pub const Finder = struct {
     pending: Shape = undefined,
     query_number: u64 = 0,
     ordered_cells: std.AutoHashMapUnmanaged(u64, []const encounter.Arc) = .empty,
-    ordered_windows: std.AutoHashMapUnmanaged(Window, []const encounter.Arc) = .empty,
+    ordered_windows: std.AutoHashMapUnmanaged(Window, []const WindowArc) = .empty,
     window_bytes: usize = 0,
     bin_list: std.ArrayList(i32) = .empty,
     bin_order: encounter.Set = .{},
@@ -179,18 +185,22 @@ pub const Finder = struct {
             const rc = subdivisions.rowColumn(bin_id);
             const tile = tiles.tileIdColRow(@divTrunc(rc.col, 5), @divTrunc(rc.row, 5));
             const bin: u16 = @intCast(@mod(rc.col, 5) + 5 * @mod(rc.row, 5));
-            const source = try bins.orderedEdgesIn(@intCast(tile), bin);
-            if (source.edges.len == 0) continue;
             const grid: fine.Grid = .{ .origin = tiles.base(tile) };
             const start = grid.square(bounds.minpt()).clamp();
             const end = grid.square(bounds.maxpt()).clamp();
             if (self.bin_list.items.len == 1) {
                 window = .{ .bin = bin_id, .first = start.id(), .last = end.id() };
                 if (self.ordered_windows.get(window.?)) |arcs| {
-                    for (arcs) |arc| try self.considerOrdered(arc, approx, squared, costing, deadline);
+                    for (arcs) |arc| {
+                        if (deadline.expired()) return error.DeadlineExceeded;
+                        const line = arc.geometry orelse (try self.cachedShape(arc.shape, deadline)) orelse continue;
+                        try self.consider(line, arc.edge, approx, squared, costing, deadline);
+                    }
                     return;
                 }
             }
+            const source = try bins.orderedEdgesIn(@intCast(tile), bin);
+            if (source.edges.len == 0) continue;
             self.bin_order.clear();
             for (@as(usize, @intCast(start.row))..@as(usize, @intCast(end.row + 1))) |row| {
                 for (@as(usize, @intCast(start.column))..@as(usize, @intCast(end.column + 1))) |column| {
@@ -226,14 +236,14 @@ pub const Finder = struct {
         // The encounter order depends only on graph cells. Bound this index
         // separately within the shape cache to leave room for projection data.
         const count = self.candidate_order.nodes.items.len;
-        const bytes = count * @sizeOf(encounter.Arc) + @sizeOf(Window) + @sizeOf([]const encounter.Arc);
+        const bytes = count * @sizeOf(WindowArc) + @sizeOf(Window) + @sizeOf([]const WindowArc);
         if (self.storage.cap_exceeded or bytes > self.options.shape_cache_bytes / 8 -| self.window_bytes) return;
         const a = self.storage.allocator();
         self.ordered_windows.ensureUnusedCapacity(a, 1) catch |err| {
             if (self.storage.cap_exceeded) return;
             return err;
         };
-        const arcs = a.alloc(encounter.Arc, count) catch |err| {
+        const arcs = a.alloc(WindowArc, count) catch |err| {
             if (self.storage.cap_exceeded) return;
             return err;
         };
@@ -243,7 +253,8 @@ pub const Finder = struct {
                 a.free(arcs);
                 return error.DeadlineExceeded;
             }
-            arc.* = items.next().?;
+            const item = items.next().?;
+            arc.* = .{ .edge = item.edge, .shape = item.shape, .geometry = self.shapes.get(item.shape) };
         }
         self.ordered_windows.putAssumeCapacityNoClobber(key, arcs);
         self.window_bytes += bytes;
@@ -314,6 +325,7 @@ pub const Finder = struct {
     }
 
     fn consider(self: *Finder, line: *const Shape, first_edge: EdgeId, approx: geo.DistanceApproximator, squared: f64, costing: anytype, deadline: Deadline) !void {
+        if (outsideRadius(line.bounds, approx, squared)) return;
         const edge = if (first_edge == line.edge.id) line.edge else line.opposing;
         const opposing = if (first_edge == line.edge.id) line.opposing else line.edge;
         const allowed = costing.allowed(edge);
@@ -353,7 +365,7 @@ pub const Finder = struct {
     }
 
     fn shape(self: *Finder, id: EdgeId, deadline: Deadline) !?*const Shape {
-        if (self.shapes.getPtr(id)) |cached| {
+        if (self.shapes.get(id)) |cached| {
             if (cached.visited == self.query_number) return null;
             cached.visited = self.query_number;
             return cached;
@@ -363,7 +375,7 @@ pub const Finder = struct {
     }
 
     fn cachedShape(self: *Finder, id: EdgeId, deadline: Deadline) !?*const Shape {
-        if (self.shapes.getPtr(id)) |cached| return cached;
+        if (self.shapes.get(id)) |cached| return cached;
         return self.loadShape(id, deadline);
     }
 
@@ -411,21 +423,35 @@ pub const Finder = struct {
         const a = self.storage.allocator();
         try self.shapes.ensureUnusedCapacity(a, 1);
         const mark = self.storage.mark();
-        const points = try a.dupe(Point, self.pending.points);
-        const segments = a.dupe(Segment, self.pending.segments) catch |err| {
+        errdefer {
             const capped = self.storage.cap_exceeded;
             self.storage.rewind(mark);
             self.storage.cap_exceeded = capped;
-            return err;
-        };
-        const entry = self.shapes.getOrPutAssumeCapacity(id);
-        std.debug.assert(!entry.found_existing);
-        entry.value_ptr.* = self.pending;
-        entry.value_ptr.points = points;
-        entry.value_ptr.segments = segments;
-        return entry.value_ptr;
+        }
+        const geometry = try a.create(Shape);
+        geometry.* = self.pending;
+        geometry.points = try a.dupe(Point, self.pending.points);
+        geometry.segments = try a.dupe(Segment, self.pending.segments);
+        // Window entries can retain the shape when the hash map grows.
+        self.shapes.putAssumeCapacityNoClobber(id, geometry);
+        return geometry;
     }
 };
+
+fn outsideRadius(bounds: geo.AABB, approx: geo.DistanceApproximator, squared: f64) bool {
+    // Leave room for rounding in interpolation and longitude unwrapping.
+    const margin = 1e-9;
+    const lat_gap = @max(0, @max(bounds.miny - approx.center_lat, approx.center_lat - bounds.maxy) - margin);
+    const dy = lat_gap * geo.constants.meters_per_degree_lat;
+    const lat_squared = dy * dy;
+    if (lat_squared > squared) return true;
+    if (bounds.maxx - bounds.minx > 180 or
+        (bounds.minx <= approx.center_lng and approx.center_lng <= bounds.maxx)) return false;
+    const first = @abs(geo.point.wrappedLongitudeDelta(bounds.minx, approx.center_lng));
+    const last = @abs(geo.point.wrappedLongitudeDelta(bounds.maxx, approx.center_lng));
+    const dx = @max(0, @min(first, last) - margin) * approx.m_per_lng_degree;
+    return lat_squared + dx * dx > squared;
+}
 
 fn nonnegative(value: f32) bool {
     return std.math.isFinite(value) and value >= 0;

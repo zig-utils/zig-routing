@@ -96,8 +96,12 @@ pub const Timing = struct {
     start: graph.time_info.TimeInfo = .{},
     invariant: bool = false,
 
-    pub noinline fn at(self: Timing, view: *const View, node: NodeId, elapsed: f32, direction: Direction) !graph.time_info.TimeInfo {
+    pub inline fn at(self: Timing, view: *const View, node: NodeId, elapsed: f32, direction: Direction) !graph.time_info.TimeInfo {
         if (!self.start.valid) return self.start;
+        return self.atNode(view, node, elapsed, direction);
+    }
+
+    noinline fn atNode(self: Timing, view: *const View, node: NodeId, elapsed: f32, direction: Direction) !graph.time_info.TimeInfo {
         const zone = try view.nodeTimezone(node);
         const used = if (zone == graph.timezone.unknown) self.start.zone else zone;
         const rules = if (view.tz_rules) |*present| present else null;
@@ -446,16 +450,42 @@ pub const Restrictions = struct {
         access_flags: u32 = 0,
     };
     const AliasStatus = std.AutoHashMapUnmanaged(AliasKey, Status);
-    const DirectedStatus = std.HashMapUnmanaged(u32, Status, struct {
-        pub fn hash(_: @This(), id: u32) u64 {
-            const mixed = @as(u64, id) *% 0x9e3779b97f4a7c15;
-            return mixed ^ (mixed >> 32);
+    const DirectedStatus = struct {
+        const Slot = struct { edge: u32, status: Status };
+        const limit = 24;
+        const Context = struct {
+            pub fn hash(_: @This(), id: u32) u64 {
+                return mixed(id);
+            }
+
+            pub fn eql(_: @This(), id: u32, other: u32) bool {
+                return id == other;
+            }
+        };
+
+        slots: [32]Slot = undefined,
+        occupied: u32 = 0,
+        len: u8 = 0,
+        spill: std.HashMapUnmanaged(u32, Status, Context, 80) = .empty,
+
+        fn mixed(id: u32) u64 {
+            const product = @as(u64, id) *% 0x9e3779b97f4a7c15;
+            return product ^ (product >> 32);
         }
 
-        pub fn eql(_: @This(), left: u32, right: u32) bool {
-            return left == right;
+        fn slot(self: *DirectedStatus, a: std.mem.Allocator, id: u32) !*Status {
+            var index: u5 = @truncate(mixed(id));
+            while (self.occupied & (@as(u32, 1) << index) != 0) : (index +%= 1) {
+                const found = &self.slots[index];
+                if (found.edge == id) return &found.status;
+            }
+            if (self.len == limit) return (try self.spill.getOrPutValue(a, id, .{})).value_ptr;
+            self.slots[index] = .{ .edge = id, .status = .{} };
+            self.occupied |= @as(u32, 1) << index;
+            self.len += 1;
+            return &self.slots[index].status;
         }
-    }, 80);
+    };
 
     access: PathAccess,
     states: []const automaton.State,
@@ -466,7 +496,7 @@ pub const Restrictions = struct {
     linear_costs: ?*const linear.Table = null,
     arrivals: std.ArrayList(u32) = .empty,
     aliases: AliasStatus = .empty,
-    directed: DirectedStatus = .empty,
+    directed: DirectedStatus = .{},
 
     fn simplePredecessor(self: *const Restrictions, context: TurnContext, previous: Label, node: *const NodeHot) ?EdgeId {
         const rows = self.access.view.turn_restrictions orelse return null;
@@ -966,9 +996,14 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     const beyond_visitor = bounded_edges and
                         last.cost + @as(f32, @floatFromInt(next.geom.len_m)) >= visitor_limit;
                     if (beyond_visitor and !try query.visitor.observesEdge(next_id)) continue;
-                    const restrict_class = if (restrict) try self.view.class(next.cls.class_id) else null;
                     const feature = if (features) |costs| costs.get(next_id) else null;
                     const allowed = feature != null and feature.?.allow;
+                    const cached_turn: ?bool = if (comptime distance_only and direction == .forward and @hasDecl(K, "cachedExpansionTurn"))
+                        kernel.cachedExpansionTurn(previous_id, outward.cls.local)
+                    else
+                        null;
+                    if (!allowed and cached_turn == @as(?bool, false)) continue;
+                    const restrict_class = if (restrict) try self.view.class(next.cls.class_id) else null;
                     const packed_move = if (compact_moves)
                         if (direction == .forward)
                             layout.get(movement_offset, exits.count(), geometry.cls.opp_local, @intCast(local))
@@ -1050,7 +1085,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                         .compact_movement = if (compact_moves) packed_move else null,
                     };
                     if (comptime @hasDecl(K, "allowedTurn")) {
-                        if (!allowed and !try kernel.allowedTurn(self.view, movement, last, direction)) continue;
+                        if (!allowed and cached_turn == null and !try kernel.allowedTurn(self.view, movement, last, direction)) continue;
                     } else if (!allowed and row & 0x80 != 0 and permission.restrictionModes() != 0) continue;
                     if (comptime @hasDecl(K, "slowAllowed")) {
                         if (!allowed and next.cls.cold_checks != 0 and !try Self.slowAllowed(kernel, self.view, next_id, next, last, direction)) continue;
@@ -1198,6 +1233,8 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             const expanding = @hasField(@TypeOf(query), "expansion");
             const distance_only = comptime distanceObjective(@TypeOf(query));
             const observe_edges = comptime observeEdges(@TypeOf(query));
+            const prune_seeds = distance_only and observe_edges and
+                snap_edge.hasPolicy(@TypeOf(query.visitor), "prunesAtDistance") and query.limit == std.math.maxInt(usize);
             const features = linearCosts(kernel);
             const floor = if (!distance_only and features != null) features.?.floor else 1;
             const a = pool.arena.allocator();
@@ -1263,7 +1300,9 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     .full = full,
                     .feature = feature,
                 });
-                if (!within) continue;
+                // Retain the cuts observed on this seed before testing its
+                // completed traversal against the best destination distances.
+                if (!within or (prune_seeds and query.visitor.prunesAtDistance(cost.cost))) continue;
                 try cuts.append(a, portion);
                 const context: TurnContext = if (@TypeOf(tracker) == @TypeOf(null)) .{} else try tracker.advance(.{}, .{}, node, id);
                 const closure: u32 = if (closed) Label.origin_closure else 0;
@@ -1410,7 +1449,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             else
                 null;
             const a = pool.arena.allocator();
-            const ordinary_slot = if (ordinary) |id| (try tracker.directed.getOrPutValue(a, id, .{})).value_ptr else null;
+            const ordinary_slot = if (ordinary) |id| try tracker.directed.slot(a, id) else null;
             const previous = if (ordinary_slot) |slot|
                 slot.*
             else if (use_time and status.label_plus_one != Status.exclusion)
@@ -1478,6 +1517,27 @@ pub fn roundedDown(value: f64) f32 {
     const rounded: f32 = @floatCast(@min(std.math.floatMax(f32), value));
     if (rounded <= value) return rounded;
     return @bitCast(@as(u32, @bitCast(rounded)) - 1);
+}
+
+test "directed arrival slots retain their values after spilling" {
+    const t = std.testing;
+    var arena = memory.Arena.init(t.allocator, .{});
+    defer arena.deinit();
+    var states: Restrictions.DirectedStatus = .{};
+    for (0..80) |i| {
+        const id = std.math.maxInt(u32) - @as(u32, @intCast(i * 32));
+        const slot = try states.slot(arena.allocator(), id);
+        try t.expectEqual(0, slot.label_plus_one);
+        slot.label_plus_one = @intCast(i + 1);
+    }
+    var i: usize = 80;
+    while (i > 0) {
+        i -= 1;
+        const id = std.math.maxInt(u32) - @as(u32, @intCast(i * 32));
+        const slot = try states.slot(arena.allocator(), id);
+        try t.expectEqual(i + 1, slot.label_plus_one);
+    }
+    try t.expectEqual(56, states.spill.count());
 }
 
 test "a running sweep polls the atomic cancel flag and clears its pages" {

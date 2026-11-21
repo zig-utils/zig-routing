@@ -191,3 +191,73 @@ All 39 native test steps passed with 612 tests passing and two skips.
 Eleven Linux x86-64 executables cross-compiled. The Linux ReleaseFast
 binary size was 14,444,792 bytes, with five search instantiations and five
 costing kernels.
+
+## Historical learning throughput
+
+Exact trace transitions keep the small directed arrival table in the
+search frame and spill larger tables into the request arena. Destination
+lookups use separate membership bits for nodes and edges. The actual
+destination lists still preserve encounter order, including repeated keys.
+Cached geometric estimates use the original queue priorities. Completed
+origin cuts can satisfy the current destination distances before the
+search adds their full traversals to the queue.
+
+The shared batch price table stays at 12 bytes per edge. It also contains
+the forward auto turn admission when the outward local index fits the
+30-bit mask. The last two local indices use the ordinary costing predicate.
+Search checks conditional restrictions, access state and clocks on the
+actual path. The cached mask rules out forbidden moves before their path
+bookkeeping.
+
+Ordered candidate windows retain decoded graph shapes. A conservative
+point-to-shape bounding calculation rules out projections outside the
+radius with margin for f64 rounding. Longitude unwrapping and projection
+preserve the original endpoint bits and first tie. The edge walk computes
+the measured prefix as it needs it, and can reject a single-edge walk as
+soon as the prefix exceeds the allowed length.
+
+Each worker keeps its matcher, request arena and graph caches across input
+chunks. The batch claims newline-aligned chunks from a shared counter and
+merges their samples in input order. Stable radix sorting skips digits
+that are uniform across the input. These changes preserve the existing
+sample accumulation, robust estimation and overlay publication.
+
+The targeted trials below each used their own adjacent control on native
+ARM64 macOS with eight workers. They timed the full noisy pipeline.
+
+| Change | Control median | Candidate median |
+| --- | ---: | ---: |
+| Small arrival table and destination lookups | 1.235 s | 1.205 s |
+| Static turn admission | 1.175 s | 1.150 s |
+| Projection and queue estimate reuse | 1.135 s | 1.110 s |
+| Candidate bounds and earlier window lookup | 1.060 s | 1.045 s |
+| Shared input chunks | 1.065 s | 1.045 s |
+| Static admission before path bookkeeping | 1.025 s | 0.990 s |
+
+For the final measurement, 16 alternating pairs ran the `f8e74d7`
+baseline and the final build on the same Apple M3 Pro. Each command used
+eight workers and the original 1,024,088-point corpus. A monotonic clock
+timed process startup through overlay publication. Each graph copy was
+prepared before its timed run.
+
+| Corpus | Base wall | Final wall | Base points/s | Final points/s |
+| --- | ---: | ---: | ---: | ---: |
+| Noisy GPS | 1.246270 s | 1.012417 s | 821,722 | 1,011,528 |
+| Geometry-aligned | 0.283880 s | 0.271393 s | 3,607,472 | 3,773,444 |
+
+The noisy median meets the one-million-point target in #257 and #204.
+Median process CPU went from 9.025 s to 7.465 s, and peak RSS from
+132.44 MiB to 119.94 MiB. Both corpora produced byte-identical reports
+and overlays in every pair. All 14,873 noisy traces contributed to the
+same 750,315 samples and 60 profiles.
+
+Three separate samples per build used the 1 ms sampling recipe above.
+The median number of top-of-stack samples for the segment projector fell
+from 248 to 177. Use the paired full-command measurements for throughput.
+
+The pinned comparison reproduced all 156 ordered candidate sets, 186
+directed ranked state paths, 120 stitched traces and 360 primary and
+ranked action results. All 39 native test steps passed, with 634 tests
+passing and two skips. Eleven Linux x86-64 binaries cross-compiled.
+The Linux ReleaseFast binary is 14,440,904 bytes with five search
+instantiations and five costing kernels.

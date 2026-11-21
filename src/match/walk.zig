@@ -29,8 +29,9 @@ const Walker = struct {
     view: *const View,
     arena: *memory.Arena,
     trace: []const Measurement,
-    distances: []const f32,
-    prefix: []const f32,
+    distances: []f32,
+    prefix: []f32,
+    ready: usize = 1,
     targets: ?[]const snap.PathEdge = null,
     ends: std.AutoHashMapUnmanaged(NodeId, End) = .empty,
     path: std.ArrayList(Part) = .empty,
@@ -40,6 +41,25 @@ const Walker = struct {
     fn frame(self: *const Walker, node: NodeId, point: u32) !Frame {
         const range = try self.view.outEdgeRange(node);
         return .{ .node = node, .point = point, .next = range.first, .end = range.end };
+    }
+
+    fn prepareThrough(self: *Walker, index: usize) !void {
+        while (self.ready <= index) : (self.ready += 1) {
+            const i = self.ready;
+            if (i % 256 == 0) try self.control.check();
+            self.distances[i] = @floatCast(self.trace[i - 1].point.distance(self.trace[i].point));
+            self.prefix[i] = self.prefix[i - 1] + self.distances[i];
+        }
+    }
+
+    fn withinLength(self: *Walker, maximum: f32) !bool {
+        // Distances are nonnegative, so a prefix outside the limit rules
+        // out the single-edge walk before measuring the rest of the trace.
+        while (self.prefix[self.ready - 1] <= maximum) {
+            if (self.ready == self.trace.len) return true;
+            try self.prepareThrough(self.ready);
+        }
+        return false;
     }
 
     fn matchShape(self: *Walker, id: EdgeId, from: u32, to: u32) !bool {
@@ -61,6 +81,7 @@ const Walker = struct {
         var length: f32 = 0;
         for (self.trace[from + 1 ..], from + 1..) |point, index| {
             if (index % 256 == 0) try self.control.check();
+            try self.prepareThrough(index);
             length += self.distances[index];
             if (length > lengthLimit(metres)) break;
             if (point.point.approxEql(end) and metres < lengthLimit(length)) {
@@ -74,6 +95,7 @@ const Walker = struct {
     fn finish(self: *Walker, node: NodeId, index: u32) !bool {
         const end = self.ends.get(node) orelse return false;
         const last: u32 = @intCast(self.trace.len - 1);
+        try self.prepareThrough(last);
         if (@abs(self.prefix[index] + end.distance - self.prefix[last]) >= 5) return false;
         if (end.edge.node == .end) {
             const edge = self.path.items[self.path.items.len - 1].segment.edge;
@@ -153,7 +175,7 @@ const Walker = struct {
                 if (try self.descend(@fromBackingInt(hot.head), point)) return self.path.items;
                 return error.NoEdgeWalk;
             }
-            if (self.prefix[last] > lengthLimit(metres)) continue;
+            if (!try self.withinLength(lengthLimit(metres))) continue;
             try self.loadTargets(destination);
             for (self.targets.?, 0..) |target, i| {
                 if (i % 256 == 0) try self.control.check();
@@ -222,9 +244,6 @@ pub fn findLazy(view: *const View, arena: *memory.Arena, trace: []const Measurem
     for (trace, 0..) |measurement, i| {
         if (i % 256 == 0) try control.check();
         if (!measurement.point.inRange()) return error.InvalidMeasurement;
-        if (i == 0) continue;
-        distances[i] = @floatCast(trace[i - 1].point.distance(measurement.point));
-        prefix[i] = prefix[i - 1] + distances[i];
     }
     var walker: Walker = .{
         .view = view,

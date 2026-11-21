@@ -577,6 +577,10 @@ pub fn RoutingCosts(comptime K: type) type {
                 self.arena.rewind(mark);
                 return null;
             };
+            column.cacheOrdering(a) catch {
+                self.arena.rewind(mark);
+                return null;
+            };
             const bytes = self.arena.used - mark.used;
             if (bytes > remaining) {
                 self.arena.rewind(mark);

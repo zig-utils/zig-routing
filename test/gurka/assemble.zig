@@ -5936,6 +5936,10 @@ test "Gurka historical traffic learns an interior edge and publishes an anonymou
     try input.appendSlice(raw, "{\"id\":\"ignored\",\"shape\":[null]}\n");
     const batch = try routing.traffic.history_trace.collect(a, view, input.items, 3, .none);
     defer batch.deinit(a);
+    const serial = try routing.traffic.history_trace.collect(a, view, input.items, 1, .none);
+    defer serial.deinit(a);
+    try testing.expectEqualDeep(serial.report, batch.report);
+    try testing.expectEqualSlices(history.Sample, serial.samples, batch.samples);
     try testing.expectEqual(6, batch.report.traces);
     try testing.expectEqual(1, batch.report.malformed_traces);
     try testing.expectEqual(5, batch.report.contributing_traces);

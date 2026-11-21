@@ -71,6 +71,7 @@ const Destination = struct {
 const Destinations = struct {
     heads: []u32,
     rows: std.ArrayList(Destination) = .empty,
+    present: [2]u64 = @splat(0),
 
     fn nodeKey(id: NodeId) u64 {
         return @as(u64, @backingInt(id)) << 1;
@@ -85,7 +86,12 @@ const Destinations = struct {
         return @intCast((mixed ^ (mixed >> 32)) & (self.heads.len - 1));
     }
 
+    fn bit(key: u64) u64 {
+        return @as(u64, 1) << @as(u6, @truncate(key >> 1));
+    }
+
     fn add(self: *Destinations, key: u64, slot: usize, fraction: f32) void {
+        self.present[key & 1] |= bit(key);
         const head = &self.heads[self.bucket(key)];
         self.rows.appendAssumeCapacity(.{ .key = key, .slot = @intCast(slot), .next = head.*, .fraction = fraction });
         head.* = @intCast(self.rows.items.len);
@@ -118,20 +124,21 @@ const Destinations = struct {
         index: u32,
         visited: usize = 0,
 
-        fn next(self: *Iterator, control: core.Control) !?Destination {
+        inline fn next(self: *Iterator, control: core.Control) !?Destination {
             while (self.index != 0) {
-                if (self.visited % 64 == 0) try control.check();
                 const row = self.rows[self.index - 1];
                 self.index = row.next;
                 self.visited += 1;
+                if (self.visited % 64 == 0) try control.check();
                 if (row.key == self.key) return row;
             }
             return null;
         }
     };
 
-    fn on(self: Destinations, key: u64) Iterator {
-        return .{ .rows = self.rows.items, .key = key, .index = self.heads[self.bucket(key)] };
+    inline fn on(self: Destinations, key: u64) Iterator {
+        const index = if (self.present[key & 1] & bit(key) != 0) self.heads[self.bucket(key)] else 0;
+        return .{ .rows = self.rows.items, .key = key, .index = index };
     }
 };
 
@@ -141,11 +148,27 @@ fn allowsNode(costing: anytype, node: *const graph.format.NodeHot) bool {
 }
 
 const TraceOrder = struct {
+    const Estimate = struct { node: u32 = core.no_index, value: f32 = 0 };
+    const Cache = [32]Estimate;
+
     coordinates: ?[]const graph.format.Coordinate,
     approx: geo.DistanceApproximator,
     radius: f32,
+    cache: ?*Cache = null,
 
     pub fn estimate(self: TraceOrder, node: NodeId) f32 {
+        if (self.cache) |cache| {
+            const index = @backingInt(node);
+            const entry = &cache[@as(u5, @truncate(index))];
+            if (entry.node == index) return entry.value;
+            const value = self.calculate(node);
+            entry.* = .{ .node = index, .value = value };
+            return value;
+        }
+        return self.calculate(node);
+    }
+
+    fn calculate(self: TraceOrder, node: NodeId) f32 {
         const coordinates = self.coordinates orelse return 0;
         const point = coordinates[@backingInt(node)].toPoint();
         const squared: f32 = @floatCast(self.approx.distanceSquared(point));
@@ -167,6 +190,13 @@ pub const DestinationColumn = struct {
         // Short sweeps are cheaper than building a second search frontier.
         return !self.built_bounds and (self.first_popped orelse 0) >= 32;
     }
+
+    pub fn cacheOrdering(self: *DestinationColumn, a: Allocator) !void {
+        if (self.ordering.coordinates == null) return;
+        const entries = try a.create(TraceOrder.Cache);
+        entries.* = @splat(.{});
+        self.ordering.cache = entries;
+    }
 };
 
 fn Collector(comptime K: type) type {
@@ -182,26 +212,34 @@ fn Collector(comptime K: type) type {
         bounds: ?transition_bounds.Bounds,
         control: core.Control,
 
-        fn record(self: *Self, i: usize, choice: Choice) void {
-            if (self.choices[i]) |previous| {
-                if (previous.metres <= choice.metres) return;
+        fn record(self: *Self, i: usize, choice: Choice) !void {
+            const previous = self.choices[i];
+            if (previous) |current| {
+                if (current.metres <= choice.metres) return;
             } else {
                 self.outstanding -= 1;
             }
-            self.greatest = @max(self.greatest, choice.metres);
             self.choices[i] = choice;
+            if (self.outstanding != 0) return;
+            if (previous) |current| if (current.metres != self.greatest) return;
+            var greatest: f32 = 0;
+            for (self.choices, 1..) |target, index| {
+                if (index % 64 == 0) try self.control.check();
+                greatest = @max(greatest, target.?.metres);
+            }
+            self.greatest = greatest;
         }
 
         fn node(self: *Self, id: NodeId, choice: Choice) !void {
             var targets = self.targets.on(Destinations.nodeKey(id));
             while (try targets.next(self.control)) |row| {
-                self.record(row.slot, choice);
+                try self.record(row.slot, choice);
             }
         }
 
-        pub fn visit(self: *Self, event: expand.Visit) !expand.Decision {
+        pub inline fn visit(self: *Self, event: expand.Visit) !expand.Decision {
             // Later queue entries can still have shorter routed distances.
-            if (self.outstanding == 0 and event.label.cost >= self.greatest) return .prune;
+            if (self.prunesAtDistance(event.label.cost)) return .prune;
             if (self.bounds) |bounds| {
                 if (bounds.rulesOut(event.node, event.label.cost, self.distanceLimit())) return .prune;
             }
@@ -216,12 +254,16 @@ fn Collector(comptime K: type) type {
             return if (self.outstanding == 0) self.greatest else self.limits.metres;
         }
 
+        pub inline fn prunesAtDistance(self: *const Self, metres: f32) bool {
+            return metres >= self.distanceLimit();
+        }
+
         pub fn observesEdge(self: *const Self, id: EdgeId) !bool {
             var targets = self.targets.on(Destinations.edgeKey(id));
             return (try targets.next(self.control)) != null;
         }
 
-        pub fn visitEdge(self: *Self, event: expand.EdgeVisit) !void {
+        pub inline fn visitEdge(self: *Self, event: expand.EdgeVisit) !void {
             var targets = self.targets.on(Destinations.edgeKey(event.edge));
             while (try targets.next(self.control)) |row| {
                 if (row.fraction < event.cut.begin or row.fraction > event.cut.end) continue;
@@ -232,7 +274,7 @@ fn Collector(comptime K: type) type {
                 const metres = event.before.cost + traversal.cost;
                 const seconds = event.before.secs + traversal.secs;
                 if (!self.limits.allows(metres, seconds)) continue;
-                self.record(row.slot, .{
+                try self.record(row.slot, .{
                     .metres = metres,
                     .seconds = seconds,
                     .predecessor = event.predecessor,
