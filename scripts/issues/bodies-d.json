@@ -572,11 +572,31 @@
       "Optimize search and rasterization while retaining predecessor restriction states, bounded expansion, deadlines and arena-backed memory.",
       "Verify performance on the same hardware and platform with alternating runners and record the corpus, label counts and timings."
     ],
-    "notes": ["The parity-corrected arm64 Linux pilot measured 45.175 ms native and 36.343 ms in Valhalla. See docs/experiments/isochrone.md."],
+    "notes": [
+      "The parity-corrected arm64 Linux pilot measured 45.175 ms native and 36.343 ms in Valhalla.",
+      "The radix queue, turn-row reuse and grid changes measured 37.280 ms native, 42.922 ms native baseline and 34.742 ms Valhalla. See docs/experiments/isochrone.md.",
+      "P7.07b tracks the remaining per-label work. The end-to-end 5x gate stays here."
+    ],
     "accept": [
       "At least 5x faster than Valhalla 3.9.3 over the matched expansion corpus.",
       "Exact path, restriction and arrival-grid tests pass in forward and reverse, with no heap calls after request warm-up.",
       "A reproducible paired benchmark reports the timing margin. The full tests and binary budget pass."
+    ]
+  },
+  {
+    "key": "P7.07b",
+    "goal": "Reduce the per-label cost of exact isochrone expansion on the published Utrecht replay.",
+    "scope": [
+      "Time successor enumeration, restriction handling and turn costing separately from rasterization and queue operations in the pinned Linux benchmark.",
+      "Reuse static node, local turn and class data across successor checks while retaining checks that depend on the predecessor chain, arrival time, access state and costing options.",
+      "Validate forward and reverse expansion across alias nodes, multiple restriction contexts and conditional access."
+    ],
+    "notes": ["The end-to-end 5x target remains in P7.07a. Keep the same tiles, padding and deterministic label order."],
+    "accept": [
+      "Before and after timings isolate expansion, restrictions, costing and rasterization.",
+      "Total expansion time falls on the matched Utrecht workload.",
+      "Arrival grids and settled label traces match byte for byte. Forward, reverse, timed and cancelled requests pass.",
+      "Warmed runs make zero backing allocator calls. The full tests and binary budget pass."
     ]
   },
   {
