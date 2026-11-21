@@ -30,19 +30,46 @@ pub const Traffic = struct {
 pub fn Motor(comptime model: type) type {
     return struct {
         const Self = @This();
+        pub const UntimedEdge = struct {
+            cost: Cost,
+            measured_speed: bool,
+            allowed: bool,
+        };
+
         profile: *const model.Profile,
         tables: *const costing.compiled.Compiled,
         arena: std.mem.Allocator,
         control: search.Control,
         traffic: Traffic = .{},
         features: ?*const linear.Table = null,
+        untimed_edges: ?[]const UntimedEdge = null,
 
         pub fn linearCosts(self: Self) ?*const linear.Table {
             return self.features;
         }
 
         pub fn allowed(self: Self, directed: snap.DirectedEdge) bool {
+            if (self.untimed_edges) |edges| return edges[@backingInt(directed.id)].allowed;
             return self.profile.allowedCandidate(directed.class, .{}, .{}, self.linearAllows(directed.id));
+        }
+
+        /// Compile graph-only prices for a batch with a fixed profile.
+        /// The caller keeps the graph, profile and static traffic data fixed.
+        pub fn prepareUntimed(self: Self, allocator: std.mem.Allocator, view: *const View, control: search.Control) ![]UntimedEdge {
+            const output = try allocator.alloc(UntimedEdge, view.edges.len);
+            errdefer allocator.free(output);
+            for (view.edges, output, 0..) |*edge, *entry, index| {
+                if (index % 1024 == 0) try control.check();
+                const id: EdgeId = @fromBackingInt(@as(u32, @intCast(index)));
+                const class = try view.class(edge.cls.class_id);
+                const traversal = self.priceClass(id, edge, class, null);
+                entry.* = .{
+                    .cost = traversal.cost,
+                    .measured_speed = traversal.measured_speed,
+                    .allowed = self.profile.allowedCandidate(class, .{}, .{}, self.linearAllows(id)),
+                };
+            }
+            return output;
         }
 
         pub fn allowedNode(self: Self, node: *const graph.format.NodeHot) bool {
@@ -78,6 +105,7 @@ pub fn Motor(comptime model: type) type {
         }
 
         pub fn edgeTraversal(self: Self, view: *const View, id: EdgeId, edge: *const Hot, _: search.Direction) !search.Traversal {
+            if (self.preparedTraversal(id)) |traversal| return traversal;
             return self.price(view, id, edge, null);
         }
 
@@ -89,8 +117,15 @@ pub fn Motor(comptime model: type) type {
             return if (self.features) |features| features.allows(id) else false;
         }
 
-        pub fn edgeTraversalWithClass(self: Self, _: *const View, id: EdgeId, edge: *const Hot, class: *const Class, _: search.Direction, time: graph.time_info.TimeInfo) !search.Traversal {
+        pub inline fn edgeTraversalWithClass(self: Self, _: *const View, id: EdgeId, edge: *const Hot, class: *const Class, _: search.Direction, time: graph.time_info.TimeInfo) !search.Traversal {
+            if (!time.valid) if (self.preparedTraversal(id)) |traversal| return traversal;
             return self.priceClass(id, edge, class, if (time.valid) graph.speed.Time.fromTimeInfo(time) else null);
+        }
+
+        inline fn preparedTraversal(self: Self, id: EdgeId) ?search.Traversal {
+            const edges = self.untimed_edges orelse return null;
+            const entry = edges[@backingInt(id)];
+            return .{ .cost = entry.cost, .measured_speed = entry.measured_speed };
         }
 
         fn price(self: Self, view: *const View, id: EdgeId, edge: *const Hot, time: ?graph.speed.Time) !search.Traversal {

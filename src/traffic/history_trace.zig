@@ -190,6 +190,7 @@ const Job = struct {
     raw: []const u8,
     profile: *const costing.auto.Profile,
     tables: *const costing.compiled.Compiled,
+    untimed_edges: ?[]const Kernel.UntimedEdge,
     control: search.Control,
     samples: std.ArrayList(history.Sample) = .empty,
     report: Report = .{},
@@ -214,6 +215,7 @@ const Job = struct {
             .tables = self.tables,
             .arena = arena.allocator(),
             .control = self.control,
+            .untimed_edges = self.untimed_edges,
         };
         const observations = try match.emission.Model.init(match.emission.Model.default_sigma_z);
         const movements = try match.transition.Model.init(.{ .turn_penalty_factor = 0 });
@@ -267,6 +269,15 @@ pub fn collect(a: Allocator, view: *const View, raw: []const u8, workers: usize,
     defer warnings.deinit(a);
     const profile = try costing.auto.Model.canonicalize(try costing.auto.parse(a, .auto, .null, &warnings, deadline));
     const tables = try costing.compiled.compileInto(costing.auto.Model, profile, classes, factors, deadline);
+    const price_bytes = view.edges.len * @sizeOf(Kernel.UntimedEdge);
+    // Amortize a bounded shared table over a batch that is large enough to
+    // revisit graph edges. A large graph can still use compiled class costs.
+    const prices = if (price_bytes <= @min(raw.len, 4 * 1024 * 1024))
+        try (Kernel{ .profile = &profile, .tables = &tables, .arena = a, .control = .{ .deadline = deadline } })
+            .prepareUntimed(a, view, .{ .deadline = deadline })
+    else
+        null;
+    defer if (prices) |entries| a.free(entries);
     const count = @min(workers, @max(1, raw.len));
     const jobs = try a.alloc(Job, count);
     defer a.free(jobs);
@@ -288,7 +299,15 @@ pub fn collect(a: Allocator, view: *const View, raw: []const u8, workers: usize,
         while (end < raw.len and end > 0 and raw[end - 1] != '\n') : (end += 1) {
             if (end % 256 == 0) try control.check();
         }
-        job.* = .{ .a = a, .view = view, .raw = raw[begin..end], .profile = &profile, .tables = &tables, .control = control };
+        job.* = .{
+            .a = a,
+            .view = view,
+            .raw = raw[begin..end],
+            .profile = &profile,
+            .tables = &tables,
+            .untimed_edges = prices,
+            .control = control,
+        };
         jobs_initialized += 1;
         begin = end;
         if (i < threads.len) {

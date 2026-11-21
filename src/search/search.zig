@@ -444,6 +444,16 @@ pub const Restrictions = struct {
         access_flags: u32 = 0,
     };
     const AliasStatus = std.AutoHashMapUnmanaged(AliasKey, Status);
+    const DirectedStatus = std.HashMapUnmanaged(u32, Status, struct {
+        pub fn hash(_: @This(), id: u32) u64 {
+            const mixed = @as(u64, id) *% 0x9e3779b97f4a7c15;
+            return mixed ^ (mixed >> 32);
+        }
+
+        pub fn eql(_: @This(), left: u32, right: u32) bool {
+            return left == right;
+        }
+    }, 80);
 
     access: PathAccess,
     states: []const automaton.State,
@@ -454,6 +464,7 @@ pub const Restrictions = struct {
     linear_costs: ?*const linear.Table = null,
     arrivals: std.ArrayList(u32) = .empty,
     aliases: AliasStatus = .empty,
+    directed: DirectedStatus = .empty,
 
     fn simplePredecessor(self: *const Restrictions, context: TurnContext, previous: Label, node: *const NodeHot) ?EdgeId {
         const rows = self.access.view.turn_restrictions orelse return null;
@@ -776,6 +787,9 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             const expanding = @hasField(@TypeOf(query), "expansion");
             const distance_only = comptime distanceObjective(@TypeOf(query));
             const observe_edges = comptime observeEdges(@TypeOf(query));
+            const bounded_edges = observe_edges and distance_only and
+                snap_edge.hasPolicy(@TypeOf(query.visitor), "distanceLimit") and
+                snap_edge.hasPolicy(@TypeOf(query.visitor), "observesEdge");
             const partial_starts = partial or expanding;
             const target = if (partial_starts) null else query.target;
             const limit = if (partial) std.math.maxInt(usize) else query.limit;
@@ -905,6 +919,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     }
                     if (decision == .prune) continue;
                 }
+                const visitor_limit = if (bounded_edges) query.visitor.distanceLimit() else std.math.inf(f32);
                 const exits = try self.view.outEdgeRange(at);
                 const node = try self.view.node(at);
                 const previous_class = if (@hasDecl(K, "allowedTurn") and self.view.classes != null)
@@ -928,6 +943,11 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     const local_id: EdgeId = @fromBackingInt(@as(u32, @intCast(index)));
                     const next_id = if (direction == .forward) local_id else try self.view.opposingId(outward);
                     const next = if (direction == .forward) outward else try self.view.edge(next_id);
+                    // A full traversal at this distance cannot improve a
+                    // destination. A destination cut on the arc still can.
+                    const beyond_visitor = bounded_edges and
+                        last.cost + @as(f32, @floatFromInt(next.geom.len_m)) >= visitor_limit;
+                    if (beyond_visitor and !try query.visitor.observesEdge(next_id)) continue;
                     const restrict_class = if (restrict) try self.view.class(next.cls.class_id) else null;
                     const feature = if (features) |costs| costs.get(next_id) else null;
                     const allowed = feature != null and feature.?.allow;
@@ -1050,7 +1070,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                             });
                         }
                     }
-                    if (prior.label_plus_one == Status.exclusion or dominated or !access.allowed) continue;
+                    if (beyond_visitor or prior.label_plus_one == Status.exclusion or dominated or !access.allowed) continue;
                     const total = if (partial)
                         previous.add(delay).add(edge_cost)
                     else if (expanding)
@@ -1340,7 +1360,8 @@ pub fn Search(comptime K: type, comptime Q: type) type {
         }
 
         inline fn findStatus(self: *Self, tracker: anytype, edge: u32, context: TurnContext, closure: u32) Status {
-            if (@TypeOf(tracker) == @TypeOf(null) or tracker.keep_time) return self.status.get(edge);
+            if (@TypeOf(tracker) == @TypeOf(null)) return self.status.get(edge);
+            if (tracker.keep_time) return if (tracker.has_exclusions) self.status.get(edge) else .{};
             if (closure == 0) {
                 if (!context.present()) return self.status.get(edge);
                 if (tracker.statusId(edge, context)) |id| return self.status.get(id);
@@ -1354,7 +1375,17 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             const pareto = if (distance_only and @TypeOf(tracker) != @TypeOf(null)) tracker.pareto else false;
             var key: Restrictions.AliasKey = if (use_time) Restrictions.timedKey(label, context) else undefined;
             if (pareto) key.elapsed = 0;
-            const previous = if (use_time and status.label_plus_one != Status.exclusion)
+            // Ordinary untimed Pareto states need only a directed edge or
+            // restriction ID. Access and alias contexts retain their full key.
+            const ordinary: ?u32 = if (pareto and status.label_plus_one != Status.exclusion and key.access_flags == 0)
+                if (!context.present()) label.edge else tracker.statusId(label.edge, context)
+            else
+                null;
+            const a = pool.arena.allocator();
+            const ordinary_slot = if (ordinary) |id| (try tracker.directed.getOrPutValue(a, id, .{})).value_ptr else null;
+            const previous = if (ordinary_slot) |slot|
+                slot.*
+            else if (use_time and status.label_plus_one != Status.exclusion)
                 tracker.aliases.get(key) orelse Status{}
             else
                 status;
@@ -1376,9 +1407,8 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             const estimate = if (floor == 1) base_estimate else roundedDown(@as(f64, base_estimate) * floor);
             var record = label;
             if (done) record.flags |= Label.target;
-            const a = pool.arena.allocator();
             const closure = closureBits(label);
-            const slot = if (use_time) timed: {
+            const slot = if (ordinary_slot) |existing| existing else if (use_time) timed: {
                 const entry = try tracker.aliases.getOrPutValue(a, key, .{});
                 break :timed entry.value_ptr;
             } else if (@TypeOf(seed_slot) != @TypeOf(null)) seed_slot else if (@TypeOf(tracker) == @TypeOf(null)) try self.status.at(pool, label.edge) else blk: {

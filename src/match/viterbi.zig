@@ -96,6 +96,7 @@ pub const Search = struct {
     columns: []SearchColumn,
     labels: std.ArrayList(Label),
     queue: pending.Queue = .{},
+    skip_dominated_moves: bool = false,
     layers: std.ArrayList([]const Clone) = .empty,
     winners: []Index,
     solved: u32 = 0,
@@ -255,6 +256,8 @@ pub const Search = struct {
             if (self.labels.items[right].cost >= 0) continue;
             const observation = try self.emission(right, model, control);
             if (!available(observation)) continue;
+            const queued = self.queue.nodes.items[right].cost;
+            if (self.skip_dominated_moves and queued >= 0 and queued <= label.cost + observation) continue;
             const movement = try self.transition(left, right, model, control);
             if (!available(movement)) continue;
             const sum = label.cost + movement + observation;
@@ -425,8 +428,13 @@ pub fn RoutingCosts(comptime K: type) type {
     return struct {
         const Self = @This();
         const Router = routing.Router(K);
+        const retained_path_budget = 1024 * 1024;
         const Move = struct { score: f32, arrival: ?EdgeId = null };
-        const Row = struct { moves: []const Move, incoming: ?EdgeId };
+        const Row = struct {
+            moves: []const Move,
+            incoming: ?EdgeId,
+            paths: ?[]const ?routing.Route = null,
+        };
 
         arena: *memory.Arena,
         states: *const StateContainer,
@@ -435,6 +443,7 @@ pub fn RoutingCosts(comptime K: type) type {
         observations: Emission,
         movements: Transition,
         rows: [][]?Row,
+        retained_path_bytes: usize = 0,
 
         pub fn init(arena: *memory.Arena, states: *const StateContainer, router: *Router, kernel: K, observations: Emission, movements: Transition, control: Control) !Self {
             const mark = arena.mark();
@@ -479,6 +488,11 @@ pub fn RoutingCosts(comptime K: type) type {
             if (to.time != from.time + 1) return error.InvalidTraceState;
             const row = self.rows[from.time][from.id] orelse return null;
             if (!available(row.moves[to.id].score)) return null;
+            if (row.paths) |paths| {
+                var route = paths[to.id] orelse return null;
+                if (arena != self.arena) route.segments = try arena.allocator().dupe(routing.Segment, route.segments);
+                return route;
+            }
             const paths = try self.connect(arena, from, to.time, &.{target.*}, row.incoming, control);
             const route = paths[0] orelse return error.UnreproducibleTraceTransition;
             if (route.score != row.moves[to.id].score or route.last_edge != row.moves[to.id].arrival)
@@ -496,12 +510,21 @@ pub fn RoutingCosts(comptime K: type) type {
                 null;
             const prices = try self.arena.allocator().alloc(Move, right.candidates.len);
             const temporary = self.arena.mark();
-            defer self.arena.rewind(temporary);
             const paths = try self.connect(self.arena, from, time, right.candidates, arrival, control);
             for (paths, prices, 0..) |path, *price, i| {
                 if (i % 256 == 0) try control.check();
                 price.* = if (path) |route| .{ .score = route.score, .arrival = route.last_edge } else .{ .score = -1 };
             }
+            // The paths used to score a row can be reused for its selected
+            // transition. A bounded cache keeps long traces and dense
+            // candidate windows from retaining all their path geometry.
+            const bytes = self.arena.used - temporary.used;
+            const budget = @min(retained_path_budget, self.arena.options.cap_bytes / 16);
+            if (bytes <= budget - self.retained_path_bytes) {
+                self.retained_path_bytes += bytes;
+                return .{ .moves = prices, .incoming = arrival, .paths = paths };
+            }
+            self.arena.rewind(temporary);
             return .{ .moves = prices, .incoming = arrival };
         }
 

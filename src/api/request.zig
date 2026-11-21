@@ -932,23 +932,27 @@ fn transitFloatRadius(value: f64) ?u32 {
 }
 
 fn parseLocation(r: json.Value, o: *const Options) error{ InvalidCoordinate, ConflictingClosures }!Location {
-    // Fast path: an object with only lat and lon (every /height point, most
-    // route stops). All other fields take their defaults, exactly as the
-    // full parser below would leave them.
-    if (r == .object and r.object.count() <= 2) fast: {
+    // Coordinates and an optional timestamp leave the other fields at
+    // their defaults, as in the full parser below.
+    if (r == .object and r.object.count() <= 3) fast: {
         var lat: ?f64 = null;
         var lon: ?f64 = null;
+        var time: f64 = -1;
         var it = r.object.iterator();
         while (it.next()) |e| {
             if (std.mem.eql(u8, e.key_ptr.*, "lat")) {
                 lat = json.convert(f64, e.value_ptr.*);
             } else if (std.mem.eql(u8, e.key_ptr.*, "lon")) {
                 lon = json.convert(f64, e.value_ptr.*);
+            } else if (std.mem.eql(u8, e.key_ptr.*, "time")) {
+                time = json.convert(f64, e.value_ptr.*) orelse -1;
             } else break :fast;
         }
         const la = lat orelse return error.InvalidCoordinate;
         if (la < -90.0 or la > 90.0) return error.InvalidCoordinate;
-        return defaultLocation(la, lon orelse return error.InvalidCoordinate, o);
+        var location = defaultLocation(la, lon orelse return error.InvalidCoordinate, o);
+        location.time = time;
+        return location;
     }
     const lat = json.getOptional(f64, r, "/lat") orelse return error.InvalidCoordinate;
     if (lat < -90.0 or lat > 90.0) return error.InvalidCoordinate;

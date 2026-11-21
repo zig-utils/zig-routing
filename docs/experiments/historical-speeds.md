@@ -67,3 +67,58 @@ On the noisy corpus, the remaining cost concentrates in directed
 transition expansion, endpoint correlation, and candidate-grid search.
 [#257](https://github.com/zig-utils/zig-routing/issues/257) tracks the
 one-million-point target for that workload.
+
+## Exact matching improvements on noisy traces
+
+The matcher reuses graph-derived candidate encounter lists for the same
+grid window and resolves an edge walk's destination once an origin can
+lead to a geometric match. Snap-bin scans rule out distant small
+bounding circles by latitude before decoding their full centers. The
+lookup caches hold graph data only.
+
+Viterbi retains a bounded amount of the directed paths already used to
+score its rows. A move whose nonnegative transition score cannot
+improve the queue can be skipped for a single result. Distance expansion
+uses compact keys for ordinary clock-bounded arrival lists and stops
+offering full traversals that cannot improve a destination. It still
+examines reachable fractional cuts on those arcs. The learning batch
+shares a bounded table of compiled untimed prices across workers.
+
+Six trials alternated the baseline at `e74fead` and the candidate on
+native ARM64 macOS on the same Apple M3 Pro. Both ran the original
+1,024,088-point corpora with eight workers. Each run started from a clean
+copy of the indexed Utrecht bundle and timed the command through overlay
+publication.
+
+| Corpus | Baseline wall time | Candidate wall time | Baseline points/s | Candidate points/s |
+| --- | ---: | ---: | ---: | ---: |
+| Noisy GPS | 2.080 s | 1.390 s | 492,350 | 736,754 |
+| Geometry-aligned | 0.445 s | 0.335 s | 2,301,321 | 3,056,979 |
+
+Noisy wall time fell 33.2%. Median process CPU time fell from 14.925 s
+to 9.960 s. Median maximum resident memory moved from 130.11 MiB to
+132.30 MiB. The one-million-point gate requires 1.024 s and remains open.
+
+Separate one-second CPU samples at 1 ms intervals recorded 393 and 243
+top-of-stack samples in endpoint correlation before and after. Insertion
+into the candidate encounter sets fell from 276 to 25 samples. The main
+distance expansion loop had 503 and 565 samples. Counts identify hot
+code within each run. The alternating trials measure total runtime.
+
+```sh
+zr traffic learn-predicted BUNDLE noisy.jsonl --threads 8 > report.json &
+pid=$!
+sample "$pid" 1 1 -file learn-predicted-sample.txt
+wait "$pid"
+```
+
+Every report and overlay matched the corresponding baseline byte for
+byte. All 14,873 noisy traces contributed, yielding 750,315 samples and
+60 profiles. The ordered candidate probe matched all 156 measurements.
+The directed auditor matched all 186 ranked state paths and all 120
+stitched traces. A separate action replay reproduced all 360 primary and
+ranked results from the earlier trace-attributes audit. The historical
+accuracy and privacy tests remain in the full native suite.
+
+[#259](https://github.com/zig-utils/zig-routing/issues/259) tracks
+sharing exact transition bounds across origins of a destination column.

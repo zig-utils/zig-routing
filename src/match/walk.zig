@@ -31,7 +31,7 @@ const Walker = struct {
     trace: []const Measurement,
     distances: []const f32,
     prefix: []const f32,
-    targets: []const snap.PathEdge,
+    targets: ?[]const snap.PathEdge = null,
     ends: std.AutoHashMapUnmanaged(NodeId, End) = .empty,
     path: std.ArrayList(Part) = .empty,
     frames: std.ArrayList(Frame) = .empty,
@@ -77,7 +77,7 @@ const Walker = struct {
         if (@abs(self.prefix[index] + end.distance - self.prefix[last]) >= 5) return false;
         if (end.edge.node == .end) {
             const edge = self.path.items[self.path.items.len - 1].segment.edge;
-            for (self.targets, 0..) |target, i| {
+            for (self.targets.?, 0..) |target, i| {
                 if (i % 256 == 0) try self.control.check();
                 if (target.id == edge and target.node == .end) return true;
             }
@@ -134,7 +134,7 @@ const Walker = struct {
         return false;
     }
 
-    fn start(self: *Walker, origins: []const snap.PathEdge) ![]const Part {
+    fn start(self: *Walker, origins: []const snap.PathEdge, destination: anytype) ![]const Part {
         const a = self.arena.allocator();
         const last: u32 = @intCast(self.trace.len - 1);
         for (origins) |origin| {
@@ -144,6 +144,7 @@ const Walker = struct {
             const hot = try self.view.edge(origin.id);
             const metres = @as(f32, @floatFromInt(hot.geom.len_m)) * (1 - origin.percent_along);
             if (try self.endOfEdge(origin.id, hot, 0, metres)) |point| {
+                try self.loadTargets(destination);
                 try self.path.append(a, .{
                     .segment = .{ .edge = origin.id, .begin = origin.percent_along, .end = 1 },
                     .first = 0,
@@ -153,7 +154,8 @@ const Walker = struct {
                 return error.NoEdgeWalk;
             }
             if (self.prefix[last] > lengthLimit(metres)) continue;
-            for (self.targets, 0..) |target, i| {
+            try self.loadTargets(destination);
+            for (self.targets.?, 0..) |target, i| {
                 if (i % 256 == 0) try self.control.check();
                 if (target.node == .begin or target.id != origin.id or target.percent_along < origin.percent_along) continue;
                 try self.path.append(a, .{
@@ -166,6 +168,27 @@ const Walker = struct {
         }
         return error.NoEdgeWalk;
     }
+
+    fn loadTargets(self: *Walker, destination: anytype) !void {
+        if (self.targets != null) return;
+        const targets = try destination.get();
+        const a = self.arena.allocator();
+        for (targets) |target| {
+            try self.control.check();
+            if (target.node == .begin) continue;
+            if (!(target.percent_along >= 0 and target.percent_along <= 1)) return error.InvalidCandidate;
+            const edge = try self.view.edge(target.id);
+            const opposing = try self.view.edge(try self.view.oppEdge(target.id));
+            const at_node = target.node == .end;
+            const node: NodeId = @fromBackingInt(if (at_node) edge.head else opposing.head);
+            _ = try self.ends.getOrPutValue(a, node, .{
+                .edge = target,
+                .distance = if (at_node) 0 else @as(f32, @floatFromInt(opposing.geom.len_m)) * target.percent_along,
+            });
+        }
+        if (self.ends.count() == 0) return error.NoEdgeWalk;
+        self.targets = targets;
+    }
 };
 
 fn lengthLimit(metres: f32) f32 {
@@ -175,6 +198,18 @@ fn lengthLimit(metres: f32) f32 {
 /// Recover a directed route from the ordered shape and its endpoint
 /// correlations. A geometric mismatch leaves the request arena unchanged.
 pub fn find(view: *const View, arena: *memory.Arena, trace: []const Measurement, origins: []const snap.PathEdge, targets: []const snap.PathEdge, control: core.Control) ![]const Part {
+    const Resolved = struct {
+        edges: []const snap.PathEdge,
+
+        fn get(self: @This()) ![]const snap.PathEdge {
+            return self.edges;
+        }
+    };
+    return findLazy(view, arena, trace, origins, Resolved{ .edges = targets }, control);
+}
+
+/// Resolve the destination when an origin could lead to a geometric walk.
+pub fn findLazy(view: *const View, arena: *memory.Arena, trace: []const Measurement, origins: []const snap.PathEdge, destination: anytype, control: core.Control) ![]const Part {
     try control.check();
     if (trace.len < 2 or trace.len >= core.no_index) return error.InvalidTraceShape;
     const mark = arena.mark();
@@ -197,22 +232,7 @@ pub fn find(view: *const View, arena: *memory.Arena, trace: []const Measurement,
         .trace = trace,
         .distances = distances,
         .prefix = prefix,
-        .targets = targets,
         .control = control,
     };
-    for (targets) |target| {
-        try control.check();
-        if (target.node == .begin) continue;
-        if (!(target.percent_along >= 0 and target.percent_along <= 1)) return error.InvalidCandidate;
-        const edge = try view.edge(target.id);
-        const opposing = try view.edge(try view.oppEdge(target.id));
-        const at_node = target.node == .end;
-        const node: NodeId = @fromBackingInt(if (at_node) edge.head else opposing.head);
-        _ = try walker.ends.getOrPutValue(a, node, .{
-            .edge = target,
-            .distance = if (at_node) 0 else @as(f32, @floatFromInt(opposing.geom.len_m)) * target.percent_along,
-        });
-    }
-    if (walker.ends.count() == 0) return error.NoEdgeWalk;
-    return walker.start(origins);
+    return walker.start(origins, destination);
 }

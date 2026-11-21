@@ -452,8 +452,10 @@ const Work = struct {
             const bin_y: f32 = @floatFromInt(bin.bin / tiles.nsubdivisions);
             const step = tiles.subdivision_size;
             const center: geo.DistanceApproximator = .init(.init(base.lng + @as(f64, bin_x * step + step / 2), base.lat + @as(f64, bin_y * step + step / 2)));
+            var latitude_band = self.latitudeBand(center.center_lat);
             for (edges) |entry| {
                 try q.check();
+                if (latitude_band.excludes(entry.circle)) continue;
                 if (entry.circle.valid() and self.outsideCircle(entry.circle, center)) continue;
                 const index = entry.edge;
                 const id: EdgeId = @fromBackingInt(index);
@@ -474,8 +476,18 @@ const Work = struct {
                     .order = .{ .tile = order },
                 }, if (forward_allowed and reverse_allowed) twin else null);
                 order += 1;
+                latitude_band = self.latitudeBand(center.center_lat);
             }
         }
+    }
+
+    fn latitudeBand(self: *const Work, origin: f64) graph.snap_bins.Circle.LatitudeBand {
+        const q = self.query;
+        const reach = if (self.eligible.nearest) |nearest|
+            @min(q.cutoff, @max(q.radius, @sqrt(nearest.projection.squared)))
+        else
+            q.cutoff;
+        return graph.snap_bins.Circle.latitudeBand(q.point.lat, origin, reach);
     }
 
     fn outsideCircle(self: *const Work, circle: graph.snap_bins.Circle, bin_center: geo.DistanceApproximator) bool {

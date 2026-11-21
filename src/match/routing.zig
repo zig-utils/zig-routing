@@ -61,37 +61,76 @@ const PathIterator = struct {
 };
 
 const Destination = struct {
-    slot: usize,
-    next: usize,
+    key: u64,
+    slot: u32,
+    next: u32,
     fraction: f32 = 0,
 };
 
 const Destinations = struct {
-    nodes: std.AutoHashMapUnmanaged(NodeId, usize) = .empty,
-    edges: std.AutoHashMapUnmanaged(EdgeId, usize) = .empty,
+    heads: []u32,
     rows: std.ArrayList(Destination) = .empty,
 
-    fn add(self: *Destinations, a: Allocator, heads: anytype, key: anytype, slot: usize, fraction: f32) !void {
-        const entry = try heads.getOrPutValue(a, key, 0);
-        try self.rows.append(a, .{ .slot = slot, .next = entry.value_ptr.*, .fraction = fraction });
-        entry.value_ptr.* = self.rows.items.len;
+    fn nodeKey(id: NodeId) u64 {
+        return @as(u64, @backingInt(id)) << 1;
+    }
+
+    fn edgeKey(id: EdgeId) u64 {
+        return (@as(u64, @backingInt(id)) << 1) | 1;
+    }
+
+    fn bucket(self: Destinations, key: u64) usize {
+        const mixed = key *% 0x9e3779b97f4a7c15;
+        return @intCast((mixed ^ (mixed >> 32)) & (self.heads.len - 1));
+    }
+
+    fn add(self: *Destinations, key: u64, slot: usize, fraction: f32) void {
+        const head = &self.heads[self.bucket(key)];
+        self.rows.appendAssumeCapacity(.{ .key = key, .slot = @intCast(slot), .next = head.*, .fraction = fraction });
+        head.* = @intCast(self.rows.items.len);
     }
 
     fn init(a: Allocator, targets: []const candidates.Candidate, control: core.Control) !Destinations {
-        var self: Destinations = .{};
+        if (targets.len > (std.math.maxInt(u32) - 1) / 2) return error.TooManyTraceStates;
+        const capacity = targets.len * 2;
+        const heads = try a.alloc(u32, try std.math.ceilPowerOfTwo(usize, @max(2, capacity)));
+        @memset(heads, 0);
+        var self: Destinations = .{ .heads = heads, .rows = .initBuffer(try a.alloc(Destination, capacity)) };
         for (targets, 0..) |*target, i| {
             if (i % 64 == 0) try control.check();
             if (target.node) |node| {
-                try self.add(a, &self.nodes, node, i, 0);
+                self.add(nodeKey(node), i, 0);
             } else {
                 if (target.direction_count > target.directions.len) return error.InvalidCandidate;
                 for (target.arcs()) |arc| {
                     if (!(0 <= arc.percent_along and arc.percent_along <= 1)) return error.InvalidCandidate;
-                    try self.add(a, &self.edges, arc.edge, i, arc.percent_along);
+                    self.add(edgeKey(arc.edge), i, arc.percent_along);
                 }
             }
         }
         return self;
+    }
+
+    const Iterator = struct {
+        rows: []const Destination,
+        key: u64,
+        index: u32,
+        visited: usize = 0,
+
+        fn next(self: *Iterator, control: core.Control) !?Destination {
+            while (self.index != 0) {
+                if (self.visited % 64 == 0) try control.check();
+                const row = self.rows[self.index - 1];
+                self.index = row.next;
+                self.visited += 1;
+                if (row.key == self.key) return row;
+            }
+            return null;
+        }
+    };
+
+    fn on(self: Destinations, key: u64) Iterator {
+        return .{ .rows = self.rows.items, .key = key, .index = self.heads[self.bucket(key)] };
     }
 };
 
@@ -136,13 +175,9 @@ fn Collector(comptime K: type) type {
         }
 
         fn node(self: *Self, id: NodeId, choice: Choice) !void {
-            var index = self.targets.nodes.get(id) orelse return;
-            var visited: usize = 0;
-            while (index != 0) : (visited += 1) {
-                if (visited % 64 == 0) try self.control.check();
-                const row = self.targets.rows.items[index - 1];
+            var targets = self.targets.on(Destinations.nodeKey(id));
+            while (try targets.next(self.control)) |row| {
                 self.record(row.slot, choice);
-                index = row.next;
             }
         }
 
@@ -156,13 +191,18 @@ fn Collector(comptime K: type) type {
             return if (allowsNode(self.kernel, try self.view.node(event.node))) .expand else .prune;
         }
 
+        pub fn distanceLimit(self: *const Self) f32 {
+            return if (self.outstanding == 0) self.greatest else self.limits.metres;
+        }
+
+        pub fn observesEdge(self: *const Self, id: EdgeId) !bool {
+            var targets = self.targets.on(Destinations.edgeKey(id));
+            return (try targets.next(self.control)) != null;
+        }
+
         pub fn visitEdge(self: *Self, event: expand.EdgeVisit) !void {
-            var index = self.targets.edges.get(event.edge) orelse return;
-            var visited: usize = 0;
-            while (index != 0) : (visited += 1) {
-                if (visited % 64 == 0) try self.control.check();
-                const row = self.targets.rows.items[index - 1];
-                index = row.next;
+            var targets = self.targets.on(Destinations.edgeKey(event.edge));
+            while (try targets.next(self.control)) |row| {
                 if (row.fraction < event.cut.begin or row.fraction > event.cut.end) continue;
                 const portion = row.fraction - event.cut.begin;
                 if (event.exclusion) |avoid| if (row.fraction >= avoid) continue;
@@ -430,6 +470,21 @@ fn onEdge(id: u32, fraction: f32) candidates.Candidate {
     candidate.directions[0] = .{ .edge = @fromBackingInt(id), .percent_along = fraction, .heading = 0 };
     candidate.direction_count = 1;
     return candidate;
+}
+
+test "transition targets keep edge and node IDs distinct and preserve duplicate order" {
+    const t = std.testing;
+    const id = 3;
+    var arena = memory.Arena.init(t.allocator, .{});
+    defer arena.deinit();
+    const targets = try Destinations.init(arena.allocator(), &.{ onEdge(id, 0.2), atNode(id), onEdge(id, 0.8) }, .{});
+    var edges = targets.on(Destinations.edgeKey(@fromBackingInt(@as(u32, id))));
+    try t.expectEqual(2, (try edges.next(.{})).?.slot);
+    try t.expectEqual(0, (try edges.next(.{})).?.slot);
+    try t.expectEqual(@as(?Destination, null), try edges.next(.{}));
+    var nodes = targets.on(Destinations.nodeKey(@fromBackingInt(@as(u32, id))));
+    try t.expectEqual(1, (try nodes.next(.{})).?.slot);
+    try t.expectEqual(@as(?Destination, null), try nodes.next(.{}));
 }
 
 test "one trace expansion reaches interior destinations before the edge bound" {

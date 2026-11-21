@@ -175,15 +175,39 @@ pub fn resolve(
     if (options.shape_match != .map_snap) {
         const view = finder.view;
         const a = arena.allocator();
-        const correlated = options.correlated orelse blk: {
-            const origin = try snap.search(view, a, endpoint(.{ .lat = trace[0].point.lat, .lng = trace[0].point.lng }), .{}, kernel, control.deadline);
-            const last = trace[trace.len - 1].point;
-            const target = try snap.search(view, a, endpoint(.{ .lat = last.lat, .lng = last.lng }), .{}, kernel, control.deadline);
-            break :blk EndpointCorrelations{ .origin = origin.edges, .target = target.edges };
+        const origin = if (options.correlated) |c| c.origin else blk: {
+            const result = try snap.search(view, a, endpoint(.{ .lat = trace[0].point.lat, .lng = trace[0].point.lng }), .{}, kernel, control.deadline);
+            break :blk result.edges;
         };
-        if (walking.find(view, arena, trace, correlated.origin, correlated.target, control)) |parts| {
+        const Destination = struct {
+            view: *const View,
+            allocator: Allocator,
+            kernel: @TypeOf(kernel),
+            location: geo.PointLL,
+            deadline: @TypeOf(control.deadline),
+            edges: ?[]const snap.PathEdge,
+
+            pub fn get(self: *@This()) ![]const snap.PathEdge {
+                if (self.edges) |edges| return edges;
+                const result = try snap.search(self.view, self.allocator, endpoint(.{
+                    .lat = self.location.lat,
+                    .lng = self.location.lng,
+                }), .{}, self.kernel, self.deadline);
+                self.edges = result.edges;
+                return result.edges;
+            }
+        };
+        var destination: Destination = .{
+            .view = view,
+            .allocator = a,
+            .kernel = kernel,
+            .location = trace[trace.len - 1].point,
+            .deadline = control.deadline,
+            .edges = if (options.correlated) |c| c.target else null,
+        };
+        if (walking.findLazy(view, arena, trace, origin, &destination, control)) |parts| {
             const output = try a.alloc(Result, 1);
-            output[0] = try walked(a, view, kernel, trace, parts, correlated, options, control);
+            output[0] = try walked(a, view, kernel, trace, parts, .{ .origin = origin, .target = destination.edges.? }, options, control);
             return output;
         } else |err| {
             if (err != error.NoEdgeWalk or options.shape_match == .edge_walk) return err;
@@ -198,6 +222,9 @@ fn snapTrace(arena: *memory.Arena, finder: *candidates.Finder, router: anytype, 
     var columns: Columns = .{};
     try columns.collect(a, finder, kernel, trace, options.interpolation_distance, control);
     var search = try columns.states.startSearch(arena, control);
+    // Later ranks reuse the original scoring rows when states are cloned.
+    // A single result never needs a row whose moves cannot improve the queue.
+    search.skip_dominated_moves = options.best_paths == 1;
     var costs = try viterbi.RoutingCosts(@TypeOf(kernel)).init(arena, &columns.states, router, kernel, observations, movements, control);
     const Collector = struct {
         arena: *memory.Arena,

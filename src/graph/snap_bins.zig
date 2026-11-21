@@ -67,7 +67,44 @@ pub const Circle = packed struct(u32) {
     pub fn center(self: Circle, bin: geo.DistanceApproximator) geo.PointLL {
         return .init(bin.center_lng + offset(self.x) / bin.m_per_lng_degree, bin.center_lat + offset(self.y) / meters_per_degree);
     }
+
+    pub const LatitudeBand = struct {
+        const small_radius_index = 33;
+
+        first: i32,
+        last: i32,
+
+        pub fn excludes(self: LatitudeBand, circle: Circle) bool {
+            return circle.valid() and circle.radius_index <= small_radius_index and
+                (circle.y < self.first or circle.y > self.last);
+        }
+    };
+
+    /// A conservative latitude-only rejection before decoding small circles.
+    pub fn latitudeBand(point: f64, origin: f64, reach: f64) LatitudeBand {
+        const scale = 8191.0 / (2 * max_offset);
+        const center_index = ((point - origin) * meters_per_degree + max_offset) * scale;
+        // Round the limits out past a full quantization step.
+        const margin = (reach + radii[LatitudeBand.small_radius_index]) * scale + 1;
+        return .{
+            .first = @intFromFloat(std.math.clamp(@floor(center_index - margin), -1, 8192)),
+            .last = @intFromFloat(std.math.clamp(@ceil(center_index + margin), -1, 8192)),
+        };
+    }
 };
+
+test "latitude screening preserves nearby, absent and large circles" {
+    const inside: Circle = .{ .x = 0, .y = 4096, .radius_index = 0 };
+    const outside: Circle = .{ .x = 0, .y = 0, .radius_index = 0 };
+    const large: Circle = .{ .x = 0, .y = 0, .radius_index = 63 };
+    const band = Circle.latitudeBand(0, 0, 10);
+    try std.testing.expect(!band.excludes(inside));
+    try std.testing.expect(band.excludes(outside));
+    try std.testing.expect(!band.excludes(large));
+    try std.testing.expect(!band.excludes(.absent));
+    const unbounded = Circle.latitudeBand(90, -90, std.math.maxInt(u32));
+    try std.testing.expect(!unbounded.excludes(outside));
+}
 
 pub const View = struct {
     tiles: []const Tile,

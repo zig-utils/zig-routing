@@ -477,12 +477,29 @@
       "Improve the shared matcher without changing candidate order, directed paths, elapsed time attribution or privacy filtering.",
       "Time the full pipeline through DCT and overlay publication on eight workers."
     ],
-    "notes": ["#204 records the geometry-aligned benchmark and the current noisy-trace throughput."],
+    "notes": [
+      "The alternating noisy Utrecht benchmark now measures 736,754 points/s, compared with 492,350 before the matching changes.",
+      "P10.09b measures shared transition bounds. The end-to-end throughput gate stays here."
+    ],
     "accept": [
       "Process at least 1 million points per second on the 1,024,088-point noisy Utrecht corpus with eight workers.",
       "Preserve the geometry-aligned throughput, exact trace parity and historical accuracy and output privacy checks.",
       "Publish same-platform before and after profiles and throughput.",
       "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P10.09b",
+    "goal": "Reduce repeated exact transition work when several candidate origins connect to the same next measurement column.",
+    "scope": [
+      "Profile multi-target transition searches and destination preparation on the original noisy Utrecht replay.",
+      "Evaluate a shared admissible reverse bound to the directed destinations. Handle fractional cuts, zero-length connectors and accumulation precision while preserving queue tie order, clock checks, access and predecessor state.",
+      "Measure construction time and per-request memory through overlay publication on eight workers."
+    ],
+    "accept": [
+      "Before and after transition and full-pipeline timings are reproducible on the same platform for the noisy and aligned corpora.",
+      "Directed candidates, selected paths, time attribution and learned overlays agree with the verified baseline in P10.09a.",
+      "Transition work falls measurably without regressing the aligned replay. Publish memory measurements, pinned trace evidence, full tests and the binary budget."
     ]
   },
   {

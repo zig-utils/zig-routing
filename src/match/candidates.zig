@@ -66,6 +66,12 @@ const Shape = struct {
     visited: u64,
 };
 
+const Window = struct {
+    bin: i32,
+    first: u32,
+    last: u32,
+};
+
 /// Request-local scratch and a byte-bounded cache of physical edge shapes.
 /// The spatial index is shared with routing and is never copied.
 pub const Finder = struct {
@@ -83,6 +89,8 @@ pub const Finder = struct {
     pending: Shape = undefined,
     query_number: u64 = 0,
     ordered_cells: std.AutoHashMapUnmanaged(u64, []const encounter.Arc) = .empty,
+    ordered_windows: std.AutoHashMapUnmanaged(Window, []const encounter.Arc) = .empty,
+    window_bytes: usize = 0,
     bin_list: std.ArrayList(i32) = .empty,
     bin_order: encounter.Set = .{},
     candidate_order: encounter.Set = .{},
@@ -165,6 +173,7 @@ pub const Finder = struct {
         self.bin_list.clearRetainingCapacity();
         try subdivisions.tileListWithin(self.a, bounds, &self.bin_list, deadline);
         self.candidate_order.clear();
+        var window: ?Window = null;
         for (self.bin_list.items) |bin_id| {
             if (deadline.expired()) return error.DeadlineExceeded;
             const rc = subdivisions.rowColumn(bin_id);
@@ -175,6 +184,13 @@ pub const Finder = struct {
             const grid: fine.Grid = .{ .origin = tiles.base(tile) };
             const start = grid.square(bounds.minpt()).clamp();
             const end = grid.square(bounds.maxpt()).clamp();
+            if (self.bin_list.items.len == 1) {
+                window = .{ .bin = bin_id, .first = start.id(), .last = end.id() };
+                if (self.ordered_windows.get(window.?)) |arcs| {
+                    for (arcs) |arc| try self.considerOrdered(arc, approx, squared, costing, deadline);
+                    return;
+                }
+            }
             self.bin_order.clear();
             for (@as(usize, @intCast(start.row))..@as(usize, @intCast(end.row + 1))) |row| {
                 for (@as(usize, @intCast(start.column))..@as(usize, @intCast(end.column + 1))) |column| {
@@ -194,11 +210,43 @@ pub const Finder = struct {
             }
         }
         var arcs = self.candidate_order.iterator();
+        if (window) |key| try self.rememberWindow(key, arcs, deadline);
         while (arcs.next()) |arc| {
-            if (deadline.expired()) return error.DeadlineExceeded;
-            const line = (try self.cachedShape(arc.shape, deadline)) orelse continue;
-            try self.consider(line, arc.edge, approx, squared, costing, deadline);
+            try self.considerOrdered(arc, approx, squared, costing, deadline);
         }
+    }
+
+    fn considerOrdered(self: *Finder, arc: encounter.Arc, approx: geo.DistanceApproximator, squared: f64, costing: anytype, deadline: Deadline) !void {
+        if (deadline.expired()) return error.DeadlineExceeded;
+        const line = (try self.cachedShape(arc.shape, deadline)) orelse return;
+        return self.consider(line, arc.edge, approx, squared, costing, deadline);
+    }
+
+    fn rememberWindow(self: *Finder, key: Window, iterator: encounter.Set.Iterator, deadline: Deadline) !void {
+        // The encounter order depends only on graph cells. Bound this index
+        // separately within the shape cache to leave room for projection data.
+        const count = self.candidate_order.nodes.items.len;
+        const bytes = count * @sizeOf(encounter.Arc) + @sizeOf(Window) + @sizeOf([]const encounter.Arc);
+        if (self.storage.cap_exceeded or bytes > self.options.shape_cache_bytes / 8 -| self.window_bytes) return;
+        const a = self.storage.allocator();
+        self.ordered_windows.ensureUnusedCapacity(a, 1) catch |err| {
+            if (self.storage.cap_exceeded) return;
+            return err;
+        };
+        const arcs = a.alloc(encounter.Arc, count) catch |err| {
+            if (self.storage.cap_exceeded) return;
+            return err;
+        };
+        var items = iterator;
+        for (arcs, 0..) |*arc, i| {
+            if (i % 64 == 0 and deadline.expired()) {
+                a.free(arcs);
+                return error.DeadlineExceeded;
+            }
+            arc.* = items.next().?;
+        }
+        self.ordered_windows.putAssumeCapacityNoClobber(key, arcs);
+        self.window_bytes += bytes;
     }
 
     fn orderedCell(self: *Finder, index: graph.spatial.View, bin: i32, source: graph.snap_bins.View.OrderedEntries, grid: fine.Grid, square: fine.Square, deadline: Deadline) ![]const encounter.Arc {
