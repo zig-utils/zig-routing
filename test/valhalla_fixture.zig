@@ -104,6 +104,61 @@ pub fn tile(reverse: bool) [512]u8 {
     return data;
 }
 
+pub fn restrictedTile() [608]u8 {
+    const raw = tile(false);
+    var header = std.mem.bytesToValue(source.Header, raw[0..@sizeOf(source.Header)]);
+    const edge_start = @sizeOf(source.Header) + @sizeOf(source.Node);
+    const access_start = edge_start + @sizeOf(source.Edge);
+    const access: source.AccessRestriction = .{
+        .attr = .{ .edge = 0, .kind = 7, .modes = 1, .except_destination = false, .spare = 0 },
+        .value = @bitCast(routing.graph.time_domain.TimeDomain{ .begin_hour = 8, .end_hour = 10 }),
+    };
+    const here: source.GraphId = .{ .tile = first_tile };
+    const other: source.GraphId = .{ .tile = first_tile + 1 };
+    const forward: source.ComplexRestriction = .{
+        .from = .{ .edge = other, .has_time = true, .day = 0, .month = 0, .week = 0, .hour = 8 },
+        .to = .{ .edge = here, .nth_weekday = false, .day = 0, .month = 0, .week = 0, .hour = 9 },
+        .attr = .{ .kind = 0, .modes = 1, .via_count = 2, .dow = 62, .begin_minute = 15, .end_minute = 30, .probability = 0, .spare = 0 },
+    };
+    const reverse: source.ComplexRestriction = .{
+        .from = .{ .edge = here, .has_time = false, .day = 0, .month = 0, .week = 0, .hour = 0 },
+        .to = .{ .edge = other, .nth_weekday = false, .day = 0, .month = 0, .week = 0, .hour = 0 },
+        .attr = .{ .kind = 11, .modes = 4, .via_count = 2, .dow = 0, .begin_minute = 0, .end_minute = 0, .probability = 75, .spare = 0 },
+    };
+    const vias = [_]u64{ @as(u46, @bitCast(other)), @as(u46, @bitCast(here)) };
+    const original_info = header.edge_info_offset;
+    header.access.restrictions = 1;
+    header.forward_restriction_offset = original_info + @sizeOf(source.AccessRestriction);
+    header.reverse_restriction_offset = header.forward_restriction_offset + @sizeOf(source.ComplexRestriction) + @sizeOf(@TypeOf(vias));
+    header.edge_info_offset = header.reverse_restriction_offset + @sizeOf(source.ComplexRestriction) + @sizeOf(@TypeOf(vias));
+    const added = header.edge_info_offset - original_info;
+    header.text_offset += added;
+    header.lane_connectivity_offset += added;
+    header.predicted_speed_offset += added;
+    header.tile_size += added;
+    var data: [608]u8 = undefined;
+    @memcpy(data[0..access_start], raw[0..access_start]);
+    @memcpy(data[0..@sizeOf(source.Header)], std.mem.asBytes(&header));
+    var node = std.mem.bytesToValue(source.Node, raw[@sizeOf(source.Header)..edge_start]);
+    node.edges.timezone = 117;
+    node.flags.timezone_ext = true;
+    @memcpy(data[@sizeOf(source.Header)..edge_start], std.mem.asBytes(&node));
+    var edge = std.mem.bytesToValue(source.Edge, raw[edge_start..access_start]);
+    edge.attributes.access_restriction = 1;
+    @memcpy(data[edge_start..access_start], std.mem.asBytes(&edge));
+    const sign_start = access_start + @sizeOf(source.AccessRestriction);
+    @memcpy(data[access_start..sign_start], std.mem.asBytes(&access));
+    @memcpy(data[sign_start..header.forward_restriction_offset], raw[access_start..original_info]);
+    const forward_vias = header.forward_restriction_offset + @sizeOf(source.ComplexRestriction);
+    const reverse_vias = header.reverse_restriction_offset + @sizeOf(source.ComplexRestriction);
+    @memcpy(data[header.forward_restriction_offset..forward_vias], std.mem.asBytes(&forward));
+    @memcpy(data[forward_vias..header.reverse_restriction_offset], std.mem.asBytes(&vias));
+    @memcpy(data[header.reverse_restriction_offset..reverse_vias], std.mem.asBytes(&reverse));
+    @memcpy(data[reverse_vias..header.edge_info_offset], std.mem.asBytes(&vias));
+    @memcpy(data[header.edge_info_offset..], raw[original_info..]);
+    return data;
+}
+
 pub fn archive() [4096]u8 {
     var bytes: [4096]u8 = @splat(0);
     tarHeader(bytes[0..512], "index.bin", "00000000040");

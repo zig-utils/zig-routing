@@ -5,9 +5,11 @@ const std = @import("std");
 const io = @import("../infra/io.zig");
 const radix = @import("../infra/radix.zig");
 const graph = @import("../graph/root.zig");
+const automaton = @import("../graph/restriction_automaton.zig");
 const geo = @import("../geo/root.zig");
 const components = @import("../build/components.zig");
 const turns = @import("../build/turns.zig");
+const restriction_builder = @import("../build/restriction_automaton.zig");
 const cold_builder = @import("../build/cold_builder.zig");
 const ColdBuilder = cold_builder.Builder;
 const StringTable = @import("../build/tags/names.zig").StringTable;
@@ -15,6 +17,7 @@ pub const tile_format = @import("valhalla_tile.zig");
 const format = graph.format;
 const Allocator = std.mem.Allocator;
 const no_edge = std.math.maxInt(u32);
+const RestrictionStarts = std.AutoHashMapUnmanaged(u32, u32);
 
 pub const Stats = struct {
     tiles: usize = 0,
@@ -54,7 +57,7 @@ const Sources = struct {
             for (try tile_format.archiveIndex(bytes, self.deadline)) |entry| {
                 if (self.deadline.expired()) return error.DeadlineExceeded;
                 if (entry.tile_id & 7 == tile_format.local_level) {
-                    try self.tiles.append(self.allocator, .{ .tile = try tile_format.archiveTile(bytes, entry) });
+                    try self.tiles.append(self.allocator, .{ .tile = try tile_format.archiveTileWithin(bytes, entry, self.deadline) });
                 }
             }
             return;
@@ -74,7 +77,7 @@ const Sources = struct {
 
     fn addFile(self: *Sources, path: []const u8) !void {
         if (self.deadline.expired()) return error.DeadlineExceeded;
-        const tile = try tile_format.Tile.parse(try self.map(path));
+        const tile = try tile_format.Tile.parseWithin(try self.map(path), self.deadline);
         if (tile.header.tile.id.level == tile_format.local_level) try self.tiles.append(self.allocator, .{ .tile = tile });
     }
 
@@ -155,7 +158,7 @@ const Layout = struct {
         self.first[node_index] = edge_index;
     }
 
-    fn connect(self: *Layout, a: Allocator, tiles: []const SourceTile, deadline: io.Deadline) !graph.class_table.Table {
+    fn connect(self: *Layout, a: Allocator, tiles: []const SourceTile, starts: RestrictionStarts, deadline: io.Deadline) !graph.class_table.Table {
         var classes = graph.class_table.Interner.init(a);
         defer classes.deinit();
         const handles = try a.alloc(graph.class_table.Handle, self.edges.len);
@@ -164,17 +167,16 @@ const Layout = struct {
             if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
             const tile = &tiles[ref.tile].tile;
             const raw = tile.edges[ref.index];
-            const head = raw.endpoint.node;
-            const other = tiles[self.by_key.get(head.tileKey()) orelse return error.MissingValhallaEndTile];
-            if (head.index >= other.tile.nodes.len) return error.InvalidValhallaEndNode;
-            const node = other.tile.nodes[head.index].edges;
-            if (raw.endpoint.opposing >= node.count) return error.InvalidValhallaOpposingEdge;
-            const opposite = other.edge_ids[@as(usize, node.first) + raw.endpoint.opposing];
-            if (opposite == no_edge or opposite == i) return error.InvalidValhallaOpposingEdge;
-            const dense = other.node_base + head.index;
+            const dense, const opposite = try self.edgeDestination(tiles, raw);
+            if (opposite == i) return error.InvalidValhallaOpposingEdge;
             ref.opposite = opposite;
             const info = try tile.info(raw.attributes.info_offset);
-            handle.* = try classes.intern(edgeClass(raw, info.bike_network));
+            var class = edgeClass(raw, info.bike_network);
+            if (starts.get(@intCast(i))) |masks| {
+                class.restrictions.start |= @truncate(masks);
+                class.restrictions.end |= @truncate(masks >> 16);
+            }
+            handle.* = try classes.intern(class);
             output.* = .{
                 .head = dense,
                 .geom = .{ .len_m = raw.geometry.length, .grade = raw.geometry.grade, .curvature = raw.geometry.curvature },
@@ -204,6 +206,61 @@ const Layout = struct {
             edge.cls.class_id = try table.id(handle);
         }
         return table;
+    }
+
+    fn edgeDestination(self: *const Layout, tiles: []const SourceTile, raw: tile_format.Edge) !struct { u32, u32 } {
+        const head = raw.endpoint.node;
+        const target = tiles[self.by_key.get(head.tileKey()) orelse return error.MissingValhallaEndTile];
+        if (head.index >= target.tile.nodes.len) return error.InvalidValhallaEndNode;
+        const edges = target.tile.nodes[head.index].edges;
+        if (raw.endpoint.opposing >= edges.count) return error.InvalidValhallaOpposingEdge;
+        const opposite = target.edge_ids[@as(usize, edges.first) + raw.endpoint.opposing];
+        if (opposite == no_edge) return error.InvalidValhallaOpposingEdge;
+        return .{ target.node_base + head.index, opposite };
+    }
+
+    fn restrictionEdge(self: *const Layout, tiles: []const SourceTile, id: tile_format.GraphId, reverse: bool) !?u32 {
+        if (id.level != tile_format.local_level) return null;
+        const source = tiles[self.by_key.get(id.tileKey()) orelse return error.MissingValhallaRestrictionTile];
+        if (id.index >= source.edge_ids.len) return error.InvalidValhallaRestrictionEdge;
+        const edge = source.edge_ids[id.index];
+        if (edge == no_edge) return null;
+        if (!reverse) return edge;
+        // Valhalla's reverse labels carry the opposing edge IDs. The
+        // native search advances its reverse automaton on travel edge IDs.
+        _, const opposing = try self.edgeDestination(tiles, source.tile.edges[id.index]);
+        return opposing;
+    }
+
+    fn compileRestrictions(self: *const Layout, a: Allocator, tiles: []const SourceTile, starts: *RestrictionStarts, deadline: io.Deadline) !restriction_builder.Program {
+        var builder: restriction_builder.Builder = .{ .a = a, .deadline = deadline };
+        defer builder.deinit();
+        for (tiles) |source| {
+            if (deadline.expired()) return error.DeadlineExceeded;
+            for ([_]bool{ false, true }) |reverse| {
+                var rules = source.tile.complexRestrictions(reverse);
+                while (try rules.next()) |row| {
+                    if (deadline.expired()) return error.DeadlineExceeded;
+                    const rule = row.restriction;
+                    const modes = @as(u16, rule.attr.modes) & @as(u16, @bitCast(graph.constants.AccessMask.all_tag_modes));
+                    if (modes == 0) continue;
+                    var buffer: [automaton.max_edges]u32 = undefined;
+                    const edges = buffer[0 .. row.vias.len + 2];
+                    edges[0] = try self.restrictionEdge(tiles, rule.from.edge, reverse) orelse continue;
+                    edges[edges.len - 1] = try self.restrictionEdge(tiles, rule.to.edge, reverse) orelse continue;
+                    for (edges[1 .. edges.len - 1], 0..) |*edge, i| {
+                        const bits: u46 = @intCast(row.vias[if (reverse) i else row.vias.len - 1 - i]);
+                        edge.* = try self.restrictionEdge(tiles, @bitCast(bits), reverse) orelse break;
+                    } else {
+                        try builder.forbidDirectional(reverse, edges, modes, rule.predicate());
+                        const start = edges[if (reverse) edges.len - 1 else 0];
+                        const entry = try starts.getOrPutValue(a, start, 0);
+                        entry.value_ptr.* |= @as(u32, modes) << (if (reverse) @as(u5, 16) else 0);
+                    }
+                }
+            }
+        }
+        return builder.finish(self.edges.len);
     }
 
     fn writeTurns(self: *Layout, a: Allocator, tiles: []const SourceTile, writer: *format.BundleWriter) !void {
@@ -245,6 +302,8 @@ const Layout = struct {
         defer points.deinit(a);
         var levels: std.ArrayList(graph.cold.LevelRange) = .empty;
         defer levels.deinit(a);
+        var limits: std.ArrayList(graph.cold.access_restriction.Entry) = .empty;
+        defer limits.deinit(a);
         var pairs: std.ArrayList(graph.spatial.Pair) = .empty;
         defer pairs.deinit(a);
         const indices = try a.alloc(u32, self.edges.len);
@@ -273,7 +332,14 @@ const Layout = struct {
             const reverse = try nameRefs(reverse_info, &strings, &cold, &reverse_names);
             const indoor = try info.indoor(a, &levels, writer.deadline);
             const different_names = if (std.mem.eql(u32, names, reverse)) null else reverse;
-            const record = try cold.appendDirectional(info.way, info.speed_limit, info.mean_elevation, points.items, names, different_names, indoor);
+            limits.clearRetainingCapacity();
+            try appendAccessLimits(a, &limits, tile, ref.index, edge.endpoint.forward, writer.deadline);
+            try appendAccessLimits(a, &limits, opposite_tile, opposite_ref.index, opposite.endpoint.forward, writer.deadline);
+            const record = try cold.appendFull(info.way, info.speed_limit, info.mean_elevation, points.items, names, .{
+                .reverse_refs = different_names,
+                .indoor = indoor,
+                .access_limits = limits.items,
+            });
             indices[i] = graph.cold.directedIndex(record, !edge.endpoint.forward);
             indices[ref.opposite] = graph.cold.directedIndex(record, edge.endpoint.forward);
             try graph.spatial.addShape(a, &pairs, @intCast(i), points.items, writer.deadline);
@@ -285,6 +351,15 @@ const Layout = struct {
         const scratch = try a.alloc(graph.spatial.Pair, pairs.items.len);
         defer a.free(scratch);
         _ = try graph.spatial.write(a, pairs.items, scratch, scratch_dir, writer, writer.deadline);
+    }
+
+    fn appendAccessLimits(a: Allocator, limits: *std.ArrayList(graph.cold.access_restriction.Entry), tile: tile_format.Tile, index: u21, forward: bool, deadline: io.Deadline) !void {
+        const rows = try tile.edgeAccessRestrictions(index, deadline);
+        try limits.ensureUnusedCapacity(a, rows.len);
+        for (rows, 0..) |row, i| {
+            if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+            limits.appendAssumeCapacity(try row.entry(if (forward) .forward else .backward));
+        }
     }
 
     // Ported from GraphTile::GetSigns for the local road tile import.
@@ -443,7 +518,11 @@ pub fn run(gpa: Allocator, inputs: []const []const u8, output: []const u8, deadl
     stats.edges = stats.source_edges - stats.skipped_shortcuts;
     var layout = try Layout.init(a, stats);
     try layout.catalog(a, tiles, deadline);
-    var classes = try layout.connect(a, tiles, deadline);
+    var starts: RestrictionStarts = .empty;
+    defer starts.deinit(a);
+    const program = try layout.compileRestrictions(a, tiles, &starts, deadline);
+    defer program.deinit(a);
+    var classes = try layout.connect(a, tiles, starts, deadline);
     defer classes.deinit();
 
     var digest: [32]u8 = undefined;
@@ -452,6 +531,8 @@ pub fn run(gpa: Allocator, inputs: []const []const u8, output: []const u8, deadl
     defer writer.deinit();
     const scratch_dir = std.fs.path.dirname(output) orelse ".";
     try layout.writeTurns(a, tiles, &writer);
+    if (program.states.len != 0) try writer.write(.restriction_automaton, program.states);
+    if (program.conditions.len != 0) try writer.write(.restriction_conditions, program.conditions);
     try writer.write(.nodes, layout.nodes);
     try writer.write(.first_edge, layout.first);
     try writer.write(.edges, layout.edges);
@@ -459,6 +540,7 @@ pub fn run(gpa: Allocator, inputs: []const []const u8, output: []const u8, deadl
     try writer.write(.classes, classes.classes);
     try writer.write(.coordinates, layout.coords);
     try writeDatasetIds(a, tiles, stats.nodes, &writer, deadline);
+    try writeTimezones(a, tiles, stats.nodes, &writer);
     try writer.write(.slopes, layout.slopes);
     try writer.write(.headings, layout.headings);
     const labels = try a.alloc(u32, stats.nodes);
@@ -467,6 +549,30 @@ pub fn run(gpa: Allocator, inputs: []const []const u8, output: []const u8, deadl
     try layout.writeCold(gpa, tiles, &writer, scratch_dir);
     try writer.commit();
     return stats;
+}
+
+fn writeTimezones(a: Allocator, tiles: []const SourceTile, nodes: usize, writer: *format.BundleWriter) !void {
+    const timezone = graph.timezone;
+    const ids = try a.alloc(timezone.Id, nodes);
+    defer a.free(ids);
+    var used: std.StaticBitSet(timezone.max_id + 1) = .empty;
+    for (tiles) |source| {
+        if (writer.deadline.expired()) return error.DeadlineExceeded;
+        for (source.tile.nodes, ids[source.node_base..][0..source.tile.nodes.len], 0..) |node, *id, i| {
+            if (i % 256 == 0 and writer.deadline.expired()) return error.DeadlineExceeded;
+            id.* = node.timezone();
+            used.set(id.*);
+        }
+    }
+    used.unset(timezone.unknown);
+    if (used.count() == 0) return;
+    const rules = try timezone.Rules.parse(&timezone.bundled_rules);
+    var present = used.iterator(.{});
+    while (present.next()) |id| {
+        if (try rules.name(@intCast(id)) == null) return error.InvalidValhallaTimezone;
+    }
+    try writer.write(.node_timezones, ids);
+    try writer.write(.timezone_rules, &timezone.bundled_rules);
 }
 
 fn writeDatasetIds(a: Allocator, tiles: []const SourceTile, nodes: usize, writer: *format.BundleWriter, deadline: io.Deadline) !void {

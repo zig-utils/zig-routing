@@ -38,14 +38,23 @@ pub const Builder = struct {
     }
 
     pub fn forbidIf(self: *Builder, edges: []const u32, modes: u16, predicate: machine.Predicate) !void {
+        if (!try self.prepare(edges, modes, predicate)) return;
+        try self.insert(false, edges, modes, predicate);
+        try self.insert(true, edges, modes, predicate);
+    }
+
+    pub fn forbidDirectional(self: *Builder, reverse: bool, edges: []const u32, modes: u16, predicate: machine.Predicate) !void {
+        if (try self.prepare(edges, modes, predicate)) try self.insert(reverse, edges, modes, predicate);
+    }
+
+    fn prepare(self: *Builder, edges: []const u32, modes: u16, predicate: machine.Predicate) !bool {
         if (edges.len < 2 or edges.len > machine.max_edges or modes & 0xf800 != 0 or predicate.probability > 100)
             return error.InvalidRestrictionSequence;
-        if (modes == 0) return;
+        if (modes == 0) return false;
         if (self.nodes.items.len == 0) try self.nodes.appendSlice(self.a, &.{
             State.root(machine.forward_root), State.root(machine.reverse_root),
         });
-        try self.insert(false, edges, modes, predicate);
-        try self.insert(true, edges, modes, predicate);
+        return true;
     }
 
     noinline fn insert(self: *Builder, reverse: bool, edges: []const u32, modes: u16, predicate: machine.Predicate) !void {

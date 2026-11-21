@@ -52,7 +52,7 @@ extra native unreachable candidate at the first location, respectively.
 The paired-candidate comparison across 240 input locations checked 619
 projected coordinates and fractions within `1e-6`. Candidate ordering
 and reachability differences are tracked in [#247](https://github.com/zig-utils/zig-routing/issues/247).
-The oracle importer omits access records needed for some verbose
-comparisons. An independent build from the same small OSM map verified
-that a directed height restriction appears in both implementations.
-The importer work is tracked in [#246](https://github.com/zig-utils/zig-routing/issues/246).
+An independent build from the same small OSM map verified that a directed
+height restriction appears in both implementations. The same-graph importer
+also preserves directed access records for verbose comparisons.
+[Restriction import](https://github.com/zig-utils/zig-routing/issues/246).

@@ -299,6 +299,18 @@ pub fn conditionalAccess(arena: Allocator) !gurka.Map {
     }, &.{}, &.{});
 }
 
+pub fn timedAccessDetour(arena: Allocator) !gurka.Map {
+    const road: gurka.Tags = &.{ .{ .key = "highway", .value = "residential" }, .{ .key = "oneway", .value = "yes" } };
+    return gurka.Map.init(arena, try gurka.mapToCoordinates("A---B---C---D\n    |   |\n    E---F", 100), &.{
+        .{ .label = "AB", .tags = road },
+        .{ .label = "BC", .tags = &.{ road[0], road[1], .{ .key = "motor_vehicle:conditional", .value = "no @ (Mo-Fr 07:00-19:00)" } } },
+        .{ .label = "CD", .tags = road },
+        .{ .label = "BE", .tags = road },
+        .{ .label = "EF", .tags = road },
+        .{ .label = "FC", .tags = road },
+    }, &.{}, &.{});
+}
+
 // Ported from test/gurka/test_time_dependent_restrictions.cc (Valhalla 3.9.3).
 pub fn timedTurns(arena: Allocator, only: bool) !gurka.Map {
     const road: gurka.Tags = if (only) &.{.{ .key = "highway", .value = "primary" }} else &.{.{ .key = "highway", .value = "motorway" }};

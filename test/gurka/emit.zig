@@ -34,6 +34,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, name, "only-turns")) break :blk try examples.onlyTurns(arena, .many_neighbours);
         if (std.mem.eql(u8, name, "multi-via-turns")) break :blk try examples.multiViaTurns(arena);
         if (std.mem.eql(u8, name, "timed-access")) break :blk try examples.conditionalAccess(arena);
+        if (std.mem.eql(u8, name, "timed-access-detour")) break :blk try examples.timedAccessDetour(arena);
         if (std.mem.eql(u8, name, "access-regions")) break :blk try examples.accessRegions(arena);
         if (std.mem.eql(u8, name, "signs")) break :blk try examples.signs(arena);
         if (std.mem.eql(u8, name, "turn-lanes")) break :blk try examples.turnLanes(arena);
@@ -58,6 +59,34 @@ pub fn main(init: std.process.Init) !void {
                 try narrative.corpus(arena, fixture, requests, "auto", &.{.{ .from = "A", .to = "C" }});
             } else if (std.mem.eql(u8, name, "guidance-views")) {
                 try narrative.corpus(arena, fixture, requests, "auto", &.{.{ .from = "A", .to = "G" }});
+            } else if (std.mem.eql(u8, name, "multi-via-turns")) {
+                try narrative.corpus(arena, fixture, requests, "auto", &.{
+                    .{ .from = "A", .to = "E", .date_time = .{ .type = 1, .value = "2026-11-16T12:00" } },
+                    .{ .from = "A", .to = "E", .date_time = .{ .type = 2, .value = "2026-11-16T12:00" } },
+                    .{ .from = "M", .to = "E", .date_time = .{ .type = 1, .value = "2026-11-16T12:00" } },
+                    .{ .from = "M", .to = "E", .date_time = .{ .type = 2, .value = "2026-11-16T12:00" } },
+                });
+            } else if (std.mem.eql(u8, name, "timed-turns")) {
+                try narrative.corpus(arena, fixture, requests, "auto", &.{
+                    .{ .from = "A", .to = "F", .date_time = .{ .type = 1, .value = "2026-11-16T12:00" } },
+                    .{ .from = "A", .to = "F", .date_time = .{ .type = 2, .value = "2026-11-16T12:00" } },
+                    .{ .from = "A", .to = "F", .date_time = .{ .type = 1, .value = "2026-11-16T23:00" } },
+                    .{ .from = "A", .to = "F", .date_time = .{ .type = 2, .value = "2026-11-16T23:00" } },
+                });
+            } else if (std.mem.eql(u8, name, "timed-access")) {
+                try narrative.corpus(arena, fixture, requests, "auto", &.{
+                    .{ .from = "R", .to = "U", .date_time = .{ .type = 1, .value = "2026-03-09T06:00" } },
+                    .{ .from = "R", .to = "U", .date_time = .{ .type = 2, .value = "2026-03-09T06:00" } },
+                    .{ .from = "R", .to = "U", .date_time = .{ .type = 1, .value = "2026-01-12T08:00" } },
+                    .{ .from = "R", .to = "U", .date_time = .{ .type = 2, .value = "2026-01-12T08:00" } },
+                });
+            } else if (std.mem.eql(u8, name, "timed-access-detour")) {
+                try narrative.corpus(arena, fixture, requests, "auto", &.{
+                    .{ .from = "A", .to = "D", .date_time = .{ .type = 1, .value = "2026-11-16T12:00" } },
+                    .{ .from = "A", .to = "D", .date_time = .{ .type = 2, .value = "2026-11-16T12:00" } },
+                    .{ .from = "A", .to = "D", .date_time = .{ .type = 1, .value = "2026-11-16T23:00" } },
+                    .{ .from = "A", .to = "D", .date_time = .{ .type = 2, .value = "2026-11-16T23:00" } },
+                });
             } else if (std.mem.eql(u8, name, "access-regions")) {
                 try accessProfiles(arena, fixture, requests);
             } else if (std.mem.eql(u8, name, "indoor")) {

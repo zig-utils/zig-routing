@@ -216,7 +216,7 @@ fn check(comptime mode: request.Costing, engine: anytype, view: *const routing.g
         .ok => |options| options,
         .failure => return error.InvalidRequest,
     };
-    if (opts.costing != mode or opts.date_time_type != .no_time) return error.UnsupportedProfile;
+    if (opts.costing != mode or opts.date_time_type == .current) return error.UnsupportedProfile;
     const options_key = if (mode == .pedestrian) "/pedestrian" else "/auto";
     const model_options = if (opts.costing_options) |root| routing.api.json.pointer(root, options_key) orelse .null else .null;
     var warnings: std.ArrayList(routing.costing.base.Warning) = .empty;
@@ -236,7 +236,11 @@ fn check(comptime mode: request.Costing, engine: anytype, view: *const routing.g
         try control.check();
         out.* = try Snap.search(view, a, location, .{}, access, deadline);
     }
-    const path = try search.multi.route(engine, arena, kernel, opts.locations, correlated, .{ .search = .{ .costing = mode } }, control);
+    const path = try search.multi.route(engine, arena, kernel, opts.locations, correlated, .{
+        .search = .{ .costing = mode },
+        .date_time_type = opts.date_time_type,
+        .now = 0,
+    }, control);
     const geometry = try search.legs.build(a, view, kernel, path, correlated, control);
     const attrs = try opts.tripAttributes(true, deadline);
     const output = try a.alloc(trip.TripLeg, path.legs.len);

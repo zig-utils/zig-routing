@@ -127,6 +127,7 @@ pub const Pair = struct {
     elevator_penalty: ?f32 = null,
     levels: [2]?f32 = .{ null, null },
     radius: ?u32 = null,
+    date_time: ?struct { type: u8, value: []const u8 } = null,
 };
 pub const indoor_routes: []const Pair = &.{
     .{ .from = "F", .to = "J" },
@@ -171,6 +172,7 @@ pub fn corpus(arena: Allocator, fixture: gurka.Map, path: []const u8, costing: [
             .costing = costing,
             .directions_type = "instructions",
             .costing_options = .{ .pedestrian = .{ .elevator_penalty = pair.elevator_penalty } },
+            .date_time = pair.date_time,
         }, .{ .emit_null_optional_fields = false });
         try rows.appendSlice(arena, "/route\t");
         try rows.appendSlice(arena, line);

@@ -576,6 +576,16 @@ an ordinary sequence for a via-way relation with the same annotation. The
 native builder preserves both representations. The tests also exercise a timed
 automaton output reached through a failure link.
 
+The same-graph importer reads both direction-specific restriction sections and
+the sorted access records. To replay routes against those records, pass a TSV
+output path after `multi-via-turns`, `timed-turns`, or `timed-access-detour`
+when running `zig build gurka-pbf`. Build the fixtures with hierarchy and
+shortcuts disabled and point `mjolnir.timezone` at the oracle timezone database
+with ocean zones. Run `tripleg-reference` on the TSV, import those same tiles,
+then run `zig build check-tripleg -- BUNDLE ROUTES.tsv 4`. The requests cover
+depart-at and arrive-by search, distinct approaches to a multi-via restriction,
+and active and inactive turn and access conditions.
+
 ### Location, polygon and closure exclusions
 
 Replay the exclusion validation corpus against the native service and
@@ -855,7 +865,8 @@ share no weak component. A shared component still requires a directed path.
 ### Trip leg fields
 
 `zig build check-tripleg -Doptimize=ReleaseFast -- BUNDLE CORPUS CASES` routes
-untimed auto requests and writes the typed leg for each corpus row as JSONL.
+auto requests and writes the typed leg for each corpus row as JSONL. Explicit
+departure and arrival times are accepted for deterministic replay.
 The Valhalla actor retains its protobuf trip when using the normal JSON route
 request. Compile `tripleg-reference.cc` inside the pinned image using the same
 compiler and libraries as `costing-parity.sh`. Run it as

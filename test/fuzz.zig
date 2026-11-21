@@ -964,8 +964,95 @@ test "fuzz valhalla-tile" {
     var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer state.deinit();
     const raw = valhalla_fixture.tile(false);
+    const restricted = valhalla_fixture.restrictedTile();
     const tar = valhalla_fixture.archive();
-    try std.testing.fuzz({}, fuzzValhallaTile, .{ .corpus = try seeds(state.allocator(), &.{ &.{}, &raw, &tar, raw[0 .. raw.len - 1] }) });
+    try std.testing.fuzz({}, fuzzValhallaTile, .{ .corpus = try seeds(state.allocator(), &.{ &.{}, &raw, &restricted, &tar, raw[0 .. raw.len - 1] }) });
+}
+
+test "Valhalla tile rejects truncated complex restrictions and out-of-range access edges" {
+    const source = valhalla_import.tile_format;
+    var truncated = valhalla_fixture.restrictedTile();
+    var header = std.mem.bytesToValue(source.Header, truncated[0..@sizeOf(source.Header)]);
+    header.reverse_restriction_offset -= 8;
+    @memcpy(truncated[0..@sizeOf(source.Header)], std.mem.asBytes(&header));
+    try std.testing.expectError(error.TruncatedValhallaComplexRestriction, source.Tile.parse(&truncated));
+
+    var bad_access = valhalla_fixture.restrictedTile();
+    const access_start = @sizeOf(source.Header) + @sizeOf(source.Node) + @sizeOf(source.Edge);
+    bad_access[access_start] |= 1;
+    try std.testing.expectError(error.InvalidValhallaAccessRestriction, source.Tile.parse(&bad_access));
+}
+
+test "Valhalla importer retains restriction directions, predicates and access across tiles" {
+    const io = routing.infra.io;
+    const test_alloc = std.testing.allocator;
+    const parent = try io.Directory.open(".");
+    defer parent.close();
+    const root = try parent.temporaryChild();
+    defer parent.deleteDir(&root.name) catch {};
+    defer root.dir.close();
+    const first_tile = valhalla_fixture.restrictedTile();
+    const second_tile = valhalla_fixture.tile(true);
+    try root.dir.writeAtomic("first.gph", &first_tile);
+    defer root.dir.deleteFile("first.gph") catch {};
+    try root.dir.writeAtomic("second.gph", &second_tile);
+    defer root.dir.deleteFile("second.gph") catch {};
+    var first_path: [128]u8 = undefined;
+    var second_path: [128]u8 = undefined;
+    var bundle_path: [128]u8 = undefined;
+    const first = try std.fmt.bufPrint(&first_path, "{s}/first.gph", .{root.name});
+    const second = try std.fmt.bufPrint(&second_path, "{s}/second.gph", .{root.name});
+    const output = try std.fmt.bufPrint(&bundle_path, "{s}/native", .{root.name});
+    _ = try valhalla_import.run(test_alloc, &.{ second, first }, output, .none);
+    defer {
+        if (root.dir.child("native")) |dir| {
+            for (graph_kinds) |kind| dir.deleteFile(kind.filename()) catch {};
+            dir.close();
+            root.dir.deleteDir("native") catch {};
+        } else |_| {}
+    }
+    var bundle = try graph.reader.Bundle.open(output);
+    defer bundle.close();
+    try bundle.view.verify(.none, null);
+    const zone = try bundle.view.nodeTimezone(@fromBackingInt(0));
+    try std.testing.expectEqualStrings("America/Ciudad_Juarez", (try bundle.view.tz_rules.?.name(zone)).?);
+    const states = bundle.view.restriction_automaton.?;
+    const conditions = bundle.view.restriction_conditions.?;
+    try std.testing.expectEqual(2, conditions.len);
+    for (conditions) |condition| {
+        const state = states[condition.state];
+        try std.testing.expectEqual(4, state.attr.depth);
+        if (state.attr.reverse) {
+            try std.testing.expectEqual(1, state.edge);
+            try std.testing.expectEqual(4, condition.attr.modes);
+            try std.testing.expectEqual(75, condition.attr.probability);
+            try std.testing.expectEqual(0, condition.domain);
+        } else {
+            try std.testing.expectEqual(0, state.edge);
+            try std.testing.expectEqual(1, condition.attr.modes);
+            try std.testing.expectEqual(0, condition.attr.probability);
+            const time: graph.time_domain.TimeDomain = @bitCast(condition.domain);
+            try std.testing.expectEqual(62, time.dow);
+            try std.testing.expectEqual(8, time.begin_hour);
+            try std.testing.expectEqual(15, time.begin_minute);
+            try std.testing.expectEqual(9, time.end_hour);
+            try std.testing.expectEqual(30, time.end_minute);
+        }
+    }
+    const first_edge = try bundle.view.coldRecord(@fromBackingInt(0));
+    const second_edge = try bundle.view.coldRecord(@fromBackingInt(1));
+    var forward_limits = first_edge.restrictions();
+    var reverse_limits = second_edge.restrictions();
+    const limit = forward_limits.next().?;
+    try std.testing.expectEqual(.timed_denied, limit.attr.kind);
+    try std.testing.expectEqual(1, limit.modes());
+    try std.testing.expectEqual(null, forward_limits.next());
+    try std.testing.expectEqual(null, reverse_limits.next());
+    const start = try bundle.view.edge(@fromBackingInt(1));
+    const class = try bundle.view.class(start.cls.class_id);
+    try std.testing.expectEqual(1, class.restrictions.start);
+    const end = try bundle.view.edge(@fromBackingInt(0));
+    try std.testing.expectEqual(4, (try bundle.view.class(end.cls.class_id)).restrictions.end);
 }
 
 test "Valhalla importer preserves cross-tile edge pairs and cold data" {

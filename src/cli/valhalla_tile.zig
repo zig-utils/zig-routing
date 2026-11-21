@@ -5,6 +5,7 @@ const std = @import("std");
 const io = @import("../infra/io.zig");
 const geo = @import("../geo/root.zig");
 const graph = @import("../graph/root.zig");
+const automaton = @import("../graph/restriction_automaton.zig");
 
 pub const local_level = 2;
 pub const version_major = '3';
@@ -18,6 +19,115 @@ pub const GraphId = packed struct(u46) {
         return @as(u32, self.tile) << 3 | self.level;
     }
 };
+
+// Ported from valhalla/baldr/accessrestriction.h.
+pub const AccessRestriction = extern struct {
+    attr: packed struct(u64) {
+        edge: u22,
+        kind: u6,
+        modes: u12,
+        except_destination: bool,
+        spare: u23,
+    },
+    value: u64,
+
+    pub fn entry(self: AccessRestriction, direction: graph.cold.access_restriction.Direction) !graph.cold.access_restriction.Entry {
+        const kind = std.math.cast(u4, self.attr.kind) orelse return error.InvalidValhallaAccessRestriction;
+        const result: graph.cold.access_restriction.Entry = .{
+            .value = self.value,
+            .attr = .{
+                .kind = @fromBackingInt(@intCast(kind)),
+                .direction = direction,
+                .modes = self.attr.modes,
+                .except_destination = self.attr.except_destination,
+            },
+        };
+        if (self.attr.modes == 0 or !result.valid()) return error.InvalidValhallaAccessRestriction;
+        return result;
+    }
+};
+
+// Ported from valhalla/baldr/complexrestriction.h. Valhalla saves vias
+// in predecessor order, which differs between the two sections.
+pub const ComplexRestriction = extern struct {
+    from: packed struct(u64) {
+        edge: GraphId,
+        has_time: bool,
+        day: u5,
+        month: u4,
+        week: u3,
+        hour: u5,
+    },
+    to: packed struct(u64) {
+        edge: GraphId,
+        nth_weekday: bool,
+        day: u5,
+        month: u4,
+        week: u3,
+        hour: u5,
+    },
+    attr: packed struct(u64) {
+        kind: u4,
+        modes: u12,
+        via_count: u5,
+        dow: u7,
+        begin_minute: u6,
+        end_minute: u6,
+        probability: u7,
+        spare: u17,
+    },
+
+    fn timeDomain(self: ComplexRestriction) graph.time_domain.TimeDomain {
+        return if (self.from.has_time) .{
+            .nth_weekday = self.to.nth_weekday,
+            .dow = self.attr.dow,
+            .begin_hour = self.from.hour,
+            .begin_minute = self.attr.begin_minute,
+            .begin_month = self.from.month,
+            .begin_day = self.from.day,
+            .begin_week = self.from.week,
+            .end_hour = self.to.hour,
+            .end_minute = self.attr.end_minute,
+            .end_month = self.to.month,
+            .end_day = self.to.day,
+            .end_week = self.to.week,
+        } else .{};
+    }
+
+    pub fn predicate(self: ComplexRestriction) automaton.Predicate {
+        return .{
+            .domain = @bitCast(self.timeDomain()),
+            .probability = if (self.attr.kind == 10 or self.attr.kind == 11) self.attr.probability else 0,
+        };
+    }
+};
+
+pub const ComplexIterator = struct {
+    remaining: []const u8,
+
+    pub const Record = struct {
+        restriction: ComplexRestriction,
+        vias: []align(1) const u64,
+    };
+
+    pub fn next(self: *ComplexIterator) !?Record {
+        if (self.remaining.len == 0) return null;
+        if (self.remaining.len < @sizeOf(ComplexRestriction)) return error.TruncatedValhallaComplexRestriction;
+        const restriction = std.mem.bytesToValue(ComplexRestriction, self.remaining[0..@sizeOf(ComplexRestriction)]);
+        const size = @sizeOf(ComplexRestriction) + @as(usize, restriction.attr.via_count) * @sizeOf(u64);
+        if (self.remaining.len < size) return error.TruncatedValhallaComplexRestriction;
+        const vias = std.mem.bytesAsSlice(u64, self.remaining[@sizeOf(ComplexRestriction)..size]);
+        self.remaining = self.remaining[size..];
+        return .{ .restriction = restriction, .vias = vias };
+    }
+};
+
+comptime {
+    std.debug.assert(@import("builtin").target.cpu.arch.endian() == .little);
+    std.debug.assert(@sizeOf(AccessRestriction) == 16 and @offsetOf(AccessRestriction, "attr") == 0 and @offsetOf(AccessRestriction, "value") == 8);
+    std.debug.assert(@sizeOf(ComplexRestriction) == 24 and @offsetOf(ComplexRestriction, "from") == 0 and
+        @offsetOf(ComplexRestriction, "to") == 8 and @offsetOf(ComplexRestriction, "attr") == 16);
+}
 
 pub const Header = extern struct {
     tile: packed struct(u64) {
@@ -109,6 +219,10 @@ pub const Node = extern struct {
         spare: u1,
     },
     headings: u64,
+
+    pub fn timezone(self: Node) graph.timezone.Id {
+        return @as(u16, self.edges.timezone) | (@as(u16, @intFromBool(self.flags.timezone_ext)) << graph.timezone.base_bits);
+    }
 
     pub fn coordinate(self: Node, base: [2]f32) !geo.FixedLL {
         if (self.position.lng_digit > 9 or self.position.lat_digit > 9) return error.InvalidTileCoordinate;
@@ -268,6 +382,9 @@ pub const Tile = struct {
     nodes: []align(1) const Node,
     edges: []align(1) const Edge,
     local_signs: []align(1) const Sign,
+    access_restrictions: []align(1) const AccessRestriction,
+    forward_restrictions: []const u8,
+    reverse_restrictions: []const u8,
     edge_info: []const u8,
     text: []const u8,
 
@@ -277,6 +394,10 @@ pub const Tile = struct {
     }
 
     pub fn parse(bytes: []const u8) !Tile {
+        return parseWithin(bytes, .none);
+    }
+
+    pub fn parseWithin(bytes: []const u8, deadline: io.Deadline) !Tile {
         if (bytes.len < @sizeOf(Header)) return error.TruncatedTileHeader;
         const header = std.mem.bytesToValue(Header, bytes[0..@sizeOf(Header)]);
         if (header.tile_size != bytes.len or header.tile.id.index != 0) return error.InvalidTileHeader;
@@ -284,7 +405,8 @@ pub const Tile = struct {
         const edge_start = node_end + @as(usize, header.transitions.count) * @sizeOf(u64);
         const edge_end = edge_start + @as(usize, header.counts.edges) * @sizeOf(Edge);
         const extended = if (header.tile.extended_edges) @as(usize, header.counts.edges) * @sizeOf(u64) else 0;
-        const access_end = edge_end + extended + @as(usize, header.access.restrictions) * 16;
+        const access_start = edge_end + extended;
+        const access_end = access_start + @as(usize, header.access.restrictions) * @sizeOf(AccessRestriction);
         const local_sign_count = if (header.tile.id.level == local_level) header.signs.count else 0;
         // Local road tiles have no transit tables between access restrictions and signs.
         if (local_sign_count != 0 and (header.transit.departures != 0 or header.transit.stops != 0 or
@@ -296,15 +418,72 @@ pub const Tile = struct {
             header.reverse_restriction_offset > header.edge_info_offset or
             header.edge_info_offset > header.text_offset or header.text_offset > header.lane_connectivity_offset or
             header.lane_connectivity_offset > bytes.len) return error.InvalidTileOffsets;
-        return .{
+        const tile: Tile = .{
             .bytes = bytes,
             .header = header,
             .nodes = std.mem.bytesAsSlice(Node, bytes[@sizeOf(Header)..node_end]),
             .edges = std.mem.bytesAsSlice(Edge, bytes[edge_start..edge_end]),
             .local_signs = std.mem.bytesAsSlice(Sign, bytes[access_end..sign_end]),
+            .access_restrictions = std.mem.bytesAsSlice(AccessRestriction, bytes[access_start..access_end]),
+            .forward_restrictions = bytes[header.forward_restriction_offset..header.reverse_restriction_offset],
+            .reverse_restrictions = bytes[header.reverse_restriction_offset..header.edge_info_offset],
             .edge_info = bytes[header.edge_info_offset..header.text_offset],
             .text = bytes[header.text_offset..header.lane_connectivity_offset],
         };
+        try tile.verifyRestrictions(deadline);
+        return tile;
+    }
+
+    fn verifyRestrictions(self: Tile, deadline: io.Deadline) !void {
+        var previous: u22 = 0;
+        for (self.access_restrictions, 0..) |row, i| {
+            if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+            if (row.attr.edge < previous or row.attr.edge >= self.edges.len) return error.InvalidValhallaAccessRestriction;
+            _ = try row.entry(.both);
+            previous = row.attr.edge;
+        }
+        for ([_]bool{ false, true }) |reverse| {
+            var iter = self.complexRestrictions(reverse);
+            while (try iter.next()) |row| {
+                if (deadline.expired()) return error.DeadlineExceeded;
+                const rule = row.restriction;
+                const anchor = if (reverse) rule.from.edge else rule.to.edge;
+                if (anchor.tileKey() != self.header.tile.id.tileKey() or rule.attr.modes == 0 or rule.attr.kind > 11 or
+                    !rule.timeDomain().valid() or (rule.from.has_time and rule.predicate().domain == 0))
+                    return error.InvalidValhallaComplexRestriction;
+                const probability = rule.predicate().probability;
+                if ((rule.attr.kind >= 10 and probability == 0) or probability > 100) return error.InvalidValhallaComplexRestriction;
+                try self.verifyRestrictionId(rule.from.edge);
+                try self.verifyRestrictionId(rule.to.edge);
+                for (row.vias) |raw| {
+                    const bits = std.math.cast(u46, raw) orelse return error.InvalidValhallaComplexRestriction;
+                    try self.verifyRestrictionId(@bitCast(bits));
+                }
+            }
+        }
+    }
+
+    fn verifyRestrictionId(self: Tile, id: GraphId) !void {
+        if (id.level > local_level or (id.tileKey() == self.header.tile.id.tileKey() and id.index >= self.edges.len))
+            return error.InvalidValhallaComplexRestriction;
+    }
+
+    pub fn complexRestrictions(self: Tile, reverse: bool) ComplexIterator {
+        return .{ .remaining = if (reverse) self.reverse_restrictions else self.forward_restrictions };
+    }
+
+    pub fn edgeAccessRestrictions(self: Tile, index: u21, deadline: io.Deadline) ![]align(1) const AccessRestriction {
+        var start: usize = 0;
+        var high = self.access_restrictions.len;
+        while (start < high) {
+            const middle = start + (high - start) / 2;
+            if (self.access_restrictions[middle].attr.edge < index) start = middle + 1 else high = middle;
+        }
+        var end = start;
+        while (end < self.access_restrictions.len and self.access_restrictions[end].attr.edge == index) : (end += 1) {
+            if (end % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+        }
+        return self.access_restrictions[start..end];
     }
 
     pub noinline fn info(self: *const Tile, offset: u25) !EdgeInfo {
@@ -467,8 +646,12 @@ fn parseOctal(comptime T: type, bytes: []const u8) !T {
 }
 
 pub fn archiveTile(bytes: []const u8, entry: ArchiveEntry) !Tile {
+    return archiveTileWithin(bytes, entry, .none);
+}
+
+pub fn archiveTileWithin(bytes: []const u8, entry: ArchiveEntry, deadline: io.Deadline) !Tile {
     if (entry.offset % 512 != 0 or entry.offset < 512 or entry.offset > bytes.len or entry.size > bytes.len - entry.offset) return error.InvalidTileArchiveIndex;
-    const tile = try Tile.parse(bytes[@intCast(entry.offset)..][0..entry.size]);
+    const tile = try Tile.parseWithin(bytes[@intCast(entry.offset)..][0..entry.size], deadline);
     if (tile.header.tile.id.tileKey() != entry.tile_id) return error.TileArchiveIdMismatch;
     return tile;
 }

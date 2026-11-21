@@ -22,8 +22,9 @@ The 5x target remains open. All 377 in-contour arrival cells in the last
 three requests meet the 1% or 5 s tolerance. The first request matches
 4,969 of 5,097 cells. Its edge trace shows a native path taking the
 tile-local movement from 22355 to 22352. Valhalla rejects the predecessor
-chain under a complex turn restriction. The importer needs to preserve
-the rule as well as its flags. [Restriction import tracking issue](https://github.com/zig-utils/zig-routing/issues/246).
+chain under a complex turn restriction. Once the importer preserved that rule,
+both engines rejected the movement and reached edge 22394 at 76.554 seconds.
+[Restriction import follow-up](https://github.com/zig-utils/zig-routing/issues/246).
 
 ## Reproduction
 

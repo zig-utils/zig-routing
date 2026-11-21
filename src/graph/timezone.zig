@@ -11,6 +11,8 @@ pub const base_bits = 9;
 pub const max_id: Id = (1 << (base_bits + 1)) - 1;
 pub const attribution = "Timezone boundaries from timezone-boundary-builder (ODbL)";
 pub const Error = error{InvalidTimezoneRules};
+const rules_file = @embedFile("timezones/iana-2026f.ztz");
+pub const bundled_rules: [rules_file.len]u8 align(8) = rules_file.*;
 
 const Header = extern struct {
     magic: [8]u8,
