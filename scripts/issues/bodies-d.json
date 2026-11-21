@@ -554,13 +554,29 @@
     "notes": [
       "Upstream comment: the isogrid update is not the bottleneck, the graph expansion is (docs/upstream/valhalla-perf-issues.md, theme c).",
       "Contouring comes from P1.06.",
-      "Matched edge reach validation requires P3.34a to preserve the oracle's restriction records in the imported graph."
+      "Matched edge reach validation requires P3.34a to preserve the oracle's restriction records in the imported graph.",
+      "P7.07a tracks the remaining exact expansion performance work."
     ],
     "accept": [
       "Upstream isochrone unit tests ported and green.",
       "Edge reach times within 1% or 5 s of the oracle (gate F input).",
       "At least 5x faster than Valhalla on the isochrone corpus.",
       "`zig build test` green."
+    ]
+  },
+  {
+    "key": "P7.07a",
+    "goal": "Run exact isochrone grid expansion at least 5x faster than Valhalla 3.9.3 on the matched isochrone corpus.",
+    "scope": [
+      "Profile shared expansion, costing and rasterization on the documented Utrecht replay with identical graphs.",
+      "Optimize search and rasterization while retaining predecessor restriction states, bounded expansion, deadlines and arena-backed memory.",
+      "Verify performance on the same hardware and platform with alternating runners and record the corpus, label counts and timings."
+    ],
+    "notes": ["The parity-corrected arm64 Linux pilot measured 45.175 ms native and 36.343 ms in Valhalla. See docs/experiments/isochrone.md."],
+    "accept": [
+      "At least 5x faster than Valhalla 3.9.3 over the matched expansion corpus.",
+      "Exact path, restriction and arrival-grid tests pass in forward and reverse, with no heap calls after request warm-up.",
+      "A reproducible paired benchmark reports the timing margin. The full tests and binary budget pass."
     ]
   },
   {
