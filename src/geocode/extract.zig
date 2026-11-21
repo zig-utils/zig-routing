@@ -7,6 +7,7 @@ const polygon = @import("../geo/polygon.zig");
 const model = @import("model.zig");
 const bundle = @import("bundle.zig");
 const admin = @import("admin.zig");
+const admin_geometry = @import("admin_geometry.zig");
 const tags = @import("tags.zig");
 const interpolation = @import("interpolation.zig");
 const postcode_index = @import("postcode_index.zig");
@@ -85,6 +86,7 @@ pub fn build(a: Allocator, input: []const u8, output: []const u8, options: Optio
     extractor.report.postcodes = address_data.postcodes.len;
     var data = extractor.data();
     data.address_data = address_data;
+    data.admin_geometry = try admin_geometry.encode(owned.allocator(), index.tree.polygons, index.owners, deadline);
     const coverage = try data.coverage(deadline);
     extractor.report.country = coverage.country;
     extractor.report.city = coverage.city;
@@ -95,7 +97,7 @@ pub fn build(a: Allocator, input: []const u8, output: []const u8, options: Optio
 
 fn identity(files: []const pbf.file.File, deadline: io.Deadline) !model.DatasetUuid {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update(if (files.len == 1) "zr-geocode-v2" else "zr-geocode-admin-v2");
+    hash.update(if (files.len == 1) "zr-geocode-v3" else "zr-geocode-admin-v3");
     for (files) |*file| {
         const bytes = file.mapping.bytes;
         if (files.len > 1) {

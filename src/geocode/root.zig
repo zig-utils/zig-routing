@@ -14,6 +14,7 @@ pub const index = @import("index.zig");
 pub const index_build = @import("index_build.zig");
 pub const query = @import("query.zig");
 pub const autocomplete = @import("autocomplete.zig");
+pub const reverse = @import("reverse.zig");
 
 test {
     std.testing.refAllDecls(@This());
@@ -21,4 +22,5 @@ test {
     _ = @import("index_postings.zig");
     _ = @import("query_edit.zig");
     _ = @import("query_retrieve.zig");
+    _ = @import("admin_geometry.zig");
 }

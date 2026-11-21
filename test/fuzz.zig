@@ -455,6 +455,18 @@ fn fuzzGeocodeBundle(_: void, s: *Smith) !void {
                 var addresses: geocode.bundle.AddressData = .{};
                 @field(addresses, @tagName(kind)) = read.records;
                 data.address_data = addresses;
+            } else if (comptime kind.geometrySection()) {
+                var geometry: geocode.bundle.AdminGeometry = .{
+                    .admin_polygons = &.{.{ .admin = @fromBackingInt(1), .outer = .{ .len = 4 }, .holes = .{ .len = 1 } }},
+                    .admin_rings = &.{.{ .first = 4, .len = 4 }},
+                    .admin_coordinates = &.{
+                        .{ .lng = 0, .lat = 0 }, .{ .lng = 4, .lat = 0 }, .{ .lng = 4, .lat = 4 }, .{ .lng = 0, .lat = 4 },
+                        .{ .lng = 1, .lat = 1 }, .{ .lng = 2, .lat = 1 }, .{ .lng = 2, .lat = 2 }, .{ .lng = 1, .lat = 2 },
+                    },
+                };
+                data.admins = &.{.{ .osm_id = 5, .names = .{}, .attr = .{ .division = .country, .level = 2 } }};
+                @field(geometry, @tagName(kind)) = read.records;
+                data.admin_geometry = geometry;
             } else {
                 @field(data, @tagName(kind)) = read.records;
             }

@@ -104,17 +104,20 @@ pub fn pointAt(shape: []const geo.FixedLL, fraction: f64, deadline: io.Deadline)
         const length = a.distance(b);
         if (length > 0 and remaining <= length) {
             const t = remaining / length;
-            // Very short segments can round to a zero central angle in
-            // the great-circle kernel. The local linear error is negligible.
-            if (length >= 1 and length < 20_000_000) return a.pointAlongSegment(b, t).toFixed();
-            const lng = a.lng + geo.wrappedLongitudeDelta(b.lng, a.lng) * t;
-            const wrapped = if (lng > 180) lng - 360 else if (lng < -180) lng + 360 else lng;
-            return geo.PointLL.init(wrapped, a.lat + (b.lat - a.lat) * t).toFixed();
+            return along(a, b, length, t);
         }
         remaining -= length;
         a = b;
     }
     return shape[shape.len - 1];
+}
+
+pub fn along(a: geo.PointLL, b: geo.PointLL, length: f64, fraction: f64) geo.FixedLL {
+    // Very short segments can round to a zero central angle.
+    if (length >= 1 and length < 20_000_000) return a.pointAlongSegment(b, fraction).toFixed();
+    const lng = a.lng + geo.wrappedLongitudeDelta(b.lng, a.lng) * fraction;
+    const wrapped = if (lng > 180) lng - 360 else if (lng < -180) lng + 360 else lng;
+    return geo.PointLL.init(wrapped, a.lat + (b.lat - a.lat) * fraction).toFixed();
 }
 
 test "all OSM interpolation modes locate addresses along the entire way" {

@@ -169,6 +169,16 @@ pub fn build(b: *std.Build) void {
     run_bench_geocode_query.addPassthruArgs();
     b.step("bench-geocode-query", "Check the 500-query regional quality set and latency").dependOn(&run_bench_geocode_query.step);
 
+    const bench_geocode_reverse = b.addExecutable(.{ .name = "bench-geocode-reverse", .root_module = b.createModule(.{
+        .root_source_file = b.path("test/bench_geocode_reverse.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "routing", .module = lib_mod }},
+    }) });
+    const run_bench_geocode_reverse = b.addRunArtifact(bench_geocode_reverse);
+    run_bench_geocode_reverse.addPassthruArgs();
+    b.step("bench-geocode-reverse", "Check sampled address recall and regional reverse lookup latency").dependOn(&run_bench_geocode_reverse.step);
+
     const narrative_tests = b.addTest(.{
         .name = "test-narrative",
         .root_module = lib_mod,

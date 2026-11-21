@@ -63,7 +63,7 @@ test "geocode bundle keeps multilingual labels and merges streets by municipalit
             .{
                 .id = 202,
                 .members = &.{.{ .kind = .way, .id = 102, .role = "outer" }},
-                .tags = &.{ boundary, .{ .key = "admin_level", .value = "8" }, .{ .key = "name", .value = "West" } },
+                .tags = &.{ boundary, .{ .key = "admin_level", .value = "8" }, .{ .key = "name", .value = "West" }, .{ .key = "name:fr", .value = "Ouest" } },
             },
             .{
                 .id = 203,
@@ -226,6 +226,36 @@ test "geocode bundle keeps multilingual labels and merges streets by municipalit
     const french_prefix = try autocomplete.suggest(request_memory, .{ .text = "Ou", .filters = .{ .language = "fr" } }, .none);
     try testing.expectEqualStrings("Ouest", french_prefix[0].name);
     try testing.expectError(error.DeadlineExceeded, autocomplete.suggest(request_memory, .{ .text = "Ma" }, .fromNow(0)));
+
+    var reverse = try geocode.reverse.Engine.open(a, output, .none);
+    defer reverse.close();
+    const at_address = try reverse.lookup(request_memory, .{ .point = .init(2, 1), .limit = 3, .language = "fr" }, .none);
+    try testing.expectEqual(12, at_address.results[0].osm_id);
+    try testing.expectEqual(0, at_address.results[0].distance_m);
+    try testing.expectEqual(.address, at_address.results[0].layer);
+    try testing.expectEqualStrings("Ouest", at_address.hierarchy.city.?.name);
+    try testing.expectEqual(201, at_address.results[0].hierarchy.country.?.osm_id);
+    try testing.expectEqual(.street, at_address.results[1].layer);
+    const along_street = try reverse.lookup(request_memory, .{ .point = .init(1.5, 1.0001), .radius_m = 12, .layer = .street }, .none);
+    try testing.expectEqual(104, along_street.results[0].osm_id);
+    try testing.expectEqual(1.0, along_street.results[0].coordinate.lat);
+    try testing.expect(along_street.results[0].distance_m > 11 and along_street.results[0].distance_m < 12);
+    const outside_radius = try reverse.lookup(request_memory, .{ .point = .init(1.5, 1.0001), .radius_m = 10, .layer = .street }, .none);
+    try testing.expectEqual(0, outside_radius.results.len);
+    const by_poi = try reverse.lookup(request_memory, .{ .point = data.pois[0].record.coordinate.toPoint(), .layer = .poi }, .none);
+    try testing.expectEqual(205, by_poi.results[0].osm_id);
+    const batch = try reverse.batch(request_memory, &.{
+        .{ .point = .init(6, 3.5), .radius_m = 0 },
+        .{ .point = .init(-140, 0) },
+        .{ .point = .init(1.5, 3.5), .layer = .country },
+    }, .none);
+    try testing.expectEqual(203, batch[0].results[0].osm_id);
+    try testing.expectEqual(.city, batch[0].results[0].layer);
+    try testing.expectEqual(null, batch[1].hierarchy.country);
+    try testing.expectEqual(0, batch[1].results.len);
+    try testing.expectEqual(201, batch[2].results[0].osm_id);
+    try testing.expectError(error.InvalidCoordinate, reverse.lookup(request_memory, .{ .point = .init(0, 99) }, .none));
+    try testing.expectError(error.DeadlineExceeded, reverse.lookup(request_memory, .{ .point = .init(2, 1) }, .fromNow(0)));
 }
 
 fn addressTags(allocator: std.mem.Allocator, number: []const u8) !gurka.Tags {
@@ -337,8 +367,21 @@ test "extract postcode areas and linked interpolation ranges from a PBF" {
         }
         try testing.expectEqual(1, matches);
     }
+    var reverse = try geocode.reverse.Engine.open(a, output, .none);
+    defer reverse.close();
+    const nearby = try reverse.lookup(arena, .{ .point = expected, .radius_m = 30, .layer = .address, .limit = 10 }, .none);
+    try testing.expectEqual(4, nearby.results.len);
+    for (nearby.results, 0..) |result, i| {
+        try testing.expect(result.approximate);
+        try testing.expect(result.distance_m < 10);
+        try testing.expect(result.osm_id >= 110 and result.osm_id <= 113);
+        try testing.expect(std.mem.indexOf(u8, result.address, "Curve Road") != null);
+        if (i != 0) try testing.expect(nearby.results[i - 1].distance_m <= result.distance_m);
+    }
     const folder = try io.Directory.open(output);
     defer folder.close();
+    try folder.deleteFile(geocode.model.Section.admin_rings.filename());
+    try testing.expectError(error.IncompleteGeocodeAdminGeometry, geocode.bundle.Bundle.open(output, .none));
     try folder.deleteFile(geocode.model.Section.postcodes.filename());
     try testing.expectError(error.IncompleteGeocodeAddressIndex, geocode.bundle.Bundle.open(output, .none));
 }

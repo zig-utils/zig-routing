@@ -7,7 +7,40 @@ const interpolation = @import("interpolation.zig");
 const postal = @import("postcode.zig");
 
 const sections = std.enums.values(model.Section);
-const base_section_count = @backingInt(model.Section.street_ways);
+const address_section_count = @backingInt(model.Section.postcodes) - @backingInt(model.Section.street_ways);
+const geometry_section_count = @backingInt(model.Section.admin_coordinates) - @backingInt(model.Section.postcodes);
+
+pub const AdminGeometry = struct {
+    admin_polygons: []const model.AdminPolygon = &.{},
+    admin_rings: []const model.Span = &.{},
+    admin_coordinates: []const model.Coordinate = &.{},
+
+    fn validate(self: AdminGeometry, core: Data, deadline: io.Deadline) !void {
+        for (self.admin_coordinates, 0..) |coordinate, i| {
+            try checkAt(deadline, i);
+            if (!coordinate.inRange()) return error.InvalidGeocodeAdminGeometry;
+        }
+        var next_ring: usize = 0;
+        var next_point: usize = 0;
+        for (self.admin_polygons, 0..) |entry, i| {
+            try checkAt(deadline, i);
+            if (entry.reserved != 0 or (try core.admin(entry.admin)) == null or
+                entry.holes.first != next_ring or entry.outer.first != next_point or entry.outer.len < 3)
+                return error.InvalidGeocodeAdminGeometry;
+            const outer = try entry.outer.get(self.admin_coordinates);
+            const holes = try entry.holes.get(self.admin_rings);
+            next_point += outer.len;
+            for (holes, 0..) |ring, j| {
+                try checkAt(deadline, j);
+                if (ring.first != next_point or ring.len < 3) return error.InvalidGeocodeAdminGeometry;
+                next_point += (try ring.get(self.admin_coordinates)).len;
+            }
+            next_ring += holes.len;
+        }
+        if (next_ring != self.admin_rings.len or next_point != self.admin_coordinates.len)
+            return error.InvalidGeocodeAdminGeometry;
+    }
+};
 
 pub const AddressData = struct {
     country_codes: []const model.Span = &.{},
@@ -44,8 +77,10 @@ pub const AddressData = struct {
                 return error.InvalidGeocodeAddressIndex;
             if (range.attr.mode == .alphabetic) {
                 if (@max(range.first, range.last) > 26) return error.InvalidGeocodeAddressIndex;
-            } else if (range.alphabetic_base != 0) {
-                return error.InvalidGeocodeAddressIndex;
+            } else {
+                if (range.alphabetic_base != 0) return error.InvalidGeocodeAddressIndex;
+                if ((range.attr.mode == .even or range.attr.mode == .odd) and @max(range.first, range.last) > std.math.maxInt(u32) / 2)
+                    return error.InvalidGeocodeAddressIndex;
             }
             try core.checkHierarchy(range.hierarchy);
         }
@@ -125,6 +160,7 @@ pub const Data = struct {
     text: []const u8 = &.{},
     street_ways: []const i64 = &.{},
     address_data: ?AddressData = null,
+    admin_geometry: ?AdminGeometry = null,
 
     pub fn coverage(self: Data, deadline: io.Deadline) !Coverage {
         var result: Coverage = .{};
@@ -184,6 +220,7 @@ pub const Data = struct {
             try nonEmpty(poi.kind, self.text);
         }
         if (self.address_data) |addresses| try addresses.validate(self, deadline);
+        if (self.admin_geometry) |geometry| try geometry.validate(self, deadline);
     }
 
     pub fn admin(self: Data, id: model.AdminId) !?model.Admin {
@@ -267,10 +304,12 @@ pub const Bundle = struct {
         var result: Bundle = .{ .uuid = undefined, .data = .{}, .mappings = @splat(null) };
         errdefer result.close();
         var addresses: AddressData = .{};
-        var extra: usize = 0;
+        var geometry: AdminGeometry = .{};
+        var address_files: usize = 0;
+        var geometry_files: usize = 0;
         inline for (sections, 0..) |section, i| {
             const mapping: ?io.Mapping = map(dir, section) catch |err| blk: {
-                if (section.addressSection() and err == error.FileNotFound) break :blk null;
+                if ((section.addressSection() or section.geometrySection()) and err == error.FileNotFound) break :blk null;
                 return err;
             };
             if (mapping) |present| {
@@ -279,15 +318,21 @@ pub const Bundle = struct {
                 result.uuid = decoded.uuid;
                 if (comptime section.addressSection()) {
                     @field(addresses, @tagName(section)) = decoded.records;
-                    extra += 1;
+                    address_files += 1;
+                } else if (comptime section.geometrySection()) {
+                    @field(geometry, @tagName(section)) = decoded.records;
+                    geometry_files += 1;
                 } else {
                     @field(result.data, @tagName(section)) = decoded.records;
                 }
             }
         }
-        if (extra == sections.len - base_section_count) {
+        if (address_files == address_section_count) {
             result.data.address_data = addresses;
-        } else if (extra != 0) return error.IncompleteGeocodeAddressIndex;
+        } else if (address_files != 0) return error.IncompleteGeocodeAddressIndex;
+        if (geometry_files == geometry_section_count) {
+            result.data.admin_geometry = geometry;
+        } else if (geometry_files != 0) return error.IncompleteGeocodeAdminGeometry;
         try result.data.validate(deadline);
         return result;
     }
@@ -325,6 +370,10 @@ pub fn write(path: []const u8, uuid: model.DatasetUuid, data: Data, deadline: io
         if (comptime section.addressSection()) {
             if (data.address_data) |addresses| {
                 try writeRecords(staged.dir, section, uuid, @field(addresses, @tagName(section)), deadline);
+            }
+        } else if (comptime section.geometrySection()) {
+            if (data.admin_geometry) |geometry| {
+                try writeRecords(staged.dir, section, uuid, @field(geometry, @tagName(section)), deadline);
             }
         } else {
             try writeRecords(staged.dir, section, uuid, @field(data, @tagName(section)), deadline);

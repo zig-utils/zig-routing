@@ -8,6 +8,7 @@ const polygon_index = @import("../geo/polygon_index.zig");
 const PointLL = @import("../geo/point.zig").PointLL;
 const model = @import("model.zig");
 const tags = @import("tags.zig");
+const admin_geometry = @import("admin_geometry.zig");
 const Allocator = std.mem.Allocator;
 const eql = std.mem.eql;
 
@@ -149,7 +150,7 @@ pub const Index = struct {
             var parent_role = @backingInt(division);
             while (parent_role != 0) {
                 parent_role -= 1;
-                const parent = selected[parent_role];
+                const parent = selected.ids[parent_role];
                 if (parent == .unknown) continue;
                 record.parent = parent;
                 break;
@@ -165,30 +166,20 @@ pub const Index = struct {
     }
 
     pub fn lookup(self: *Index, coordinate: model.Coordinate) !model.Hierarchy {
-        const selected = try self.find(coordinate.toPoint(), 0);
-        var result: model.Hierarchy = .{};
-        inline for (std.enums.values(model.Division)) |role_value| {
-            @field(result, @tagName(role_value)) = selected[@backingInt(role_value)];
-        }
-        return result;
+        return (try self.find(coordinate.toPoint(), 0)).hierarchy();
     }
 
-    fn find(self: *Index, point: PointLL, min_area: f64) ![5]model.AdminId {
+    fn find(self: *Index, point: PointLL, min_area: f64) !admin_geometry.Choice {
         self.hits.clearRetainingCapacity();
         try self.tree.lookup(self.a, point, &self.hits, self.deadline);
-        var selected: [5]model.AdminId = @splat(.unknown);
-        var best_area: [5]f64 = @splat(std.math.inf(f64));
+        var selected: admin_geometry.Choice = .{};
         for (self.hits.items) |hit| {
             if (self.deadline.expired()) return error.DeadlineExceeded;
             const i = self.owners[hit];
             const area = self.areas[i];
             if (area < min_area) continue;
-            const role_index = @backingInt(self.records[i].attr.division);
             const id = std.math.cast(u32, i + 1) orelse return error.GeocodeSectionTooLarge;
-            if (area > best_area[role_index] or (area == best_area[role_index] and id >= @backingInt(selected[role_index])))
-                continue;
-            best_area[role_index] = area;
-            selected[role_index] = @fromBackingInt(@intCast(id));
+            selected.add(self.records[i].attr.division, @fromBackingInt(id), area);
         }
         return selected;
     }

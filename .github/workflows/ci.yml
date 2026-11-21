@@ -101,6 +101,7 @@ jobs:
           assert result["requests_per_second"] >= budget["requests_per_second"], result
           assert result["steady_state_heap_calls"] == budget["steady_state_heap_calls"], result
           PY
+          zig build bench-geocode-reverse -Doptimize=ReleaseFast -- "$work/geocoder"
       - uses: actions/checkout@v6
         if: matrix.os == 'ubuntu-latest'
         with:

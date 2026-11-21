@@ -326,6 +326,23 @@ fn distanceToCell(point: geo.PointLL, id: u32) f64 {
 /// Sort order is cell ID, then the representative directed edge ID.
 pub const Pair = u64;
 
+/// Conservative grid cover for a point cap on the sphere.
+pub fn addCircleCover(a: Allocator, output: *std.ArrayList(Pair), id: u32, point: geo.PointLL, radius_m: f64, deadline: io.Deadline) !void {
+    if (!point.inRange()) return error.InvalidCoordinate;
+    if (!std.math.isFinite(radius_m) or radius_m < 0) return error.InvalidRadius;
+    const bounds = ScanBounds.spherical(point, radius_m);
+    for (bounds.south..bounds.north + 1) |row| {
+        if (deadline.expired()) return error.DeadlineExceeded;
+        for (bounds.longitude[0..bounds.range_count]) |range| {
+            for (range.first..range.end) |column| {
+                if (column % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
+                const cell = row * grid.snap_columns + column;
+                try output.append(a, (@as(u64, cell) << 32) | id);
+            }
+        }
+    }
+}
+
 pub fn addShape(gpa: Allocator, output: *std.ArrayList(Pair), representative: u32, points: []const geo.FixedLL, deadline: io.Deadline) !void {
     if (points.len < 2) return error.InvalidSegmentShape;
     const Sink = struct {
@@ -354,6 +371,32 @@ pub const Stats = struct {
     payload_bytes: u64,
 };
 
+/// In-memory form of the graph grid for callers that own their feature IDs.
+pub const Owned = struct {
+    view: View,
+    a: Allocator,
+
+    pub fn deinit(self: *Owned) void {
+        self.a.free(self.view.directory);
+        self.a.free(self.view.lists);
+        self.* = undefined;
+    }
+};
+
+pub fn encode(a: Allocator, pairs: []Pair, scratch: []Pair, count: u32, deadline: io.Deadline) !Owned {
+    if (pairs.len != scratch.len) return error.InvalidSpatialScratch;
+    try radix.sortByU64(Pair, a, pairs, scratch, {}, pairKey, deadline);
+    var directory: std.ArrayList(Entry) = .empty;
+    defer directory.deinit(a);
+    var sink: MemorySink = .{ .a = a };
+    defer sink.bytes.deinit(a);
+    try encodePairs(a, pairs, &directory, &sink, deadline);
+    const entries = try directory.toOwnedSlice(a);
+    errdefer a.free(entries);
+    const bytes = try sink.bytes.toOwnedSlice(a);
+    return .{ .a = a, .view = .{ .directory = entries, .lists = bytes, .edge_count = count } };
+}
+
 pub fn write(gpa: Allocator, pairs: []Pair, scratch: []Pair, dir: []const u8, bundle: *format.BundleWriter, deadline: io.Deadline) !Stats {
     if (pairs.len != scratch.len) return error.InvalidSpatialScratch;
     try radix.sortByU64(Pair, gpa, pairs, scratch, {}, pairKey, deadline);
@@ -362,38 +405,71 @@ pub fn write(gpa: Allocator, pairs: []Pair, scratch: []Pair, dir: []const u8, bu
     var directory: std.ArrayList(Entry) = .empty;
     defer directory.deinit(gpa);
     var buffer: [64 * 1024]u8 = undefined;
-    var bytes: std.Io.Writer = .fixed(&buffer);
-    var offset: u64 = 0;
+    var sink: FileSink = .{ .file = file, .buffer = &buffer };
+    try encodePairs(gpa, pairs, &directory, &sink, deadline);
+    try sink.flush();
+    try bundle.stream(.spatial, Payload{ .file = file, .length = sink.written, .directory = directory.items }, Payload.emit);
+    return .{
+        .cells = @intCast(directory.items.len),
+        .payload_bytes = @sizeOf(Header) + directory.items.len * @sizeOf(Entry) + sink.written,
+    };
+}
+
+fn encodePairs(a: Allocator, pairs: []const Pair, directory: *std.ArrayList(Entry), sink: anytype, deadline: io.Deadline) !void {
     var previous: ?Pair = null;
     for (pairs, 0..) |pair, i| {
         if (i % 1024 == 0 and deadline.expired()) return error.DeadlineExceeded;
         if (previous == pair) continue;
-        if (bytes.end + 5 > buffer.len) {
-            try file.pwriteAll(bytes.buffered(), offset);
-            offset += bytes.end;
-            bytes.end = 0;
-        }
         const id: u32 = @intCast(pair >> 32);
         const edge: u32 = @truncate(pair);
         const same_cell = if (previous) |prev| (prev >> 32) == id else false;
         if (!same_cell) {
             if (id >= cell_count) return error.InvalidSpatialCell;
-            const start = std.math.cast(u32, offset + bytes.end) orelse return error.SpatialListsTooLarge;
-            try directory.append(gpa, .{ .id = id, .offset = start });
+            const start = std.math.cast(u32, sink.offset()) orelse return error.SpatialListsTooLarge;
+            try directory.append(a, .{ .id = id, .offset = start });
         }
         const delta = edge - if (same_cell) @as(u32, @truncate(previous.?)) else 0;
-        try wire.writeVarint(&bytes, delta);
+        try wire.writeVarint(sink, delta);
         previous = pair;
     }
-    const length = offset + bytes.end;
-    if (length > std.math.maxInt(u32)) return error.SpatialListsTooLarge;
-    try file.pwriteAll(bytes.buffered(), offset);
-    try bundle.stream(.spatial, Payload{ .file = file, .length = length, .directory = directory.items }, Payload.emit);
-    return .{
-        .cells = @intCast(directory.items.len),
-        .payload_bytes = @sizeOf(Header) + directory.items.len * @sizeOf(Entry) + length,
-    };
+    if (sink.offset() > std.math.maxInt(u32)) return error.SpatialListsTooLarge;
 }
+
+const MemorySink = struct {
+    a: Allocator,
+    bytes: std.ArrayList(u8) = .empty,
+
+    fn offset(self: MemorySink) usize {
+        return self.bytes.items.len;
+    }
+
+    pub fn writeAll(self: *MemorySink, bytes: []const u8) !void {
+        try self.bytes.appendSlice(self.a, bytes);
+    }
+};
+
+const FileSink = struct {
+    file: io.File,
+    buffer: []u8,
+    used: usize = 0,
+    written: u64 = 0,
+
+    fn offset(self: FileSink) u64 {
+        return self.written + self.used;
+    }
+
+    fn flush(self: *FileSink) !void {
+        try self.file.pwriteAll(self.buffer[0..self.used], self.written);
+        self.written += self.used;
+        self.used = 0;
+    }
+
+    pub fn writeAll(self: *FileSink, bytes: []const u8) !void {
+        if (bytes.len > self.buffer.len - self.used) try self.flush();
+        @memcpy(self.buffer[self.used..][0..bytes.len], bytes);
+        self.used += bytes.len;
+    }
+};
 
 const Payload = struct {
     file: io.File,

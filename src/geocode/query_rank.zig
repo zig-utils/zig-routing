@@ -150,7 +150,7 @@ fn baseLanguage(tag: []const u8) []const u8 {
     return tag[0 .. std.mem.indexOfScalar(u8, tag, '-') orelse tag.len];
 }
 
-fn adminName(data: bundle.Data, id: model.AdminId, language: []const u8, deadline: io.Deadline) ![]const u8 {
+pub fn adminName(data: bundle.Data, id: model.AdminId, language: []const u8, deadline: io.Deadline) ![]const u8 {
     const admin = try data.admin(id) orelse return "";
     return (try selectName(data, admin.names, language, deadline)).text;
 }
@@ -166,6 +166,36 @@ pub fn assembleAll(a: Allocator, data: bundle.Data, top: Top, language: []const 
 
 pub fn assemble(a: Allocator, data: bundle.Data, candidate: Ranked, language: []const u8, deadline: io.Deadline) !Result {
     const doc = candidate.document;
+    const feature = retrieve.record(data, doc);
+    const detail = try describe(a, data, doc, language, deadline);
+    return .{
+        .document = doc,
+        .osm_id = feature.osm_id,
+        .source = feature.attr.source,
+        .kind = detail.kind,
+        .name = detail.name,
+        .formatted_address = detail.formatted_address,
+        .city = detail.city,
+        .country = detail.country,
+        .country_code = detail.country_code,
+        .postcode = detail.postcode,
+        .coordinate = feature.coordinate.toPoint(),
+        .bounds = try extent(data, doc, feature.coordinate.toPoint(), deadline),
+        .score = candidate.score,
+    };
+}
+
+pub const Description = struct {
+    kind: []const u8,
+    name: []const u8,
+    formatted_address: []const u8,
+    city: []const u8,
+    country: []const u8,
+    country_code: []const u8,
+    postcode: []const u8,
+};
+
+pub fn describe(a: Allocator, data: bundle.Data, doc: format.Document, language: []const u8, deadline: io.Deadline) !Description {
     const feature = retrieve.record(data, doc);
     const subject = feature.hierarchy;
     const country = try adminName(data, subject.country, language, deadline);
@@ -194,6 +224,18 @@ pub fn assemble(a: Allocator, data: bundle.Data, candidate: Ranked, language: []
             break :address "address";
         },
     };
+    return .{
+        .kind = kind,
+        .name = name,
+        .formatted_address = try formatAddress(a, iso, name, country, components),
+        .city = city,
+        .country = country,
+        .country_code = iso,
+        .postcode = postcode_text,
+    };
+}
+
+pub fn formatAddress(a: Allocator, iso: []const u8, name: []const u8, country: []const u8, components: address_format.Components) ![]const u8 {
     const street_buffer = try a.alloc(u8, components.street.len + components.number.len + components.unit.len + 8);
     const locality_buffer = try a.alloc(u8, components.postcode.len + components.locality.len + 8);
     const lines = try address_format.render(iso, components, street_buffer, locality_buffer);
@@ -208,21 +250,7 @@ pub fn assemble(a: Allocator, data: bundle.Data, candidate: Ranked, language: []
             count += 1;
         }
     }
-    return .{
-        .document = doc,
-        .osm_id = feature.osm_id,
-        .source = feature.attr.source,
-        .kind = kind,
-        .name = name,
-        .formatted_address = try std.mem.join(a, ", ", display[0..count]),
-        .city = city,
-        .country = country,
-        .country_code = iso,
-        .postcode = postcode_text,
-        .coordinate = feature.coordinate.toPoint(),
-        .bounds = try extent(data, doc, feature.coordinate.toPoint(), deadline),
-        .score = candidate.score,
-    };
+    return std.mem.join(a, ", ", display[0..count]);
 }
 
 fn extent(data: bundle.Data, doc: format.Document, center: geo.PointLL, deadline: io.Deadline) !Bounds {

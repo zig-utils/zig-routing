@@ -202,6 +202,13 @@ fn createCommands(a: Allocator) !*Command {
     _ = try command(geocode_cmd, "suggest", "Match an unfinished geocoding query", suggestGeocode, &geocode_filters, &.{
         arg("BUNDLE", "Geocoding bundle directory"), arg("TEXT", "Text typed so far"),
     });
+    _ = try command(geocode_cmd, "reverse", "Find geocoding features near a coordinate", reverseGeocode, &.{
+        option("radius", "Search radius in metres (default 200)", .float),
+        option("limit", "Maximum results (default 1)", .int),
+        option("layer", "Nearest, address, street, poi, place, city or country", .string),
+        option("language", "Preferred result language", .string),
+        option("timeout", "Time limit for opening the bundle and searching", .string),
+    }, &.{ arg("BUNDLE", "Geocoding bundle directory"), arg("LON,LAT", "Longitude and latitude") });
     _ = try command(geocode_cmd, "postcode", "Look up postcode centroids and extents", lookupGeocodePostcodes, &.{
         option("timeout", "Time limit for bundle verification and lookup", .string),
     }, &.{
@@ -753,6 +760,7 @@ fn inspectGeocode(ctx: *Context) !u8 {
         .addresses = data.addresses.len,
         .pois = data.pois.len,
         .admins = data.admins.len,
+        .admin_polygons = if (data.admin_geometry) |geometry| geometry.admin_polygons.len else 0,
         .house_links = if (data.address_data) |addresses| addresses.house_links.len else 0,
         .interpolations = if (data.address_data) |addresses| addresses.interpolations.len else 0,
         .postcodes = if (data.address_data) |addresses| addresses.postcodes.len else 0,
@@ -817,6 +825,28 @@ fn suggestGeocode(ctx: *Context) !u8 {
         .limit = limit,
     }, deadline);
     try ctx.writeJson(found);
+    return 0;
+}
+
+fn reverseGeocode(ctx: *Context) !u8 {
+    const reverse = routing.geocode.reverse;
+    const point = geocodeNumbers(2, ctx.getArgument(1).?) catch return badOption(ctx, "expected longitude,latitude");
+    var request: reverse.Request = .{
+        .point = .init(point[0], point[1]),
+        .language = ctx.getOption("language") orelse "",
+    };
+    if (ctx.getOption("radius")) |text| {
+        request.radius_m = std.fmt.parseFloat(f64, text) catch return badOption(ctx, "--radius expects metres");
+    }
+    if (ctx.getOption("layer")) |name| {
+        request.layer = std.meta.stringToEnum(reverse.Layer, name) orelse
+            return badOption(ctx, "--layer expects nearest, address, street, poi, place, city or country");
+    }
+    request.limit = (try unsigned(ctx, usize, "limit")) orelse request.limit;
+    const deadline: io.Deadline = if (try duration(ctx, "timeout")) |ns| .fromNow(ns) else .none;
+    var engine = try reverse.Engine.open(std.heap.page_allocator, ctx.getArgument(0).?, deadline);
+    defer engine.close();
+    try ctx.writeJson(try engine.lookup(App.from(ctx).arena, request, deadline));
     return 0;
 }
 

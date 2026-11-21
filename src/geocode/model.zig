@@ -102,6 +102,13 @@ pub const Admin = extern struct {
     },
 };
 
+pub const AdminPolygon = extern struct {
+    admin: AdminId,
+    outer: Span,
+    holes: Span,
+    reserved: u32 = 0,
+};
+
 pub const HouseKey = extern struct {
     number: u32,
     fraction: packed struct(u32) {
@@ -185,9 +192,16 @@ pub const Section = enum(u32) {
     house_links = 13,
     interpolations = 14,
     postcodes = 15,
+    admin_polygons = 16,
+    admin_rings = 17,
+    admin_coordinates = 18,
 
     pub fn addressSection(self: Section) bool {
-        return @backingInt(self) >= @backingInt(Section.country_codes);
+        return @backingInt(self) >= @backingInt(Section.country_codes) and !self.geometrySection();
+    }
+
+    pub fn geometrySection(self: Section) bool {
+        return @backingInt(self) >= @backingInt(Section.admin_polygons);
     }
 
     pub fn filename(self: Section) [:0]const u8 {
@@ -207,6 +221,9 @@ pub const Section = enum(u32) {
             .house_links => "house-links.bin",
             .interpolations => "interpolations.bin",
             .postcodes => "postcodes.bin",
+            .admin_polygons => "admin-polygons.bin",
+            .admin_rings => "admin-rings.bin",
+            .admin_coordinates => "admin-coordinates.bin",
         };
     }
 
@@ -220,11 +237,12 @@ pub const Section = enum(u32) {
             .names => Name,
             .text => u8,
             .street_ways => i64,
-            .country_codes, .street_shapes, .street_houses => Span,
-            .address_coordinates => Coordinate,
+            .country_codes, .street_shapes, .street_houses, .admin_rings => Span,
+            .address_coordinates, .admin_coordinates => Coordinate,
             .house_links => HouseLink,
             .interpolations => Interpolation,
             .postcodes => Postcode,
+            .admin_polygons => AdminPolygon,
         };
     }
 };
@@ -278,6 +296,8 @@ comptime {
     std.debug.assert(@sizeOf(Poi) == 72 and @offsetOf(Poi, "record") == 0 and @offsetOf(Poi, "category") == 56 and @offsetOf(Poi, "kind") == 64);
     std.debug.assert(@sizeOf(Admin) == 24 and @offsetOf(Admin, "osm_id") == 0 and @offsetOf(Admin, "names") == 8 and
         @offsetOf(Admin, "parent") == 16 and @offsetOf(Admin, "attr") == 20);
+    std.debug.assert(@sizeOf(AdminPolygon) == 24 and @offsetOf(AdminPolygon, "admin") == 0 and
+        @offsetOf(AdminPolygon, "outer") == 4 and @offsetOf(AdminPolygon, "holes") == 12 and @offsetOf(AdminPolygon, "reserved") == 20);
     std.debug.assert(@sizeOf(HouseKey) == 16 and @offsetOf(HouseKey, "number") == 0 and @offsetOf(HouseKey, "fraction") == 4 and
         @offsetOf(HouseKey, "letters") == 8);
     std.debug.assert(@sizeOf(HouseLink) == 56 and @offsetOf(HouseLink, "object_id") == 0 and @offsetOf(HouseLink, "street_way") == 4 and
