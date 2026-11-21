@@ -577,7 +577,7 @@
       "The radix queue, turn-row reuse and grid changes measured 37.280 ms native, 42.922 ms native baseline and 34.742 ms Valhalla. See docs/experiments/isochrone.md.",
       "P7.07b reused graph operands. Grouped radix buckets and raster arithmetic subsequently reduced the native median from 37.021 ms to 35.176 ms, compared with 36.271 ms in Valhalla.",
       "P7.07c measured 21.565 ms for traversal and 12.835 ms for raster replay against a 7.171 ms end-to-end target. The layout improved full Utrecht time by 6.1% and remains a benchmark option.",
-      "P7.07d and P7.07e separately evaluate the remaining traversal and raster bottlenecks. The end-to-end 5x gate stays here."
+      "The combined movement and geometry layouts measured 28.315 ms against 35.581 ms in Valhalla. P7.07f evaluates the cell overlay. The end-to-end 5x gate stays here."
     ],
     "accept": [
       "At least 5x faster than Valhalla 3.9.3 over the matched expansion corpus.",
@@ -641,6 +641,24 @@
       "Before and after timings and memory costs are reproducible on the same Linux hardware on both fixtures.",
       "Forward and reverse grids and label traces match byte for byte, including repeated points, clipped origins and shapes crossing multiple cells. Warmed requests make zero backing allocator calls.",
       "Document the measured tradeoff and an adoption decision. Run the full suite and binary budget for any retained source changes."
+    ]
+  },
+  {
+    "key": "P7.07f",
+    "goal": "Measure whether the turn-aware cell overlay can reduce exact isochrone traversal and rasterization enough to advance the fivefold target in P7.07a.",
+    "scope": [
+      "Build a prototype on the boundary-arc overlay and contiguous cells from P7.05. Measure the priority queue work saved and the cost of reconstructing or processing cell-interior arrivals.",
+      "Preserve exact generalized costs, seconds and distances, insertion-order ties, predecessor restrictions, fractional origins, and the full padded arrival grid. Check shortcut arithmetic against the original f32 accumulation.",
+      "Compare against the bounded sweep and raster replay on Utrecht and a larger fixture. Cover forward and reverse, timed and restricted cases, older bundles, deadlines and warmed request allocation."
+    ],
+    "notes": [
+      "The measured combined benchmark used 19.530 ms for traversal and 8.189 ms for raster replay on Utrecht, with a 7.116 ms end-to-end target.",
+      "Baum et al. use graph partitions and PHAST-style scanning for boundary-edge isochrones. This project needs the full Valhalla arrival grid. See https://arxiv.org/abs/1512.09090."
+    ],
+    "accept": [
+      "Reproducible same-platform measurements record end-to-end time, traversal and output work, overlay construction and memory.",
+      "Any accelerated results match the native grids byte for byte, with exact turn and arrival tests for the chosen path. Warmed requests use zero backing allocator calls.",
+      "Document an adoption decision and keep the original 5x gate in P7.07a. Run the full suite and binary budget for retained source changes."
     ]
   },
   {

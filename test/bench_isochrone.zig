@@ -214,12 +214,16 @@ const Measurement = struct {
     geometry: ?*const iso.GeometryLayout,
 
     fn run(self: Measurement, engine: anytype, kernel: anytype, request: iso.Request) !void {
-        if (self.geometry) |geometry|
-            try self.measure(engine, kernel, request, {}, geometry)
-        else if (self.layout) |layout|
-            try self.measure(engine, kernel, request, layout, {})
-        else
+        if (self.layout) |layout| {
+            if (self.geometry) |geometry|
+                try self.measure(engine, kernel, request, layout, geometry)
+            else
+                try self.measure(engine, kernel, request, layout, {});
+        } else if (self.geometry) |geometry| {
+            try self.measure(engine, kernel, request, {}, geometry);
+        } else {
             try self.measure(engine, kernel, request, {}, {});
+        }
     }
 
     fn measure(self: Measurement, engine: anytype, kernel: anytype, request: iso.Request, layout: anytype, geometry: anytype) !void {
@@ -386,7 +390,7 @@ pub fn main(init: std.process.Init) !void {
         } else return error.InvalidArguments;
     }
     if ((profile and (prepare_layout or prepare_headings or geometry_mode != null)) or (prepare_layout and prepare_headings) or
-        (geometry_mode != null and (prepare_layout or prepare_headings)) or (raster_profile and !stages) or
+        (raster_profile and !stages) or
         (trace_states and trace_path == null)) return error.InvalidArguments;
     const input = try io.File.open(input_path, .read_only);
     defer input.close();

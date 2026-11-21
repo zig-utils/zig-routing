@@ -463,6 +463,60 @@ cmp base.trace test.trace
 
 Repeat the byte comparison with `--geometry-distances`.
 
+## Combined layout measurements and the fivefold gate
+
+The benchmark can use the movement layout and either geometry layout
+together. It tested all three native configurations and Valhalla 3.9.3
+on the same Utrecht tile and ARM64 Linux CPU 0. Sixteen rounds used
+four balanced orders, recording four requests per round. The results
+below are medians of the per-request times and, in the last row, the
+per-round totals.
+
+| Utrecht request | Native baseline | Movements and samples | Movements and distances | Valhalla 3.9.3 |
+| --- | ---: | ---: | ---: | ---: |
+| Auto, 9.1 min | 11.243 ms | 8.742 ms | 9.046 ms | 10.989 ms |
+| Auto, two origins, 2 min | 10.393 ms | 8.586 ms | 8.652 ms | 10.526 ms |
+| Pedestrian, 12 min and 1.4 km | 6.863 ms | 5.754 ms | 5.950 ms | 7.167 ms |
+| Auto, reverse, 1 min | 6.902 ms | 5.557 ms | 5.648 ms | 7.095 ms |
+| **Full grid** | **35.519 ms** | **28.315 ms** | **29.077 ms** | **35.581 ms** |
+
+The two native combinations reproduce all four baseline grids and
+143,389 extended settled records byte for byte. They keep zero warmed
+backing allocator calls. The sample combination adds 4,518,976 graph
+table bytes and the distance combination adds 3,441,668 bytes.
+
+In a separate 12-round series, baseline traversal and raster replay
+took 21.292 ms and 13.078 ms. The sample combination took 19.530 ms
+and 8.189 ms. The distance combination took 19.228 ms and 8.772 ms.
+Each series uses its own cache state. The best full result is 1.26x
+faster than Valhalla. The fivefold threshold is 7.116 ms in these
+trials, below the observed time of either isolated stage.
+
+Two local trials kept the same bounds and byte comparisons. Exact
+per-profile edge and turn prices added 9,736,640 table bytes and moved
+the same-runner full median from 28.785 ms to 29.349 ms. The timed-access
+and multi-via grids and extended traces also matched. Reusing the
+projected row for the raster neighbor check moved isolated raster time
+from 12.987 ms to 12.954 ms at baseline and from 7.795 ms to 7.869 ms
+with the movement and sample layouts. Both trials were discarded.
+
+[#262](https://github.com/zig-utils/zig-routing/issues/262) evaluates a
+different traversal structure using the turn-aware cell overlay from
+[#162](https://github.com/zig-utils/zig-routing/issues/162). Published
+partition-based methods target edges on the boundary of reachability.
+The native comparison here requires the full padded grid, including
+both arrival metrics, precise accumulated costs and direction-specific
+restrictions. [Fast Computation of Isochrones in Road Networks](https://arxiv.org/abs/1512.09090)
+
+Use the same fixture and pinned executable as in the earlier comparisons.
+The flags can be combined for both the full and split runs.
+
+```sh
+taskset -c 0 ./bench-isochrone BUNDLE requests.jsonl /dev/null --layout --geometry --rss --memory
+taskset -c 0 ./bench-isochrone BUNDLE requests.jsonl /dev/null --layout --geometry-distances --rss --memory
+taskset -c 0 ./bench-isochrone BUNDLE requests.jsonl combined.grid combined.trace --layout --geometry --trace-states --stages
+```
+
 ## Reproduction
 
 Set `mjolnir.hierarchy` and `mjolnir.shortcuts` to `false` in a Valhalla
