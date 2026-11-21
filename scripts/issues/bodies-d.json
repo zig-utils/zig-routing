@@ -576,7 +576,8 @@
       "The parity-corrected arm64 Linux pilot measured 45.175 ms native and 36.343 ms in Valhalla.",
       "The radix queue, turn-row reuse and grid changes measured 37.280 ms native, 42.922 ms native baseline and 34.742 ms Valhalla. See docs/experiments/isochrone.md.",
       "P7.07b reused graph operands. Grouped radix buckets and raster arithmetic subsequently reduced the native median from 37.021 ms to 35.176 ms, compared with 36.271 ms in Valhalla.",
-      "P7.07c measures a compact turn-movement layout. The end-to-end 5x gate stays here."
+      "P7.07c measured 21.565 ms for traversal and 12.835 ms for raster replay against a 7.171 ms end-to-end target. The layout improved full Utrecht time by 6.1% and remains a benchmark option.",
+      "P7.07d and P7.07e separately evaluate the remaining traversal and raster bottlenecks. The end-to-end 5x gate stays here."
     ],
     "accept": [
       "At least 5x faster than Valhalla 3.9.3 over the matched expansion corpus.",
@@ -612,6 +613,34 @@
       "Before and after timings and memory costs are reproducible on the same Linux hardware, including a larger graph and the original four Utrecht requests.",
       "Forward and reverse arrival grids and settled label traces match byte for byte. Timed and restricted cases pass and warmed runs make zero backing allocator calls.",
       "Record the speedup and memory tradeoff and whether the layout merits adoption. The full suite and binary budget pass for any retained source changes."
+    ]
+  },
+  {
+    "key": "P7.07d",
+    "goal": "Measure whether a compact exact queue and label store can materially reduce isochrone traversal time.",
+    "scope": [
+      "Use the isolated traversal runner from P7.07c to measure queue, status and label traffic on Utrecht and the larger Luxembourg fixture.",
+      "Prototype a queue and label layout that reduces random arena reads while retaining exact f32 cost order and insertion order for ties. Preserve the actual access, timing and restriction contexts, including aliases and partial origins.",
+      "Measure isolated traversal, full grid time, request arena high-water even on timed cases, and any graph-side memory. Keep deadlines and cancellation."
+    ],
+    "accept": [
+      "Before and after timings and memory costs are reproducible on the same Linux hardware on both fixtures.",
+      "Forward and reverse settled label traces and arrival grids match byte for byte. Timed and restricted cases pass, and warmed requests make zero backing allocator calls.",
+      "Document the measured tradeoff and an adoption decision. Run the full suite and binary budget for any retained source changes."
+    ]
+  },
+  {
+    "key": "P7.07e",
+    "goal": "Measure whether reusable exact geometry can materially reduce isochrone raster time without duplicating per-worker shape caches.",
+    "scope": [
+      "Use the isolated raster replay and full grid runner from P7.07c. Measure stored shape decoding, resampling and cell painting on Utrecht and Luxembourg.",
+      "Evaluate a bundle-derived geometry representation shared by workers. Preserve the original resampling arithmetic and stored direction, partial origin clipping, dynamically aligned cells and the same padded search bounds.",
+      "Measure startup work, resident table bytes and warmed request memory alongside both raster and full grid time. Preserve older bundles and exercise the supported cell sizes."
+    ],
+    "accept": [
+      "Before and after timings and memory costs are reproducible on the same Linux hardware on both fixtures.",
+      "Forward and reverse grids and label traces match byte for byte, including repeated points, clipped origins and shapes crossing multiple cells. Warmed requests make zero backing allocator calls.",
+      "Document the measured tradeoff and an adoption decision. Run the full suite and binary budget for any retained source changes."
     ]
   },
   {

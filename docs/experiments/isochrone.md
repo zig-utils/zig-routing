@@ -232,6 +232,22 @@ All 39 native test steps passed. The Linux x86-64 ReleaseFast binary is
 14,385,776 bytes, 568 bytes above the base, with five search instantiations
 and five costing kernels.
 
+## Node-to-grid lookup trial
+
+A request-local cache reused the grid cell of each short edge's endpoint
+nodes. It initialized 122,552 bytes on Utrecht. Eighteen alternating ARM64
+Linux pairs at `71b5b01` measured 36.183 ms for the full baseline and
+36.227 ms with the cache. The isolated raster replay moved from 12.801 to
+12.680 ms in a separate set of eighteen pairs. All grids and traces matched
+byte for byte and warmed runs made zero backing allocator calls. The small
+replay gain did not carry through to the full workload, so the cache was
+discarded.
+
+The isolated timings leave work in both stages. [#260](https://github.com/zig-utils/zig-routing/issues/260)
+tracks a more compact exact queue and label store, and [#261](https://github.com/zig-utils/zig-routing/issues/261)
+tracks graph-derived geometry reuse. [#251](https://github.com/zig-utils/zig-routing/issues/251)
+retains the original paired end-to-end gate.
+
 ## Reproduction
 
 Set `mjolnir.hierarchy` and `mjolnir.shortcuts` to `false` in a Valhalla
