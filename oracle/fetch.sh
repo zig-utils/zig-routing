@@ -7,7 +7,7 @@ IFS=$'\t' read -r _ pbf_url pbf_sha tiles profile second_url second_sha <<<"$row
 dir="$ORACLE_DATA/$name"
 case "${profile:-fixture}" in
   fixture) seconds=180 ;;
-  production) seconds=14400 ;;
+  production) seconds=28800 ;;
   *) die "unknown build profile '$profile'" ;;
 esac
 if [ -n "${second_url:-}" ] && [ -z "${second_sha:-}" ]; then die "missing secondary PBF checksum"; fi

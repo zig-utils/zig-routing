@@ -84,14 +84,25 @@ fetch_checked() {
   local url="$1" dest="$2" want="$3" seconds="${4:-180}"
   [[ "$want" =~ ^[0-9a-f]{64}$ ]] || die "invalid SHA-256 for $url"
   if [ -f "$dest" ] && [ "$(sha256 "$dest")" = "$want" ]; then return 0; fi
-  local args=(--connect-timeout 15 --max-time "$seconds" --retry 4 --retry-all-errors --retry-delay 5)
-  if [ "$seconds" -gt 180 ]; then args+=(--continue-at -); else rm -f "$dest.part"; fi
-  if ! curl -sSfL "${args[@]}" -o "$dest.part" "$url"; then
-    if [ "$seconds" -le 180 ]; then rm -f "$dest.part"; fi
-    die "download failed: $url"
+  local partial="$dest.part" args=(--connect-timeout 15 --max-time "$seconds")
+  if [ "$seconds" -gt 180 ]; then
+    args+=(--continue-at - --speed-time 120 --speed-limit 1024)
+    local attempt
+    for attempt in 1 2 3 4 5; do
+      if curl -sSfL "${args[@]}" -o "$partial" "$url"; then break; fi
+      if [ -f "$partial" ] && [ "$(sha256 "$partial")" = "$want" ]; then break; fi
+      if [ "$attempt" -eq 5 ]; then die "download failed: $url"; fi
+      sleep 5
+    done
+  else
+    rm -f "$partial"
+    if ! curl -sSfL "${args[@]}" --retry 4 --retry-all-errors --retry-delay 5 -o "$partial" "$url"; then
+      rm -f "$partial"
+      die "download failed: $url"
+    fi
   fi
   local got
-  got=$(sha256 "$dest.part")
-  [ "$got" = "$want" ] || { rm -f "$dest.part"; die "checksum mismatch for $url: got $got"; }
-  mv "$dest.part" "$dest"
+  got=$(sha256 "$partial")
+  [ "$got" = "$want" ] || { rm -f "$partial"; die "checksum mismatch for $url: got $got"; }
+  mv "$partial" "$dest"
 }
