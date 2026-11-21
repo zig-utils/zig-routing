@@ -251,8 +251,6 @@ const Label = struct {
     },
     node: NodeId,
     predecessor: u32 = no_label,
-    next_at_edge: u32 = no_label,
-    inactive: bool = false,
     terminal: bool = false,
     forbid_initial_uturn: bool = false,
     can_board: bool = true,
@@ -268,6 +266,46 @@ const Label = struct {
         return road;
     }
 };
+
+/// Queue and dominance state for one accepted label. The graph supplies the
+/// arrival node and the route supplies the walking turn when unpacked.
+const StoredLabel = struct {
+    elapsed: Cost,
+    movement: u32,
+    predecessor: u32,
+    next_at_edge: u32,
+    contexts: packed struct(u32) { journey: u16, turn: u16 },
+    flags: Flags,
+
+    const Flags = packed struct(u32) {
+        walk_distance: u17,
+        extended: bool,
+        is_ride: bool,
+        has_cut: bool,
+        inactive: bool = false,
+        turn_alias: bool,
+        destination_only: bool,
+        vehicle_exceptions: u7,
+        forbid_initial_uturn: bool,
+        can_board: bool,
+    };
+
+    fn access(self: StoredLabel) costing.base.AccessState {
+        return .{ .destination_only = self.flags.destination_only, .vehicle_exceptions = self.flags.vehicle_exceptions };
+    }
+};
+
+const LabelContext = struct {
+    walk_distance: u32 = 0,
+    journey: u32 = 0,
+    turn: u32 = 0,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(StoredLabel) == 28);
+}
+
+const StoredRide = struct { run: Ride, transition: Cost };
 
 const TransferIndex = struct {
     const Key = struct { from: u32, to: u32 };
@@ -553,8 +591,10 @@ const Query = struct {
     timed_hits: std.AutoHashMapUnmanaged(StreetState, u32) = .empty,
     ride_hits: std.AutoHashMapUnmanaged(RideState, u32) = .empty,
     journeys: std.AutoArrayHashMapUnmanaged(Journey, void) = .empty,
-    rides: std.ArrayList(Ride) = .empty,
-    labels: paged.Array(Label, undefined) = .{},
+    rides: std.ArrayList(StoredRide) = .empty,
+    cuts: std.AutoHashMapUnmanaged(u32, core.Cut) = .empty,
+    labels: paged.Array(StoredLabel, undefined) = .{},
+    extended: paged.Array(LabelContext, .{}) = .{},
     label_count: u32 = 0,
     pending: queue.Heap = .{},
     terminal: ?Label = null,
@@ -563,13 +603,14 @@ const Query = struct {
         while (self.pending.pop()) |item| {
             try self.control.check();
             if (@as(f32, @bitCast(item.key)) >= self.bestPriority()) break;
-            const label = self.labels.get(item.label);
-            if (label.inactive) continue;
+            const stored = self.labels.get(item.label);
+            if (stored.flags.inactive) continue;
+            const label = try self.loadLabel(item.label, stored);
             if (!try self.canEnter(label.node)) continue;
             try self.expandWalk(item.label, label, self);
             if (label.can_board) try self.expandRides(item.label, label, self);
         }
-        if (self.terminal) |label| return self.trace(try self.appendLabel(label));
+        if (self.terminal) |label| return self.trace(try self.appendLabel(label, 0));
         return if (self.ceiling_hit) error.CostCeilingReached else error.NoPath;
     }
 
@@ -601,27 +642,124 @@ const Query = struct {
         }
         const steps = try self.a.alloc(Step, count);
         id = end;
+        const view = self.search.view;
         while (count != 0) {
             try self.control.check();
             count -= 1;
             const label = self.labels.get(id);
-            steps[count] = .{
-                .movement = switch (label.step.movement) {
-                    .walk => |walk| .{ .walk = walk },
-                    .ride => |index| .{ .ride = self.rides.items[index] },
-                },
-                .elapsed = label.step.elapsed,
-                .transition = label.step.transition,
-            };
+            var step: Step = .{ .movement = undefined, .elapsed = label.elapsed };
+            if (label.flags.is_ride) {
+                const ride = self.rides.items[label.movement];
+                step.movement = .{ .ride = ride.run };
+                step.transition = ride.transition;
+            } else {
+                const segment = self.walkSegment(label, id);
+                step.movement = .{ .walk = segment };
+                if (label.predecessor != no_label) {
+                    const previous = self.labels.get(label.predecessor);
+                    if (!previous.flags.is_ride) {
+                        const incoming: EdgeId = @fromBackingInt(previous.movement);
+                        const next_edge = try view.edge(segment.edge);
+                        const before = try view.edge(incoming);
+                        const at: NodeId = @fromBackingInt(before.head);
+                        step.transition = try self.walkTransition(
+                            at,
+                            try view.node(at),
+                            incoming,
+                            try view.class(before.cls.class_id),
+                            segment.edge,
+                            try view.class(next_edge.cls.class_id),
+                        );
+                    }
+                }
+            }
+            steps[count] = step;
             id = label.predecessor;
         }
-        return .{ .steps = steps, .total = self.labels.get(end).step.elapsed, .ignored_filter = self.ignored_filter };
+        return .{ .steps = steps, .total = self.labels.get(end).elapsed, .ignored_filter = self.ignored_filter };
     }
 
-    fn appendLabel(self: *Query, label: Label) !u32 {
+    fn walkSegment(self: *const Query, label: StoredLabel, id: u32) endpoints.Segment {
+        const cut = if (label.flags.has_cut) self.cuts.get(id).? else core.Cut{};
+        return .{ .edge = @fromBackingInt(label.movement), .begin = cut.begin, .end = cut.end };
+    }
+
+    fn labelContext(self: *const Query, label: StoredLabel, id: u32) LabelContext {
+        if (label.flags.extended) return self.extended.get(id);
+        return .{
+            .walk_distance = label.flags.walk_distance,
+            .journey = label.contexts.journey,
+            .turn = label.contexts.turn,
+        };
+    }
+
+    fn loadLabel(self: *const Query, id: u32, stored: StoredLabel) !Label {
+        const view = self.search.view;
+        const context = self.labelContext(stored, id);
+        var label: Label = .{
+            .step = .{ .movement = undefined, .elapsed = stored.elapsed },
+            .node = undefined,
+            .predecessor = stored.predecessor,
+            .walk_distance = context.walk_distance,
+            .journey = context.journey,
+            .forbid_initial_uturn = stored.flags.forbid_initial_uturn,
+            .can_board = stored.flags.can_board,
+            .access = stored.access(),
+            .turn = .{ .value = context.turn, .alias = stored.flags.turn_alias },
+        };
+        if (stored.flags.is_ride) {
+            const table = view.transit_index.?;
+            const ride = self.rides.items[stored.movement];
+            const line = table.lines[ride.run.departure.line];
+            label.node = @fromBackingInt(table.stops[line.destination].place.graph_node);
+            label.step.movement = .{ .ride = stored.movement };
+        } else {
+            const segment = self.walkSegment(stored, id);
+            label.node = @fromBackingInt((try view.edge(segment.edge)).head);
+            label.step.movement = .{ .walk = segment };
+        }
+        return label;
+    }
+
+    fn appendLabel(self: *Query, label: Label, next_at_edge: u32) !u32 {
         const next = self.label_count;
         if (next == no_label) return error.TooManySearchLabels;
-        (try self.labels.at(self.a, next)).* = label;
+        const has_cut = label.step.movement == .walk and
+            (label.step.movement.walk.begin != 0 or label.step.movement.walk.end != 1);
+        if (has_cut) {
+            const walk = label.step.movement.walk;
+            try self.cuts.put(self.a, next, .{ .begin = walk.begin, .end = walk.end });
+        }
+        const extended = label.walk_distance > std.math.maxInt(u17) or
+            label.journey > std.math.maxInt(u16) or label.turn.value > std.math.maxInt(u16);
+        if (extended) {
+            (try self.extended.at(self.a, next)).* = .{
+                .walk_distance = label.walk_distance,
+                .journey = label.journey,
+                .turn = label.turn.value,
+            };
+        }
+        (try self.labels.at(self.a, next)).* = .{
+            .elapsed = label.step.elapsed,
+            .movement = switch (label.step.movement) {
+                .walk => |walk| @backingInt(walk.edge),
+                .ride => |ride| ride,
+            },
+            .predecessor = label.predecessor,
+            .next_at_edge = next_at_edge,
+            .contexts = .{ .journey = @truncate(label.journey), .turn = @truncate(label.turn.value) },
+            .flags = .{
+                .walk_distance = @truncate(label.walk_distance),
+                .extended = extended,
+                .is_ride = label.step.movement == .ride,
+                .has_cut = has_cut,
+                .turn_alias = label.turn.alias,
+                .destination_only = label.access.destination_only,
+                .vehicle_exceptions = label.access.vehicle_exceptions,
+                .forbid_initial_uturn = label.forbid_initial_uturn,
+                .can_board = label.can_board,
+            },
+        };
         self.label_count += 1;
         return next;
     }
@@ -695,11 +833,13 @@ const Query = struct {
         var scanned: usize = 0;
         while (parent.* != 0) : (scanned += 1) {
             if (scanned % 64 == 0) try self.control.check();
-            const prior = try self.labels.at(self.a, parent.* - 1);
-            if (comparable(prior.*, candidate)) {
-                if (self.dominates(prior.*, candidate)) return;
-                if (self.dominates(candidate, prior.*)) {
-                    prior.inactive = true;
+            const index = parent.* - 1;
+            const prior = try self.labels.at(self.a, index);
+            const context = self.labelContext(prior.*, index);
+            if (comparable(prior.*, context, candidate)) {
+                if (self.dominates(prior.elapsed, context.walk_distance, candidate.step.elapsed, candidate.walk_distance, candidate.node, candidate.can_board)) return;
+                if (self.dominates(candidate.step.elapsed, candidate.walk_distance, prior.elapsed, context.walk_distance, candidate.node, candidate.can_board)) {
+                    prior.flags.inactive = true;
                     parent.* = prior.next_at_edge;
                     continue;
                 }
@@ -707,29 +847,26 @@ const Query = struct {
             parent = &prior.next_at_edge;
         }
         var label = candidate;
-        label.next_at_edge = slot.*;
         if (ride) |run| {
             label.step.movement.ride = std.math.cast(u32, self.rides.items.len) orelse return error.TooManySearchLabels;
-            try self.rides.append(self.a, run);
+            try self.rides.append(self.a, .{ .run = run, .transition = candidate.step.transition });
         }
-        const index = try self.appendLabel(label);
+        const index = try self.appendLabel(label, slot.*);
         try self.pending.push(self.a, queue.Entry.init(@floatCast(priority), index));
         slot.* = @intCast(index + 1);
     }
 
-    fn comparable(a: Label, b: Label) bool {
-        return a.journey == b.journey and std.meta.eql(a.turn, b.turn) and
-            std.meta.eql(a.access, b.access) and a.forbid_initial_uturn == b.forbid_initial_uturn and
-            a.can_board == b.can_board;
+    fn comparable(a: StoredLabel, context: LabelContext, b: Label) bool {
+        return context.journey == b.journey and context.turn == b.turn.value and a.flags.turn_alias == b.turn.alias and
+            std.meta.eql(a.access(), b.access) and a.flags.forbid_initial_uturn == b.forbid_initial_uturn and
+            a.flags.can_board == b.can_board;
     }
 
-    fn dominates(self: *const Query, a: Label, b: Label) bool {
-        if (a.walk_distance > b.walk_distance) return false;
-        const first = a.step.elapsed;
-        const second = b.step.elapsed;
+    fn dominates(self: *const Query, first: Cost, first_metres: u32, second: Cost, second_metres: u32, node: NodeId, can_board: bool) bool {
+        if (first_metres > second_metres) return false;
         if (first.secs == second.secs) return first.cost <= second.cost;
-        if (self.needsClock(b)) return false;
-        if (!b.can_board) return first.cost <= second.cost;
+        if (self.search.timed_walking.within(node, self.search.kernel.walking_limit -| second_metres)) return false;
+        if (!can_board) return first.cost <= second.cost;
         if (first.secs > second.secs) return false;
         // With static walking access, the earlier label can follow the
         // same walk and wait for the same departure. Allow for whole-second
@@ -789,6 +926,11 @@ const Query = struct {
         }
     }
 
+    fn walkTransition(self: *const Query, at: NodeId, node: *const graph.format.NodeHot, incoming: EdgeId, from: *const graph.class_table.EdgeClass, outgoing: EdgeId, to: *const graph.class_table.EdgeClass) !Cost {
+        const turn = try costing.pedestrian.Turn.read(self.search.view, at, incoming, outgoing);
+        return costing.pedestrian.Kernel.turnCost(&self.search.kernel.walking, node, from, to, turn);
+    }
+
     fn expandWalk(self: *Query, pred: u32, label: Label, sink: anytype) !void {
         const view = self.search.view;
         const kernel = self.search.kernel;
@@ -826,7 +968,7 @@ const Query = struct {
             const cost = kernel.scaleWalkCost(base_cost);
             if (!std.math.isFinite(cost.cost)) continue;
             const transition: Cost = if (previous != null)
-                costing.pedestrian.Kernel.turnCost(&kernel.walking, node, incoming, class, try costing.pedestrian.Turn.read(view, label.node, road.edgeId(), id))
+                try self.walkTransition(label.node, node, road.edgeId(), incoming, id, class)
             else
                 .{};
             const elapsed = label.step.elapsed.add(transition);
@@ -997,4 +1139,39 @@ test "after-midnight departures check the preceding service day's calendar" {
     try testing.expectEqual(1, found.offered.departure.trip);
     try testing.expectEqual(instant + 900, found.instant);
     try testing.expectEqual(null, try departures.next(.{}));
+}
+
+test "stored transit labels retain wide distances and restriction contexts" {
+    const testing = std.testing;
+    var arena = Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    var query: Query = .{
+        .search = undefined,
+        .a = arena.allocator(),
+        .control = .{},
+        .restrictions = undefined,
+        .targets = undefined,
+        .ceiling = 0,
+        .potential = undefined,
+        .ignored_filter = .{ false, false },
+    };
+    const edge: EdgeId = @fromBackingInt(123456);
+    const label: Label = .{
+        .node = @fromBackingInt(0),
+        .step = .{ .movement = .{ .walk = .{ .edge = edge, .begin = 0.25, .end = 0.75 } }, .elapsed = .{} },
+        .walk_distance = 200_000,
+        .journey = 90_000,
+        .turn = .{ .value = 110_000, .alias = true },
+        .access = .{ .destination_only = true, .vehicle_exceptions = 127 },
+    };
+    const id = try query.appendLabel(label, 7);
+    const stored = query.labels.get(id);
+    const context = query.labelContext(stored, id);
+    try testing.expectEqualDeep(label.step.movement.walk, query.walkSegment(stored, id));
+    try testing.expectEqual(label.walk_distance, context.walk_distance);
+    try testing.expectEqual(label.journey, context.journey);
+    try testing.expectEqual(label.turn.value, context.turn);
+    try testing.expect(stored.flags.turn_alias);
+    try testing.expectEqualDeep(label.access, stored.access());
+    try testing.expectEqual(@as(u32, 7), stored.next_at_edge);
 }

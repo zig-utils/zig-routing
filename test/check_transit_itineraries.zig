@@ -89,6 +89,15 @@ const Recost = struct {
     failure: ?[]const u8 = null,
 };
 
+const Measurement = struct {
+    iteration: usize,
+    peak_request_bytes: usize = 0,
+    reserved_bytes: usize = 0,
+    elapsed_ns: u64 = 0,
+    overrun_ns: u64 = 0,
+    backing_calls: usize = 0,
+};
+
 const Output = struct {
     index: usize,
     error_code: ?u32 = null,
@@ -99,6 +108,7 @@ const Output = struct {
     oracle_recost: ?Recost = null,
     native_recost: ?Recost = null,
     offers: ?[]const Offer = null,
+    measurement: ?Measurement = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -107,39 +117,65 @@ pub fn main(init: std.process.Init) !void {
     const bundle_path = args.next() orelse return error.MissingBundle;
     const corpus_path = args.next() orelse return error.MissingCorpus;
     const reference_path = args.next() orelse return error.MissingReference;
-    if (args.next() != null) return error.InvalidArguments;
+    var measure = false;
+    var repeat: usize = 1;
+    var deadline_ms: u64 = 20_000;
+    var replay_paths = true;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--measure")) {
+            measure = true;
+        } else if (std.mem.eql(u8, arg, "--repeat")) {
+            repeat = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
+        } else if (std.mem.eql(u8, arg, "--deadline-ms")) {
+            deadline_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
+            replay_paths = false;
+        } else return error.InvalidArguments;
+    }
+    if (repeat == 0) return error.InvalidArguments;
     var bundle = try graph.reader.Bundle.open(bundle_path);
     defer bundle.close();
     const corpus = try io.Mapping.mapFile(corpus_path, .read_only);
     defer corpus.unmap();
     const reference = try io.Mapping.mapFile(reference_path, .read_only);
     defer reference.unmap();
-    var arena = routing.infra.arena.Arena.init(init.gpa, .{});
+    var counting = routing.infra.arena.CountingAllocator.init(init.gpa);
+    var arena = routing.infra.arena.Arena.init(if (measure) counting.allocator() else init.gpa, .{});
     defer arena.deinit();
     var buffer: [16 * 1024]u8 = undefined;
     var stdout = io.stdoutWriter(init.io, &buffer);
     const writer = &stdout.interface;
 
-    var requests = std.mem.tokenizeScalar(u8, corpus.bytes, '\n');
-    var rows = std.mem.tokenizeScalar(u8, reference.bytes, '\n');
-    var index: usize = 0;
-    while (requests.next()) |row| : (index += 1) {
-        if (!std.mem.startsWith(u8, row, "/route\t")) return error.InvalidCorpusRow;
-        arena.reset();
-        const a = arena.allocator();
-        const input = try std.json.parseFromSliceLeaky(Reference, a, rows.next() orelse return error.ShortReference, .{ .ignore_unknown_fields = true });
-        if (input.index != index) return error.InvalidReferenceIndex;
-        const result = check(&bundle.view, &arena, row[7..], input) catch |err| Output{ .index = index, .failure = @errorName(err) };
-        try std.json.Stringify.value(result, .{ .emit_null_optional_fields = false }, writer);
-        try writer.writeByte('\n');
-        try writer.flush();
+    for (0..repeat) |iteration| {
+        var requests = std.mem.tokenizeScalar(u8, corpus.bytes, '\n');
+        var rows = std.mem.tokenizeScalar(u8, reference.bytes, '\n');
+        var index: usize = 0;
+        while (requests.next()) |row| : (index += 1) {
+            if (!std.mem.startsWith(u8, row, "/route\t")) return error.InvalidCorpusRow;
+            arena.reset();
+            arena.high_water = 0;
+            counting.resetCounts();
+            const a = arena.allocator();
+            const input = try std.json.parseFromSliceLeaky(Reference, a, rows.next() orelse return error.ShortReference, .{ .ignore_unknown_fields = true });
+            if (input.index != index) return error.InvalidReferenceIndex;
+            var measurement: Measurement = .{ .iteration = iteration };
+            var result = check(&bundle.view, &arena, row[7..], input, deadline_ms, replay_paths, if (measure) &measurement else null) catch |err|
+                Output{ .index = index, .failure = @errorName(err) };
+            if (measure) {
+                measurement.backing_calls = counting.calls();
+                result.measurement = measurement;
+            }
+            try std.json.Stringify.value(result, .{ .emit_null_optional_fields = false }, writer);
+            try writer.writeByte('\n');
+            try writer.flush();
+        }
+        if (rows.next() != null) return error.LongReference;
     }
-    if (rows.next() != null) return error.LongReference;
 }
 
-fn check(view: *const graph.reader.View, arena: *routing.infra.arena.Arena, body: []const u8, input: Reference) !Output {
+fn check(view: *const graph.reader.View, arena: *routing.infra.arena.Arena, body: []const u8, input: Reference, deadline_ms: u64, replay_paths: bool, measurement: ?*Measurement) !Output {
     const a = arena.allocator();
-    const control: Control = .{ .deadline = io.Deadline.fromNowMs(20_000) };
+    const timer = io.Timer.start();
+    const control: Control = .{ .deadline = .{ .at_ns = timer.start_ns +| (deadline_ms *| std.time.ns_per_ms) } };
     const parsed = try api.request.parseHttpWithin(a, "/route", &.{}, body, false, control.deadline);
     var result: Output = .{ .index = input.index };
     if (parsed == .failure) {
@@ -153,6 +189,12 @@ fn check(view: *const graph.reader.View, arena: *routing.infra.arena.Arena, body
     const correlated = [2]Snap.PathLocation{ try locations[0].correlation(a), try locations[1].correlation(a) };
     const options = &parsed.ok;
     const routed = api.route_action.routeWithCorrelations(view, arena, options, &correlated, control);
+    if (measurement) |sample| {
+        sample.peak_request_bytes = @max(arena.used, arena.high_water);
+        sample.reserved_bytes = arena.reserved;
+        sample.elapsed_ns = timer.read();
+        sample.overrun_ns = sample.elapsed_ns -| (deadline_ms *| std.time.ns_per_ms);
+    }
     var emitted: ?Route = null;
     if (routed) |route| switch (route) {
         .failure => |failure| {
@@ -172,6 +214,7 @@ fn check(view: *const graph.reader.View, arena: *routing.infra.arena.Arena, body
         result.failure = @errorName(err);
     }
 
+    if (!replay_paths) return result;
     const replay_control: Control = .{ .deadline = io.Deadline.fromNowMs(20_000) };
     reprice(a, view, options, correlated, input, emitted, &result, replay_control) catch |err| {
         result.oracle_recost = .{ .failure = @errorName(err) };

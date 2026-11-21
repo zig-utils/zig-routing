@@ -85,6 +85,50 @@ In the 55 discrepancies with routes from both engines, the native path
 cost less under native costing. Its median advantage was 653.947 cost
 units. Three native requests still reached the arena limit.
 
+## Request arena
+
+The same 100 requests and 506 directed cuts were replayed under the
+original 256 MiB replay arena cap. Before the storage change, each failing
+request allocated about 3.5 million 68-byte labels. The records took
+236 to 241 MB of the live request arena when allocation failed.
+
+Scheduled search now stores 28-byte labels for ordinary walking and
+boarding state. Wide distances and context IDs use sparse storage with
+their full precision. The graph supplies the arrival node and the route
+unpacker reconstructs walking turns from the same costing call used
+during expansion. Fractional endpoints and boarding transitions retain
+their exact values. The reverse potential settles within the existing
+cost ceiling, which gives the forward search a stronger admissible bound
+than the previous 32,768-node stop. With compact labels alone, case 9
+still reached the cap. With the stronger bound alone, case 46 still
+reached it.
+
+| Case | Peak before | Peak after | Native weighted cost |
+| --- | ---: | ---: | ---: |
+| 9 | 255.86 MiB | 76.54 MiB | 17,275.842 |
+| 35 | 255.85 MiB | 36.88 MiB | 15,152.825 |
+| 46 | 249.79 MiB | 136.74 MiB | 19,675.543 |
+
+All 100 searches completed. The 97 previously successful searches
+retained their exact weighted costs. Fixed-path replay reproduced all
+100 native costs. Across the corpus, the peak fell from 255.86 MiB to
+136.74 MiB. The median rose from 2.89 MiB to 6.20 MiB as the reverse
+search retained more costs for the forward bound.
+
+The second replay in the same arena made zero backing allocator calls.
+In the 100-request 20 ms cancellation trial, the largest observed
+deadline overrun was 3.833 microseconds before the change and 0.833
+microseconds after it. Three 250 ms trials over the original failing
+cases had maxima of 4.042 and 1.250 microseconds respectively. Every
+request in those trials stopped at its deadline.
+
+```sh
+zig build check-transit-itineraries -Doptimize=ReleaseFast -- \
+  BUNDLE corpus.tsv cuts.jsonl --measure --repeat 2 > native-measured.jsonl
+zig build check-transit-itineraries -Doptimize=ReleaseFast -- \
+  BUNDLE corpus.tsv cuts.jsonl --measure --deadline-ms 20 > deadline-measured.jsonl
+```
+
 ## Overtaking fixture
 
 Generate two disconnected walking approaches and a GTFS line between

@@ -61,18 +61,15 @@ pub const Potential = struct {
             try result.offer(a, &pending, from.head, @max(0, partial + result.terminal_shift - 2 * spacing), ceiling);
         }
 
-        // Distance to an unsettled node is at least the last settled cost.
-        // This lets us bound construction without pruning the forward search.
-        var settled: usize = 0;
-        while (settled < 32768) {
+        // Settle the reverse costs within the current ceiling. A node
+        // outside that range can still use the last settled cost as a bound.
+        while (pending.pop()) |item| {
             try control.check();
-            const item = pending.pop() orelse break;
             const status = try result.nodes.at(a, item.label);
             if (item.key != @as(u32, @bitCast(status.cost)) or status.settled) continue;
             const cost: f64 = status.cost;
             result.unsettled_floor = status.cost;
             status.settled = true;
-            settled += 1;
             const node: NodeId = @fromBackingInt(item.label);
             const range = try view.outEdgeRange(node);
             for (view.edges[range.first..range.end], range.first..) |edge, i| {
