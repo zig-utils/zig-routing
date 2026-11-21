@@ -39,6 +39,9 @@ pub const Info = protobuf.Message(&.{
     .{ .name = "version", .number = 1, .kind = .int32, .presence = .optional },
     .{ .name = "changeset", .number = 3, .kind = .int64, .presence = .optional },
 });
+pub const DenseInfo = protobuf.Message(&.{
+    .{ .name = "changeset", .number = 3, .kind = .sint64, .presence = .repeated, .packed_encoding = true },
+});
 const entity_fields = [_]protobuf.Field{
     .{ .name = "keys", .number = 2, .kind = .uint32, .presence = .repeated, .packed_encoding = true },
     .{ .name = "vals", .number = 3, .kind = .uint32, .presence = .repeated, .packed_encoding = true },
@@ -64,6 +67,7 @@ pub const Relation = protobuf.Message(&([_]protobuf.Field{
 }));
 pub const DenseNodes = protobuf.Message(&.{
     .{ .name = "id", .number = 1, .kind = .sint64, .presence = .repeated, .packed_encoding = true },
+    .{ .name = "denseinfo", .number = 5, .kind = .message, .presence = .optional, .message = DenseInfo },
     .{ .name = "lat", .number = 8, .kind = .sint64, .presence = .repeated, .packed_encoding = true },
     .{ .name = "lon", .number = 9, .kind = .sint64, .presence = .repeated, .packed_encoding = true },
     .{ .name = "keys_vals", .number = 10, .kind = .int32, .presence = .repeated, .packed_encoding = true },

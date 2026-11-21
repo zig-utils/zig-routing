@@ -139,12 +139,13 @@ pub const SectionKind = enum(u32) {
     edge_key_hash_header = 41,
     edge_key_hash_buckets = 42,
     edge_key_hash_slots = 43,
+    dataset_id = 44,
 
     pub fn placement(kind: SectionKind) Placement {
         return switch (kind) {
             .nodes, .edges, .first_edge, .turns, .classes, .turn_sides, .headings => .hot,
             .coordinates, .spatial, .components, .metadata, .coverage, .admins, .node_admins, .node_timezones, .timezone_rules, .lb_speeds => .warm,
-            .turn_restrictions, .restriction_automaton, .restriction_conditions => .warm,
+            .turn_restrictions, .restriction_automaton, .restriction_conditions, .dataset_id => .warm,
             .transit_metadata, .transit_stops, .transit_stations, .transit_egresses, .transit_routes, .transit_lines, .transit_departures, .transit_occurrences, .transit_schedules, .transit_days, .transit_exceptions, .transit_transfers => .warm,
             .cold_idx, .cold, .slopes, .signs, .turnlanes, .lane_connectivity => .cold,
             .edge_keys, .edge_key_inverse, .edge_key_hash_header, .edge_key_hash_buckets, .edge_key_hash_slots => .cold,
@@ -196,6 +197,7 @@ pub const SectionKind = enum(u32) {
             .edge_key_hash_header => "edge_key_hash_header.bin",
             .edge_key_hash_buckets => "edge_key_hash_buckets.bin",
             .edge_key_hash_slots => "edge_key_hash_slots.bin",
+            .dataset_id => "dataset_id.bin",
         };
     }
 
@@ -212,6 +214,7 @@ pub const SectionKind = enum(u32) {
             .slopes, .turnlanes => u16,
             .spatial => u8,
             .metadata => Metadata,
+            .dataset_id => u64,
             .coverage => Bounds,
             .admins, .timezone_rules => u8,
             .node_admins, .node_timezones => u16,

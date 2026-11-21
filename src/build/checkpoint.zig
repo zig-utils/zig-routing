@@ -174,6 +174,7 @@ pub const Artifact = enum {
     bundle_edge_key_hash_header,
     bundle_edge_key_hash_buckets,
     bundle_edge_key_hash_slots,
+    bundle_dataset_id,
 
     noinline fn filename(self: Artifact) [:0]const u8 {
         return switch (self) {

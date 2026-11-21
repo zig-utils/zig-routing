@@ -169,6 +169,7 @@ pub const View = struct {
     spatial: ?[]const u8,
     spatial_index: ?spatial.View,
     metadata: ?[]const format.Metadata,
+    dataset_id: ?[]const u64 = null,
     components: ?[]const u32,
     turn_sides: ?[]const u32,
     turn_side_index: ?turn_sides.View,
@@ -282,6 +283,12 @@ pub const View = struct {
             if (metadata.count != 1) {
                 note(diagnostic, .metadata);
                 return error.InvalidMetadataCount;
+            }
+        }
+        if (headers.get(.dataset_id)) |dataset| {
+            if (dataset.count != 1 and dataset.count != @as(u64, node_count) + 1) {
+                note(diagnostic, .dataset_id);
+                return error.InvalidDatasetIdCount;
             }
         }
 
@@ -495,6 +502,20 @@ pub const View = struct {
         const index = @backingInt(id);
         if (index >= self.nodes.len) return error.InvalidNodeId;
         return &self.nodes[index];
+    }
+
+    pub fn datasetId(self: *const View) ?u64 {
+        const ids = self.dataset_id orelse return null;
+        return ids[0];
+    }
+
+    /// Native bundles use one source ID. A mixed tile import also records
+    /// the original tile ID value for each node in CSR order.
+    pub fn nodeDatasetId(self: *const View, id: format.NodeId) ?u64 {
+        const ids = self.dataset_id orelse return null;
+        if (ids.len == 1) return ids[0];
+        const index: usize = @backingInt(id);
+        return if (index < self.nodes.len) ids[index + 1] else null;
     }
 
     pub fn nodeAdmin(self: *const View, id: format.NodeId) !admin.Names {

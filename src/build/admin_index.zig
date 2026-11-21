@@ -23,9 +23,10 @@ pub const Index = struct {
 const Piece = polygon_grid.Piece;
 const Grid = []std.ArrayList(Piece);
 
-pub fn build(gpa: Allocator, source: anytype, deadline: io.Deadline, boundaries: bool, restrictions: *turns.Catalog, connections: *lanes.Catalog) !?Index {
+pub fn build(gpa: Allocator, source: anytype, deadline: io.Deadline, boundaries: bool, restrictions: *turns.Catalog, connections: *lanes.Catalog, max_changeset: *u64) !?Index {
     var catalog = try boundary.collectRelations(gpa, source, deadline, boundaries, restrictions, connections);
     defer catalog.deinit();
+    max_changeset.* = @max(max_changeset.*, catalog.max_relation_changeset);
     if (catalog.regions.len == 0) return null;
     return try pack(gpa, catalog.regions, deadline);
 }

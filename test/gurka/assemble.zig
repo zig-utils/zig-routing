@@ -5389,6 +5389,12 @@ test "Gurka trip leg retains a near-end trim, an interior via and the physical i
         },
     };
     const leg = try tripleg.build(arena.allocator(), view, input, .{});
+    try testing.expectEqual(@as(?u64, 1001), view.datasetId());
+    try testing.expectEqual(1001, leg.osm_changeset);
+    var legacy = view.*;
+    legacy.dataset_id = null;
+    const legacy_leg = try tripleg.build(arena.allocator(), &legacy, input, .{});
+    try testing.expectEqual(0, legacy_leg.osm_changeset);
     try testing.expectEqual(4, leg.node.len);
     try testing.expectEqual(3, leg.location.len);
     try testing.expectEqual(routing.api.trip.LocationType.kVia, leg.location[1].type);
@@ -5440,6 +5446,7 @@ test "Gurka trip leg retains a near-end trim, an interior via and the physical i
     var without_cold = view.*;
     without_cold.cold_data = null;
     const projected = try tripleg.build(arena.allocator(), &without_cold, narrowed, .{});
+    try testing.expectEqual(0, projected.osm_changeset);
     try testing.expectEqual(0, projected.node[0].edge.?.name.len);
     try testing.expectEqual(0, projected.node[0].edge.?.speed_limit);
     try testing.expectEqual(0, projected.node[1].intersecting_edge.len);

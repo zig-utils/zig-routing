@@ -6,6 +6,7 @@ const examples = @import("examples.zig");
 const gurka = @import("gurka.zig");
 const lane_examples = @import("lane_examples.zig");
 const narrative = @import("narrative_examples.zig");
+const pbf = @import("pbf.zig");
 
 pub fn main(init: std.process.Init) !void {
     var args = std.process.Args.Iterator.init(init.minimal.args);
@@ -16,8 +17,16 @@ pub fn main(init: std.process.Init) !void {
     };
     const arena = init.arena.allocator();
     const scenario = args.next();
+    const metadata: ?pbf.Metadata = if (scenario) |name| blk: {
+        if (std.mem.eql(u8, name, "dataset-sparse")) break :blk .sparse;
+        if (std.mem.eql(u8, name, "dataset-dense")) break :blk .dense;
+        if (std.mem.eql(u8, name, "dataset-absent")) break :blk .absent;
+        break :blk null;
+    } else null;
     const lane_example = if (scenario) |name| try lane_examples.find(arena, name) else null;
     const fixture = if (lane_example) |example| example.map else if (scenario) |name| blk: {
+        if (metadata != null) break :blk try examples.datasetMetadata(arena);
+        if (std.mem.eql(u8, name, "guidance-views")) break :blk try examples.guidanceViews(arena);
         if (std.mem.eql(u8, name, "motor-vehicle")) break :blk try examples.motorVehicle(arena);
         if (std.mem.eql(u8, name, "admin-boundaries")) break :blk try examples.adminBoundaries(arena);
         if (std.mem.eql(u8, name, "country-access")) break :blk try examples.countryAccess(arena);
@@ -45,6 +54,10 @@ pub fn main(init: std.process.Init) !void {
         if (args.next()) |requests| {
             if (lane_example) |example| {
                 try narrative.corpus(arena, fixture, requests, "auto", example.routes);
+            } else if (metadata != null) {
+                try narrative.corpus(arena, fixture, requests, "auto", &.{.{ .from = "A", .to = "C" }});
+            } else if (std.mem.eql(u8, name, "guidance-views")) {
+                try narrative.corpus(arena, fixture, requests, "auto", &.{.{ .from = "A", .to = "G" }});
             } else if (std.mem.eql(u8, name, "access-regions")) {
                 try accessProfiles(arena, fixture, requests);
             } else if (std.mem.eql(u8, name, "indoor")) {
@@ -61,7 +74,11 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     if (args.next() != null) return error.ExtraArguments;
-    try fixture.osm.writePbf(init.gpa, path);
+    if (metadata) |mode| {
+        try routing.infra.io.writeFile(path, try pbf.encodeWithMetadata(arena, fixture.osm, mode));
+    } else {
+        try fixture.osm.writePbf(init.gpa, path);
+    }
 }
 
 fn accessProfiles(arena: std.mem.Allocator, fixture: gurka.Map, path: []const u8) !void {

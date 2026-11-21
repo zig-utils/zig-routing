@@ -6,6 +6,7 @@ const math = @import("../geo/build_math.zig");
 const graph = @import("../graph/constants.zig");
 const io = @import("../infra/io.zig");
 const node_store = @import("node_store.zig");
+const osm = @import("osm.zig");
 const pbf = @import("pbf/root.zig");
 const tags = @import("tags/root.zig");
 const usage = @import("node_store/usage.zig");
@@ -81,6 +82,7 @@ pub const Stats = struct {
     self_edges: u64 = 0,
     zero_length_edges: u64 = 0,
     duplicate_edges: u64 = 0,
+    dataset_ids: ?osm.DatasetIds = null,
 };
 
 pub const Options = struct {
@@ -184,7 +186,7 @@ pub fn generate(
         .shared = .{ .store = store, .controls = &prep.controls, .options = options, .culdesacs = &prep.culdesacs },
         .used = &used,
         .culdesacs = &prep.culdesacs,
-        .stats = .{ .too_short_ways = prep.too_short_ways },
+        .stats = .{ .too_short_ways = prep.too_short_ways, .dataset_ids = prep.dataset_ids },
     };
     defer pass.deinit();
     try source.forEach(gpa, options.deadline, &pass, Pass.visit);
@@ -198,10 +200,13 @@ fn transform(
     options: Options,
 ) !?tags.WayAttrs {
     const attrs = try tags.transformWay(scratch, way.tags, options.deadline) orelse return null;
-    if (attrs.flags.pedestrian_area) return null;
-    if (attrs.use == .construction and !options.include_construction) return null;
-    if (attrs.use == .platform and !options.include_platforms) return null;
+    if (!includeAttrs(attrs, options)) return null;
     return attrs;
+}
+
+fn includeAttrs(attrs: tags.WayAttrs, options: Options) bool {
+    return !attrs.flags.pedestrian_area and (attrs.use != .construction or options.include_construction) and
+        (attrs.use != .platform or options.include_platforms);
 }
 
 const Controls = std.AutoHashMapUnmanaged(i64, NodeFlags);
@@ -233,6 +238,7 @@ comptime {
 const SelectionStats = struct {
     selected_ways: u64,
     too_short_ways: u64,
+    max_changeset: u64 = 0,
 };
 
 pub fn saveUsage(tx: *checkpoint.Transaction, store: *usage.Usage, directory: checkpoint.Artifact, leaves: checkpoint.Artifact) !void {
@@ -274,6 +280,7 @@ pub const Preparation = struct {
     culdesacs: culdesac.Tracker = .{},
     too_short_ways: u64 = 0,
     selected_ways: u64 = 0,
+    dataset_ids: osm.DatasetIds = .{},
 
     pub fn init(gpa: Allocator, options: Options, track_culdesacs: bool) !Preparation {
         return .{
@@ -310,6 +317,7 @@ pub const Preparation = struct {
         return node_store.collectReferenced(self.gpa, source, referenced, output, .{
             .scratch_dir = self.options.scratch_dir,
             .deadline = self.options.deadline,
+            .dataset_ids = &self.dataset_ids,
         }, &observer, Observe.accept);
     }
 
@@ -320,6 +328,7 @@ pub const Preparation = struct {
         try tx.writeJson(self.gpa, SelectionStats{
             .selected_ways = self.selected_ways,
             .too_short_ways = self.too_short_ways,
+            .max_changeset = self.dataset_ids.max_changeset,
         }, .source_stats);
     }
 
@@ -338,9 +347,11 @@ pub const Preparation = struct {
         defer stats.deinit();
         self.selected_ways = stats.value.selected_ways;
         self.too_short_ways = stats.value.too_short_ways;
+        self.dataset_ids.max_changeset = stats.value.max_changeset;
     }
 
     pub fn saveNodes(self: *Preparation, tx: *checkpoint.Transaction) !void {
+        try tx.writeJson(self.gpa, self.dataset_ids, .source_stats);
         try saveUsage(tx, &self.cuts, .cuts_directory, .cuts_leaves);
         const file = try tx.create(.controls);
         defer file.close();
@@ -356,6 +367,11 @@ pub const Preparation = struct {
     }
 
     pub fn loadNodes(self: *Preparation, saved: *const checkpoint.Existing) !void {
+        if (saved.manifest.files.get(.source_stats) != null) {
+            const ids = try saved.readJson(osm.DatasetIds, self.gpa, .source_stats, self.options.deadline);
+            defer ids.deinit();
+            self.dataset_ids = ids.value;
+        }
         const mapped = try saved.map(.controls, self.options.deadline);
         defer mapped.unmap();
         for (try checkpoint.array(ControlEntry, mapped), 0..) |entry, i| {
@@ -381,7 +397,7 @@ pub const Preparation = struct {
     }
 
     fn include(self: *Preparation, way: *const pbf.block.Way) !bool {
-        const attrs = try transform(&self.scratch, way.*, self.options) orelse return false;
+        const attrs = try tags.transformWay(&self.scratch, way.tags, self.options.deadline) orelse return false;
         try loadRefs(self.gpa, &self.refs, way.*);
         const refs = self.refs.items;
         const shape = shapeOf(refs);
@@ -390,6 +406,8 @@ pub const Preparation = struct {
             return false;
         }
         if (!try way_shape.accepts(shape, way.tags)) return false;
+        self.dataset_ids.max_changeset = @max(self.dataset_ids.max_changeset, way.changeset);
+        if (!includeAttrs(attrs, self.options)) return false;
         _ = try self.cuts.insert(usage.keyFor(refs[0]));
         _ = try self.cuts.insert(usage.keyFor(refs[refs.len - 1]));
         self.last.clearRetainingCapacity();

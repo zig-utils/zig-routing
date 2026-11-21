@@ -24,6 +24,7 @@ fn BoundaryFor(comptime Policy: type) type {
 pub fn CatalogFor(comptime Policy: type) type {
     return struct {
         regions: []BoundaryFor(Policy),
+        max_relation_changeset: u64,
         storage: std.heap.ArenaAllocator,
 
         pub fn deinit(self: *@This()) void {
@@ -90,6 +91,7 @@ fn collectWith(comptime Policy: type, gpa: Allocator, source: anytype, deadline:
     try source.forEach(gpa, deadline, &collector, Collector.visit);
     if (collector.relations.items.len == 0) return .{
         .regions = &.{},
+        .max_relation_changeset = collector.max_relation_changeset,
         .storage = storage,
     };
     collector.phase = .ways;
@@ -120,7 +122,7 @@ fn collectWith(comptime Policy: type, gpa: Allocator, source: anytype, deadline:
         }
         try regions.append(owned, .{ .osm_id = relation.id, .attrs = relation.attrs, .geometry = geometry });
     }
-    return .{ .regions = regions.items, .storage = storage };
+    return .{ .regions = regions.items, .max_relation_changeset = collector.max_relation_changeset, .storage = storage };
 }
 
 const Member = struct { way_id: i64, role: polygon.Role };
@@ -137,6 +139,7 @@ fn CollectorFor(comptime Policy: type) type {
         boundaries: bool,
         restrictions: ?*turns.Catalog,
         connections: ?*lanes.Catalog,
+        max_relation_changeset: u64 = 0,
         phase: enum { relations, ways, nodes } = .relations,
         block: pbf.block.Scratch = .{},
         relations: std.ArrayList(Relation) = .empty,
@@ -156,6 +159,7 @@ fn CollectorFor(comptime Policy: type) type {
         fn readRelations(self: *Collector, block: pbf.block.Block) !void {
             var entries = block.relations();
             while (try entries.next()) |relation| {
+                self.max_relation_changeset = @max(self.max_relation_changeset, relation.changeset);
                 if (self.restrictions) |present| try present.add(relation);
                 if (self.connections) |present| try present.addRelation(relation);
                 if (!self.boundaries) continue;

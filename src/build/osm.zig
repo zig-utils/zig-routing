@@ -17,6 +17,15 @@ const std = @import("std");
 /// Degrees to fixed-point units.
 pub const coordinate_scale = 10_000_000;
 
+pub const DatasetIds = struct {
+    max_changeset: u64 = 0,
+    last_input_max_node: u64 = 0,
+
+    pub fn effective(self: DatasetIds) u64 {
+        return if (self.max_changeset != 0) self.max_changeset else self.last_input_max_node;
+    }
+};
+
 pub const Tag = struct {
     key: []const u8,
     value: []const u8,

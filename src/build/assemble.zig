@@ -65,6 +65,7 @@ pub const Options = struct {
     ordering: node_order.Ordering = .{},
     emit_edge_keys: bool = true,
     edge_key_hash: bool = false,
+    dataset_id: ?u64 = null,
     deadline: io.Deadline = .none,
 };
 
@@ -148,7 +149,8 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     defer restrictions.deinit();
     var metadata = Metadata.init(gpa, options);
     defer metadata.deinit();
-    var compiled_admins = try admin_index.build(gpa, source, options.deadline, options.use_admin_db and options.admin_index == null, &restrictions, &metadata.lanes);
+    var relation_changeset: u64 = 0;
+    var compiled_admins = try admin_index.build(gpa, source, options.deadline, options.use_admin_db and options.admin_index == null, &restrictions, &metadata.lanes, &relation_changeset);
     defer if (compiled_admins) |*index| index.deinit();
     if (compiled_admins) |index| options.admin_index = index.view;
     try metadata.lanes.prepare();
@@ -157,13 +159,14 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     const shape_file = try io.File.temporary(options.scratch_dir);
     defer shape_file.close();
 
-    const source_stats = try edges.buildWithGeometry(gpa, source, .{ .edges = edge_file, .shapes = shape_file }, .{
+    var source_stats = try edges.buildWithGeometry(gpa, source, .{ .edges = edge_file, .shapes = shape_file }, .{
         .scratch_dir = options.scratch_dir,
         .workers = options.workers,
         .include_construction = options.include_construction,
         .include_platforms = options.include_platforms,
         .deadline = options.deadline,
     }, &metadata, Metadata.way, Metadata.node, Metadata.culdesac);
+    source_stats.dataset_ids.?.max_changeset = @max(source_stats.dataset_ids.?.max_changeset, relation_changeset);
 
     const timer = io.Timer.start();
     if (source_stats.edges > std.math.maxInt(u32) / 2) return error.TooManyDirectedEdges;
@@ -240,6 +243,7 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
         .order_hash = plan.order_hash,
     }};
     try writer.write(.metadata, &bundle_metadata);
+    try writer.write(.dataset_id, &.{options.dataset_id orelse source_stats.dataset_ids.?.effective()});
     return .{
         .source = source_stats,
         .nodes = @intCast(topology.nodes.len),
@@ -266,10 +270,14 @@ pub fn buildStaged(
     source_stats: edges.Stats,
     edge_file: io.File,
     shape_file: io.File,
-    options: Options,
+    supplied: Options,
     restrictions: turn_restrictions.Source,
     transit: ?TransitInput,
 ) !void {
+    var options = supplied;
+    if (options.dataset_id == null) {
+        if (source_stats.dataset_ids) |ids| options.dataset_id = ids.effective();
+    }
     const gpa = session.gpa;
     const edge_map = try io.Mapping.mapFd(edge_file, .read_only);
     defer edge_map.unmap();
@@ -493,6 +501,7 @@ noinline fn saveColdStage(session: *checkpoint.Session, shared: *const Shared, m
         .ordering_kind = @backingInt(options.ordering.kind),
         .order_hash = plan.order_hash,
     }});
+    if (options.dataset_id) |dataset| try writer.write(.dataset_id, &.{dataset});
     try tx.saveSections(&writer);
     try session.commit(&tx, shared.topology.output.data.len / 2, start);
 }

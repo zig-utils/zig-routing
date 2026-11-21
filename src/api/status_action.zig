@@ -18,6 +18,10 @@ pub fn handle(svc: *service.Service, _: *http.Ctx, options: *service.Options, re
         try writer.string(@tagName(action));
     }
     try writer.endArray();
+    if (options.verbose and svc.allow_status_verbose) {
+        const dataset_id = if (svc.graph) |view| view.datasetId() orelse 0 else 0;
+        if (dataset_id != 0) try writer.field("osm_changeset", dataset_id);
+    }
     try writer.endObject();
     return null;
 }

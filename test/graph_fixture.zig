@@ -101,6 +101,7 @@ pub fn records(comptime kind: format.SectionKind) []const kind.Record() {
         .slopes => &slopes,
         .spatial => spatial,
         .metadata => &metadata,
+        .dataset_id => &.{1001},
         .components => &.{ 0, 0 },
         .turn_sides => &.{ 3, 0, 0 },
         .headings => &headings,

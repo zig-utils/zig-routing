@@ -1,5 +1,4 @@
 // Ported from src/odin/maneuversbuilder.cc (Valhalla 3.9.3).
-// TripLeg supplies the source dataset ID. Native bundle propagation is tracked in P6.09a.
 const std = @import("std");
 const trip = @import("../api/trip.zig");
 const enhanced = @import("enhanced.zig");

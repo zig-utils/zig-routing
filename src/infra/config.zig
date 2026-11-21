@@ -24,6 +24,7 @@ pub const Config = struct {
     zig_routing: ZigRouting = .{},
 
     pub const Mjolnir = struct {
+        dataset_id: ?u64 = null,
         reclassify_links: ?bool = null,
         default_speeds_config: ?[]const u8 = null,
         data_processing: struct {
@@ -46,6 +47,7 @@ pub const Config = struct {
             min_resample: f32 = (service.Limits{}).skadi_min_resample,
         } = .{},
         tile: struct { allow_verbose: bool = false } = .{},
+        status: struct { allow_verbose: bool = false } = .{},
     };
 
     pub const HttpService = struct {
@@ -110,6 +112,7 @@ pub const Config = struct {
                 },
             },
             .actions = self.loki.actions,
+            .allow_status_verbose = self.service_limits.status.allow_verbose,
         };
     }
 };

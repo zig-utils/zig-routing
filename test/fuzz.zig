@@ -1217,12 +1217,13 @@ fn osmPrimitiveSeed(buffer: []u8) ![]const u8 {
             "no_left_turn @ probability=75",
         } },
         .primitivegroup = &.{
-            .{ .dense = .{ .id = &.{1}, .lat = &.{-2}, .lon = &.{3}, .keys_vals = &.{ 1, 2, 0 } } },
-            .{ .nodes = &.{.{ .id = 2, .lat = 0, .lon = 0 }} },
-            .{ .ways = &.{.{ .id = 3, .refs = &.{ 2, -1 }, .keys = &.{ 1, 3, 5, 7 }, .vals = &.{ 2, 4, 6, 8 } }} },
+            .{ .dense = .{ .id = &.{1}, .lat = &.{-2}, .lon = &.{3}, .denseinfo = .{ .changeset = &.{42} }, .keys_vals = &.{ 1, 2, 0 } } },
+            .{ .nodes = &.{.{ .id = 2, .lat = 0, .lon = 0, .info = .{ .changeset = 40 } }} },
+            .{ .ways = &.{.{ .id = 3, .refs = &.{ 2, -1 }, .keys = &.{ 1, 3, 5, 7 }, .vals = &.{ 2, 4, 6, 8 }, .info = .{ .changeset = 41 } }} },
             .{ .relations = &.{
                 .{
                     .id = 4,
+                    .info = .{ .changeset = 43 },
                     .keys = &.{ 9, 10 },
                     .vals = &.{ 10, 11 },
                     .roles_sid = &.{ 12, 13, 14 },

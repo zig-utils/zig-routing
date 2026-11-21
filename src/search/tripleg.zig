@@ -50,6 +50,8 @@ pub fn build(a: std.mem.Allocator, view: *const View, input: Input, control: Con
         return error.InvalidRoute;
 
     const attrs = input.attributes;
+    const include_dataset_id = attrs.has(.osm_changeset) and view.dataset_id != null;
+    var dataset_id: u64 = 0;
     const nodes = try a.alloc(model.Node, input.segments.len + 1);
     var admins: std.ArrayList(graph.admin.Names) = .empty;
     defer admins.deinit(a);
@@ -85,6 +87,7 @@ pub fn build(a: std.mem.Allocator, view: *const View, input: Input, control: Con
             break :blk try buildEdge(a, view, from, try view.node(from), directed, segment, edge, input, control);
         };
         const node = try view.node(from);
+        if (include_dataset_id and dataset_id == 0) dataset_id = view.nodeDatasetId(from) orelse 0;
         out.* = .{
             .edge = trip_edge,
             .cost = nodeCost(attrs, elapsed, edge.transition),
@@ -132,6 +135,7 @@ pub fn build(a: std.mem.Allocator, view: *const View, input: Input, control: Con
     };
     const locations = if (input.locations) |source| try projectLocations(a, input, source, control) else &.{};
     return .{
+        .osm_changeset = dataset_id,
         .leg_id = input.leg_id,
         .leg_count = input.leg_count,
         .location = locations,

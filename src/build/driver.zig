@@ -26,6 +26,7 @@ pub const Options = struct {
     work_dir: []const u8,
     dem_dir: ?[]const u8 = null,
     default_speeds_config: ?[]const u8 = null,
+    dataset_id: ?u64 = null,
     timezone_geojson: ?[]const u8 = null,
     timezone_rules: ?[]const u8 = null,
     reclassify_links: ?bool = null,
@@ -79,6 +80,7 @@ const Inputs = struct {
     dem_dir: ?[]const u8,
     dem_digest: ?[32]u8 = null,
     speed_digest: ?[32]u8 = null,
+    dataset_id: ?u64 = null,
     timezones: ?TimezoneInputs = null,
     reclassify_links: bool = true,
     infer_turn_channels: bool = true,
@@ -120,6 +122,10 @@ const Inputs = struct {
         if (self.speed_digest) |digest| {
             hash.update("default-speed-config");
             hash.update(&digest);
+        }
+        if (self.dataset_id) |dataset| {
+            hash.update("source-dataset-id");
+            hash.update(std.mem.asBytes(&dataset));
         }
         if (self.timezones) |input| {
             hash.update("timezone-inputs");
@@ -169,6 +175,7 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
         .sources = try fingerprintInputs(a, options, diagnostic),
         .gtfs_sources = try fingerprintGtfs(a, options, diagnostic),
         .dem_dir = options.dem_dir,
+        .dataset_id = options.dataset_id,
         .timezones = try timezoneInputs(options, diagnostic),
         .reclassify_links = options.reclassify_links orelse true,
         .infer_turn_channels = options.infer_turn_channels orelse true,
@@ -248,6 +255,7 @@ pub fn run(gpa: Allocator, options: Options, progress: ?*io.Writer, diagnostic: 
         .deadline = options.deadline,
         .drive_side = inputs.drive_side,
         .ordering = .{ .kind = inputs.order },
+        .dataset_id = inputs.dataset_id,
         .dem_source = if (tiles) |*catalog| .{ .catalog = catalog } else null,
         .speed_rules = if (speed_input) |*input| &input.rules else null,
         .reclassify_links = inputs.reclassify_links,
@@ -522,6 +530,7 @@ const TimezoneMappings = struct {
 };
 
 fn checkOptions(a: Allocator, inputs: *Inputs, options: Options, diagnostic: *Diagnostic) !void {
+    if (options.dataset_id) |dataset| if (dataset != inputs.dataset_id) return error.CheckpointInputMismatch;
     if (options.drive_side) |side| if (side != inputs.drive_side) return error.CheckpointInputMismatch;
     if (options.order) |order| if (order != inputs.order) return error.CheckpointInputMismatch;
     if (options.reclassify_links) |reclassify| if (reclassify != inputs.reclassify_links) return error.CheckpointInputMismatch;
@@ -602,15 +611,15 @@ fn buildSegments(session: *checkpoint.Session, metadata: *assemble.Metadata, inp
         referenced = try usage.Usage.init(session.path);
         have_referenced = true;
         try prep.selectWays(source, &referenced);
-        try prep.saveTags(&tx);
         try edges.saveUsage(&tx, &referenced, .usage_directory, .usage_leaves);
         var restrictions: turn_restrictions.Catalog = .{ .a = gpa, .deadline = deadline };
         defer restrictions.deinit();
-        if (try admin_index.build(gpa, source, deadline, graph_options.use_admin_db, &restrictions, &metadata.lanes)) |compiled| {
+        if (try admin_index.build(gpa, source, deadline, graph_options.use_admin_db, &restrictions, &metadata.lanes, &prep.dataset_ids.max_changeset)) |compiled| {
             var index = compiled;
             defer index.deinit();
             try admin_index.save(index.view, &tx);
         }
+        try prep.saveTags(&tx);
         if (restrictions.stats.parsed != 0) {
             try tx.writeArray(restrictions.entries.items, .simple_turn_relations);
             try tx.writeJson(gpa, restrictions.stats, .simple_turn_stats);

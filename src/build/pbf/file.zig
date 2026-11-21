@@ -235,6 +235,15 @@ pub const IndexedStreams = struct {
     files: []const File,
     decode: DecodeOptions,
 
+    pub fn finalInputFirstBlock(self: IndexedStreams, deadline: io.Deadline) !usize {
+        var first: usize = 0;
+        for (self.files[0..self.files.len -| 1]) |file| {
+            if (deadline.expired()) return error.DeadlineExceeded;
+            first += file.index.blobs.len;
+        }
+        return first;
+    }
+
     pub fn forEach(self: IndexedStreams, gpa: Allocator, deadline: io.Deadline, context: anytype, comptime consume: anytype) !void {
         var forward: OrderedConsumer(@TypeOf(context), consume) = .{ .target = context };
         for (self.files) |*file| {

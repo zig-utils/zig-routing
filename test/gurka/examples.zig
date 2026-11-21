@@ -43,6 +43,41 @@ pub fn intersection(arena: Allocator) !gurka.Map {
     });
 }
 
+pub fn datasetMetadata(arena: Allocator) !gurka.Map {
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "residential" }};
+    return gurka.Map.init(arena, try gurka.mapToCoordinates("A---B---C   Z", 100), &.{
+        .{ .label = "AB", .tags = road },
+        .{ .label = "BC", .tags = &.{ road[0], .{ .key = "osm_id", .value = "5000" } } },
+    }, &.{.{ .label = "Z", .tags = &.{.{ .key = "osm_id", .value = "6000" }} }}, &.{.{
+        .members = &.{.{ .kind = .way, .ref = "AB", .role = "" }},
+        .tags = &.{ .{ .key = "type", .value = "route" }, .{ .key = "route", .value = "road" } },
+    }});
+}
+
+// Ported from test/gurka/test_guidance_views.cc (Valhalla 3.9.3).
+pub fn guidanceViews(arena: Allocator) !gurka.Map {
+    const motorway = gurka.Tag{ .key = "highway", .value = "motorway" };
+    const link = gurka.Tag{ .key = "highway", .value = "motorway_link" };
+    const oneway = gurka.Tag{ .key = "oneway", .value = "yes" };
+    const first = gurka.Tag{ .key = "name", .value = "National Route 1" };
+    const second = gurka.Tag{ .key = "name", .value = "National Route 2" };
+    const ramp = gurka.Tag{ .key = "name", .value = "xyz ramp" };
+    return gurka.Map.init(arena, try gurka.mapToCoordinates(
+        \\A----B----C----X
+        \\           \
+        \\            D
+        \\             \
+        \\         E----F----G
+    , 100), &.{
+        .{ .label = "AB", .tags = &.{ motorway, oneway, first } },
+        .{ .label = "BC", .tags = &.{ motorway, oneway, first, .{ .key = "guidance_view:jct:base", .value = "PA717;1" } } },
+        .{ .label = "CX", .tags = &.{ motorway, oneway, first } },
+        .{ .label = "CD", .tags = &.{ link, oneway, ramp } },
+        .{ .label = "DF", .tags = &.{ link, oneway, ramp, .{ .key = "guidance_view:jct:overlay", .value = "PA717;E" } } },
+        .{ .label = "EFG", .tags = &.{ motorway, oneway, second } },
+    }, &.{.{ .label = "C", .tags = &.{ .{ .key = "highway", .value = "motorway_junction" }, .{ .key = "ref", .value = "10" } } }}, &.{});
+}
+
 // Access costs from test_destination_only.cc and a required return through
 // the entrance from test_not_thru_pruning.cc (Valhalla 3.9.3).
 pub fn accessRegions(arena: Allocator) !gurka.Map {

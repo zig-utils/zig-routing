@@ -458,6 +458,7 @@ pub fn run(gpa: Allocator, inputs: []const []const u8, output: []const u8, deadl
     try graph.speed.writeBounds(&writer, layout.edges);
     try writer.write(.classes, classes.classes);
     try writer.write(.coordinates, layout.coords);
+    try writeDatasetIds(a, tiles, stats.nodes, &writer, deadline);
     try writer.write(.slopes, layout.slopes);
     try writer.write(.headings, layout.headings);
     const labels = try a.alloc(u32, stats.nodes);
@@ -466,4 +467,38 @@ pub fn run(gpa: Allocator, inputs: []const []const u8, output: []const u8, deadl
     try layout.writeCold(gpa, tiles, &writer, scratch_dir);
     try writer.commit();
     return stats;
+}
+
+fn writeDatasetIds(a: Allocator, tiles: []const SourceTile, nodes: usize, writer: *format.BundleWriter, deadline: io.Deadline) !void {
+    var representative: ?u64 = null;
+    var mixed = false;
+    for (tiles) |source| {
+        if (deadline.expired()) return error.DeadlineExceeded;
+        if (source.tile.header.counts.nodes == 0) continue;
+        const id = source.tile.header.dataset_id;
+        if (representative) |first| {
+            if (id != first) mixed = true;
+        } else {
+            representative = id;
+        }
+    }
+    const id = representative orelse 0;
+    if (!mixed) return writer.write(.dataset_id, &.{id});
+
+    const ids = try a.alloc(u64, nodes + 1);
+    defer a.free(ids);
+    ids[0] = id;
+    for (tiles) |source| {
+        if (deadline.expired()) return error.DeadlineExceeded;
+        const start: usize = @as(usize, source.node_base) + 1;
+        const values = ids[start..][0..source.tile.header.counts.nodes];
+        var offset: usize = 0;
+        while (offset < values.len) {
+            if (deadline.expired()) return error.DeadlineExceeded;
+            const len = @min(values.len - offset, 8192);
+            @memset(values[offset..][0..len], source.tile.header.dataset_id);
+            offset += len;
+        }
+    }
+    try writer.write(.dataset_id, ids);
 }

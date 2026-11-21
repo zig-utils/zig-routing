@@ -431,7 +431,12 @@ fn route(ctx: *Context) !u8 {
     var runtime: Runtime = .{ .svc = loaded.config.serviceConfig() };
     defer runtime.close();
     try runtime.open(loaded.config.additional_data.elevation);
-    if (action == .locate or action == .tile or action == .transit_available) try runtime.openGraph(ctx, loaded.config.zig_routing.bundle_path);
+    const open_graph = switch (action) {
+        .locate, .tile, .transit_available => true,
+        .status => runtime.svc.allow_status_verbose,
+        else => false,
+    };
+    if (open_graph) try runtime.openGraph(ctx, loaded.config.zig_routing.bundle_path);
 
     var arena = routing.infra.arena.Arena.init(std.heap.c_allocator, .{ .cap_bytes = settings.arena_cap_bytes });
     defer arena.deinit();
@@ -605,6 +610,7 @@ fn buildGraph(ctx: *Context) !u8 {
         .timezone_geojson = ctx.getOption("timezones") orelse settings.timezone_geojson,
         .timezone_rules = ctx.getOption("timezone-rules") orelse settings.timezone_rules,
         .default_speeds_config = loaded.config.mjolnir.default_speeds_config,
+        .dataset_id = loaded.config.mjolnir.dataset_id,
         .reclassify_links = loaded.config.mjolnir.reclassify_links,
         .infer_turn_channels = loaded.config.mjolnir.data_processing.infer_turn_channels,
         .infer_internal_intersections = loaded.config.mjolnir.data_processing.infer_internal_intersections,

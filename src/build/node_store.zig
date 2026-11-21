@@ -387,6 +387,7 @@ const Writer = struct {
 pub const BuildOptions = struct {
     scratch_dir: []const u8,
     deadline: io.Deadline = .none,
+    dataset_ids: ?*osm.DatasetIds = null,
 };
 
 /// Mark refs from qualifying ways, then stream just those nodes to output.
@@ -467,13 +468,17 @@ pub fn collectReferenced(
         scratch: pbf.block.Scratch = .{},
         mode: Mode = .sorted_nodes,
         out_of_order: bool = false,
+        dataset_ids: ?*osm.DatasetIds,
+        final_input_first: usize,
 
-        fn consume(self: *Self, _: usize, bytes: []const u8) !void {
+        fn consume(self: *Self, index: usize, bytes: []const u8) !void {
             const block = try self.scratch.decode(self.gpa, bytes, self.deadline);
+            const from_final_input = index >= self.final_input_first;
             switch (self.mode) {
                 .sorted_nodes => {
                     var nodes = block.nodes();
                     while (try nodes.next()) |node| {
+                        self.observeId(node, from_final_input);
                         const key = keyFor(node.id);
                         const uses = try self.used.count(key);
                         if (uses == 0) continue;
@@ -487,6 +492,7 @@ pub fn collectReferenced(
                 .unsorted_nodes => |positions| {
                     var nodes = block.nodes();
                     while (try nodes.next()) |node| {
+                        self.observeId(node, from_final_input);
                         const located = try self.used.locate(positions, keyFor(node.id), .{ .lat = node.lat, .lon = node.lon });
                         if (observeNode) |observe| {
                             if (located) try observe(self.selection, node);
@@ -495,6 +501,14 @@ pub fn collectReferenced(
                 },
             }
         }
+
+        fn observeId(self: *const Self, node: pbf.block.Node, from_final_input: bool) void {
+            const ids = self.dataset_ids orelse return;
+            ids.max_changeset = @max(ids.max_changeset, node.changeset);
+            // Valhalla uses the maximum node ID in the last input extract
+            // when no entity supplies a changeset.
+            if (from_final_input) ids.last_input_max_node = @max(ids.last_input_max_node, std.math.cast(u64, node.id) orelse 0);
+        }
     };
     var pass: Pass = .{
         .gpa = gpa,
@@ -502,6 +516,11 @@ pub fn collectReferenced(
         .selection = context,
         .used = used,
         .writer = &writer,
+        .dataset_ids = options.dataset_ids,
+        .final_input_first = if (@hasDecl(@TypeOf(source), "finalInputFirstBlock") and options.dataset_ids != null)
+            try source.finalInputFirstBlock(options.deadline)
+        else
+            0,
     };
     defer pass.scratch.deinit(gpa);
     source.forEach(gpa, options.deadline, &pass, Pass.consume) catch |err| {

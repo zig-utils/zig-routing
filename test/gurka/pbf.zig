@@ -12,6 +12,7 @@ const BlobHeader = schema.BlobHeader;
 const Blob = schema.Blob;
 const HeaderBlock = schema.HeaderBlock;
 const Node = schema.Node;
+const DenseNodes = schema.DenseNodes;
 const Way = schema.Way;
 const Relation = schema.Relation;
 const PrimitiveGroup = schema.PrimitiveGroup;
@@ -88,31 +89,56 @@ fn appendBlock(arena: Allocator, out: *std.ArrayList(u8), kind: []const u8, raw:
 
 /// Emit an OSMHeader and one OSMData block with a shared string table.
 pub fn encode(arena: Allocator, dataset: gurka.Dataset) ![]const u8 {
+    return encodeWithMetadata(arena, dataset, .standard);
+}
+
+pub const Metadata = enum { standard, sparse, dense, absent };
+
+pub fn encodeWithMetadata(arena: Allocator, dataset: gurka.Dataset, metadata: Metadata) ![]const u8 {
     var strings: Strings = .{ .arena = arena };
     try strings.bytes.append(arena, "");
     const nodes = try arena.alloc(Node.Values, dataset.nodes.len);
-    for (dataset.nodes, nodes) |node, *record| {
+    for (dataset.nodes, nodes, 0..) |node, *record, i| {
         const tags = try strings.encodeTags(node.tags);
         record.* = .{
             .id = node.id,
             .keys = tags.keys,
             .vals = tags.values,
-            .info = .{ .version = 1 },
+            .info = switch (metadata) {
+                .standard => .{ .version = 1 },
+                .sparse, .dense => .{ .version = 1, .changeset = if (i + 1 == nodes.len) 9001 else if (i % 2 == 0) 8001 else 7001 },
+                .absent => null,
+            },
             .lat = try encodePosition(node.location.lat, 90),
             .lon = try encodePosition(node.location.lng, 180),
         };
     }
     const ways = try arena.alloc(Way.Values, dataset.ways.len);
-    for (dataset.ways, ways) |way, *record| record.* = try encodeWay(arena, &strings, way);
+    for (dataset.ways, ways) |way, *record| {
+        record.* = try encodeWay(arena, &strings, way);
+        record.info = switch (metadata) {
+            .standard => record.info,
+            .sparse, .dense => .{ .version = 1, .changeset = 9000 },
+            .absent => null,
+        };
+    }
     const relations = try arena.alloc(Relation.Values, dataset.relations.len);
-    for (dataset.relations, relations) |relation, *record| record.* = try encodeRelation(arena, &strings, relation);
+    for (dataset.relations, relations) |relation, *record| {
+        record.* = try encodeRelation(arena, &strings, relation);
+        record.info = switch (metadata) {
+            .standard => record.info,
+            .sparse => .{ .version = 1, .changeset = 9002 },
+            .dense => .{ .version = 1, .changeset = 8002 },
+            .absent => null,
+        };
+    }
 
     var groups: std.ArrayList(PrimitiveGroup.Values) = .empty;
-    if (nodes.len != 0) try groups.append(arena, .{ .nodes = nodes });
+    if (nodes.len != 0) try groups.append(arena, if (metadata == .dense) .{ .dense = try denseNodes(arena, nodes) } else .{ .nodes = nodes });
     if (ways.len != 0) try groups.append(arena, .{ .ways = ways });
     if (relations.len != 0) try groups.append(arena, .{ .relations = relations });
     const header: HeaderBlock.Values = .{
-        .required_features = &.{"OsmSchema-V0.6"},
+        .required_features = if (metadata == .dense) &.{ "OsmSchema-V0.6", "DenseNodes" } else &.{"OsmSchema-V0.6"},
         .optional_features = &.{"Sort.Type_then_ID"},
         .writingprogram = "zig-routing-gurka",
     };
@@ -126,6 +152,29 @@ pub fn encode(arena: Allocator, dataset: gurka.Dataset) ![]const u8 {
     const block_buf = try arena.alloc(u8, try PrimitiveBlock.encodedSize(block, none));
     try appendBlock(arena, &out, "OSMData", try PrimitiveBlock.encode(block_buf, block, none));
     return out.items;
+}
+
+fn denseNodes(arena: Allocator, nodes: []const Node.Values) !DenseNodes.Values {
+    const ids = try arena.alloc(i64, nodes.len);
+    const lats = try arena.alloc(i64, nodes.len);
+    const lons = try arena.alloc(i64, nodes.len);
+    const changesets = try arena.alloc(i64, nodes.len);
+    var tags: std.ArrayList(i32) = .empty;
+    var previous: struct { id: i64 = 0, lat: i64 = 0, lon: i64 = 0, changeset: i64 = 0 } = .{};
+    for (nodes, 0..) |node, i| {
+        const changeset = node.info.?.changeset.?;
+        ids[i] = try std.math.sub(i64, node.id, previous.id);
+        lats[i] = node.lat - previous.lat;
+        lons[i] = node.lon - previous.lon;
+        changesets[i] = changeset - previous.changeset;
+        previous = .{ .id = node.id, .lat = node.lat, .lon = node.lon, .changeset = changeset };
+        for (node.keys, node.vals) |key, value| {
+            try tags.append(arena, std.math.cast(i32, key) orelse return error.TooManyStrings);
+            try tags.append(arena, std.math.cast(i32, value) orelse return error.TooManyStrings);
+        }
+        try tags.append(arena, 0);
+    }
+    return .{ .id = ids, .lat = lats, .lon = lons, .denseinfo = .{ .changeset = changesets }, .keys_vals = tags.items };
 }
 
 fn expectBlock(file: *[]const u8, kind: []const u8) ![]const u8 {

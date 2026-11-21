@@ -17,6 +17,7 @@ pub const Error = protobuf.Error || error{
     InvalidTags,
     InvalidMembers,
     InvalidMemberType,
+    InvalidChangeset,
     DeltaOverflow,
 };
 
@@ -105,23 +106,35 @@ fn addDelta(previous: *i64, delta: i64) Error!i64 {
     return previous.*;
 }
 
+fn changesetId(value: i64) Error!u64 {
+    return std.math.cast(u64, value) orelse error.InvalidChangeset;
+}
+
+fn sparseChangeset(view: anytype, deadline: Deadline) Error!u64 {
+    const info = try view.get("info", deadline) orelse return 0;
+    return changesetId(try info.getOrDefault("changeset", deadline));
+}
+
 pub const Node = struct {
     id: i64,
     lat: i32,
     lon: i32,
     tags: TagIterator,
+    changeset: u64 = 0,
 };
 
 pub const Way = struct {
     id: i64,
     refs: RefIterator,
     tags: TagIterator,
+    changeset: u64 = 0,
 };
 
 pub const Relation = struct {
     id: i64,
     members: MemberIterator,
     tags: TagIterator,
+    changeset: u64 = 0,
 };
 
 pub const TagIterator = struct {
@@ -220,6 +233,8 @@ const DenseIterator = struct {
     lons: Repeated(schema.DenseNodes, "lon"),
     keys_vals: Repeated(schema.DenseNodes, "keys_vals"),
     has_tags: bool,
+    changesets: ?Repeated(schema.DenseInfo, "changeset"),
+    changeset: i64 = 0,
     id: i64 = 0,
     lat: i64 = 0,
     lon: i64 = 0,
@@ -227,12 +242,18 @@ const DenseIterator = struct {
     fn init(dense: schema.DenseNodes.View, deadline: Deadline) Error!DenseIterator {
         const keys_vals = try dense.get("keys_vals", deadline);
         var probe = keys_vals;
+        const changesets = if (try dense.get("denseinfo", deadline)) |info| blk: {
+            const values = try info.get("changeset", deadline);
+            var first = values;
+            break :blk if (try first.next(deadline) != null) values else null;
+        } else null;
         return .{
             .ids = try dense.get("id", deadline),
             .lats = try dense.get("lat", deadline),
             .lons = try dense.get("lon", deadline),
             .keys_vals = keys_vals,
             .has_tags = try probe.next(deadline) != null,
+            .changesets = changesets,
         };
     }
 
@@ -243,9 +264,16 @@ const DenseIterator = struct {
         const lon = try self.lons.next(deadline);
         if (id == null and lat == null and lon == null) {
             if (try self.keys_vals.next(deadline) != null) return error.InvalidDenseTags;
+            if (self.changesets) |*changesets| {
+                if (try changesets.next(deadline) != null) return error.InvalidDenseColumns;
+            }
             return null;
         }
         if (id == null or lat == null or lon == null) return error.InvalidDenseColumns;
+        const changeset = if (self.changesets) |*changesets|
+            try changesetId(try addDelta(&self.changeset, try changesets.next(deadline) orelse return error.InvalidDenseColumns))
+        else
+            0;
 
         const start = self.keys_vals;
         var pairs: usize = 0;
@@ -261,6 +289,7 @@ const DenseIterator = struct {
             .id = try addDelta(&self.id, id.?),
             .lat = try block.coordinate(try addDelta(&self.lat, lat.?), block.lat_offset, 90),
             .lon = try block.coordinate(try addDelta(&self.lon, lon.?), block.lon_offset, 180),
+            .changeset = changeset,
             .tags = .{
                 .strings = block.strings,
                 .deadline = deadline,
@@ -309,21 +338,25 @@ fn PrimitiveIterator(comptime kind: osm.Kind) type {
                     if (try records.next(deadline)) |view| {
                         const id = try view.get("id", deadline);
                         const tags = try TagIterator.separate(block, view);
+                        const changeset = try sparseChangeset(view, deadline);
                         return switch (kind) {
                             .node => .{
                                 .id = id,
                                 .tags = tags,
                                 .lat = try block.coordinate(try view.get("lat", deadline), block.lat_offset, 90),
                                 .lon = try block.coordinate(try view.get("lon", deadline), block.lon_offset, 180),
+                                .changeset = changeset,
                             },
                             .way => .{
                                 .id = id,
                                 .tags = tags,
                                 .refs = .{ .deltas = try view.get("refs", deadline), .deadline = deadline },
+                                .changeset = changeset,
                             },
                             .relation => .{
                                 .id = id,
                                 .tags = tags,
+                                .changeset = changeset,
                                 .members = .{
                                     .roles = try view.get("roles_sid", deadline),
                                     .deltas = try view.get("memids", deadline),
@@ -374,14 +407,16 @@ test "dense deltas, offsets and tags remain valid after advancing across groups"
                 .id = &.{ -2, -4, 12 },
                 .lat = &.{ -6, 10, -6 },
                 .lon = &.{ 9, -15, 8 },
+                .denseinfo = .{ .changeset = &.{ 125, -2, 20 } },
                 .keys_vals = &.{ 1, 2, 3, 0, 0, 0, 1, 2, 0 },
             } },
             .{},
-            .{ .ways = &.{.{ .id = 6, .refs = &.{ -2, -4, 12 } }} },
-            .{ .nodes = &.{.{ .id = 12, .lat = 100, .lon = -100 }} },
+            .{ .ways = &.{.{ .id = 6, .info = .{ .changeset = 401 }, .refs = &.{ -2, -4, 12 } }} },
+            .{ .nodes = &.{.{ .id = 12, .info = .{ .changeset = 301 }, .lat = 100, .lon = -100 }} },
             .{ .dense = .{ .id = &.{20}, .lat = &.{0}, .lon = &.{0} } },
             .{ .relations = &.{.{
                 .id = 24,
+                .info = .{ .changeset = 501 },
                 .roles_sid = &.{ 3, 0, 3 },
                 .memids = &.{ 6, -12, 36 },
                 .types = &.{ 1, 0, 2 },
@@ -400,6 +435,7 @@ test "dense deltas, offsets and tags remain valid after advancing across groups"
     const d = (try nodes.next()).?;
     var e = (try nodes.next()).?;
     try testing.expectEqualSlices(i64, &.{ -2, -6, 6, 12, 20 }, &.{ a.id, b.id, c.id, d.id, e.id });
+    try testing.expectEqualSlices(u64, &.{ 125, 123, 143, 301, 0 }, &.{ a.changeset, b.changeset, c.changeset, d.changeset, e.changeset });
     try testing.expectEqualSlices(i32, &.{ -2, 0, -1, 29, 0 }, &.{ a.lat, b.lat, c.lat, d.lat, e.lat });
     try testing.expectEqualSlices(i32, &.{ 3, 0, 1, -28, 1 }, &.{ a.lon, b.lon, c.lon, d.lon, e.lon });
     try testing.expectEqual(null, try nodes.next());
@@ -420,6 +456,7 @@ test "dense deltas, offsets and tags remain valid after advancing across groups"
     var ways = block.ways();
     var way = (try ways.next()).?;
     try testing.expectEqual(6, way.id);
+    try testing.expectEqual(401, way.changeset);
     try testing.expectEqual(-2, (try way.refs.next()).?);
     try testing.expectEqual(-6, (try way.refs.next()).?);
     try testing.expectEqual(6, (try way.refs.next()).?);
@@ -429,6 +466,7 @@ test "dense deltas, offsets and tags remain valid after advancing across groups"
     var relations = block.relations();
     var relation = (try relations.next()).?;
     try testing.expectEqual(24, relation.id);
+    try testing.expectEqual(501, relation.changeset);
     const first = (try relation.members.next()).?;
     try testing.expectEqual(.way, first.type);
     try testing.expectEqual(6, first.ref);
@@ -503,6 +541,9 @@ test "short and surplus dense streams return errors" {
     const cases = [_]struct { dense: schema.DenseNodes.Values, valid_nodes: usize, err: Error }{
         .{ .dense = .{ .id = &.{1}, .lat = &.{0} }, .valid_nodes = 0, .err = error.InvalidDenseColumns },
         .{ .dense = .{ .id = &.{1}, .lat = &.{0}, .lon = &.{ 0, 0 } }, .valid_nodes = 1, .err = error.InvalidDenseColumns },
+        .{ .dense = .{ .id = &.{ 1, 1 }, .lat = &.{ 0, 0 }, .lon = &.{ 0, 0 }, .denseinfo = .{ .changeset = &.{1} } }, .valid_nodes = 1, .err = error.InvalidDenseColumns },
+        .{ .dense = .{ .id = &.{1}, .lat = &.{0}, .lon = &.{0}, .denseinfo = .{ .changeset = &.{ 1, 1 } } }, .valid_nodes = 1, .err = error.InvalidDenseColumns },
+        .{ .dense = .{ .id = &.{1}, .lat = &.{0}, .lon = &.{0}, .denseinfo = .{ .changeset = &.{-1} } }, .valid_nodes = 0, .err = error.InvalidChangeset },
         .{ .dense = .{ .id = &.{1}, .lat = &.{0}, .lon = &.{0}, .keys_vals = &.{ 1, 1 } }, .valid_nodes = 0, .err = error.InvalidDenseTags },
         .{ .dense = .{ .id = &.{1}, .lat = &.{0}, .lon = &.{0}, .keys_vals = &.{ 0, 0 } }, .valid_nodes = 1, .err = error.InvalidDenseTags },
         .{ .dense = .{ .id = &.{ std.math.maxInt(i64), 1 }, .lat = &.{ 0, 0 }, .lon = &.{ 0, 0 } }, .valid_nodes = 1, .err = error.DeltaOverflow },
