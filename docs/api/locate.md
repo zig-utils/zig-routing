@@ -28,6 +28,9 @@ arrays and includes a reason in verbose mode.
   zero, and `elevation` uses Valhalla's unavailable sentinel of `-500`.
   Unstored named intersections use `false`. Tile-only optional edge
   metadata with no native representation is omitted.
+- Each native node array lists unique nodes in the order their first
+  incoming candidate appears. Valhalla collects these nodes in an
+  unordered set. [Valhalla node serialization](https://github.com/valhalla/valhalla/blob/3.9.3/src/tyr/locate_serializer.cc).
 - `live_speed` is an empty object and `predicted_speeds` an empty array.
 - `format: "osrm"` selects an [OSRM nearest-style response](https://project-osrm.org/docs/v5.24.0/api/#nearest-service)
   with one nearest waypoint per location and a `NoSegment` error when
@@ -54,9 +57,13 @@ search cutoff, respectively.
 The Utrecht replay matched the order and identity of 654 edges and 100
 filtered edges across 267 input locations. Both projections and fractions
 agreed within `1e-6`, and side of street and directional reach counts agreed
-exactly. The same nodes appeared at every location, with a different
-presentation order at 12 locations. [Candidate validation](https://github.com/zig-utils/zig-routing/issues/247).
-An independent build from the same small OSM map verified that a directed
-height restriction appears in both implementations. The same-graph importer
-also preserves directed access records for verbose comparisons.
+exactly. The paired responses also agreed on every format-independent
+field, including verbose edge attributes, OpenLR and access restrictions.
+The same nodes appeared at every location, with a different presentation
+order at 12 locations. [Candidate validation](https://github.com/zig-utils/zig-routing/issues/247).
+
+Gate H passed status, schema and enums on all 122 HTTP requests, and both
+error codes matched. An independent build of the same small OSM map
+matched the projected point and fraction in both directions. Both engines
+reported the 4 m height restriction in the same direction.
 [Restriction import](https://github.com/zig-utils/zig-routing/issues/246).
