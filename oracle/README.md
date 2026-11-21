@@ -47,6 +47,29 @@ databases, and can pass two PBFs to the same tile build. The build date stored i
 tile headers and tar metadata can differ between builds. Use the same platform when
 comparing graphs or exact responses.
 
+### Production datasets
+
+```bash
+oracle/up.sh germany
+```
+
+The Germany manifest pins Geofabrik's January 1, 2026 extract and all 107 SRTM cells covered
+by the completed local graph tiles. Valhalla 3.9.3 served `/status` and passed `/height` and
+auto, pedestrian, and bicycle `/route` checks in Berlin. The same shortest-auto request
+received warning 205 in default mode and ran with pruning disabled in opt-in mode.
+
+Measured on native x86-64 Linux with eight vCPUs, 32 GiB RAM, and six build workers:
+
+| Dataset | Graph tiles | Peak intermediate tile files | Peak builder cgroup memory | Dataset directory | Build time |
+|---|---:|---:|---:|---:|---:|
+| germany | 1,150 | 14.34 GiB | 27.25 GiB | 14.66 GiB | 20m 50s |
+
+The dataset directory includes the extracts, elevation, unpacked tiles, and the tile tar.
+Intermediate files and container memory were sampled during the build. Container memory
+includes file cache. Build time covers graph preparation, construction, and tarring.
+Elevation coverage comes from Valhalla's `valhalla_build_elevation` tool on the completed
+level 2 graph, including tiles added during final validation and binning.
+
 ### Hierarchy pruning
 
 Both server modes share a single graph. The default retains Valhalla's zero-metre

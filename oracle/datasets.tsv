@@ -1,3 +1,4 @@
 # name	pbf_url	pbf_sha256	elevation (inline name=sha256 list or @manifest.sha256)	optional profile	optional second_pbf_url	optional second_pbf_sha256
 liechtenstein	https://raw.githubusercontent.com/valhalla/valhalla/3.9.3/test/data/liechtenstein-latest.osm.pbf	b8b6c7f2122bd46a65b1d1c669b47c20df4f784a501ace3221d5ea6053121ecc	N47E009.hgt.gz=09ad8900736431e587ede7258b4fbbf399d639dfdad562ce83628faa4a043ae8
 utrecht	https://raw.githubusercontent.com/valhalla/valhalla/3.9.3/test/data/utrecht_netherlands.osm.pbf	8522f893d9c9c201d19d8fc0e39a038ad25fb21f6832370d4d257b4b495b9fa7	N52E005.hgt.gz=d78b184d053586a012fd3cfebd0cbcac02399f4f9e60479026ea8f13bb34b7dc
+germany	https://download.geofabrik.de/europe/germany/germany-260101.osm.pbf	4a2e3181c2cef4795b62ef9b447d4fa5f7f9bb2352d563292a7b98baa75279f8	@germany.sha256	production
