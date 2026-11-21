@@ -26,6 +26,28 @@ chain under a complex turn restriction. Once the importer preserved that rule,
 both engines rejected the movement and reached edge 22394 at 76.554 seconds.
 [Restriction import follow-up](https://github.com/zig-utils/zig-routing/issues/246).
 
+## Replay with imported restrictions
+
+The expansion now uses the directed predecessor's stored dead-end flag and
+applies vehicle dimensions from the imported access records. Twelve trials
+rotated the runners through the same ARM64 Linux environment and Utrecht tiles.
+The median total was 36.343 ms for Valhalla, 44.549 ms for the previous native
+runner, and 45.175 ms for the updated native runner. The 5x target remains open.
+
+| Request | Edges within 1% or 5 s |
+| --- | ---: |
+| Auto, 9.1 minutes | 22,137 / 22,150 |
+| Auto, two origins, 2 minutes | 784 / 784 |
+| Pedestrian, 12 minutes and 1.4 km | 2,945 / 2,945 |
+| Auto, reverse, 1 minute | 91 / 91 |
+
+Twelve differences in the first request follow the legal predecessor sequence
+4730 → 4775 → 4782. Valhalla's route search traverses the sequence when seeded
+on edge 4730. Its isochrone expansion retained the cheaper arrival at edge
+4775 from edge 4778, which is barred from continuing to 4782. Native expansion
+retains both restriction contexts. Edge 28525 has equal weighted cost and a
+6.27-second difference in elapsed time.
+
 ## Reproduction
 
 Set `mjolnir.hierarchy` and `mjolnir.shortcuts` to `false` in a Valhalla

@@ -30,7 +30,7 @@ pub const Foot = struct {
         const prior = if (direction == .forward) from else to;
         const check: pedestrian.PathCheck = .{
             .previous_distance = previous.dist_m,
-            .previous_dead_end = prior.flags.dead_end or (try view.outEdgeRange(movement.node)).count() == 1,
+            .previous_dead_end = try movement.predecessorAtDeadEnd(view, prior),
             .backtrack = movement.incoming_edge.cls.opp_local == movement.outgoing_edge.cls.local,
         };
         return if (direction == .forward)

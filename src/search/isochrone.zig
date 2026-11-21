@@ -222,7 +222,6 @@ const Rasterizer = struct {
     max_metres: f32,
     shape_interval: f32,
     settled: flags.Array(u64, 0) = .{},
-    fixed: std.ArrayList(geo.FixedLL) = .empty,
     vertices: std.ArrayList(Point) = .empty,
     samples: std.ArrayList(Point) = .empty,
 
@@ -293,14 +292,10 @@ const Rasterizer = struct {
     }
 
     fn decodeShape(self: *Rasterizer, record: graph.cold.Record, stored_reverse: bool) ![]Point {
-        if (record.header.point_count < 2) return error.IncompleteShape;
-        try self.fixed.resize(self.allocator, record.header.point_count);
         try self.vertices.resize(self.allocator, record.header.point_count);
-        try record.decodeShape(self.fixed.items, self.control.deadline);
-        for (self.fixed.items, 0..) |fixed, i| {
-            if (i % 256 == 0) try self.control.check();
-            self.vertices.items[if (stored_reverse) self.fixed.items.len - 1 - i else i] = fixed.toTilePoint();
-        }
+        var shape = record;
+        shape.reverse = record.reverse != stored_reverse;
+        try shape.decodeTilePoints(self.vertices.items, self.control.deadline);
         return self.vertices.items;
     }
 

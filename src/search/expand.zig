@@ -41,6 +41,8 @@ const EdgeId = graph.format.EdgeId;
 const Edge = graph.format.EdgeHot;
 
 const FixtureKernel = struct {
+    check_dead_ends: bool = false,
+
     pub fn edgeCost(_: FixtureKernel, _: *const View, _: EdgeId, edge: *const Edge, _: core.Direction) !Cost {
         const metres: f32 = @floatFromInt(edge.geom.len_m);
         return .{ .cost = metres / 10, .secs = metres / 20 };
@@ -56,6 +58,12 @@ const FixtureKernel = struct {
 
     pub fn turnCost(_: FixtureKernel, _: *const View, _: core.Transition, _: core.Label, _: core.Direction) !Cost {
         return .{};
+    }
+
+    pub fn allowedTurn(self: FixtureKernel, view: *const View, movement: core.Transition, _: core.Label, direction: core.Direction) !bool {
+        if (!self.check_dead_ends or movement.incoming_edge.cls.opp_local != movement.outgoing_edge.cls.local) return true;
+        const previous = if (direction == .forward) movement.incoming_edge else movement.outgoing_edge;
+        return movement.predecessorAtDeadEnd(view, try view.class(previous.cls.class_id));
     }
 };
 
@@ -113,6 +121,30 @@ const Recorder = struct {
         return if (self.prune_at == event.node) .prune else .expand;
     }
 };
+
+test "expansion backtracks on stored dead ends in forward and reverse" {
+    const testing = std.testing;
+    var edges = fixture.edges[0..6].*;
+    edges[4].cls.class_id = 1;
+    var classes: [2]graph.class_table.EdgeClass = @splat(std.mem.zeroes(graph.class_table.EdgeClass));
+    classes[1].flags.dead_end = true;
+    var view = fixture;
+    view.edges = &edges;
+    view.classes = &classes;
+    var arena = memory.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    var engine = try Expansion(FixtureKernel, queue.BucketQueue).init(testing.allocator, &view);
+    defer engine.deinit();
+    for ([_]core.Direction{ .forward, .reverse }) |direction| {
+        var seen: Recorder = .{};
+        _ = try engine.run(&arena, .{ .check_dead_ends = true }, .{ .origins = &.{@fromBackingInt(1)}, .direction = direction }, &seen, .{});
+        var visited: std.StaticBitSet(edges.len) = .empty;
+        for (seen.entries[0..seen.count]) |event| visited.set(event.label.edge);
+        try testing.expect(visited.isSet(if (direction == .forward) 5 else 4));
+        try testing.expect(!visited.isSet(if (direction == .forward) 0 else 1));
+        arena.reset();
+    }
+}
 
 // Ported from Isochrones.OriginEdge and Isochrones.LongEdge. The contour
 // tests belong to the isochrone builder. These assertions check its inputs.

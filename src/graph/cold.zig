@@ -455,6 +455,14 @@ pub const Record = struct {
     }
 
     pub fn decodeShape(self: Record, vertices: []point.FixedLL, deadline: io.Deadline) !void {
+        return self.decodeShapeInto(point.FixedLL, vertices, deadline);
+    }
+
+    pub fn decodeTilePoints(self: Record, vertices: []point.PointLL, deadline: io.Deadline) !void {
+        return self.decodeShapeInto(point.PointLL, vertices, deadline);
+    }
+
+    fn decodeShapeInto(self: Record, comptime Vertex: type, vertices: []Vertex, deadline: io.Deadline) !void {
         if (deadline.expired()) return error.DeadlineExceeded;
         if (vertices.len != self.header.point_count) return error.InvalidShapeBuffer;
         var decoder = polyline.Decoder(.varint).init(self.encoded, 7);
@@ -462,7 +470,7 @@ pub const Record = struct {
             if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
             const vertex = (try decoder.nextFixed()) orelse return error.IncompleteShape;
             if (!vertex.inRange()) return error.InvalidColdCoordinate;
-            vertices[if (self.reverse) vertices.len - 1 - i else i] = vertex;
+            vertices[if (self.reverse) vertices.len - 1 - i else i] = if (Vertex == point.FixedLL) vertex else vertex.toTilePoint();
         }
         if (!decoder.empty()) return error.TrailingShapeBytes;
     }

@@ -13,6 +13,14 @@ pub const Auto = struct {
     tables: *const routing.costing.compiled.Compiled,
     arena: std.mem.Allocator,
 
+    pub fn restrictionPermission(self: Auto) routing.costing.base.Permission {
+        return self.profile.permission;
+    }
+
+    pub fn restrictionDimensions(self: Auto) auto.Dimensions {
+        return self.profile.dimensions;
+    }
+
     pub fn edgeCost(self: Auto, view: *const View, _: Edge, edge: *const Hot, _: search.Direction) !Cost {
         const class = try view.class(edge.cls.class_id);
         return auto.Kernel.edgeCost(self.profile, self.tables, class, edge.*, self.profile.untimedSpeed(edge.*), .{});
@@ -24,7 +32,7 @@ pub const Auto = struct {
         const to = try view.class(movement.outgoing_edge.cls.class_id);
         const previous = if (direction == .forward) from else to;
         const check: auto.PathCheck = .{
-            .previous_dead_end = previous.flags.dead_end or (try view.outEdgeRange(movement.node)).count() == 1,
+            .previous_dead_end = try movement.predecessorAtDeadEnd(view, previous),
             .backtrack = movement.incoming_edge.cls.opp_local == movement.outgoing_edge.cls.local,
             .previous_access = if (direction == .forward) movement.incoming_access else movement.outgoing_access,
         };

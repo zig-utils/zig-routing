@@ -151,6 +151,12 @@ pub const Tiles = struct {
 
     /// Whether two tiles share an edge (N, E, S, W).
     pub fn areNeighbors(self: Tiles, a: i32, b: i32) bool {
+        const low = @min(a, b);
+        const high = @max(a, b);
+        if (!self.wrapx and low >= 0 and low != high and @as(i64, high) < @as(i64, self.nrows) * self.ncolumns) {
+            const delta = high - low;
+            return delta == self.ncolumns or (delta == 1 and @rem(low, self.ncolumns) != self.ncolumns - 1);
+        }
         return b == self.topNeighbor(a) or b == self.rightNeighbor(a) or b == self.bottomNeighbor(a) or b == self.leftNeighbor(a);
     }
 

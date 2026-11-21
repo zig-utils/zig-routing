@@ -197,6 +197,12 @@ pub const Transition = struct {
     incoming_access: base.AccessState = .{},
     outgoing_access: base.AccessState = .{},
     measured_speed: bool = false,
+    predecessor_dead_end: ?bool = null,
+
+    pub fn predecessorAtDeadEnd(self: Transition, view: *const View, previous: *const graph.class_table.EdgeClass) !bool {
+        if (self.predecessor_dead_end) |stored| return stored;
+        return previous.flags.dead_end or (try view.outEdgeRange(self.node)).count() == 1;
+    }
 };
 
 pub const Traversal = struct {
@@ -325,6 +331,10 @@ pub const PathAccess = struct {
     pub const Position = enum { start, middle, end };
 
     pub inline fn evaluate(self: PathAccess, id: EdgeId, edge: *const EdgeHot, node: NodeId, previous: Label, position: Position) !base.AccessEvaluation {
+        return self.evaluateWith(id, edge, node, previous, position, null);
+    }
+
+    inline fn evaluateWith(self: PathAccess, id: EdgeId, edge: *const EdgeHot, node: NodeId, previous: Label, position: Position, limits: anytype) !base.AccessEvaluation {
         const class = try self.view.class(edge.cls.class_id);
         // The directed not_thru bit is Valhalla's search hint. Admission
         // here follows the edge's access rules on the first search.
@@ -332,13 +342,13 @@ pub const PathAccess = struct {
         const access_modes: u16 = @bitCast(self.permission.access_mask);
         var evaluation: base.AccessEvaluation = .{};
         if (self.check_access and edge.cls.cold_checks != 0 and class.detail.access_restriction & access_modes != 0) {
-            evaluation = try self.evaluateConditionalAccess(id, node, previous, position);
+            evaluation = try self.evaluateConditionalAccess(id, node, previous, position, limits);
         }
         evaluation.state.destination_only = evaluation.state.destination_only or restricted;
         return evaluation;
     }
 
-    noinline fn evaluateConditionalAccess(self: PathAccess, id: EdgeId, node: NodeId, previous: Label, position: Position) !base.AccessEvaluation {
+    noinline fn evaluateConditionalAccess(self: PathAccess, id: EdgeId, node: NodeId, previous: Label, position: Position, limits: anytype) !base.AccessEvaluation {
         const local = try self.timing.local(self.view, node, previous.secs, self.direction);
         try self.control.check();
         const record = try self.view.coldRecordWithDeadline(id, self.control.deadline);
@@ -354,7 +364,7 @@ pub const PathAccess = struct {
         }
         var permission = self.permission;
         permission.allow_destination_only = permission.allow_destination_only or position == .end;
-        return permission.evaluateRestrictions(record.access_limits, !record.reverse, local, prior, null, self.control.deadline);
+        return permission.evaluateRestrictions(record.access_limits, !record.reverse, local, prior, limits, self.control.deadline);
     }
 };
 
@@ -596,6 +606,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
         }
 
         fn runLoop(self: *Self, comptime direction: Direction, comptime with_restrictions: bool, arena: *memory.Arena, kernel: K, query: anytype, potential: anytype, control: Control, permission: base.Permission, check_access: bool, keep_time: bool) !Result {
+            const limits = if (comptime @hasDecl(K, "restrictionDimensions")) kernel.restrictionDimensions() else null;
             const partial = @TypeOf(query) == PartialRequest;
             const expanding = @hasField(@TypeOf(query), "expansion");
             const partial_starts = partial or expanding;
@@ -712,6 +723,12 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     if (decision == .prune) continue;
                 }
                 const exits = try self.view.outEdgeRange(at);
+                // Dijkstras keeps the directed predecessor's stored dead-end bit.
+                // In reverse, that predecessor is the opposing edge.
+                const predecessor_dead_end = if (expanding and @hasDecl(K, "allowedTurn") and self.view.classes != null)
+                    (try self.view.class(geometry.cls.class_id)).flags.dead_end
+                else
+                    null;
                 const forward_row = if (direction == .forward) try self.view.turnRow(at, geometry.cls.opp_local) else &.{};
                 for (self.view.edges[exits.first..exits.end], exits.first.., 0..) |*outward, index, local| {
                     if (partial_starts and last.flags & Label.forbid_uturn != 0 and local == geometry.cls.opp_local) continue;
@@ -739,13 +756,13 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     if (closed and next_phase == 0) continue;
                     const head: NodeId = @fromBackingInt(outward.head);
                     const access = if (with_restrictions and (model_access or (check_access and next.cls.cold_checks != 0)))
-                        try tracker.access.evaluate(next_id, next, at, last, if (target != null and head == target.?) .end else .middle)
+                        try tracker.access.evaluateWith(next_id, next, at, last, if (target != null and head == target.?) .end else .middle, limits)
                     else
                         base.AccessEvaluation{};
                     if (!access.allowed) {
                         if (!partial or targets.index == 0 or permission.allow_destination_only) continue;
                         const endpoint_access = if (with_restrictions)
-                            try tracker.access.evaluate(next_id, next, at, last, .end)
+                            try tracker.access.evaluateWith(next_id, next, at, last, .end, limits)
                         else
                             base.AccessEvaluation{};
                         if (!endpoint_access.allowed) continue;
@@ -767,6 +784,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                         .row = row,
                         .incoming_access = if (direction == .forward) previous_access else access.state,
                         .outgoing_access = if (direction == .forward) access.state else previous_access,
+                        .predecessor_dead_end = predecessor_dead_end,
                     };
                     if (comptime @hasDecl(K, "allowedTurn")) {
                         if (!try kernel.allowedTurn(self.view, movement, last, direction)) continue;
