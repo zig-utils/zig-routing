@@ -83,7 +83,7 @@ pub const Leg = struct {
 pub const Result = struct {
     matches: []const Match,
     segments: []const Segment,
-    legs: []const Leg,
+    legs: []const Leg = &.{},
     score: f64 = 0,
 };
 
@@ -213,14 +213,23 @@ fn snapTrace(arena: *memory.Arena, finder: *candidates.Finder, router: anytype, 
         sequences: std.ArrayList([]const EdgeId) = .empty,
 
         pub fn accept(self: *@This(), alloc: Allocator, path: viterbi.Path, work: core.Control) !bool {
-            const result = try stitch(self.arena, self.view, self.kernel, self.trace, self.columns, self.costs, path, self.observations, self.movements, self.options, work);
-            if (self.options.best_paths > 1 and result.segments.len != 0) {
-                const sequence = try edgeSequence(alloc, result.segments, work);
+            var result = try stitch(self.arena, self.view, self.trace, self.columns, self.costs, path, self.observations, self.movements, work);
+            const alternate = self.results.items.len != 0;
+            if (alternate and result.segments.len == 0) return false;
+            const sequence = if (self.options.best_paths > 1 and result.segments.len != 0)
+                try edgeSequence(alloc, result.segments, work)
+            else
+                null;
+            if (sequence) |edges| {
                 for (self.sequences.items) |prior| {
-                    if (try containsEdges(prior, sequence, work) or try containsEdges(sequence, prior, work)) return false;
+                    if (try containsEdges(prior, edges, work) or try containsEdges(edges, prior, work)) return false;
                 }
-                try self.sequences.append(alloc, sequence);
             }
+            result.legs = formPaths(alloc, self.view, self.kernel, result.matches, result.segments, self.options, false, work) catch |err| switch (err) {
+                error.DisconnectedPath, error.InvalidRouteAccess, error.InvalidRouteCost => if (alternate) return false else return err,
+                else => return err,
+            };
+            if (sequence) |edges| try self.sequences.append(alloc, edges);
             try self.results.append(alloc, result);
             return true;
         }
@@ -336,7 +345,7 @@ fn walked(a: Allocator, view: *const View, kernel: anytype, trace: []const Measu
     };
 }
 
-fn stitch(arena: *memory.Arena, view: *const View, kernel: anytype, trace: []const Measurement, columns: *const Columns, costs: anytype, path: viterbi.Path, observations: Emission, movements: Transition, options: Options, control: core.Control) !Result {
+fn stitch(arena: *memory.Arena, view: *const View, trace: []const Measurement, columns: *const Columns, costs: anytype, path: viterbi.Path, observations: Emission, movements: Transition, control: core.Control) !Result {
     const a = arena.allocator();
     const matches = try initialMatches(a, trace, control);
     const pair_paths = try a.alloc(?routing.Route, path.states.len -| 1);
@@ -370,7 +379,10 @@ fn stitch(arena: *memory.Arena, view: *const View, kernel: anytype, trace: []con
         const arrives = t != 0 and pair_paths[t - 1] != null;
         const departs = t < pair_paths.len and pair_paths[t] != null;
         if (arrives) {
-            previous = pair_paths[t - 1].?.last_edge orelse previous;
+            // A stationary transition can carry an incoming edge from the
+            // cached scoring row. Keep this result's actual arrival instead.
+            const parts = pair_paths[t - 1].?.segments;
+            if (parts.len != 0) previous = parts[parts.len - 1].edge;
         } else previous = null;
         const candidate = columns.states.candidate(id) orelse continue;
         const match = &matches[index];
@@ -412,7 +424,6 @@ fn stitch(arena: *memory.Arena, view: *const View, kernel: anytype, trace: []con
     return .{
         .matches = matches,
         .segments = segments.items,
-        .legs = try formPaths(a, view, kernel, matches, segments.items, options, false, control),
         .score = path.cost,
     };
 }
@@ -612,4 +623,54 @@ fn formPaths(a: Allocator, view: *const View, kernel: anytype, matches: []const 
         first = end;
     }
     return legs.items;
+}
+
+test "stationary trace alias keeps the selected path's incoming edge" {
+    const t = std.testing;
+    const arrived: EdgeId = @fromBackingInt(@as(u32, 0));
+    const alias: EdgeId = @fromBackingInt(@as(u32, 1));
+    const node: graph.format.NodeId = @fromBackingInt(@as(u32, 1));
+    const Scores = struct {
+        pub fn selectedRoute(_: @This(), _: *memory.Arena, from: viterbi.StateId, _: viterbi.StateId, _: core.Control) !?routing.Route {
+            return if (from.time == 0)
+                .{ .segments = &.{.{ .edge = arrived, .cut = .{ .begin = 0.25 } }}, .last_edge = arrived, .score = 1, .metres = 75, .seconds = 5, .turn_cost = 0 }
+            else
+                .{ .segments = &.{}, .last_edge = alias, .score = 0, .metres = 0, .seconds = 0, .turn_cost = 0 };
+        }
+    };
+    const edge: graph.format.EdgeHot = .{
+        .head = @backingInt(node),
+        .geom = .{ .len_m = 100, .grade = 6, .curvature = 0 },
+        .cls = .{ .class_id = 0, .local = 0, .opp_local = 0, .cold_checks = 0, .pred_speed = 0 },
+        .speed = @splat(0),
+    };
+    var view: View = undefined;
+    view.edges = &.{ edge, edge };
+    const trace: [3]Measurement = @splat(.{ .point = .init(0, 0) });
+    var arena = memory.Arena.init(t.allocator, .{});
+    defer arena.deinit();
+    const a = arena.allocator();
+    var columns: Columns = .{};
+    var states: [trace.len]viterbi.StateId = undefined;
+    for (trace, &states, 0..) |measurement, *id, time| {
+        const candidate: candidates.Candidate = .{
+            .point = measurement.point,
+            .squared_distance = 0,
+            .node = if (time == 0) null else node,
+            .directions = @splat(.{ .edge = if (time == 0) arrived else alias, .percent_along = if (time == 0) 0.25 else 1, .heading = 0 }),
+            .direction_count = 1,
+        };
+        id.* = .{ .time = try columns.states.append(a, measurement, &.{candidate}), .id = 0 };
+        try columns.input_indices.append(a, id.time);
+    }
+    const result = try stitch(&arena, &view, &trace, &columns, Scores{}, .{
+        .states = &states,
+        .submatches = &.{.{ .first = 0, .count = trace.len }},
+        .cost = 1,
+        .broken = false,
+    }, try Emission.init(Emission.default_sigma_z), try Transition.init(.{}), .{});
+    try t.expectEqual(1, result.segments.len);
+    try t.expectEqual(arrived, result.segments[0].path.edge);
+    try t.expectEqual(arrived, result.matches[2].edge.?);
+    try t.expectEqual(@as(f32, 1), result.matches[2].fraction);
 }

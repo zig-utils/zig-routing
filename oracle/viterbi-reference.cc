@@ -14,6 +14,7 @@
 #include <valhalla/meili/transition_cost_model.h>
 #include <valhalla/midgard/logging.h>
 #include <valhalla/sif/costfactory.h>
+#include <valhalla/thor/map_matcher.h>
 
 #include "trace-transition-audit.h"
 
@@ -45,21 +46,25 @@ trace_audit::Cut stationary_cut(baldr::GraphReader& reader,
   return {baldr::GraphId(candidate.graph_id()), fraction, fraction};
 }
 
-void write_directed_segments(
-    size_t row,
+struct Segment {
+  trace_audit::Cut cut;
+  bool disconnected = false;
+};
+
+std::vector<Segment> directed_segments(
     baldr::GraphReader& reader,
     meili::ViterbiSearch& search,
+    meili::TopKSearch& topk,
     const meili::StateContainer& states,
     const std::vector<meili::StateId>& reverse,
     const std::unordered_map<meili::StateId, std::vector<trace_audit::Path>>& routed) {
-  struct Segment { trace_audit::Cut cut; bool disconnected = false; };
   std::vector<Segment> segments;
   std::vector<const trace_audit::Path*> pairs;
   for (size_t i = reverse.size(); i > 1; --i) {
     const auto left = reverse[i - 1];
     const auto right = reverse[i - 2];
     pairs.push_back(left.IsValid() && right.IsValid() && search.Predecessor(right) == left
-        ? &routed.at(left).at(right.id()) : nullptr);
+        ? &routed.at(topk.GetOrigin(left, left)).at(topk.GetOrigin(right, right).id()) : nullptr);
   }
   bool gap = false;
   baldr::GraphId previous;
@@ -70,8 +75,8 @@ void write_directed_segments(
       previous = {};
       continue;
     }
-    if (route->arrival.is_valid())
-      previous = route->arrival;
+    if (!route->cuts.empty())
+      previous = route->cuts.back().edge;
     const auto append = [&](trace_audit::Cut cut) {
       if (!segments.empty() && gap)
         segments.back().disconnected = true;
@@ -92,27 +97,59 @@ void write_directed_segments(
         }
       }
       const auto right = reverse[reverse.size() - i - 2];
-      append(stationary_cut(reader, states.state(right).candidate(), previous, following));
+      append(stationary_cut(reader, states.state(topk.GetOrigin(right, right)).candidate(), previous,
+                            following));
     } else {
       for (const auto& cut : route->cuts)
         append(cut);
     }
   }
-  std::cout << row;
+  return segments;
+}
+
+void write_segments(const std::vector<Segment>& segments) {
   for (const auto& entry : segments) {
     const auto& cut = entry.cut;
     std::cout << '\t' << cut.edge.id() << ',' << cut.begin << ',' << cut.end << ',' << entry.disconnected;
   }
-  std::cout << '\n';
+}
+
+// A ranked result also records its measuring columns. The cached row's
+// distance and turn sum explain score differences on the same stitched route.
+void write_state(meili::StateId state, float emission, float metres, float turns) {
+  std::cout << '\t' << "state=" << state.time() << ',' << state.id() << ',' << emission << ','
+            << metres << ',' << turns;
+}
+
+std::vector<uint32_t> path_edges(const std::vector<Segment>& segments) {
+  std::vector<uint32_t> edges;
+  for (size_t i = 0; i < segments.size(); ++i) {
+    const auto& cut = segments[i].cut;
+    if ((i == 0 && cut.begin == 1.f) || (i + 1 == segments.size() && cut.end == 0.f))
+      continue;
+    if (edges.empty() || edges.back() != cut.edge.id())
+      edges.push_back(cut.edge.id());
+  }
+  return edges;
+}
+
+bool contains(const std::vector<uint32_t>& path, const std::vector<uint32_t>& part) {
+  if (part.empty())
+    return path.empty();
+  return std::search(path.begin(), path.end(), part.begin(), part.end()) != path.end();
 }
 } // namespace
 
 int main(int argc, char** argv) {
-  const bool directed_segments = argc == 4 && std::string_view(argv[3]) == "--directed-segments";
-  const bool directed = directed_segments || (argc == 4 && std::string_view(argv[3]) == "--directed");
+  const bool primary_segments = argc == 4 && std::string_view(argv[3]) == "--directed-segments";
+  const bool action_ranks = argc == 4 && std::string_view(argv[3]) == "--action-ranks";
+  const bool stock_ranks = argc == 4 && std::string_view(argv[3]) == "--stock-ranks";
+  const bool directed = primary_segments || action_ranks ||
+                        (argc == 4 && std::string_view(argv[3]) == "--directed");
   const bool segments = argc == 4 && std::string_view(argv[3]) == "--segments";
-  if (argc != 3 && !directed && !segments) {
-    std::cerr << "usage: viterbi-reference CONFIG CORPUS [--directed|--segments|--directed-segments]\n";
+  if (argc != 3 && !directed && !segments && !stock_ranks) {
+    std::cerr << "usage: viterbi-reference CONFIG CORPUS "
+                 "[--directed|--segments|--directed-segments|--action-ranks|--stock-ranks]\n";
     return 2;
   }
   using namespace valhalla;
@@ -135,9 +172,11 @@ int main(int argc, char** argv) {
   const auto& costing = modes[static_cast<size_t>(mode)];
   const float cell = baldr::TileHierarchy::levels().back().tiles.TileSize() / settings.candidate_search.grid_size;
   meili::CandidateGridQuery query(reader, cell, cell);
-  constexpr float radius = 35.f;
-  constexpr float accuracy = 5.f;
-  const float effective = std::min(settings.candidate_search.max_search_radius_meters, radius);
+  const bool action_options = action_ranks || stock_ranks;
+  const float radius = action_options ? settings.candidate_search.search_radius_meters : 35.f;
+  const float accuracy = action_options ? settings.emission_cost.gps_accuracy_meters : 5.f;
+  const float effective = std::min(settings.candidate_search.max_search_radius_meters,
+                                   std::max(radius, accuracy));
   constexpr double break_penalty = 99999999.f;
   std::array<float, 181> penalties;
   for (size_t degree = 0; degree < penalties.size(); ++degree)
@@ -157,6 +196,62 @@ int main(int argc, char** argv) {
       if (!(input >> lat >> lon >> epoch))
         return 2;
       measurements.emplace_back(midgard::PointLL{lon, lat}, accuracy, radius, epoch);
+    }
+    if (stock_ranks) {
+      meili::MapMatcher matcher(settings, reader, query, modes, mode);
+      try {
+        auto matches = matcher.OfflineMatch(measurements, k);
+        Options options;
+        options.set_action(Options::trace_attributes);
+        for (const auto& measurement : measurements) {
+          auto* point = options.add_shape();
+          point->mutable_ll()->set_lng(measurement.lnglat().lng());
+          point->mutable_ll()->set_lat(measurement.lnglat().lat());
+          point->set_time(measurement.epoch_time());
+        }
+        for (size_t rank = 0; rank < matches.size(); ++rank) {
+          auto& match = matches[rank];
+          std::string formation = match.segments.empty() ? "empty" : "ok";
+          if (!match.segments.empty()) {
+            try {
+              auto paths = thor::MapMatcher::FormPath(&matcher, match.results, match.segments,
+                                                      modes, mode, options);
+              if (paths.empty())
+                formation = "empty";
+            } catch (const std::exception& error) {
+              formation = error.what();
+            }
+          }
+          std::cout << row << '\t' << rank << '\t' << formation << '\t' << match.score;
+          for (const auto& edge : match.segments)
+            std::cout << '\t' << edge.edgeid.id() << ',' << edge.source << ',' << edge.target << ','
+                      << edge.discontinuity;
+          const auto& states = matcher.state_container();
+          meili::StateId previous;
+          for (const auto& result : match.results) {
+            if (!result.HasState())
+              continue;
+            const auto state = result.stateid;
+            float metres = -1.f;
+            float turns = -1.f;
+            if (previous.IsValid() && previous.time() + 1 == state.time()) {
+              const auto& left = states.state(previous);
+              const auto first = left.RouteBegin(states.state(state));
+              if (first != left.RouteEnd()) {
+                metres = first->cost().cost;
+                turns = first->turn_cost();
+              }
+            }
+            write_state(state, matcher.emission_cost_model()(state), metres, turns);
+            previous = state;
+          }
+          std::cout << '\n';
+        }
+      } catch (const std::exception& error) {
+        std::cout << row << "\t-1\t" << error.what() << '\n';
+      }
+      ++row;
+      continue;
     }
     if (segments) {
       meili::MapMatcher matcher(settings, reader, query, modes, mode);
@@ -181,7 +276,7 @@ int main(int argc, char** argv) {
     size_t selected = 0;
     for (size_t i = 0; i < measurements.size(); ++i) {
       const auto& measurement = measurements[i];
-      if (directed_segments && i != 0) {
+      if ((primary_segments || action_ranks) && i != 0) {
         const auto& previous = measurements[selected];
         const auto distance = settings.routing.interpolation_distance_meters;
         if (i + 1 != measurements.size() && previous.distance_squared(measurement) <= distance * distance)
@@ -228,7 +323,8 @@ int main(int argc, char** argv) {
       });
     }
 
-    for (uint32_t rank = 0; rank < k; ++rank) {
+    std::vector<std::vector<uint32_t>> accepted;
+    for (uint32_t rank = 0; rank < k;) {
       std::vector<meili::StateId> reverse;
       bool broken = false;
       double cost = 0;
@@ -247,19 +343,46 @@ int main(int argc, char** argv) {
           broken = true;
         }
       }
-      if (directed_segments) {
-        write_directed_segments(row, reader, search, states, reverse, routed);
+      if (primary_segments) {
+        std::cout << row;
+        write_segments(directed_segments(reader, search, topk, states, reverse, routed));
+        std::cout << '\n';
         break;
       }
       if (rank != 0 && broken)
         break;
-      std::cout << row << '\t' << rank << '\t' << broken << '\t' << cost;
-      for (auto it = reverse.rbegin(); it != reverse.rend(); ++it) {
-        const auto state = topk.GetOrigin(*it, *it);
-        std::cout << '\t' << (state.IsValid() ? static_cast<int64_t>(state.id()) : -1);
+      if (action_ranks) {
+        const auto cuts = directed_segments(reader, search, topk, states, reverse, routed);
+        auto edges = path_edges(cuts);
+        const auto repeated = std::any_of(accepted.begin(), accepted.end(), [&](const auto& prior) {
+          return contains(prior, edges) || contains(edges, prior);
+        });
+        if (!cuts.empty() && !repeated) {
+          std::cout << row << '\t' << rank++ << '\t' << broken << '\t' << cost;
+          write_segments(cuts);
+          meili::StateId previous;
+          for (auto it = reverse.rbegin(); it != reverse.rend(); ++it) {
+            const auto state = topk.GetOrigin(*it, *it);
+            if (state.IsValid()) {
+              const auto found = routed.find(previous);
+              const auto* move = found == routed.end() ? nullptr : &found->second.at(state.id());
+              write_state(state, emission(state), move ? move->cost.cost : -1.f,
+                          move ? move->turns : -1.f);
+            }
+            previous = state;
+          }
+          std::cout << '\n';
+          accepted.push_back(std::move(edges));
+        }
+      } else {
+        std::cout << row << '\t' << rank++ << '\t' << broken << '\t' << cost;
+        for (auto it = reverse.rbegin(); it != reverse.rend(); ++it) {
+          const auto state = topk.GetOrigin(*it, *it);
+          std::cout << '\t' << (state.IsValid() ? static_cast<int64_t>(state.id()) : -1);
+        }
+        std::cout << '\n';
       }
-      std::cout << '\n';
-      if (broken || reverse.empty() || rank + 1 == k)
+      if (broken || reverse.empty() || rank == k)
         break;
       topk.RemovePath(reverse);
       search.ClearSearch();
