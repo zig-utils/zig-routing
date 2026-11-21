@@ -121,6 +121,32 @@
     ]
   },
   {
+    "key": "P9.05a",
+    "goal": "Replay Valhalla 3.9.3 and zig-routing on the same street and transit topology, timetable and endpoint cuts to isolate itinerary differences in P9.05.",
+    "upstream": [
+      "src/baldr/graphtile.cc",
+      "valhalla/baldr/transit*.h",
+      "src/mjolnir/convert_transit.cc",
+      "src/mjolnir/transitbuilder.cc",
+      "src/thor/multimodal_transit.cc",
+      "src/thor/triplegbuilder_utils.h"
+    ],
+    "scope": [
+      "Extend the test-only importer to level-3 transit tiles and their level-2 street links. Preserve departures, stops, lines, trips, blocks, service masks, metadata and scheduled times.",
+      "Translate the oracle's selected street edges and fractions to native edge IDs. Replay the same departure requests and costing options.",
+      "Compare route and stop IDs, boarding times and weighted costs. Reprice divergences on the shared graph.",
+      "Add a reproducible Brockton comparison and a fixture where a later departure overtakes the first one."
+    ],
+    "out_of_scope": ["Production dependencies on Valhalla or its storage format", "Changes to the P9.05 itinerary threshold or production GTFS ingest policy"],
+    "accept": [
+      "Paired road and transit tiles import into a verified bundle with the oracle's stop connectivity and timetable.",
+      "Both searches use the same directed endpoint edges and fractions.",
+      "A seeded real corpus replays at least 100 requests and reports itinerary equality, failures and shared-graph recosts.",
+      "The overtaking fixture reports the first offered departure and the lowest-cost feasible itinerary for each search.",
+      "Tile parser seeds, malformed input tests and the full test suite pass."
+    ]
+  },
+  {
     "key": "P9.05b",
     "goal": "Keep exact scheduled routing within the production request arena on the shared Brockton graph.",
     "upstream": ["src/thor/multimodal_transit.cc", "valhalla/sif/edgelabel.h"],
