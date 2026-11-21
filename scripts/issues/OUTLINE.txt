@@ -233,7 +233,8 @@ P10.05 | Traffic in costing and the admissibility floors | costing | new | M | P
 P10.06 | Time-dependent potentials for predicted and live traffic | accel | new | L | P10.05 P5.21
 P10.07 | Incidents in responses | api | port | M | P10.02 P6.13
 P10.08 | Feed adapters: generic speed feeds and OpenLR decoding | traffic | new | L | P10.03
-P10.09 | Historical speeds from map-matched traces | traffic | new | L | P10.04 P8.04
+P10.09 | Historical speeds from map-matched traces | traffic | new | L | P10.04 P8.04 P10.09a
+P10.09a | Reach historical traffic throughput on noisy GPS traces | traffic | perf | L | P10.04 P8.04
 P10.10 | Phase 10 gate: traffic-aware ETAs within budget on the accelerated search | traffic | gate | M | P10.06 P10.07 P10.08
 
 ## P11 | P11 Vector map tiles | Basemap tiles from the same OSM extract.

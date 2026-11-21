@@ -444,6 +444,22 @@
     ]
   },
   {
+    "key": "P10.09a",
+    "goal": "Reach the historical traffic throughput target on ordinary timestamped GPS traces that require map snapping.",
+    "scope": [
+      "Profile exact transition expansion, candidate search and route stitching on the perturbed Utrecht trace corpus.",
+      "Improve the shared matcher without changing candidate order, directed paths, elapsed time attribution or privacy filtering.",
+      "Time the full pipeline through DCT and overlay publication on eight workers."
+    ],
+    "notes": ["#204 records the geometry-aligned benchmark and the current noisy-trace throughput."],
+    "accept": [
+      "Process at least 1 million points per second on the 1,024,088-point noisy Utrecht corpus with eight workers.",
+      "Preserve the geometry-aligned throughput, exact trace parity and historical accuracy and output privacy checks.",
+      "Publish same-platform before and after profiles and throughput.",
+      "`zig build test` green."
+    ]
+  },
+  {
     "key": "P10.10",
     "goal": "Phase 10 is complete when traffic-aware ETAs are correct against the oracle and fast on the accelerated search.",
     "upstream": [],
