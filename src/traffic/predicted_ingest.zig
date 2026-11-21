@@ -169,9 +169,45 @@ pub fn apply(a: Allocator, dir: io.Directory, uuid: format.DatasetUuid, edge_cou
         if (data.present()) try changes.append(a, .{ .edge = edge, .data = data });
     }
 
-    const scratch = try a.alloc(Update, changes.items.len);
+    return publish(a, dir, uuid, edge_count, previous, &incoming, changes.items, report, deadline);
+}
+
+pub const GeneratedProfile = struct {
+    edge: EdgeId,
+    coefficients: codec.Profile,
+};
+
+/// Install learned profiles without changing static speeds or other edges.
+pub fn applyGenerated(a: Allocator, dir: io.Directory, uuid: format.DatasetUuid, edge_count: u32, input: []const GeneratedProfile, deadline: io.Deadline) !Report {
+    if (input.len == 0) return .{};
+    try dir.lockExclusive();
+    const saved = try predicted.Reader.open(dir, uuid, edge_count, deadline);
+    defer if (saved) |reader| reader.close();
+    const previous = if (saved) |reader| reader.view else null;
+    var incoming: Intern = .{};
+    defer incoming.deinit(a);
+    const changes = try a.alloc(Update, input.len);
+    defer a.free(changes);
+    for (input, changes, 0..) |*profile, *change, index| {
+        if (index % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+        if (@backingInt(profile.edge) >= edge_count) return error.InvalidPredictedTrafficRecord;
+        change.* = .{
+            .edge = profile.edge,
+            .data = .{ .profile = try incoming.add(a, &profile.coefficients) },
+        };
+    }
+    return publish(a, dir, uuid, edge_count, previous, &incoming, changes, .{ .rows = input.len, .applied_rows = input.len }, deadline);
+}
+
+fn publish(a: Allocator, dir: io.Directory, uuid: format.DatasetUuid, edge_count: u32, previous: ?predicted.View, incoming: *const Intern, changes: []Update, stats: Report, deadline: io.Deadline) !Report {
+    var report = stats;
+    const scratch = try a.alloc(Update, changes.len);
     defer a.free(scratch);
-    try radix.sortByU64(Update, a, changes.items, scratch, {}, byEdge, deadline);
+    try radix.sortByU64(Update, a, changes, scratch, {}, byEdge, deadline);
+    if (changes.len > 1) for (changes[0 .. changes.len - 1], changes[1..], 0..) |left, right, i| {
+        if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+        if (left.edge == right.edge) return error.DuplicatePredictedTrafficEdge;
+    };
     const blocks = try a.alloc(live.RankBlock, predicted.blockCount(edge_count));
     defer a.free(blocks);
     var records: std.ArrayList(predicted.EdgeData) = .empty;
@@ -184,8 +220,8 @@ pub fn apply(a: Allocator, dir: io.Directory, uuid: format.DatasetUuid, edge_cou
         const before = if (previous) |view| view.blocks[group] else live.RankBlock{ .mask = 0, .first = 0 };
         const lo = next_change;
         var mask = before.mask;
-        while (next_change < changes.items.len and @backingInt(changes.items[next_change].edge) / 64 == group) : (next_change += 1) {
-            mask |= @as(u64, 1) << @as(u6, @truncate(@backingInt(changes.items[next_change].edge)));
+        while (next_change < changes.len and @backingInt(changes[next_change].edge) / 64 == group) : (next_change += 1) {
+            mask |= @as(u64, 1) << @as(u6, @truncate(@backingInt(changes[next_change].edge)));
         }
         block.* = .{ .mask = mask, .first = @intCast(records.items.len) };
         var previous_id = before.first;
@@ -196,8 +232,8 @@ pub fn apply(a: Allocator, dir: io.Directory, uuid: format.DatasetUuid, edge_cou
             const edge = group * 64 + offset;
             const old = if (before.mask & bit != 0) previous.?.records[previous_id] else predicted.EdgeData{};
             previous_id += @intFromBool(before.mask & bit != 0);
-            const replaced = changed_id < next_change and @backingInt(changes.items[changed_id].edge) == edge;
-            const new = if (replaced) changes.items[changed_id].data else predicted.EdgeData{};
+            const replaced = changed_id < next_change and @backingInt(changes[changed_id].edge) == edge;
+            const new = if (replaced) changes[changed_id].data else predicted.EdgeData{};
             changed_id += @intFromBool(replaced);
             const coefficients = if (new.profile != predicted.no_profile)
                 &incoming.items.items[new.profile].coefficients
@@ -214,7 +250,7 @@ pub fn apply(a: Allocator, dir: io.Directory, uuid: format.DatasetUuid, edge_cou
             });
         }
     }
-    if (next_change != changes.items.len) return error.InvalidEdgeKeyIndex;
+    if (next_change != changes.len) return error.InvalidEdgeKeyIndex;
     try predicted.write(dir, uuid, edge_count, blocks, records.items, profiles.items.items, deadline);
     report.updated_edges = records.items.len;
     report.unique_profiles = profiles.items.items.len;

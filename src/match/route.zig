@@ -87,6 +87,38 @@ pub const Result = struct {
     score: f64 = 0,
 };
 
+/// Map measurements to their directed segment in travel order. A valid
+/// candidate can still lack a segment when neither neighboring path uses it.
+pub fn segmentIndices(a: Allocator, result: Result, control: core.Control) ![]u32 {
+    const indices = try a.alloc(u32, result.matches.len);
+    @memset(indices, core.no_index);
+    var walked_start: usize = 0;
+    for (result.segments, 0..) |segment, i| {
+        try control.check();
+        const first = segment.first_match orelse segment.last_match;
+        const last = segment.last_match orelse segment.first_match;
+        const low = if (segment.shape_end != null) walked_start else first orelse continue;
+        const high = segment.shape_end orelse last orelse continue;
+        if (high >= indices.len or low > high) return error.InvalidTracePath;
+        for (low..@as(usize, high) + 1) |point| {
+            if (point % 256 == 0) try control.check();
+            if (result.matches[point].edge == segment.path.edge) indices[point] = @intCast(i);
+        }
+        if (segment.shape_end != null) walked_start = high;
+    }
+    return indices;
+}
+
+/// Apply Valhalla's trace endpoint correlation defaults to the two ends
+/// of a shape. Transitions establish reachability during map matching.
+pub fn endpoint(input: request.Location) request.Location {
+    var location = input;
+    location.radius = 10;
+    location.minimum_reachability = 0;
+    location.node_snap_tolerance = 0;
+    return location;
+}
+
 fn breaks(stop_type: request.LocationType) bool {
     return stop_type == .@"break" or stop_type == .break_through;
 }
@@ -144,9 +176,9 @@ pub fn resolve(
         const view = finder.view;
         const a = arena.allocator();
         const correlated = options.correlated orelse blk: {
-            const origin = try snap.search(view, a, .{ .lat = trace[0].point.lat, .lng = trace[0].point.lng }, .{}, kernel, control.deadline);
+            const origin = try snap.search(view, a, endpoint(.{ .lat = trace[0].point.lat, .lng = trace[0].point.lng }), .{}, kernel, control.deadline);
             const last = trace[trace.len - 1].point;
-            const target = try snap.search(view, a, .{ .lat = last.lat, .lng = last.lng }, .{}, kernel, control.deadline);
+            const target = try snap.search(view, a, endpoint(.{ .lat = last.lat, .lng = last.lng }), .{}, kernel, control.deadline);
             break :blk EndpointCorrelations{ .origin = origin.edges, .target = target.edges };
         };
         if (walking.find(view, arena, trace, correlated.origin, correlated.target, control)) |parts| {

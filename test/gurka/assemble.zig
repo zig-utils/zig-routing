@@ -5788,3 +5788,108 @@ test "Gurka trace attributes filters edge and match fields in JSON and PBF" {
     }
     try testing.expectEqual(0, counting.calls());
 }
+
+test "Gurka historical traffic learns an interior edge and publishes an anonymous overlay" {
+    const history = routing.traffic.history;
+    const a = testing.allocator;
+    var storage: std.heap.ArenaAllocator = .init(a);
+    defer storage.deinit();
+    const raw = storage.allocator();
+    const road: gurka.Tags = &.{
+        .{ .key = "highway", .value = "primary" },
+        .{ .key = "maxspeed", .value = "40" },
+    };
+    const layout = try gurka.mapToCoordinates("A----B----C----D", 20);
+    const fixture = try gurka.Map.init(raw, layout, &.{
+        .{ .label = "AB", .tags = road },
+        .{ .label = "BC", .tags = road },
+        .{ .label = "CD", .tags = road },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+
+    const ids = [_]format.EdgeId{
+        try directedBetween(view, &fixture, "A", "B"),
+        try directedBetween(view, &fixture, "B", "C"),
+        try directedBetween(view, &fixture, "C", "D"),
+    };
+    const labels = [_][]const u8{ "A", "B", "C", "D" };
+    const start_time: f64 = 1_767_484_800;
+    var input: std.ArrayList(u8) = .empty;
+    const ground_truth: f64 = 40;
+    for ([_]f64{ ground_truth, ground_truth, ground_truth, ground_truth, 110 }) |interior_speed| {
+        var instant = start_time;
+        try input.appendSlice(raw, "{\"id\":\"discarded\",\"shape\":[");
+        for (labels, 0..) |label, i| {
+            if (i != 0) {
+                const hot = try view.edge(ids[i - 1]);
+                const speed = if (i == 2) interior_speed else ground_truth;
+                instant += @as(f64, @floatFromInt(hot.geom.len_m)) * 3.6 / speed;
+                try input.append(raw, ',');
+            }
+            const p = fixture.findNode(label).?.location;
+            try input.print(raw, "{{\"lat\":{d},\"lon\":{d},\"time\":{d}}}", .{ p.lat, p.lng, instant });
+        }
+        try input.appendSlice(raw, "]}\n");
+    }
+    try input.appendSlice(raw, "{\"id\":\"ignored\",\"shape\":[null]}\n");
+    const batch = try routing.traffic.history_trace.collect(a, view, input.items, 3, .none);
+    defer batch.deinit(a);
+    try testing.expectEqual(6, batch.report.traces);
+    try testing.expectEqual(1, batch.report.malformed_traces);
+    try testing.expectEqual(5, batch.report.contributing_traces);
+    try testing.expectEqual(5, batch.samples.len);
+    var outliers: usize = 0;
+    for (batch.samples) |sample| {
+        try testing.expectEqual(ids[1], sample.edge);
+        if (sample.kph > 100) {
+            outliers += 1;
+            try testing.expectApproxEqAbs(110, sample.kph, 0.01);
+        } else {
+            try testing.expectApproxEqAbs(ground_truth, sample.kph, 0.01);
+        }
+    }
+    try testing.expectEqual(1, outliers);
+    const fit = try history.fit(a, view, batch.samples, 3, .none);
+    defer fit.deinit(a);
+    try testing.expectEqual(1, fit.profiles.len);
+    try testing.expectEqual(ids[1], fit.profiles[0].edge);
+    const primary = fit.coverage[@backingInt(graph.constants.RoadClass.primary)];
+    try testing.expectEqual(1, primary.supported_buckets);
+    try testing.expectEqual(4, primary.retained_samples);
+
+    const dir = try built.root.child("bundle");
+    defer dir.close();
+    defer dir.deleteFile(routing.traffic.predicted.filename) catch {};
+    const applied = try routing.traffic.predicted_ingest.applyGenerated(a, dir, view.dataset_uuid, @intCast(view.edges.len), fit.profiles, .none);
+    try testing.expectEqual(1, applied.edges_with_profiles);
+    const reader = (try routing.traffic.predicted.Reader.open(dir, view.dataset_uuid, view.edges.len, .none)).?;
+    defer reader.close();
+    try testing.expect(reader.view.entry(ids[0]) == null);
+    try testing.expect(reader.view.entry(ids[2]) == null);
+    const observed = reader.view.speed(ids[1], @as(u64, batch.samples[0].bucket) * routing.traffic.predicted_codec.bucket_seconds).?;
+    try testing.expectApproxEqAbs(ground_truth, observed, ground_truth * 0.05);
+
+    // Verify actual DCT round-trip errors on a full synthetic weekly pattern.
+    const codec = routing.traffic.predicted_codec;
+    const full = try a.alloc(history.Sample, codec.bucket_count * 6);
+    defer a.free(full);
+    const perturbation = [_]f32{ -0.8, -0.4, 0, 0.4, 0.8, 0 };
+    var expected: [codec.bucket_count]f32 = undefined;
+    for (&expected, 0..) |*target, bucket| {
+        const phase: f32 = @as(f32, @floatFromInt(bucket)) * (@as(f32, 2 * std.math.pi) / codec.bucket_count);
+        target.* = 45 + 8 * @cos(7 * phase) + 3 * @sin(phase);
+        for (full[bucket * 6 ..][0..6], perturbation, 0..) |*sample, noise, i| {
+            sample.* = .{ .edge = ids[1], .bucket = @intCast(bucket), .kph = if (i == 5) 115 else target.* + noise };
+        }
+    }
+    const full_fit = try history.fit(a, view, full, 5, .none);
+    defer full_fit.deinit(a);
+    try testing.expectEqual(1, full_fit.profiles.len);
+    try testing.expectEqual(codec.bucket_count, full_fit.coverage[@backingInt(graph.constants.RoadClass.primary)].supported_buckets);
+    const decode = try codec.Codec.init(.none);
+    const profile = codec.StoredProfile.init(full_fit.profiles[0].coefficients);
+    for (expected, 0..) |target, bucket|
+        try testing.expectApproxEqAbs(target, decode.decodeBucket(&profile, @intCast(bucket)), 0.05 * target);
+}

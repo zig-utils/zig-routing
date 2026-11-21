@@ -166,6 +166,10 @@ fn createCommands(a: Allocator) !*Command {
     _ = try command(traffic_cmd, "add-predicted", "Add weekly profiles and static traffic speeds from CSV", addPredicted, &.{}, &.{
         arg("BUNDLE", "Graph bundle directory"), arg("FILE", "CSV with edge keys and predicted speeds"),
     });
+    _ = try command(traffic_cmd, "learn-predicted", "Learn weekly speed profiles from timestamped traces", learnPredicted, &.{
+        option("threads", "Parallel trace workers", .int),
+        option("minimum-samples", "Minimum distinct trace samples per edge and bucket (default 3)", .int),
+    }, &.{ arg("BUNDLE", "Graph bundle directory"), arg("FILE", "Newline-delimited trace requests") });
     const geocode_cmd = try command(root, "geocode", "Manage geocoding data", null, &.{}, &.{});
     _ = try command(geocode_cmd, "build", "Extract geocoding records from OpenStreetMap", buildGeocode, &.{
         option("threads", "Number of PBF decode workers", .int),
@@ -963,6 +967,36 @@ fn addPredicted(ctx: *Context) !u8 {
     defer map.unmap();
     const report = try routing.traffic.predicted_ingest.apply(std.heap.c_allocator, dir, view.dataset_uuid, edge_count, index, map.bytes, .none);
     try ctx.writeJson(report);
+    return 0;
+}
+
+fn learnPredicted(ctx: *Context) !u8 {
+    const a = std.heap.c_allocator;
+    const hardware = std.Thread.getCpuCount() catch 1;
+    const requested = (try unsigned(ctx, usize, "threads")) orelse hardware;
+    if (requested == 0) return badOption(ctx, "--threads must be positive");
+    const minimum = (try unsigned(ctx, u32, "minimum-samples")) orelse 3;
+    if (minimum < 3) return badOption(ctx, "--minimum-samples must be at least 3");
+    const dir = try io.Directory.open(ctx.getArgument(0).?);
+    defer dir.close();
+    var bundle = try routing.graph.reader.Bundle.openInDir(dir, null);
+    defer bundle.close();
+    const view = &bundle.view;
+    const edge_count = std.math.cast(u32, view.edges.len) orelse return error.PredictedTrafficTooLarge;
+    const map = try io.Mapping.mapFile(ctx.getArgument(1).?, .read_only);
+    defer map.unmap();
+    const overlays = routing.traffic;
+    const batch = try overlays.history_trace.collect(a, view, map.bytes, requested, .none);
+    defer batch.deinit(a);
+    const fit = try overlays.history.fit(a, view, batch.samples, minimum, .none);
+    defer fit.deinit(a);
+    const saved = try overlays.predicted_ingest.applyGenerated(a, dir, view.dataset_uuid, edge_count, fit.profiles, .none);
+    try ctx.writeJson(.{
+        .input = batch.report,
+        .coverage = fit.coverage,
+        .profiles_written = fit.profiles.len,
+        .overlay = saved,
+    });
     return 0;
 }
 

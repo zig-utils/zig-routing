@@ -190,8 +190,8 @@ fn matchTrip(view: *const View, ctx: *http.Ctx, options: *const request.Options,
             .stop_type = location.type,
         };
     }
-    const origin = try snap.search(view, a, endpoint(options.shape[0]), .{}, kernel, control.deadline);
-    const target = try snap.search(view, a, endpoint(options.shape[len - 1]), .{}, kernel, control.deadline);
+    const origin = try snap.search(view, a, match.route.endpoint(options.shape[0]), .{}, kernel, control.deadline);
+    const target = try snap.search(view, a, match.route.endpoint(options.shape[len - 1]), .{}, kernel, control.deadline);
     if (origin.edges.len == 0 or target.edges.len == 0) return error.MissingTraceCorrelation;
 
     // Transit costing starts at pedestrian correlations for an exact walk.
@@ -245,14 +245,6 @@ fn matchTrip(view: *const View, ctx: *http.Ctx, options: *const request.Options,
     return .{ .routes = routes };
 }
 
-fn endpoint(input: request.Location) request.Location {
-    var location = input;
-    location.radius = 10;
-    location.minimum_reachability = 0;
-    location.node_snap_tolerance = 0;
-    return location;
-}
-
 fn project(a: Allocator, view: *const View, result: match.route.Result, attrs: Attributes, travel: tripleg.Travel, confidence: f32, options: *const request.Options, control: search.Control) !model.TripRoute {
     if (result.legs.len == 0) return error.InvalidTraceRoute;
     const n = result.segments.len;
@@ -261,6 +253,7 @@ fn project(a: Allocator, view: *const View, result: match.route.Result, attrs: A
     const steps = try a.alloc(legs.Recost.Step, n);
     const cuts = try a.alloc(legs.ShapeCut, n);
     const points = try a.alloc(model.MatchedPoint, if (walked) 0 else result.matches.len);
+    const indices = if (!walked and attrs.has(.@"matched.edge_index")) try match.route.segmentIndices(a, result, control) else &.{};
     for (points, result.matches[0..points.len], 0..) |*point, m, i| {
         if (i % 256 == 0) try control.check();
         point.* = .{
@@ -269,7 +262,7 @@ fn project(a: Allocator, view: *const View, result: match.route.Result, attrs: A
                 .interpolated => .kInterpolated,
                 .unmatched => .kUnmatched,
             } else .kUnmatched,
-            .edge_index = if (attrs.has(.@"matched.edge_index") and m.edge != null) std.math.maxInt(u32) else null,
+            .edge_index = if (indices.len != 0 and m.edge != null) indices[i] else null,
             .begins_discontinuity = attrs.has(.@"matched.begin_route_discontinuity") and m.begins_discontinuity,
             .ends_discontinuity = attrs.has(.@"matched.end_route_discontinuity") and m.ends_discontinuity,
             .distance_along_edge = if (attrs.has(.@"matched.distance_along_edge") and m.kind != .unmatched) m.fraction else null,
@@ -281,15 +274,6 @@ fn project(a: Allocator, view: *const View, result: match.route.Result, attrs: A
         try control.check();
         edge.* = segment.path;
         cut.* = .{ .disconnected = i != 0 and result.segments[i - 1].discontinuity };
-        const lo = segment.first_match orelse segment.last_match;
-        const hi = segment.last_match orelse segment.first_match;
-        if (lo) |first| if (hi) |last| {
-            for (first..@as(usize, last) + 1) |point| {
-                if (point % 256 == 0) try control.check();
-                if (!walked and points[point].edge_index != null and result.matches[point].edge == edge.edge)
-                    points[point].edge_index = @intCast(i);
-            }
-        };
         if (i == 0 or cut.disconnected)
             if (segment.first_match) |first| {
                 cut.start = result.matches[first].point;
