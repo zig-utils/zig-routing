@@ -1056,6 +1056,14 @@ const RestrictionMotor = struct {
     allow_destination_only: bool = true,
     destination_penalty: f32 = 0,
 
+    pub fn allowed(self: RestrictionMotor, edge: routing.snap.candidates.DirectedEdge) bool {
+        return self.restrictionPermission().allowedClass(edge.class);
+    }
+
+    pub fn allowedNode(self: RestrictionMotor, node: *const format.NodeHot) bool {
+        return self.restrictionPermission().allowedNode(node);
+    }
+
     pub fn restrictionPermission(self: RestrictionMotor) routing.costing.base.Permission {
         var permission: routing.costing.base.Permission = .{ .flags = .empty, .flow = .{}, .access_mask = @bitCast(self.modes), .filter_closures = false };
         if (self.ignore) permission.flags.insert(.ignore_restrictions);
@@ -5502,4 +5510,155 @@ test "Gurka trip leg retains a near-end trim, an interior via and the physical i
     }
     try testing.expectEqual(0, counting.calls());
     try testing.expectError(error.Cancelled, tripleg.build(arena.allocator(), view, input, .{ .deadline = .{ .at_ns = 0 } }));
+}
+
+// Ported from the edge walk and walk-or-snap cases in test/mapmatch.cc.
+test "Gurka trace follows an exact shape and falls back after a geometric mismatch" {
+    const match = routing.match;
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "primary" }};
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const fixture = try gurka.Map.init(storage.allocator(), try gurka.mapToCoordinates("A---B---C", 30), &.{
+        .{ .label = "AB", .tags = road },
+        .{ .label = "BC", .tags = road },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    var trace = [_]match.candidates.Measurement{
+        .{ .point = fixture.findNode("A").?.location, .epoch_time = 0, .stop_type = .@"break" },
+        .{ .point = fixture.findNode("B").?.location, .epoch_time = 8 },
+        .{ .point = fixture.findNode("C").?.location, .epoch_time = 31, .stop_type = .@"break" },
+    };
+    const east = [_]format.EdgeId{
+        try directedBetween(view, &fixture, "A", "B"),
+        try directedBetween(view, &fixture, "B", "C"),
+    };
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    var finder = match.candidates.Finder.init(view, testing.allocator, .{});
+    defer finder.deinit();
+    const Router = match.routing.Router(RestrictionMotor);
+    var router = try Router.init(testing.allocator, view, Router.default_scratch_bytes);
+    defer router.deinit();
+    const emission = try match.emission.Model.init(match.emission.Model.default_sigma_z);
+    const transition = try match.transition.Model.init(.{});
+    const kernel: RestrictionMotor = .{};
+    const walked = try match.route.resolve(&arena, &finder, &router, kernel, &trace, emission, transition, .{ .shape_match = .edge_walk, .use_timestamps = true }, .{});
+    try testing.expectEqual(@as(usize, 1), walked[0].legs.len);
+    const leg = walked[0].legs[0];
+    try testing.expectEqual(east.len, leg.segments.len);
+    for (east, leg.segments) |edge, segment| try testing.expectEqual(edge, segment.edge);
+    try testing.expectEqual(@as(f32, 8), leg.steps[0].elapsed.secs);
+    try testing.expectEqual(@as(f32, 31), leg.steps[1].elapsed.secs);
+
+    arena.reset();
+    trace[1].point.lat += 0.0001;
+    trace[1].epoch_time = 90;
+    trace[2].epoch_time = 181;
+    try testing.expectError(error.NoEdgeWalk, match.route.resolve(&arena, &finder, &router, kernel, &trace, emission, transition, .{ .shape_match = .edge_walk }, .{}));
+    const snapped = try match.route.resolve(&arena, &finder, &router, kernel, &trace, emission, transition, .{ .shape_match = .walk_or_snap }, .{});
+    try testing.expectEqual(@as(usize, 1), snapped[0].legs.len);
+    try testing.expectEqual(east.len, snapped[0].segments.len);
+    for (east, snapped[0].segments) |edge, segment| try testing.expectEqual(edge, segment.path.edge);
+    try testing.expect(snapped[0].matches[1].distance > 1);
+}
+
+// Ported from Mapmatch.interpolation and test_discontinuity_on_same_edge.
+test "Gurka trace splits interpolated breaks and preserves discontinuities on the same edge" {
+    const match = routing.match;
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "primary" }};
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const fixture = try gurka.Map.init(storage.allocator(), try gurka.mapToCoordinates("A-------------------Z", 25), &.{
+        .{ .label = "AZ", .tags = road },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    const a = fixture.findNode("A").?.location;
+    const z = fixture.findNode("Z").?.location;
+    const edge = try directedBetween(view, &fixture, "A", "Z");
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    var finder = match.candidates.Finder.init(view, testing.allocator, .{});
+    defer finder.deinit();
+    const Router = match.routing.Router(RestrictionMotor);
+    var router = try Router.init(testing.allocator, view, Router.default_scratch_bytes);
+    defer router.deinit();
+    const emission = try match.emission.Model.init(match.emission.Model.default_sigma_z);
+    const transition = try match.transition.Model.init(.{});
+    const kernel: RestrictionMotor = .{};
+    const timed = [_]match.candidates.Measurement{
+        .{ .point = a.pointAlongSegment(z, 0.1), .epoch_time = 10 },
+        .{ .point = a.pointAlongSegment(z, 0.112), .epoch_time = 15, .stop_type = .@"break" },
+        .{ .point = a.pointAlongSegment(z, 0.2), .epoch_time = 80 },
+    };
+    const interpolated = (try match.route.resolve(&arena, &finder, &router, kernel, &timed, emission, transition, .{ .shape_match = .map_snap, .use_timestamps = true }, .{}))[0];
+    try testing.expectEqual(.interpolated, interpolated.matches[1].kind);
+    try testing.expectEqual(@as(usize, 2), interpolated.legs.len);
+    try testing.expectEqual(edge, interpolated.segments[0].path.edge);
+    try testing.expectEqual(interpolated.segments[0].path.end, interpolated.segments[1].path.begin);
+    try testing.expectEqual(@as(f32, 5), interpolated.legs[0].steps[0].elapsed.secs);
+    try testing.expectEqual(@as(f32, 65), interpolated.legs[1].steps[0].elapsed.secs);
+
+    arena.reset();
+    const disjoint = [_]match.candidates.Measurement{
+        .{ .point = a.pointAlongSegment(z, 0.1), .epoch_time = 0 },
+        .{ .point = a.pointAlongSegment(z, 0.2), .epoch_time = 60 },
+        .{ .point = .init(a.lng, a.lat + 0.2), .epoch_time = 120 },
+        .{ .point = a.pointAlongSegment(z, 0.7), .epoch_time = 180 },
+        .{ .point = a.pointAlongSegment(z, 0.8), .epoch_time = 280 },
+    };
+    const broken = (try match.route.resolve(&arena, &finder, &router, kernel, &disjoint, emission, transition, .{ .shape_match = .map_snap, .use_timestamps = true }, .{}))[0];
+    try testing.expectEqual(.unmatched, broken.matches[2].kind);
+    try testing.expectEqual(@as(usize, 2), broken.legs.len);
+    try testing.expectEqual(edge, broken.segments[0].path.edge);
+    try testing.expectEqual(edge, broken.segments[1].path.edge);
+    try testing.expect(broken.segments[0].discontinuity);
+    try testing.expect(broken.matches[1].begins_discontinuity);
+    try testing.expect(broken.matches[3].ends_discontinuity);
+    for (broken.legs) |part| try testing.expectApproxEqAbs(part.steps[0].length_m, part.steps[0].elapsed.secs, 0.0001);
+}
+
+// Ported from Mapmatch.test_loop_matching_walk_or_snap.
+test "Gurka exact trace revisits the same intersection later in the shape" {
+    const match = routing.match;
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "primary" }};
+    const oneway: gurka.Tags = &.{ .{ .key = "highway", .value = "primary" }, .{ .key = "oneway", .value = "yes" } };
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const fixture = try gurka.Map.init(storage.allocator(), try gurka.mapToCoordinates(
+        \\A---B---C
+        \\    |   |
+        \\    D---E
+    , 30), &.{
+        .{ .label = "AB", .tags = road },
+        .{ .label = "BC", .tags = oneway },
+        .{ .label = "CE", .tags = oneway },
+        .{ .label = "ED", .tags = oneway },
+        .{ .label = "DB", .tags = oneway },
+    }, &.{}, &.{});
+    var built = try Built.assemble(fixture.osm, 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    var finder = match.candidates.Finder.init(view, testing.allocator, .{});
+    defer finder.deinit();
+    const Router = match.routing.Router(RestrictionMotor);
+    var router = try Router.init(testing.allocator, view, Router.default_scratch_bytes);
+    defer router.deinit();
+    const emission = try match.emission.Model.init(match.emission.Model.default_sigma_z);
+    const transition = try match.transition.Model.init(.{});
+    const kernel: RestrictionMotor = .{};
+    const points = [_][]const u8{ "A", "B", "C", "E", "D", "B", "A" };
+    var trace: [points.len]match.candidates.Measurement = undefined;
+    for (&trace, points) |*sample, point| sample.* = .{ .point = fixture.findNode(point).?.location };
+    try testing.expectError(error.MissingTraceTimestamps, match.route.resolve(&arena, &finder, &router, kernel, &trace, emission, transition, .{ .use_timestamps = true }, .{}));
+    const result = (try match.route.resolve(&arena, &finder, &router, kernel, &trace, emission, transition, .{ .shape_match = .edge_walk }, .{}))[0];
+    try testing.expectEqual(points.len - 1, result.segments.len);
+    for (result.segments, points[0 .. points.len - 1], points[1..]) |segment, from, to| {
+        try testing.expectEqual(try directedBetween(view, &fixture, from, to), segment.path.edge);
+    }
 }

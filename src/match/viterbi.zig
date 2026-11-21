@@ -407,6 +407,7 @@ pub fn RoutingCosts(comptime K: type) type {
         const Self = @This();
         const Router = routing.Router(K);
         const Move = struct { score: f32, arrival: ?EdgeId = null };
+        const Row = struct { moves: []const Move, incoming: ?EdgeId };
 
         arena: *memory.Arena,
         states: *const StateContainer,
@@ -414,16 +415,16 @@ pub fn RoutingCosts(comptime K: type) type {
         kernel: K,
         observations: Emission,
         movements: Transition,
-        rows: [][]?[]const Move,
+        rows: [][]?Row,
 
         pub fn init(arena: *memory.Arena, states: *const StateContainer, router: *Router, kernel: K, observations: Emission, movements: Transition, control: Control) !Self {
             const mark = arena.mark();
             errdefer arena.rewind(mark);
             const a = arena.allocator();
-            const rows = try a.alloc([]?[]const Move, states.columns.items.len);
+            const rows = try a.alloc([]?Row, states.columns.items.len);
             for (rows, states.columns.items, 0..) |*row, column, time| {
                 if (time % 256 == 0) try control.check();
-                row.* = try a.alloc(?[]const Move, column.candidates.len);
+                row.* = try a.alloc(?Row, column.candidates.len);
                 for (row.*, 0..) |*cell, i| {
                     if (i % 256 == 0) try control.check();
                     cell.* = null;
@@ -448,31 +449,51 @@ pub fn RoutingCosts(comptime K: type) type {
         pub fn transition(self: *Self, from: StateId, to: StateId, previous: StateId, control: Control) !f32 {
             const row = &self.rows[from.time][from.id];
             if (row.* == null) row.* = try self.routeRow(from, to.time, previous, control);
-            return row.*.?[to.id].score;
+            return row.*.?.moves[to.id].score;
         }
 
-        fn routeRow(self: *Self, from: StateId, time: u32, previous: StateId, control: Control) ![]const Move {
+        /// Recover only the selected path. Use the incoming edge that priced
+        /// the row, including when top-k selected a different predecessor.
+        pub fn selectedRoute(self: *Self, arena: *memory.Arena, from: StateId, to: StateId, control: Control) !?routing.Route {
+            _ = self.states.candidate(from) orelse return error.InvalidTraceState;
+            const target = self.states.candidate(to) orelse return error.InvalidTraceState;
+            if (to.time != from.time + 1) return error.InvalidTraceState;
+            const row = self.rows[from.time][from.id] orelse return null;
+            if (!available(row.moves[to.id].score)) return null;
+            const paths = try self.connect(arena, from, to.time, &.{target.*}, row.incoming, control);
+            const route = paths[0] orelse return error.UnreproducibleTraceTransition;
+            if (route.score != row.moves[to.id].score or route.last_edge != row.moves[to.id].arrival)
+                return error.UnreproducibleTraceTransition;
+            return route;
+        }
+
+        fn routeRow(self: *Self, from: StateId, time: u32, previous: StateId, control: Control) !Row {
             const mark = self.arena.mark();
             errdefer self.arena.rewind(mark);
-            const left = self.states.columns.items[from.time];
             const right = self.states.columns.items[time];
             const arrival = if (previous.valid())
-                (self.rows[previous.time][previous.id] orelse return error.UnroutedTracePredecessor)[from.id].arrival
+                (self.rows[previous.time][previous.id] orelse return error.UnroutedTracePredecessor).moves[from.id].arrival
             else
                 null;
             const prices = try self.arena.allocator().alloc(Move, right.candidates.len);
             const temporary = self.arena.mark();
             defer self.arena.rewind(temporary);
-            const paths = try self.router.connect(self.arena, self.kernel, &self.movements, .{
-                .candidate = left.candidates[from.id],
-                .stop_type = left.measurement.stop_type,
-                .previous_edge = arrival,
-            }, right.candidates, .{ .left = left.measurement, .right = right.measurement, .leave_time = left.leave_time }, control);
+            const paths = try self.connect(self.arena, from, time, right.candidates, arrival, control);
             for (paths, prices, 0..) |path, *price, i| {
                 if (i % 256 == 0) try control.check();
                 price.* = if (path) |route| .{ .score = route.score, .arrival = route.last_edge } else .{ .score = -1 };
             }
-            return prices;
+            return .{ .moves = prices, .incoming = arrival };
+        }
+
+        fn connect(self: *Self, arena: *memory.Arena, from: StateId, time: u32, targets: []const Candidate, arrival: ?EdgeId, control: Control) ![]const ?routing.Route {
+            const left = self.states.columns.items[from.time];
+            const right = self.states.columns.items[time];
+            return self.router.connect(arena, self.kernel, &self.movements, .{
+                .candidate = left.candidates[from.id],
+                .stop_type = left.measurement.stop_type,
+                .previous_edge = arrival,
+            }, targets, .{ .left = left.measurement, .right = right.measurement, .leave_time = left.leave_time }, control);
         }
     };
 }

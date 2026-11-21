@@ -55,6 +55,49 @@ def compare(reference, native):
     return bool(expected) and not (missing or extra or differing)
 
 
+def segments(path):
+    traces = {}
+    for line in path.read_text().splitlines():
+        case, *values = line.split()
+        key = int(case)
+        if key in traces:
+            raise ValueError(f"duplicate trace {key} in {path.name}")
+        pieces = []
+        for value in values:
+            edge, begin, end, broken = value.split(",")
+            begin, end = float(begin), float(end)
+            if not 0 <= begin <= end <= 1 or broken not in ("0", "1"):
+                raise ValueError(f"invalid segment on trace {key} in {path.name}")
+            pieces.append((int(edge), begin, end, int(broken)))
+        traces[key] = pieces
+    return traces
+
+
+def compare_segments(reference, native):
+    expected, actual = segments(reference), segments(native)
+    if expected.keys() != actual.keys():
+        print("The route probes emitted different traces")
+        return False
+    differences = []
+    maximum = 0.0
+    for key, reference_path in expected.items():
+        candidate = actual[key]
+        for i, (left, right) in enumerate(zip(reference_path, candidate)):
+            fraction = max(abs(left[1] - right[1]), abs(left[2] - right[2]))
+            if left[0] != right[0] or left[3] != right[3] or fraction > 1e-4:
+                differences.append(key)
+                print(f"Trace {key} segment {i} reference {left}, native {right}")
+                break
+            maximum = max(maximum, fraction)
+        else:
+            if len(reference_path) != len(candidate):
+                differences.append(key)
+                print(f"Trace {key} has {len(reference_path)} reference segments and {len(candidate)} native segments")
+    print(f"{len(expected)} traces, {len(differences)} differences")
+    print(f"Maximum cut difference before divergence {maximum:.8g}")
+    return bool(expected) and not differences
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -64,10 +107,15 @@ def main():
     compare_cmd = commands.add_parser("compare")
     compare_cmd.add_argument("reference", type=Path)
     compare_cmd.add_argument("native", type=Path)
+    segments_cmd = commands.add_parser("compare-segments")
+    segments_cmd.add_argument("reference", type=Path)
+    segments_cmd.add_argument("native", type=Path)
     args = parser.parse_args()
     if args.command == "extract":
         extract(args.measurements, args.corpus)
-    elif not compare(args.reference, args.native):
+    elif args.command == "compare" and not compare(args.reference, args.native):
+        raise SystemExit(1)
+    elif args.command == "compare-segments" and not compare_segments(args.reference, args.native):
         raise SystemExit(1)
 
 

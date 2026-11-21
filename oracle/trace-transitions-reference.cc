@@ -119,8 +119,8 @@ int main(int argc, char** argv) {
             const meili::RoutePathIterator end(labels.get());
             for (meili::RoutePathIterator it(labels.get(), result->second); it != end; ++it)
               if (it->edgeid().is_valid())
-                stock.edges.push_back(it->edgeid().id());
-            std::reverse(stock.edges.begin(), stock.edges.end());
+                stock.cuts.push_back({it->edgeid(), it->source(), it->target()});
+            std::reverse(stock.cuts.begin(), stock.cuts.end());
           }
         }
         const auto& path = audit ? directed[t] : stock;
@@ -130,8 +130,8 @@ int main(int argc, char** argv) {
           const auto cost = path.cost;
           const auto score = transition.CalculateTransitionCost(path.turns, cost.cost, observed, cost.secs, clock);
           std::cout << '\t' << cost.cost << '\t' << cost.secs << '\t' << path.turns << '\t' << score << '\t';
-          for (size_t i = 0; i < path.edges.size(); ++i)
-            std::cout << (i == 0 ? "" : ",") << path.edges[i];
+          for (size_t i = 0; i < path.cuts.size(); ++i)
+            std::cout << (i == 0 ? "" : ",") << path.cuts[i].edge.id();
           std::cout << '\n';
         }
       }

@@ -14,6 +14,10 @@ pub fn main(init: std.process.Init) !void {
     _ = args.skip();
     const bundle_name = args.next() orelse return error.MissingBundle;
     const corpus_name = args.next() orelse return error.MissingCorpus;
+    const segments_only = if (args.next()) |mode| mode: {
+        if (!std.mem.eql(u8, mode, "--segments")) return error.InvalidArguments;
+        break :mode true;
+    } else false;
     if (args.next() != null) return error.InvalidArguments;
     var bundle = try routing.graph.reader.Bundle.open(bundle_name);
     defer bundle.close();
@@ -45,12 +49,26 @@ pub fn main(init: std.process.Init) !void {
         const k = try std.fmt.parseInt(u32, token, 10);
         const count = try std.fmt.parseInt(u32, try field(&tokens), 10);
         arena.reset();
-        var states: viterbi.StateContainer = .{};
-        for (0..count) |_| {
+        const measurements = try arena.allocator().alloc(match.candidates.Measurement, count);
+        for (measurements) |*measurement| {
             const lat = try std.fmt.parseFloat(f64, try field(&tokens));
             const lon = try std.fmt.parseFloat(f64, try field(&tokens));
             const epoch = try std.fmt.parseFloat(f64, try field(&tokens));
-            const measurement: match.candidates.Measurement = .{ .point = .init(lon, lat), .search_radius = 35, .epoch_time = epoch };
+            measurement.* = .{ .point = .init(lon, lat), .search_radius = 35, .epoch_time = epoch };
+        }
+        if (segments_only) {
+            const results = try match.route.resolve(&arena, &finder, &router, kernel, measurements, observations, movements, .{ .shape_match = .map_snap }, .{});
+            try output.interface.print("{d}", .{case});
+            for (results[0].segments) |segment| {
+                try output.interface.print("\t{d},{d},{d},{d}", .{
+                    @backingInt(segment.path.edge), segment.path.begin, segment.path.end, @intFromBool(segment.discontinuity),
+                });
+            }
+            try output.interface.writeByte('\n');
+            continue;
+        }
+        var states: viterbi.StateContainer = .{};
+        for (measurements) |measurement| {
             _ = try states.append(arena.allocator(), measurement, try finder.query(measurement, kernel, .none));
         }
         var search = try states.startSearch(&arena, .{});

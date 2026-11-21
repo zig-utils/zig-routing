@@ -20,10 +20,16 @@ using namespace valhalla;
 using baldr::GraphId;
 using baldr::graph_tile_ptr;
 
+struct Cut {
+  GraphId edge;
+  float begin;
+  float end;
+};
+
 struct Path {
   sif::Cost cost{std::numeric_limits<float>::infinity(), 0.f};
   float turns = 0.f;
-  std::vector<uint32_t> edges;
+  std::vector<Cut> cuts;
   GraphId arrival;
 };
 
@@ -183,17 +189,19 @@ private:
     return false;
   }
 
-  void record(size_t target, sif::Cost cost, float turns, GraphId tail = {}) {
+  void record(size_t target, sif::Cost cost, float turns, std::optional<Cut> tail = std::nullopt) {
     auto& best = paths_[target];
     if (cost.cost >= best.cost.cost)
       return;
     if (best.cost.cost == std::numeric_limits<float>::infinity())
       --remaining_;
-    best = {cost, turns, {}, tail.is_valid() ? tail : history_.empty() ? GraphId{} : history_.back().edgeid()};
-    for (size_t i = inherited_; i < history_.size(); ++i)
-      best.edges.push_back(history_[i].edgeid().id());
-    if (tail.is_valid())
-      best.edges.push_back(tail.id());
+    best = {cost, turns, {}, tail ? tail->edge : history_.empty() ? GraphId{} : history_.back().edgeid()};
+    for (size_t i = inherited_; i < history_.size(); ++i) {
+      const auto& label = history_[i];
+      best.cuts.push_back({label.edgeid(), label.source(), label.target()});
+    }
+    if (tail)
+      best.cuts.push_back(*tail);
     if (remaining_ == 0) {
       // Every remaining step has nonnegative length.
       bound_ = 0.f;
@@ -251,7 +259,7 @@ private:
         if (end >= begin) {
           const auto cost = clipped(end);
           if (within(cost))
-            record(target, cost, turn, id);
+            record(target, cost, turn, Cut{id, begin, end});
         }
       }
     }

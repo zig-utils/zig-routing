@@ -75,6 +75,10 @@ pub const Recost = struct {
         return self.addDirected(view, kernel, segment, edge, starts_pair, false, .forward, .{});
     }
 
+    pub fn addForward(self: *Recost, view: *const View, kernel: anytype, segment: Segment, terminal: bool, options: Options) !Step {
+        return self.addDirected(view, kernel, segment, try view.edge(segment.edge), false, terminal, .forward, options);
+    }
+
     /// Steps use physical path order. Their cumulative costs start at the
     /// endpoint from which the walk begins.
     pub fn walk(view: *const View, kernel: anytype, path: []const Segment, steps: ?[]Step, comptime direction: search.Direction, options: Options) !Cost {
