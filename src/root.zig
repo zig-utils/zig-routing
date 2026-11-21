@@ -5,7 +5,7 @@
 
 const std = @import("std");
 
-pub const version = "0.0.0";
+pub const version = @import("build_options").version;
 
 pub const infra = @import("infra/root.zig");
 pub const geo = @import("geo/root.zig");

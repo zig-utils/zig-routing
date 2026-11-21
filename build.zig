@@ -1,4 +1,5 @@
 const std = @import("std");
+const package = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -34,6 +35,18 @@ pub fn build(b: *std.Build) void {
     });
     const locale_catalog = b.createModule(.{ .root_source_file = compile_locales.addOutputFileArg("locale_catalog.zig") });
 
+    const version_options = b.addOptions();
+    const commit = b.option([]const u8, "commit", "Source commit for release builds") orelse switch (b.runFallible(
+        &.{ "git", "rev-parse", "HEAD" },
+        .{ .cwd = .{ .path = b.root.joinString(b.allocator, ".") catch @panic("OOM") }, .stderr_behavior = .ignore },
+    )) {
+        .success => |value| std.mem.trim(u8, value, "\r\n"),
+        else => "unknown",
+    };
+    version_options.addOption([]const u8, "version", package.version);
+    version_options.addOption([]const u8, "commit", commit);
+    const metadata = version_options.createModule();
+
     // The library: every routing module hangs off src/root.zig.
     const lib_mod = b.addModule("routing", .{
         .root_source_file = b.path("src/root.zig"),
@@ -41,6 +54,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
         .imports = &.{
+            .{ .name = "build_options", .module = metadata },
             .{ .name = "zig_cli", .module = zig_cli },
             .{ .name = "zig_config", .module = zig_config },
             .{ .name = "tls", .module = tls },
@@ -54,16 +68,6 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const version_options = b.addOptions();
-    const commit = b.option([]const u8, "commit", "Source commit for release builds") orelse switch (b.runFallible(
-        &.{ "git", "rev-parse", "HEAD" },
-        .{ .cwd = .{ .path = b.root.joinString(b.allocator, ".") catch @panic("OOM") }, .stderr_behavior = .ignore },
-    )) {
-        .success => |value| std.mem.trim(u8, value, "\r\n"),
-        else => "unknown",
-    };
-    version_options.addOption([]const u8, "commit", commit);
-
     const exe = cpuExecutable(b, "zr", b.createModule(.{
         .root_source_file = b.path("src/cli/main.zig"),
         .target = target,
@@ -71,7 +75,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "routing", .module = lib_mod },
             .{ .name = "zig_cli", .module = zig_cli },
-            .{ .name = "build_options", .module = version_options.createModule() },
+            .{ .name = "build_options", .module = metadata },
         },
     }));
     // Keep the symbol table and DWARF in Linux release binaries. Compress
@@ -107,9 +111,16 @@ pub fn build(b: *std.Build) void {
 
     const version_test = b.addRunArtifact(exe);
     version_test.addArg("--version");
+    version_test.expectStdOutMatch(package.version);
     version_test.expectStdOutMatch("commit ");
     version_test.expectStdOutMatch("features ");
     test_step.dependOn(&version_test.step);
+
+    const status_test = b.addRunArtifact(exe);
+    status_test.addArgs(&.{ "route", "--action", "status", "{}" });
+    status_test.expectStdOutMatch("\"version\":\"" ++ package.version ++ "\"");
+    status_test.expectStdOutMatch("\"available_actions\":[\"status\"]");
+    test_step.dependOn(&status_test.step);
 
     const route_test = b.addRunArtifact(exe);
     route_test.addArgs(&.{ "route", "{bad json" });
@@ -570,6 +581,7 @@ pub fn build(b: *std.Build) void {
         .optimize = fuzz_opt,
         .link_libc = true,
         .imports = &.{
+            .{ .name = "build_options", .module = metadata },
             .{ .name = "zig_cli", .module = b.dependency("zig_cli", .{ .target = target, .optimize = fuzz_opt }).module("zig_cli") },
             .{ .name = "zig_config", .module = b.dependency("zig_config", .{ .target = target, .optimize = fuzz_opt }).module("zig_config") },
             .{ .name = "tls", .module = b.dependency("tls", .{ .target = target, .optimize = fuzz_opt }).module("tls") },

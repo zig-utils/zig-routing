@@ -54,6 +54,7 @@ pub const Service = struct {
     state: ?*anyopaque = null,
     graph: ?*const @import("../graph/reader.zig").View = null,
     transit_coverage: ?*const @import("../graph/transit_coverage.zig").Index = null,
+    tileset_last_modified: u32 = 0,
 
     pub fn register(self: *Service, action: Action, f: ActionFn) void {
         self.handlers[@backingInt(action)] = f;

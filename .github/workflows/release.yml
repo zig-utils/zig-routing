@@ -1,0 +1,125 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        type: boolean
+        default: false
+        description: Publish an existing version tag
+      approve_1_0:
+        type: boolean
+        default: false
+        description: Explicit maintainer approval for 1.0.0
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ZIG_VERSION: 0.17.0-dev.1857+3c46da14d
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      issues: read
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Check the version and publication gates
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+          APPROVE_ONE: ${{ inputs.approve_1_0 || false }}
+        run: |
+          tag=$(python3 scripts/release.py tag)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [[ "$PUBLISH" != true ]]; then exit 0; fi
+          if [[ "$GITHUB_REF_TYPE" != tag || "$GITHUB_REF_NAME" != "$tag" ]]; then
+            echo "Publication must run from $tag"
+            exit 1
+          fi
+          args=()
+          if [[ "$APPROVE_ONE" == true ]]; then args+=(--approve-1.0); fi
+          python3 scripts/release.py gate --repo "$GITHUB_REPOSITORY" --tag "$tag" "${args[@]}"
+
+  binaries:
+    name: Build ${{ matrix.platform }}
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64-baseline
+            runner: ubuntu-latest
+          - platform: linux-x86_64-v3
+            runner: ubuntu-latest
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - platform: macos-aarch64
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: release-${{ matrix.platform }}-${{ hashFiles('build.zig.zon') }}
+      - name: Build, verify and package
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          RELEASE_PLATFORM: ${{ matrix.platform }}
+        run: |
+          python3 scripts/release.py build --tag "$RELEASE_TAG" --platform "$RELEASE_PLATFORM" \
+            --output "$RUNNER_TEMP/release-artifacts" --require-native
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.platform }}
+          path: ${{ runner.temp }}/release-artifacts
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' || inputs.publish
+    needs: [preflight, binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+      issues: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v7
+        with:
+          path: ${{ runner.temp }}/release-artifacts
+          merge-multiple: true
+      - name: Setup Pantry
+        uses: pantry-pm/pantry/packages/action@fe21b9517e2da3f63c53069845f0b31965bc92d8
+        with:
+          version: 0.11.212
+          install: false
+      - name: Publish verified binaries and source package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PANTRY_TOKEN: ${{ secrets.PANTRY_TOKEN }}
+          PANTRY_REGISTRY_TOKEN: ${{ secrets.PANTRY_TOKEN }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          APPROVE_ONE: ${{ inputs.approve_1_0 || false }}
+        run: |
+          args=()
+          if [[ "$APPROVE_ONE" == true ]]; then args+=(--approve-1.0); fi
+          python3 scripts/release.py publish --repo "$GITHUB_REPOSITORY" --tag "$RELEASE_TAG" \
+            --output "$RUNNER_TEMP/release-artifacts" "${args[@]}"

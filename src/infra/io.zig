@@ -93,6 +93,12 @@ pub fn wallSeconds() i64 {
     return @divFloor(wallNs(), std.time.ns_per_s);
 }
 
+pub fn lastModifiedSeconds(path: []const u8) u32 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const metadata = std.Io.Dir.cwd().statFile(io, path, .{}) catch return 0;
+    return std.math.cast(u32, @divFloor(metadata.mtime.nanoseconds, std.time.ns_per_s)) orelse 0;
+}
+
 /// Measures elapsed time on the monotonic clock.
 pub const Timer = struct {
     start_ns: u64,

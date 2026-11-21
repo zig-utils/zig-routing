@@ -14,6 +14,7 @@ pub const height_action = @import("height_action.zig");
 pub const locate_action = @import("locate_action.zig");
 pub const tile_action = @import("tile_action.zig");
 pub const transit_available_action = @import("transit_available_action.zig");
+pub const status_action = @import("status_action.zig");
 pub const proto = @import("proto/root.zig");
 pub const trip = @import("trip.zig");
 pub const directions = @import("directions.zig");

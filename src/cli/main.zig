@@ -323,6 +323,7 @@ const Runtime = struct {
     source: routing.elevation.Source = undefined,
 
     fn open(self: *Runtime, path: ?[]const u8) !void {
+        self.svc.register(.status, routing.api.status_action.handle);
         const elevation = path orelse return;
         if (std.mem.endsWith(u8, elevation, ".zdem")) {
             self.pack = try routing.elevation.@"packed".Pack.open(elevation);
@@ -354,6 +355,7 @@ const Runtime = struct {
             return err;
         };
         self.svc.graph = &self.bundle.?.view;
+        self.svc.tileset_last_modified = io.lastModifiedSeconds(path.?);
         self.svc.transit_coverage = try routing.graph.transit_coverage.Index.init(std.heap.c_allocator, self.bundle.?.view.transit_index, .none);
         self.svc.register(.locate, routing.api.locate_action.handle);
         self.svc.register(.tile, routing.api.tile_action.handle);

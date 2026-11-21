@@ -1,0 +1,30 @@
+{
+  "name": "zig-routing",
+  "version": "0.0.0",
+  "description": "A native Zig port of the Valhalla routing engine",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zig-utils/zig-routing.git"
+  },
+  "engines": {
+    "zig": "0.17.0-dev.1857+3c46da14d"
+  },
+  "files": [
+    "LICENSE",
+    "NOTICE",
+    "README.md",
+    "CHANGELOG.md",
+    "deps.yaml",
+    "build.zig",
+    "build.zig.zon",
+    "src",
+    "packages",
+    "locales",
+    "scripts/narrative_cpp.zig",
+    "scripts/narrative_fixtures.zig"
+  ],
+  "scripts": {
+    "build": "zig build -Doptimize=ReleaseFast"
+  }
+}
