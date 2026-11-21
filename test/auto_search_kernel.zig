@@ -46,7 +46,7 @@ pub const Auto = struct {
     pub fn turnCost(self: Auto, view: *const View, movement: search.Transition, _: search.Label, direction: search.Direction) !Cost {
         const from = try view.class(movement.incoming_edge.cls.class_id);
         const to = try view.class(movement.outgoing_edge.cls.class_id);
-        var turn = try auto.Turn.read(view, movement.node, movement.incoming, movement.outgoing, self.arena, .none);
+        var turn = try auto.Turn.fromRow(view, movement.node, movement.incoming_edge.cls.opp_local, movement.outgoing_edge.cls.local, movement.row, self.arena, .none);
         const previous = if (direction == .forward) movement.incoming_edge else movement.outgoing_edge;
         turn.measured_speed = @as(u8, @bitCast(self.profile.untimedSpeed(previous.*).sources)) != 0;
         const node = try view.node(movement.node);

@@ -52,20 +52,21 @@ fn measure(
     kernel: anytype,
     request: iso.Request,
     arena: *memory.Arena,
+    backing: *memory.CountingAllocator,
     index: usize,
     log: *std.Io.Writer,
     grids: io.File,
     traces: ?io.File,
     scratch: std.mem.Allocator,
 ) !void {
-    var result: iso.Result = undefined;
-    var elapsed: u64 = 0;
-    for (0..2) |_| {
-        arena.reset();
-        const start = io.monotonicNs();
-        result = try engine.run(arena, kernel, request, .{});
-        elapsed = io.monotonicNs() - start;
-    }
+    arena.reset();
+    _ = try engine.run(arena, kernel, request, .{});
+    backing.resetCounts();
+    arena.reset();
+    const start = io.monotonicNs();
+    const result = try engine.run(arena, kernel, request, .{});
+    const elapsed = io.monotonicNs() - start;
+    if (backing.calls() != 0) return error.IsochroneAllocatedAfterWarmup;
     const tiles = result.grid.tiles;
     const bounds = tiles.bounds;
     try log.print("{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\n", .{
@@ -127,9 +128,10 @@ pub fn main(init: std.process.Init) !void {
     var bundle = try routing.graph.reader.Bundle.open(graph_path);
     defer bundle.close();
     const view = &bundle.view;
-    var walker = try iso.Isochrone(Foot).init(init.gpa, view);
+    var backing = memory.CountingAllocator.init(init.gpa);
+    var walker = try iso.Isochrone(Foot).init(backing.allocator(), view);
     defer walker.deinit();
-    var motorist = try iso.Isochrone(Auto).init(init.gpa, view);
+    var motorist = try iso.Isochrone(Auto).init(backing.allocator(), view);
     defer motorist.deinit();
     var walk_cache = try pedestrian.Cache.init(init.gpa, view.classes.?, 1);
     defer walk_cache.deinit();
@@ -144,7 +146,7 @@ pub fn main(init: std.process.Init) !void {
 
     var output_buffer: [4096]u8 = undefined;
     var output = io.stdoutWriter(init.io, &output_buffer);
-    var request_memory = memory.Arena.init(init.gpa, .{});
+    var request_memory = memory.Arena.init(backing.allocator(), .{});
     defer request_memory.deinit();
     var rows = std.mem.tokenizeScalar(u8, data, '\n');
     var index: usize = 0;
@@ -173,8 +175,8 @@ pub fn main(init: std.process.Init) !void {
             },
         };
         switch (row.costing) {
-            .auto => try measure(&motorist, Auto{ .profile = drive.profile(), .tables = drive.tables(), .arena = request_memory.allocator() }, request, &request_memory, index, &output.interface, grids, traces, a),
-            .pedestrian => try measure(&walker, Foot{ .profile = walk.profile(), .tables = walk.tables() }, request, &request_memory, index, &output.interface, grids, traces, a),
+            .auto => try measure(&motorist, Auto{ .profile = drive.profile(), .tables = drive.tables(), .arena = request_memory.allocator() }, request, &request_memory, &backing, index, &output.interface, grids, traces, a),
+            .pedestrian => try measure(&walker, Foot{ .profile = walk.profile(), .tables = walk.tables() }, request, &request_memory, &backing, index, &output.interface, grids, traces, a),
         }
     }
     try output.interface.flush();

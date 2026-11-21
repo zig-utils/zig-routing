@@ -158,6 +158,63 @@ pub const BucketQueue = struct {
     }
 };
 
+/// Radix heap for Dijkstra walks with nondecreasing popped costs.
+/// Positive float bit patterns sort in the same order as their values.
+pub const RadixQueue = struct {
+    buckets: [32]std.ArrayList(Entry) = @splat(.empty),
+    equal: Heap = .{},
+    nonempty: u32 = 0,
+    minimum: u32 = 0,
+    redistributing: ?u5 = null,
+
+    pub fn init(unit_size: u32) !RadixQueue {
+        if (unit_size == 0) return error.InvalidBucketWidth;
+        return .{};
+    }
+
+    pub fn push(self: *RadixQueue, arena: std.mem.Allocator, entry: Entry) !void {
+        if (entry.key < self.minimum) return error.NonmonotonePriority;
+        const differing = entry.key ^ self.minimum;
+        if (differing == 0) return self.equal.push(arena, entry);
+        const index: u5 = @intCast(31 - @clz(differing));
+        try self.buckets[index].append(arena, entry);
+        self.nonempty |= @as(u32, 1) << index;
+    }
+
+    pub fn popWithin(self: *RadixQueue, arena: std.mem.Allocator, control: anytype) !?Entry {
+        if (self.redistributing != null) {
+            try self.redistribute(arena, control);
+        } else if (self.equal.items.items.len == 0) {
+            if (self.nonempty == 0) return null;
+            const index: u5 = @intCast(@ctz(self.nonempty));
+            var minimum: u32 = std.math.maxInt(u32);
+            for (self.buckets[index].items, 0..) |entry, i| {
+                if (i % 256 == 0) try control.check();
+                minimum = @min(minimum, entry.key);
+            }
+            self.minimum = minimum;
+            self.redistributing = index;
+            try self.redistribute(arena, control);
+        }
+        return self.equal.pop();
+    }
+
+    noinline fn redistribute(self: *RadixQueue, arena: std.mem.Allocator, control: anytype) !void {
+        const index = self.redistributing.?;
+        const bucket = &self.buckets[index];
+        var moved: usize = 0;
+        while (bucket.last()) |entry| : (moved += 1) {
+            if (moved % 256 == 0) try control.check();
+            // Lowering the differing bit puts every moved entry in a
+            // strictly lower bucket. Keep its original copy until push succeeds.
+            try self.push(arena, entry);
+            _ = bucket.pop();
+        }
+        self.nonempty &= ~(@as(u32, 1) << index);
+        self.redistributing = null;
+    }
+};
+
 test "four-way heap handles ties and sparse final child groups" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
@@ -257,4 +314,54 @@ test "bucket queue can resume an interrupted refill without misordering entries"
     try heap.push(a, later);
     while (heap.pop()) |entry| try t.expectEqual(@as(?Entry, entry), try buckets.popWithin(a, Uncancelled{}));
     try t.expectEqual(@as(?Entry, null), try buckets.popWithin(a, Uncancelled{}));
+}
+
+test "radix queue preserves fractional costs and label ties" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var pending: RadixQueue = .{};
+    var heap: Heap = .{};
+    var rng = std.Random.DefaultPrng.init(0x251);
+    const random = rng.random();
+    var minimum: f32 = 0;
+    for (0..3300) |i| {
+        const cost = minimum + @as(f32, @floatFromInt(random.uintLessThan(u32, 1024))) * 0.125;
+        const entry = Entry.init(cost, @intCast(3300 - i));
+        try heap.push(a, entry);
+        try pending.push(a, entry);
+        if (i % 3 == 0) {
+            const expected = heap.pop().?;
+            try t.expectEqual(@as(?Entry, expected), try pending.popWithin(a, Uncancelled{}));
+            minimum = @bitCast(expected.key);
+        }
+    }
+    while (heap.pop()) |entry| try t.expectEqual(@as(?Entry, entry), try pending.popWithin(a, Uncancelled{}));
+    try t.expectEqual(@as(?Entry, null), try pending.popWithin(a, Uncancelled{}));
+}
+
+test "radix queue retains entries across interrupted redistribution" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var pending = try RadixQueue.init(1);
+    for (0..1024) |label| try pending.push(a, Entry.init(300, @intCast(label)));
+
+    const CancelAfterFiveChecks = struct {
+        remaining: usize = 5,
+
+        fn check(self: *@This()) error{Cancelled}!void {
+            if (self.remaining == 0) return error.Cancelled;
+            self.remaining -= 1;
+        }
+    };
+    var control: CancelAfterFiveChecks = .{};
+    try t.expectError(error.Cancelled, pending.popWithin(a, &control));
+    try t.expect(pending.redistributing != null);
+    for (0..1024) |label| {
+        try t.expectEqual(@as(?Entry, Entry.init(300, @intCast(label))), try pending.popWithin(a, Uncancelled{}));
+    }
+    try t.expectEqual(@as(?Entry, null), try pending.popWithin(a, Uncancelled{}));
 }

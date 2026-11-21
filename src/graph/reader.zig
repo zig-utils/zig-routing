@@ -629,7 +629,10 @@ pub const View = struct {
     }
 
     pub fn turnSides(self: *const View, id: format.NodeId, from: u5, to: u5) !turn_sides.Sides {
-        const degree = (try self.outEdgeRange(id)).count();
+        return self.turnSidesAtDegree(id, (try self.outEdgeRange(id)).count(), from, to);
+    }
+
+    pub fn turnSidesAtDegree(self: *const View, id: format.NodeId, degree: u32, from: u5, to: u5) !turn_sides.Sides {
         if (from >= degree or to >= degree) return error.InvalidLocalEdge;
         const index = self.turn_side_index orelse return .{};
         return index.at(@backingInt(id), degree, from, to);

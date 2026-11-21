@@ -271,7 +271,10 @@ pub const Kernel = struct {
 
         var previous_access = check.previous_access;
         previous_access.destination_only = previous_destination;
-        var result = try permission.evaluateRestrictions(check.limits, check.original_forward, check.time, previous_access, profile.dimensions, deadline);
+        var result = if (check.limits.len == 0)
+            base.AccessEvaluation{}
+        else
+            try permission.evaluateRestrictions(check.limits, check.original_forward, check.time, previous_access, profile.dimensions, deadline);
         result.state.destination_only = result.state.destination_only or candidate.flags.destination_only;
         return result;
     }

@@ -259,7 +259,7 @@ exactly the requests our apps send.
 - Label 32 B (`cost f32, secs f32, pred u32, edge u32, dist u32, tcost f32, flags u32, ctx u32`);
   costs stay `f32` so recosting matches upstream arithmetic.
 - Queue is a comptime parameter: 4-ary heap of `{key u32, label u32}` with lazy deletion for guided
-  searches, two-level bucket queue for isochrones and sweeps.
+  searches, exact radix queue for isochrones, and two-level bucket queue for other sweeps.
 - Edge status and potential memo: two-level paged arrays (directory by `id >> 12`, pages bumped from
   the request arena). No hashing, no per-thread dense arrays (those would be 8.6 GB on US+DACH),
   reset by rewinding the arena.

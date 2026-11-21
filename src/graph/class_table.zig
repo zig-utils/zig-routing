@@ -73,10 +73,16 @@ pub const EdgeClass = extern struct {
         reserved: u6 = 0,
     } = .{},
 
-    pub fn valid(self: EdgeClass) bool {
+    const use_mask = blk: {
+        var mask: u64 = 0;
+        for (std.enums.values(constants.Use)) |value| mask |= @as(u64, 1) << @backingInt(value);
+        break :blk mask;
+    };
+
+    pub inline fn valid(self: EdgeClass) bool {
         return self.category.reserved == 0 and self.flags.reserved == 0 and self.detail.reserved == 0 and
-            std.enums.fromInt(constants.Use, self.category.use) != null and
-            std.enums.fromInt(constants.SacScale, self.category.sac_scale) != null;
+            (use_mask >> self.category.use) & 1 != 0 and
+            self.category.sac_scale <= @backingInt(constants.SacScale.difficult_alpine_hiking);
     }
 
     pub fn forwardAccess(self: EdgeClass) constants.AccessMask {

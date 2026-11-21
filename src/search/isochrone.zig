@@ -54,7 +54,7 @@ pub fn Isochrone(comptime K: type) type {
     return struct {
         const Self = @This();
         view: *const View,
-        engine: expansion.Expansion(K, queue.BucketQueue),
+        engine: expansion.Expansion(K, queue.RadixQueue),
 
         pub fn init(a: Allocator, view: *const View) !Self {
             return .{ .view = view, .engine = try .init(a, view) };
@@ -257,7 +257,7 @@ const Rasterizer = struct {
                 (try self.originSuffix(try self.decodeShape(try self.view.coldRecordWithDeadline(outward, self.control.deadline), false), traversed))[0]
             else
                 (try self.view.coordinate(@fromBackingInt((try self.view.edge(behind)).head))).toTilePoint();
-            try self.markSegment(start, end, self.grid.tiles.tileIdOf(start), self.grid.tiles.tileIdOf(end), event.label.secs, end_metres);
+            _ = try self.markSegment(start, end, self.grid.tiles.tileIdOf(start), self.grid.tiles.tileIdOf(end), event.label.secs, end_metres);
             return .expand;
         }
         const record = try self.view.coldRecordWithDeadline(outward, self.control.deadline);
@@ -277,15 +277,22 @@ const Rasterizer = struct {
         const count: f32 = @floatFromInt(points.len - 1);
         const delta_seconds = (event.label.secs - previous.secs) / count;
         const delta_metres = (end_metres - start_metres) / count;
+        const nondecreasing = delta_seconds >= 0 and delta_metres >= 0;
         var seconds = previous.secs;
         var metres = start_metres;
-        var from_cell = self.grid.tiles.tileIdOf(points[0]);
-        for (points[0 .. points.len - 1], points[1..], 0..) |from, to, i| {
+        var from = points[0];
+        var from_cell = self.grid.tiles.tileIdOf(from);
+        var from_marked = false;
+        for (points[1..], 0..) |to, i| {
             if (i % 256 == 0) try self.control.check();
             seconds += delta_seconds;
             metres += delta_metres;
             const to_cell = self.grid.tiles.tileIdOf(to);
-            try self.markSegment(from, to, from_cell, to_cell, seconds, metres);
+            // The previous segment already contributed an equal or earlier
+            // observation to this cell.
+            if (from_cell != to_cell or !from_marked or !nondecreasing)
+                from_marked = try self.markSegment(from, to, from_cell, to_cell, seconds, metres);
+            from = to;
             from_cell = to_cell;
         }
         return .expand;
@@ -318,17 +325,23 @@ const Rasterizer = struct {
         return points;
     }
 
-    fn markSegment(self: *Rasterizer, from: Point, to: Point, a: i32, b: i32, seconds: f32, metres: f32) !void {
+    fn markSegment(self: *Rasterizer, from: Point, to: Point, a: i32, b: i32, seconds: f32, metres: f32) !bool {
         const value: Grid.Value = .{ seconds * units.min_per_sec, metres * units.km_per_meter };
         if (a == b) {
             self.grid.setIfLess(a, value);
         } else if (self.grid.tiles.areNeighbors(a, b)) {
             self.grid.setCellsIfLess(2, .{ a, b }, value);
         } else {
-            var cells: SegmentCells = .{ .grid = self.grid, .value = value };
-            try self.grid.tiles.visitIntersectLine(&.{ from, to }, &cells, self.control.deadline);
-            cells.flush();
+            try self.markDistantSegment(from, to, value);
+            return false;
         }
+        return true;
+    }
+
+    noinline fn markDistantSegment(self: *Rasterizer, from: Point, to: Point, value: Grid.Value) !void {
+        var cells: SegmentCells = .{ .grid = self.grid, .value = value };
+        try self.grid.tiles.visitIntersectLine(&.{ from, to }, &cells, self.control.deadline);
+        cells.flush();
     }
 };
 

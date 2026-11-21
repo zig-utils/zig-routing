@@ -48,6 +48,33 @@ on edge 4730. Its isochrone expansion retained the cheaper arrival at edge
 retains both restriction contexts. Edge 28525 has equal weighted cost and a
 6.27-second difference in elapsed time.
 
+## Exact radix queue and grid writes
+
+[#251](https://github.com/zig-utils/zig-routing/issues/251) uses a radix queue
+for nondecreasing weighted costs, with label order preserved on ties. The
+search reuses the turn row for motor costing, and the rasterizer skips repeated
+nondecreasing writes to the same cell. A native CPU sample identified queue
+operations, turn handling, and shape decoding and rasterization in the hot
+path. The benchmark checks the backing allocator during every warmed request.
+
+Twelve trials rotated the three runners on CPU 0 of the same ARM64 Linux VM.
+Each runner used the same four requests and the same Utrecht tiles. The
+candidate's grids and label traces were byte-identical to the native baseline
+at `219b6a6`. Every warmed run made zero backing allocator calls.
+
+| Request | Settled / popped | Native baseline | Native with radix | Valhalla 3.9.3 |
+| --- | ---: | ---: | ---: | ---: |
+| Auto, 9.1 minutes | 41,128 / 42,301 | 13.466 ms | 11.475 ms | 10.566 ms |
+| Auto, two origins, 2 minutes | 40,436 / 41,631 | 13.166 ms | 11.093 ms | 9.972 ms |
+| Pedestrian, 12 minutes and 1.4 km | 35,503 / 35,984 | 7.963 ms | 7.179 ms | 7.182 ms |
+| Auto, reverse, 1 minute | 26,322 / 27,168 | 8.774 ms | 7.361 ms | 6.918 ms |
+| Median total per trial | 143,389 / 147,084 | 42.922 ms | 37.280 ms | 34.742 ms |
+
+Native elapsed time fell 13.1%. The 5x target on this run requires a median
+total of 6.948 ms and remains open. A trial cache for resampled shapes saved
+2.6% in a separate paired run and required about 2.3 MiB per worker. The
+measured candidate uses the original request-local geometry buffers.
+
 ## Reproduction
 
 Set `mjolnir.hierarchy` and `mjolnir.shortcuts` to `false` in a Valhalla
@@ -91,3 +118,18 @@ float pairs holding minutes and kilometres. A fourth argument to
 `bench-isochrone` writes label traces. The oracle accepts an
 optional final TSV path for its label trace. Dumping traces happens
 outside the timed expansion.
+
+For the before-and-after run, build the native benchmark at `219b6a6` and
+again with the optimization. Keep the same bundle and Valhalla config for
+all runs. Pin each executable to the same Linux CPU and run each of the six
+orders of baseline, candidate and oracle twice. For each runner, report the
+median of each request's elapsed time and the median of each trial's sum
+of elapsed times. Use the optional trace argument for the separate grid and
+label comparison.
+
+```sh
+taskset -c 0 ./bench-isochrone-base BUNDLE requests.jsonl base-grid.bin base-trace.bin
+taskset -c 0 ./bench-isochrone-new BUNDLE requests.jsonl new-grid.bin new-trace.bin
+cmp base-grid.bin new-grid.bin
+cmp base-trace.bin new-trace.bin
+```

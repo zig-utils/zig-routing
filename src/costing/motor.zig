@@ -124,13 +124,26 @@ pub const Turn = struct {
         const movement = try base.IntersectionTurn.read(view, node, incoming, outgoing);
         const range = try view.outEdgeRange(node);
         const opposing = try view.oppEdge(incoming);
+        return readGeometry(view, range, opposing, outgoing, movement, arena, deadline);
+    }
+
+    /// Price a movement whose local turn row has already been read by search.
+    pub fn fromRow(view: *const graph.reader.View, node: graph.format.NodeId, from: u5, to: u5, row: graph.format.TurnEntry, arena: std.mem.Allocator, deadline: Deadline) !Turn {
+        const range = try view.outEdgeRange(node);
+        const movement: base.IntersectionTurn = .{
+            .base_turn = .{ .row = row },
+            .sides = try view.turnSidesAtDegree(node, range.count(), from, to),
+        };
+        return readGeometry(view, range, @fromBackingInt(range.first + from), @fromBackingInt(range.first + to), movement, arena, deadline);
+    }
+
+    fn readGeometry(view: *const graph.reader.View, range: graph.reader.View.EdgeRange, opposing: graph.format.EdgeId, outgoing: graph.format.EdgeId, movement: base.IntersectionTurn, arena: std.mem.Allocator, deadline: Deadline) !Turn {
         const approach = (try heading(view, opposing, arena, deadline) + 180) % 360;
         const departure = try heading(view, outgoing, arena, deadline);
-        const last = try view.edge(@fromBackingInt(range.end - 1));
         return .{
             .movement = movement,
             .degrees = (departure + 360 - approach) % 360,
-            .more_than_two_roads = range.count() > 2 or (try view.class(last.cls.class_id)).flags.node_connector,
+            .more_than_two_roads = range.count() > 2 or (try view.class(view.edges[range.end - 1].cls.class_id)).flags.node_connector,
         };
     }
 
