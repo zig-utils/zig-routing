@@ -803,12 +803,15 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     if (decision == .prune) continue;
                 }
                 const exits = try self.view.outEdgeRange(at);
-                // Dijkstras keeps the directed predecessor's stored dead-end bit.
-                // In reverse, that predecessor is the opposing edge.
-                const predecessor_dead_end = if (expanding and @hasDecl(K, "allowedTurn") and self.view.classes != null)
-                    (try self.view.class(geometry.cls.class_id)).flags.dead_end
-                else
-                    null;
+                const predecessor_dead_end: ?bool = dead_end: {
+                    if (!@hasDecl(K, "allowedTurn") or self.view.classes == null) break :dead_end null;
+                    if (!expanding and direction == .forward) break :dead_end null;
+                    // The stored bit describes the head of the directed
+                    // predecessor. Reverse labels keep the travel edge,
+                    // whose head is on the other side of this intersection.
+                    const stored = (try self.view.class(geometry.cls.class_id)).flags.dead_end;
+                    break :dead_end stored or (!expanding and exits.count() == 1);
+                };
                 const forward_row = if (direction == .forward) try self.view.turnRow(at, geometry.cls.opp_local) else &.{};
                 for (self.view.edges[exits.first..exits.end], exits.first.., 0..) |*outward, index, local| {
                     if (partial_starts and last.flags & Label.forbid_uturn != 0 and local == geometry.cls.opp_local) continue;

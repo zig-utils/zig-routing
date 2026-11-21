@@ -579,13 +579,19 @@ automaton output reached through a failure link.
 
 The same-graph importer reads both direction-specific restriction sections and
 the sorted access records. To replay routes against those records, pass a TSV
-output path after `multi-via-turns`, `timed-turns`, or `timed-access-detour`
+output path after `multi-via-turns`, `timed-turns`, `timed-access`, or `timed-access-detour`
 when running `zig build gurka-pbf`. Build the fixtures with hierarchy and
 shortcuts disabled and point `mjolnir.timezone` at the oracle timezone database
 with ocean zones. Run `tripleg-reference` on the TSV, import those same tiles,
 then run `zig build check-tripleg -- BUNDLE ROUTES.tsv 4`. The requests cover
 depart-at and arrive-by search, distinct approaches to a multi-via restriction,
 and active and inactive turn and access conditions.
+
+In the `timed-access` fixture, both searches reject the R-to-U request
+at 06:00 on March 9 and use RS, ST and TU at 08:00 on January 12, for
+both departure and arrival times. Reverse expansion checks the dead-end
+flag on the edge that enters the junction in search order. The flag at U
+had also allowed a reversal at T when ST was closed.
 
 ### Location, polygon and closure exclusions
 

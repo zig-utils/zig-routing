@@ -1070,10 +1070,13 @@ const RestrictionMotor = struct {
         return .{ .cost = @floatFromInt(edge.geom.len_m), .secs = @floatFromInt(edge.geom.len_m) };
     }
 
-    pub fn allowedTurn(self: RestrictionMotor, view: *const graph.reader.View, turn: search.Transition, _: search.Label, _: search.Direction) !bool {
+    pub fn allowedTurn(self: RestrictionMotor, view: *const graph.reader.View, turn: search.Transition, _: search.Label, direction: search.Direction) !bool {
         if (!self.restrictionPermission().allowedNode(try view.node(turn.node))) return false;
         const backtrack = turn.incoming_edge.cls.opp_local == turn.outgoing_edge.cls.local;
-        if (backtrack and (try view.outEdgeRange(turn.node)).count() > 1) return false;
+        if (backtrack) {
+            const previous = if (direction == .forward) turn.incoming_edge else turn.outgoing_edge;
+            if (!try turn.predecessorAtDeadEnd(view, try view.class(previous.cls.class_id))) return false;
+        }
         return self.ignore or turn.row & 0x80 == 0;
     }
 
@@ -1772,11 +1775,12 @@ test "Gurka legacy turn windows support hours, weekdays and wrapping dates" {
     }
 }
 
-test "time-dependent search keeps the better continuation of a later arrival" {
+test "time-dependent search keeps distinct arrival times in both directions" {
     const TimedCost = struct {
         shortcut: format.EdgeId,
-        departure: u32,
-        target: u32,
+        start: u32,
+        forward_gate: format.EdgeId,
+        reverse_gate: format.EdgeId,
 
         pub fn edgeCost(self: @This(), view: *const graph.reader.View, id: format.EdgeId, edge: *const format.EdgeHot, _: search.Direction) !Cost {
             if (!(try view.class(edge.cls.class_id)).forwardAccess().auto) return .forbidden;
@@ -1785,8 +1789,11 @@ test "time-dependent search keeps the better continuation of a later arrival" {
 
         pub fn edgeCostAt(self: @This(), view: *const graph.reader.View, id: format.EdgeId, edge: *const format.EdgeHot, direction: search.Direction, time: graph.time_info.TimeInfo) !search.Traversal {
             var cost = try self.edgeCost(view, id, edge, direction);
-            if (cost.cost != std.math.inf(f32) and time.second_of_week < self.departure + 60 and edge.head == self.target)
-                cost.cost += 50;
+            const costly = switch (direction) {
+                .forward => id == self.forward_gate and time.second_of_week < self.start + 160,
+                .reverse => id == self.reverse_gate and time.second_of_week > self.start - 160,
+            };
+            if (cost.cost != std.math.inf(f32) and costly) cost.cost += 50;
             return .{ .cost = cost };
         }
 
@@ -1799,13 +1806,15 @@ test "time-dependent search keeps the better continuation of a later arrival" {
     const a = storage.allocator();
     const road: gurka.Tags = &.{ .{ .key = "highway", .value = "residential" }, .{ .key = "oneway", .value = "yes" } };
     const layout = try gurka.mapToCoordinates(
-        \\A-----X--Y--Z
-        \\|    /
-        \\B----
+        \\A--V--W-----X--Y--Z
+        \\      |    /
+        \\      B----
     , 10);
     const fixture = try gurka.Map.init(a, layout, &.{
-        .{ .label = "AX", .tags = road },
-        .{ .label = "AB", .tags = road },
+        .{ .label = "AV", .tags = road },
+        .{ .label = "VW", .tags = road },
+        .{ .label = "WX", .tags = road },
+        .{ .label = "WB", .tags = road },
         .{ .label = "BX", .tags = road },
         .{ .label = "XY", .tags = road },
         .{ .label = "YZ", .tags = road },
@@ -1817,26 +1826,30 @@ test "time-dependent search keeps the better continuation of a later arrival" {
     const to = try at(view, fixture.findNode("Z").?.location.toFixed());
     const timing = try restrictionTiming("2026-11-02T12:00", false);
     const kernel: TimedCost = .{
-        .shortcut = try directedBetween(view, &fixture, "A", "X"),
-        .departure = timing.start.second_of_week,
-        .target = @backingInt(to),
+        .shortcut = try directedBetween(view, &fixture, "W", "X"),
+        .start = timing.start.second_of_week,
+        .forward_gate = try directedBetween(view, &fixture, "Y", "Z"),
+        .reverse_gate = try directedBetween(view, &fixture, "A", "V"),
     };
     var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
     defer arena.deinit();
     var engine = try search.Search(TimedCost, routing.search.queue.Heap).init(testing.allocator, view);
     defer engine.deinit();
-    var request: search.Request = .{ .origin = from, .destination = to };
-    const untimed = try engine.run(&arena, kernel, request, search.Zero{}, .{});
-    try expectWayPath(view, &fixture, untimed, .forward, &.{ "AX", "XY", "YZ" });
-    arena.reset();
-    request.timing = timing;
-    const timed = try engine.run(&arena, kernel, request, search.Zero{}, .{});
-    try expectWayPath(view, &fixture, timed, .forward, &.{ "AB", "BX", "XY", "YZ" });
-    try testing.expectEqual(@as(f32, 8), timed.best().cost);
-    arena.reset();
-    request.timing.invariant = true;
-    const invariant = try engine.run(&arena, kernel, request, search.Zero{}, .{});
-    try expectWayPath(view, &fixture, invariant, .forward, &.{ "AX", "XY", "YZ" });
+    for ([_]search.Direction{ .forward, .reverse }) |direction| {
+        var request: search.Request = .{ .origin = from, .destination = to, .direction = direction };
+        const untimed = try engine.run(&arena, kernel, request, search.Zero{}, .{});
+        try expectWayPath(view, &fixture, untimed, direction, &.{ "AV", "VW", "WX", "XY", "YZ" });
+        arena.reset();
+        request.timing = timing;
+        const timed = try engine.run(&arena, kernel, request, search.Zero{}, .{});
+        try expectWayPath(view, &fixture, timed, direction, &.{ "AV", "VW", "WB", "BX", "XY", "YZ" });
+        try testing.expectEqual(@as(f32, 12), timed.best().cost);
+        arena.reset();
+        request.timing.invariant = true;
+        const invariant = try engine.run(&arena, kernel, request, search.Zero{}, .{});
+        try expectWayPath(view, &fixture, invariant, direction, &.{ "AV", "VW", "WX", "XY", "YZ" });
+        arena.reset();
+    }
 }
 
 test "via-way relation annotations follow the pinned untimed representation" {
@@ -1987,6 +2000,31 @@ test "Gurka conditional access distinguishes unknown time, modes and destination
             try expectWayPath(view, &fixture, ignored, direction, expected);
             arena.reset();
         }
+    }
+    try checkTimedDeadEnd(view, &fixture);
+}
+
+fn checkTimedDeadEnd(view: *const graph.reader.View, fixture: *const gurka.Map) !void {
+    const tu = try directedBetween(view, fixture, "T", "U");
+    const ut = try view.oppEdge(tu);
+    try testing.expect((try view.class((try view.edge(tu)).cls.class_id)).flags.dead_end);
+    try testing.expect(!(try view.class((try view.edge(ut)).cls.class_id)).flags.dead_end);
+
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    var engine = try RestrictionSearch.init(testing.allocator, view);
+    defer engine.deinit();
+    const origin = try at(view, fixture.findNode("R").?.location.toFixed());
+    const destination = try at(view, fixture.findNode("U").?.location.toFixed());
+    for ([_]search.Direction{ .forward, .reverse }) |direction| {
+        var request: search.Request = .{ .origin = origin, .destination = destination, .direction = direction };
+        request.timing = try restrictionTiming("2026-03-09T06:00", false);
+        try testing.expectError(error.NoPath, engine.run(&arena, .{}, request, search.Zero{}, .{}));
+        arena.reset();
+        request.timing = try restrictionTiming("2026-01-12T08:00", false);
+        const open = try engine.run(&arena, .{}, request, search.Zero{}, .{});
+        try expectWayPath(view, fixture, open, direction, &.{ "RS", "ST", "TU" });
+        arena.reset();
     }
 }
 
