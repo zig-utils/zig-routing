@@ -102,6 +102,7 @@ pub fn records(comptime kind: format.SectionKind) []const kind.Record() {
         .spatial => spatial,
         .metadata => &metadata,
         .dataset_id => &.{1001},
+        .snap_bins => &([_]u32{ 1, 818660 } ++ (@as([25]u32, @splat(1))) ++ [_]u32{ 0, @bitCast(routing.graph.snap_bins.Circle.absent) }),
         .components => &.{ 0, 0 },
         .turn_sides => &.{ 3, 0, 0 },
         .headings => &headings,

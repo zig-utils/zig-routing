@@ -383,6 +383,8 @@ pub const Tile = struct {
     edges: []align(1) const Edge,
     local_signs: []align(1) const Sign,
     access_restrictions: []align(1) const AccessRestriction,
+    bins: []align(1) const u64,
+    bounding_circles: []align(1) const u32,
     forward_restrictions: []const u8,
     reverse_restrictions: []const u8,
     edge_info: []const u8,
@@ -418,6 +420,19 @@ pub const Tile = struct {
             header.reverse_restriction_offset > header.edge_info_offset or
             header.edge_info_offset > header.text_offset or header.text_offset > header.lane_connectivity_offset or
             header.lane_connectivity_offset > bytes.len) return error.InvalidTileOffsets;
+        var previous: u32 = 0;
+        for (header.bins) |end| {
+            if (end < previous) return error.InvalidTileBinOffsets;
+            previous = end;
+        }
+        const has_circles = header.bounding_circles_offset != 0 and header.bounding_circles_offset != header.tile_size;
+        const bin_end = if (has_circles) header.bounding_circles_offset else header.forward_restriction_offset;
+        if (bin_end < sign_end or bin_end > header.forward_restriction_offset or previous > (bin_end - sign_end) / @sizeOf(u64))
+            return error.InvalidTileBinOffsets;
+        const circle_bytes = bytes[bin_end..header.forward_restriction_offset];
+        if (has_circles and circle_bytes.len != @as(usize, previous) * @sizeOf(u32))
+            return error.InvalidTileBinOffsets;
+        const bin_start = bin_end - @as(usize, previous) * @sizeOf(u64);
         const tile: Tile = .{
             .bytes = bytes,
             .header = header,
@@ -425,6 +440,8 @@ pub const Tile = struct {
             .edges = std.mem.bytesAsSlice(Edge, bytes[edge_start..edge_end]),
             .local_signs = std.mem.bytesAsSlice(Sign, bytes[access_end..sign_end]),
             .access_restrictions = std.mem.bytesAsSlice(AccessRestriction, bytes[access_start..access_end]),
+            .bins = std.mem.bytesAsSlice(u64, bytes[bin_start..bin_end]),
+            .bounding_circles = std.mem.bytesAsSlice(u32, circle_bytes),
             .forward_restrictions = bytes[header.forward_restriction_offset..header.reverse_restriction_offset],
             .reverse_restrictions = bytes[header.reverse_restriction_offset..header.edge_info_offset],
             .edge_info = bytes[header.edge_info_offset..header.text_offset],
@@ -470,6 +487,14 @@ pub const Tile = struct {
 
     pub fn complexRestrictions(self: Tile, reverse: bool) ComplexIterator {
         return .{ .remaining = if (reverse) self.reverse_restrictions else self.forward_restrictions };
+    }
+
+    pub fn binRange(self: Tile, index: usize) !struct { start: usize, end: usize } {
+        if (index >= self.header.bins.len) return error.InvalidTileBin;
+        return .{
+            .start = if (index == 0) 0 else self.header.bins[index - 1],
+            .end = self.header.bins[index],
+        };
     }
 
     pub fn edgeAccessRestrictions(self: Tile, index: u21, deadline: io.Deadline) ![]align(1) const AccessRestriction {

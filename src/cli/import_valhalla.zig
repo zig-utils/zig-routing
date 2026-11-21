@@ -293,6 +293,47 @@ const Layout = struct {
         try writer.write(.turn_sides, side_data);
     }
 
+    fn writeSnapBins(self: *const Layout, a: Allocator, tiles: []const SourceTile, writer: *format.BundleWriter) !void {
+        const bins = graph.snap_bins;
+        var present = false;
+        for (tiles) |source| {
+            if (writer.deadline.expired()) return error.DeadlineExceeded;
+            // The importer retains local edges. A hierarchical bin can
+            // refer to an edge from a level outside that imported graph.
+            if (source.tile.header.transitions.count != 0) return;
+            present = present or source.tile.bins.len != 0;
+        }
+        if (!present) return;
+        var words: std.ArrayList(u32) = .empty;
+        defer words.deinit(a);
+        const directory = 1 + tiles.len * bins.words_per_tile;
+        try words.resize(a, directory);
+        words.items[0] = @intCast(tiles.len);
+        for (tiles, 0..) |source, i| {
+            if (writer.deadline.expired()) return error.DeadlineExceeded;
+            const index = 1 + i * bins.words_per_tile;
+            words.items[index] = source.tile.header.tile.id.tile;
+            for (0..bins.bins_per_tile) |bin| {
+                const range = try source.tile.binRange(bin);
+                for (source.tile.bins[range.start..range.end], range.start..) |raw, j| {
+                    if (j % 256 == 0 and writer.deadline.expired()) return error.DeadlineExceeded;
+                    const bits = std.math.cast(u46, raw) orelse return error.InvalidValhallaBinEdge;
+                    const id: tile_format.GraphId = @bitCast(bits);
+                    if (id.level != tile_format.local_level) continue;
+                    const other = tiles[self.by_key.get(id.tileKey()) orelse continue];
+                    if (id.index >= other.edge_ids.len) return error.InvalidValhallaBinEdge;
+                    const edge = other.edge_ids[id.index];
+                    if (edge == no_edge) continue;
+                    const circle = if (source.tile.bounding_circles.len != 0) source.tile.bounding_circles[j] else @as(u32, @bitCast(bins.Circle.absent));
+                    try words.appendSlice(a, &.{ edge, circle });
+                }
+                const entries = (words.items.len - directory) / (@sizeOf(bins.Entry) / @sizeOf(u32));
+                words.items[index + 1 + bin] = std.math.cast(u32, entries) orelse return error.ValhallaBinsTooLarge;
+            }
+        }
+        try writer.write(.snap_bins, words.items);
+    }
+
     fn writeCold(self: *const Layout, a: Allocator, tiles: []const SourceTile, writer: *format.BundleWriter, scratch_dir: []const u8) !void {
         var strings = StringTable.init(a);
         defer strings.deinit();
@@ -539,6 +580,7 @@ pub fn run(gpa: Allocator, inputs: []const []const u8, output: []const u8, deadl
     try graph.speed.writeBounds(&writer, layout.edges);
     try writer.write(.classes, classes.classes);
     try writer.write(.coordinates, layout.coords);
+    try layout.writeSnapBins(a, tiles, &writer);
     try writeDatasetIds(a, tiles, stats.nodes, &writer, deadline);
     try writeTimezones(a, tiles, stats.nodes, &writer);
     try writer.write(.slopes, layout.slopes);

@@ -104,7 +104,7 @@ pub fn tile(reverse: bool) [512]u8 {
     return data;
 }
 
-pub fn restrictedTile() [608]u8 {
+pub fn restrictedTile() [620]u8 {
     const raw = tile(false);
     var header = std.mem.bytesToValue(source.Header, raw[0..@sizeOf(source.Header)]);
     const edge_start = @sizeOf(source.Header) + @sizeOf(source.Node);
@@ -128,7 +128,10 @@ pub fn restrictedTile() [608]u8 {
     const vias = [_]u64{ @as(u46, @bitCast(other)), @as(u46, @bitCast(here)) };
     const original_info = header.edge_info_offset;
     header.access.restrictions = 1;
-    header.forward_restriction_offset = original_info + @sizeOf(source.AccessRestriction);
+    const bin_start = original_info + @sizeOf(source.AccessRestriction);
+    header.bins = @splat(1);
+    header.bounding_circles_offset = bin_start + @sizeOf(u64);
+    header.forward_restriction_offset = header.bounding_circles_offset + @sizeOf(u32);
     header.reverse_restriction_offset = header.forward_restriction_offset + @sizeOf(source.ComplexRestriction) + @sizeOf(@TypeOf(vias));
     header.edge_info_offset = header.reverse_restriction_offset + @sizeOf(source.ComplexRestriction) + @sizeOf(@TypeOf(vias));
     const added = header.edge_info_offset - original_info;
@@ -136,7 +139,7 @@ pub fn restrictedTile() [608]u8 {
     header.lane_connectivity_offset += added;
     header.predicted_speed_offset += added;
     header.tile_size += added;
-    var data: [608]u8 = undefined;
+    var data: [620]u8 = undefined;
     @memcpy(data[0..access_start], raw[0..access_start]);
     @memcpy(data[0..@sizeOf(source.Header)], std.mem.asBytes(&header));
     var node = std.mem.bytesToValue(source.Node, raw[@sizeOf(source.Header)..edge_start]);
@@ -148,7 +151,9 @@ pub fn restrictedTile() [608]u8 {
     @memcpy(data[edge_start..access_start], std.mem.asBytes(&edge));
     const sign_start = access_start + @sizeOf(source.AccessRestriction);
     @memcpy(data[access_start..sign_start], std.mem.asBytes(&access));
-    @memcpy(data[sign_start..header.forward_restriction_offset], raw[access_start..original_info]);
+    @memcpy(data[sign_start..bin_start], raw[access_start..original_info]);
+    std.mem.writeInt(u64, data[bin_start..][0..@sizeOf(u64)], @as(u46, @bitCast(other)), .little);
+    @memset(data[header.bounding_circles_offset..header.forward_restriction_offset], 0);
     const forward_vias = header.forward_restriction_offset + @sizeOf(source.ComplexRestriction);
     const reverse_vias = header.reverse_restriction_offset + @sizeOf(source.ComplexRestriction);
     @memcpy(data[header.forward_restriction_offset..forward_vias], std.mem.asBytes(&forward));

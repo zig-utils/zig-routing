@@ -168,6 +168,8 @@ pub const View = struct {
     slopes: ?[]const u16,
     spatial: ?[]const u8,
     spatial_index: ?spatial.View,
+    snap_bins: ?[]const u32 = null,
+    snap_bin_index: ?@import("snap_bins.zig").View = null,
     metadata: ?[]const format.Metadata,
     dataset_id: ?[]const u64 = null,
     components: ?[]const u32,
@@ -364,6 +366,10 @@ pub const View = struct {
         if (graph.spatial) |bytes| {
             note(diagnostic, .spatial);
             graph.spatial_index = try spatial.View.parse(bytes, @intCast(edge_count));
+        }
+        if (graph.snap_bins) |words| {
+            note(diagnostic, .snap_bins);
+            graph.snap_bin_index = try @import("snap_bins.zig").View.parse(words);
         }
         if (graph.turn_sides) |words| {
             note(diagnostic, .turn_sides);
@@ -705,6 +711,10 @@ pub const View = struct {
         try @import("lanes.zig").verifyTurns(self, deadline);
         note(diagnostic, .lane_connectivity);
         try @import("lanes.zig").verifyConnectivity(self, deadline);
+        if (self.snap_bin_index) |index| {
+            note(diagnostic, .snap_bins);
+            try index.verify(self.edges.len, deadline);
+        }
         if (self.admin_index) |index| {
             note(diagnostic, .admins);
             try index.verify(deadline);

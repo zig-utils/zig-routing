@@ -41,17 +41,21 @@ Use the [Utrecht extract](../../oracle/datasets.tsv) and the
 [matching single-level build and import](../experiments/isochrone.md#reproduction).
 Run the pinned Valhalla and native HTTP services on those graphs and give
 `zr diff` a TSV with `/locate`, a tab and one JSON request per line.
-These requests reproduce an ordered tie at the second location and an
-extra native unreachable candidate at the first location, respectively.
+These requests exercise tied junction ordering, removal of an exterior
+unreachable candidate, and retention of a fallback with a 300 metre
+search cutoff, respectively.
 
 ```jsonl
 {"locations":[{"lat":52.112579,"lon":5.07434,"radius":30,"search_cutoff":250},{"lat":52.078277,"lon":5.129571,"radius":30,"search_cutoff":250}],"costing":"pedestrian","verbose":true}
 {"locations":[{"lat":52.053613,"lon":5.050598},{"lat":52.126265,"lon":5.095931}],"costing":"motorcycle","verbose":true}
+{"locations":[{"lat":52.128773,"lon":5.154834,"search_cutoff":300}],"costing":"motorcycle","verbose":true}
 ```
 
-The paired-candidate comparison across 240 input locations checked 619
-projected coordinates and fractions within `1e-6`. Candidate ordering
-and reachability differences are tracked in [#247](https://github.com/zig-utils/zig-routing/issues/247).
+The Utrecht replay matched the order and identity of 654 edges and 100
+filtered edges across 267 input locations. Both projections and fractions
+agreed within `1e-6`, and side of street and directional reach counts agreed
+exactly. The same nodes appeared at every location, with a different
+presentation order at 12 locations. [Candidate validation](https://github.com/zig-utils/zig-routing/issues/247).
 An independent build from the same small OSM map verified that a directed
 height restriction appears in both implementations. The same-graph importer
 also preserves directed access records for verbose comparisons.

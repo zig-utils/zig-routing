@@ -31,10 +31,14 @@ pub const Finder = struct {
     generation: u32 = 0,
     frontier: std.ArrayList(Arc) = .empty,
 
+    pub fn cached(self: *const Finder, id: EdgeId) ?Counts {
+        return self.cache.get(@backingInt(id));
+    }
+
     pub fn counts(self: *Finder, id: EdgeId, costing: anytype) !Counts {
         if (self.limit == 0) return .{};
         try self.check();
-        if (self.cache.get(@backingInt(id))) |value| return value;
+        if (self.cached(id)) |value| return value;
         const seed = try Arc.read(self.view, id);
         var result: Counts = .{};
         if (costing.allowed(seed)) {

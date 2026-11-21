@@ -84,11 +84,15 @@ pub const Projection = struct {
 const Hit = struct {
     projection: Projection,
     edge: DirectedEdge,
-    order: BinOrder,
+    order: union(enum) { native: BinOrder, tile: usize },
 
     fn compare(_: void, a: Hit, b: Hit) std.math.Order {
         const distance = std.math.order(a.projection.squared, b.projection.squared);
-        return if (distance == .eq) a.order.compare(b.order) else distance;
+        if (distance != .eq) return distance;
+        return switch (a.order) {
+            .native => |native| native.compare(b.order.native),
+            .tile => |index| std.math.order(index, b.order.tile),
+        };
     }
 };
 
@@ -170,11 +174,13 @@ const DirectionOrder = struct {
 };
 
 fn hierarchyLevel(edge: DirectedEdge) usize {
+    if (edge.graph_view.snap_bin_index != null) return 2;
     const rc = edge.class.category.road_class;
     return if (rc <= 2) 0 else if (rc <= 4) 1 else 2;
 }
 
 fn incidentRank(edge: DirectedEdge) u5 {
+    if (edge.graph_view.snap_bin_index != null) return 0;
     return graph.constants.incidentEdgeRank(edge.class.forwardAccess().auto, edge.class.category.road_class, edge.class.flags.named);
 }
 
@@ -364,6 +370,7 @@ const Work = struct {
     }
 
     fn find(self: *Work, index: graph.spatial.View, view: *const graph.reader.View, costing: anytype) !void {
+        if (view.snap_bin_index) |bins| return self.findTileBins(bins, view, costing);
         const q = self.query;
         // Rounding E7 shape coordinates to the E6 used for projection moves
         // the whole segment by at most half a microdegree per axis (< 0.08 m).
@@ -400,31 +407,10 @@ const Work = struct {
                         projection.squared > self.eligible.nearest.?.projection.squared and
                         (self.fallback.nearest == null or projection.squared >= self.closest_external)) continue;
                     if (q.point.distance(projection.point) > q.cutoff) continue;
-                    var hit = try self.orderHit(projection, edge, opposite, forward_allowed, reverse_allowed);
-                    var allowed = (try self.finder.counts(hit.edge.id, costing)).satisfies(q.required);
+                    const hit = try self.orderHit(projection, edge, opposite, forward_allowed, reverse_allowed);
                     const twin = if (hit.edge.id == edge.id) opposite else edge;
                     const twin_allowed = if (hit.edge.id == edge.id) reverse_allowed else forward_allowed;
-                    if (!allowed and twin_allowed and (try self.finder.counts(twin.id, costing)).satisfies(q.required)) {
-                        hit.edge = twin;
-                        allowed = true;
-                    }
-                    if (allowed) {
-                        if (self.eligible.nearest) |nearest| {
-                            const previous = nearest.projection.squared;
-                            if (projection.squared < self.closest_external) {
-                                if (previous >= q.radius * q.radius and projection.squared < previous) {
-                                    self.closest_external = previous;
-                                } else if (!in_radius and projection.squared >= previous) {
-                                    self.closest_external = projection.squared;
-                                }
-                            }
-                        } else {
-                            self.closest_external = projection.squared;
-                        }
-                        try self.eligible.retain(q.arena, hit, in_radius);
-                    } else {
-                        try self.fallback.retain(q.arena, hit, in_radius);
-                    }
+                    try self.collect(costing, hit, if (twin_allowed) twin else null);
                 }
             }
             if (extent == limit) return;
@@ -434,6 +420,113 @@ const Work = struct {
             scanned = extent;
             extent = @min(limit, 2 * extent);
         }
+    }
+
+    fn findTileBins(self: *Work, bins: graph.snap_bins.View, view: *const graph.reader.View, costing: anytype) !void {
+        const q = self.query;
+        const tiles = upstream_tiles[2];
+        var closest = try grid.ClosestFirst.init(q.arena, tiles, q.point);
+        defer closest.deinit();
+        var order: usize = 0;
+        while (try closest.next()) |bin| {
+            try q.check();
+            if (bin.distance > q.cutoff) break;
+            if (self.eligible.nearest) |nearest| {
+                if (bin.distance > @max(q.radius, @sqrt(nearest.projection.squared))) break;
+            }
+            const edges = try bins.edgesIn(@intCast(bin.tile), bin.bin);
+            const base = tiles.base(bin.tile);
+            const bin_x: f32 = @floatFromInt(bin.bin % tiles.nsubdivisions);
+            const bin_y: f32 = @floatFromInt(bin.bin / tiles.nsubdivisions);
+            const step = tiles.subdivision_size;
+            const center: geo.DistanceApproximator = .init(.init(base.lng + @as(f64, bin_x * step + step / 2), base.lat + @as(f64, bin_y * step + step / 2)));
+            for (edges) |entry| {
+                try q.check();
+                if (entry.circle.valid() and self.outsideCircle(entry.circle, center)) continue;
+                const index = entry.edge;
+                const id: EdgeId = @fromBackingInt(index);
+                const opposing = try view.oppEdge(id);
+                const slot = @min(index, @backingInt(opposing));
+                const status = try self.seen.at(q.arena, slot);
+                if (status.* & projected_flag != 0) continue;
+                status.* |= projected_flag;
+                const edge = try DirectedEdge.read(view, id);
+                const twin = try DirectedEdge.read(view, opposing);
+                const forward_allowed = try q.allows(costing, edge);
+                const reverse_allowed = try q.allows(costing, twin);
+                if (!forward_allowed and !reverse_allowed) continue;
+                const projection = try project(q.approx, try self.decode(edge), q.deadline);
+                try self.collect(costing, .{
+                    .projection = projection,
+                    .edge = if (forward_allowed) edge else twin,
+                    .order = .{ .tile = order },
+                }, if (forward_allowed and reverse_allowed) twin else null);
+                order += 1;
+            }
+        }
+    }
+
+    fn outsideCircle(self: *const Work, circle: graph.snap_bins.Circle, bin_center: geo.DistanceApproximator) bool {
+        const q = self.query;
+        var center = circle.center(bin_center);
+        center.lng = q.point.lng + geo.wrappedLongitudeDelta(center.lng, q.point.lng);
+        const squared = q.approx.distanceSquared(center);
+        const radius = circle.radius();
+        const cutoff = q.cutoff + radius;
+        if (squared > cutoff * cutoff) return true;
+        const nearest = self.eligible.nearest orelse return false;
+        const search_radius = q.radius + radius;
+        if (nearest.projection.squared < q.radius * q.radius and squared > search_radius * search_radius) return true;
+        const lower = @sqrt(squared) - radius;
+        return lower >= q.cutoff or (lower >= q.radius and lower >= @sqrt(nearest.projection.squared));
+    }
+
+    fn collect(self: *Work, costing: anytype, candidate: Hit, twin: ?DirectedEdge) !void {
+        const q = self.query;
+        var hit = candidate;
+        var reachable = try self.candidateReachable(costing, hit);
+        if (!reachable) {
+            if (twin) |opposite| {
+                var other = hit;
+                other.edge = opposite;
+                if (try self.candidateReachable(costing, other)) {
+                    hit = other;
+                    reachable = true;
+                }
+            }
+        }
+        const squared = hit.projection.squared;
+        const radius = q.radius * q.radius;
+        const in_radius = squared < radius;
+        if (!reachable) return self.fallback.retain(q.arena, hit, in_radius);
+        if (squared < self.closest_external) {
+            if (self.eligible.nearest) |nearest| {
+                const previous = nearest.projection.squared;
+                if (previous >= radius and squared < previous) {
+                    self.closest_external = previous;
+                } else if (!in_radius and squared >= previous) {
+                    self.closest_external = squared;
+                }
+            } else {
+                self.closest_external = squared;
+            }
+        }
+        try self.eligible.retain(q.arena, hit, in_radius);
+    }
+
+    fn candidateReachable(self: *Work, costing: anytype, hit: Hit) !bool {
+        const required = self.query.required;
+        if (hit.order == .tile) {
+            if (self.finder.cached(hit.edge.id)) |reach| return reach.satisfies(required);
+            if (self.eligible.nearest) |nearest| {
+                // The tile search only expands uncached reach when a hit can
+                // replace the closest reachable one. The exterior cutoff uses
+                // this provisional classification. Emitted edges get measured
+                // counts in append.
+                if (hit.projection.squared >= nearest.projection.squared) return true;
+            }
+        }
+        return (try self.finder.counts(hit.edge.id, costing)).satisfies(required);
     }
 
     fn orderHit(self: *const Work, projection: Projection, edge: DirectedEdge, opposing: DirectedEdge, edge_allowed: bool, opposing_allowed: bool) !Hit {
@@ -452,12 +545,12 @@ const Work = struct {
         return .{
             .projection = projection,
             .edge = if (forward) edge else opposing,
-            .order = .{
+            .order = .{ .native = .{
                 .distance = bin.distance,
                 .subdivision = bin.subdivision,
                 .originating = first.level == 2 and bin.tile == (if (a_first) a_local else b_local),
                 .direction = first,
-            },
+            } },
         };
     }
 
@@ -472,6 +565,10 @@ const Work = struct {
         }
         while (self.eligible.hits.pop()) |hit| {
             try q.check();
+            // Imported bins apply the cutoff to the circle before projecting.
+            // A projection outside the cutoff can still set the exterior
+            // fallback bound, but only in-range projections are returned.
+            if (hit.order == .tile and q.point.distance(hit.projection.point) > q.cutoff) continue;
             try self.correlate(costing, hit);
         }
         for (self.through_ends.items) |edge| {

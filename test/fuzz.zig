@@ -777,6 +777,11 @@ fn checkValhallaTile(tile: valhalla_import.tile_format.Tile) !void {
     for (tile.local_signs) |sign| {
         if (!sign.data.tagged) _ = tile.signText(sign.text_offset) catch continue;
     }
+    for (0..tile.header.bins.len) |bin| {
+        const range = try tile.binRange(bin);
+        _ = tile.bins[range.start..range.end];
+        if (tile.bounding_circles.len != 0) _ = tile.bounding_circles[range.start..range.end];
+    }
 }
 
 fn fuzzAdminIndex(_: void, s: *Smith) !void {
@@ -983,6 +988,22 @@ test "Valhalla tile rejects truncated complex restrictions and out-of-range acce
     try std.testing.expectError(error.InvalidValhallaAccessRestriction, source.Tile.parse(&bad_access));
 }
 
+test "Valhalla tile rejects descending bin offsets and incomplete bounding circles" {
+    const source = valhalla_import.tile_format;
+    var bytes = valhalla_fixture.restrictedTile();
+    const header_bytes = bytes[0..@sizeOf(source.Header)];
+    const original = std.mem.bytesToValue(source.Header, header_bytes);
+    var bad = original;
+    bad.bins[0] += 1;
+    @memcpy(header_bytes, std.mem.asBytes(&bad));
+    try std.testing.expectError(error.InvalidTileBinOffsets, source.Tile.parse(&bytes));
+
+    bad = original;
+    bad.bounding_circles_offset += 1;
+    @memcpy(header_bytes, std.mem.asBytes(&bad));
+    try std.testing.expectError(error.InvalidTileBinOffsets, source.Tile.parse(&bytes));
+}
+
 test "Valhalla importer retains restriction directions, predicates and access across tiles" {
     const io = routing.infra.io;
     const test_alloc = std.testing.allocator;
@@ -1016,6 +1037,12 @@ test "Valhalla importer retains restriction directions, predicates and access ac
     try bundle.view.verify(.none, null);
     const zone = try bundle.view.nodeTimezone(@fromBackingInt(0));
     try std.testing.expectEqualStrings("America/Ciudad_Juarez", (try bundle.view.tz_rules.?.name(zone)).?);
+    const bins = bundle.view.snap_bin_index.?;
+    const entries = try bins.edgesIn(valhalla_fixture.first_tile, 0);
+    try std.testing.expectEqual(1, entries.len);
+    try std.testing.expectEqual(1, entries[0].edge);
+    try std.testing.expectEqual(0, @as(u32, @bitCast(entries[0].circle)));
+    try std.testing.expectEqual(0, (try bins.edgesIn(valhalla_fixture.first_tile, 1)).len);
     const states = bundle.view.restriction_automaton.?;
     const conditions = bundle.view.restriction_conditions.?;
     try std.testing.expectEqual(2, conditions.len);
