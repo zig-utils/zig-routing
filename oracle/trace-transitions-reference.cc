@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <iostream>
 #include <rapidjson/document.h>
+#include <set>
 #include <valhalla/meili/candidate_search.h>
 #include <valhalla/meili/config.h>
 #include <valhalla/meili/emission_cost_model.h>
@@ -14,10 +15,24 @@
 #include <valhalla/midgard/logging.h>
 #include <valhalla/sif/costfactory.h>
 
+#include "trace-transition-audit.h"
+
 int main(int argc, char** argv) {
-  if (argc != 3) {
-    std::cerr << "usage: trace-transitions-reference CONFIG CORPUS\n";
+  if (argc < 3 || argc > 4) {
+    std::cerr << "usage: trace-transitions-reference CONFIG CORPUS [AUDIT_COLUMNS]\n";
     return 2;
+  }
+  const bool audit = argc == 4;
+  std::set<std::pair<size_t, size_t>> selected;
+  if (audit) {
+    std::ifstream columns(argv[3]);
+    size_t row, source;
+    while (columns >> row) {
+      if (!(columns >> source) || !selected.emplace(row, source).second)
+        throw std::runtime_error("invalid or duplicate audit column");
+    }
+    if (!columns.eof() || selected.empty())
+      throw std::runtime_error("expected audit rows and source candidate indices");
   }
   using namespace valhalla;
   boost::property_tree::ptree config;
@@ -58,7 +73,9 @@ int main(int argc, char** argv) {
   double from_lat, from_lon, to_lat, to_lon, clock;
   float radius;
   size_t row = 0;
-  while (input >> from_lat >> from_lon >> to_lat >> to_lon >> radius >> clock) {
+  for (; input >> from_lat >> from_lon >> to_lat >> to_lon >> radius >> clock; ++row) {
+    if (audit && (selected.empty() || selected.begin()->first != row))
+      continue;
     const midgard::PointLL left{from_lon, from_lat};
     const midgard::PointLL right{to_lon, to_lat};
     const auto effective = std::min(settings.candidate_search.max_search_radius_meters, std::max(5.f, radius));
@@ -72,34 +89,54 @@ int main(int argc, char** argv) {
       destinations.push_back(&target);
     const midgard::DistanceApproximator<midgard::PointLL> approx(right);
     for (size_t s = 0; s < from.size(); ++s) {
+      std::optional<trace_audit::Enumerator> enumerator;
+      const std::vector<trace_audit::Path>* directed = nullptr;
+      meili::labelset_ptr_t labels;
+      std::unordered_map<uint16_t, uint32_t> found;
       destinations[0] = &from[s];
-      auto labels = std::make_shared<meili::LabelSet>(max_distance);
-      const auto found = meili::find_shortest_path(reader, destinations, 0, labels, approx, radius, costing,
-                                                   nullptr, penalties.data(), max_distance, max_time);
+      if (audit) {
+        if (selected.erase({row, s}) == 0)
+          continue;
+        enumerator.emplace(reader, costing, penalties, to, max_distance, max_time);
+        directed = &enumerator->run(from[s]);
+        std::cerr << "Audited row " << row << " source " << s << " over " << enumerator->prefixes()
+                  << " path prefixes\n";
+      } else {
+        labels = std::make_shared<meili::LabelSet>(max_distance);
+        found = meili::find_shortest_path(reader, destinations, 0, labels, approx, radius, costing,
+                                           nullptr, penalties.data(), max_distance, max_time);
+      }
       for (size_t t = 0; t < to.size(); ++t) {
         const auto left_score = emission.CalculateEmissionCost(from[s].correlation().edges(0).distance());
         const auto right_score = emission.CalculateEmissionCost(to[t].correlation().edges(0).distance());
         std::cout << row << '\t' << s << '\t' << t << '\t' << left_score << '\t' << right_score;
-        const auto result = found.find(t + 1);
-        if (result == found.end()) {
+        trace_audit::Path stock;
+        if (!audit) {
+          const auto result = found.find(t + 1);
+          if (result != found.end()) {
+            const auto& label = labels->label(result->second);
+            stock.cost = label.cost();
+            stock.turns = label.turn_cost();
+            const meili::RoutePathIterator end(labels.get());
+            for (meili::RoutePathIterator it(labels.get(), result->second); it != end; ++it)
+              if (it->edgeid().is_valid())
+                stock.edges.push_back(it->edgeid().id());
+            std::reverse(stock.edges.begin(), stock.edges.end());
+          }
+        }
+        const auto& path = audit ? directed->at(t) : stock;
+        if (!std::isfinite(path.cost.cost)) {
           std::cout << "\t-1\t-1\t-1\t-1\n";
         } else {
-          const auto& label = labels->label(result->second);
-          const auto cost = label.cost();
-          const auto score = transition.CalculateTransitionCost(label.turn_cost(), cost.cost, observed, cost.secs, clock);
-          std::cout << '\t' << cost.cost << '\t' << cost.secs << '\t' << label.turn_cost() << '\t' << score << '\t';
-          std::vector<uint32_t> edges;
-          const meili::RoutePathIterator end(labels.get());
-          for (meili::RoutePathIterator it(labels.get(), result->second); it != end; ++it)
-            if (it->edgeid().is_valid())
-              edges.push_back(it->edgeid().id());
-          for (size_t i = 0; i < edges.size(); ++i)
-            std::cout << (i == 0 ? "" : ",") << edges[edges.size() - 1 - i];
+          const auto cost = path.cost;
+          const auto score = transition.CalculateTransitionCost(path.turns, cost.cost, observed, cost.secs, clock);
+          std::cout << '\t' << cost.cost << '\t' << cost.secs << '\t' << path.turns << '\t' << score << '\t';
+          for (size_t i = 0; i < path.edges.size(); ++i)
+            std::cout << (i == 0 ? "" : ",") << path.edges[i];
           std::cout << '\n';
         }
       }
     }
-    ++row;
   }
-  return input.eof() && std::cout.good() ? 0 : 2;
+  return input.eof() && std::cout.good() && selected.empty() ? 0 : 2;
 }

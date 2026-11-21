@@ -35,4 +35,38 @@ of the arrival on 77710, which can make that turn. The native expansion
 retains that directed state and reaches the first of the nine destinations
 in 776.220 metres instead of 926.220 metres. The pinned costing permits
 every move on the shorter route. The full stock-oracle comparison reports
-these differences. [Exact-route validation follow-up](https://github.com/zig-utils/zig-routing/issues/252).
+these differences and exits 1.
+
+## Directed path audit
+
+The independent reference enumerates feasible path prefixes on the same
+Valhalla tiles. It keeps the full predecessor chain and uses Valhalla's auto
+costing to check edge access, simple turns and complex restrictions. It
+prices the source and target cuts from the oracle's own correlations and
+applies the same strict distance and elapsed-time bounds as Meili. After
+every target has a feasible route, a prefix longer than all current winners
+cannot improve a destination. No arrivals are merged by node or edge.
+
+Audit source candidate 2 at rows 36 through 38, with zero-based indices.
+These are the same measurements with an unlimited clock, a 15-second
+measurement gap and a 2-second gap. The bounded cases allow less than
+75 seconds and 10 seconds of travel, respectively.
+
+```sh
+printf '36\t2\n37\t2\n38\t2\n' > audit-columns.tsv
+./trace-transitions-reference CONFIG.json transitions.tsv audit-columns.tsv > directed.tsv
+python3 oracle/trace-transitions.py audit oracle.tsv native.tsv directed.tsv
+```
+
+| Clock gap | Feasible path prefixes examined | Native paths verified |
+| --- | ---: | ---: |
+| Unlimited | 12,513 | 9 / 9 |
+| 15 seconds | 3,852 | 9 / 9 |
+| 2 seconds | 0 | 9 / 9 unreachable |
+
+The first target takes 55.888 seconds at 776.220 metres on the verified path,
+compared with 66.688 seconds at 926.220 metres in stock Meili. Across the
+27 audited pairs, the maximum absolute errors were `2.930e-5` metres,
+`1.248e-6` seconds, `2.531e-7` for emission and `6.592e-6` for transition
+score. The audit checks the directed path as well as the metrics and requires
+coverage of every stock score difference. [Issue #252](https://github.com/zig-utils/zig-routing/issues/252).

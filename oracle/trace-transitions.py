@@ -59,6 +59,39 @@ def compare(oracle, native):
     return bool(reachable) and differences == 0
 
 
+def audit(oracle, native, directed):
+    stock, actual, exact = read(oracle), read(native), read(directed)
+    if stock.keys() != actual.keys():
+        print("The stock and native probes emitted different candidate pairs")
+        return False
+    divergences = {
+        key for key, (values, _) in stock.items()
+        if any(abs(a - b) > TOLERANCE for a, b in zip(values, actual[key][0], strict=True))
+    }
+    missing = divergences - exact.keys()
+    extra = exact.keys() - actual.keys()
+    if missing or extra:
+        print(f"Missing directed checks {sorted(missing)[:10]}")
+        print(f"Unexpected directed checks {sorted(extra)[:10]}")
+        return False
+
+    maxima = [0.0] * len(FIELDS)
+    passed = 0
+    for key, (values, path) in exact.items():
+        native_values, native_path = actual[key]
+        errors = [abs(a - b) for a, b in zip(values, native_values, strict=True)]
+        maxima = list(map(max, maxima, errors))
+        if max(errors) <= TOLERANCE and path == native_path:
+            passed += 1
+        else:
+            print(f"{key} directed {values} {path}, native {native_values} {native_path}")
+
+    print(f"{len(stock)} stock pairs, {len(divergences)} stock divergences")
+    print(f"{passed}/{len(exact)} directed checks matched the native paths and metrics")
+    print("Maximum directed absolute errors " + ", ".join(f"{name} {error:.6g}" for name, error in zip(FIELDS, maxima)))
+    return bool(exact) and passed == len(exact)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -68,10 +101,16 @@ def main():
     compare_cmd = commands.add_parser("compare")
     compare_cmd.add_argument("oracle", type=Path)
     compare_cmd.add_argument("native", type=Path)
+    audit_cmd = commands.add_parser("audit")
+    audit_cmd.add_argument("oracle", type=Path)
+    audit_cmd.add_argument("native", type=Path)
+    audit_cmd.add_argument("directed", type=Path)
     args = parser.parse_args()
     if args.command == "extract":
         extract(args.measurements, args.corpus)
-    elif not compare(args.oracle, args.native):
+    elif args.command == "compare" and not compare(args.oracle, args.native):
+        sys.exit(1)
+    elif args.command == "audit" and not audit(args.oracle, args.native, args.directed):
         sys.exit(1)
 
 
