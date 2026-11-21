@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # oracle/bench-vm.sh <dataset> <corpus> [label]
 #
-# Valhalla against zr, both native arm64 inside the Docker VM, on one network, with the zr
-# bench client in a third container: no emulation and no port forwarding in the numbers.
+# Valhalla against zr, both native to the Docker host, on one network, with the zr bench
+# client in a third container: no emulation and no port forwarding in the numbers.
 # Each server gets the same worker count; the client runs at 1 connection and at as many
 # connections as the VM has CPUs.
 #
@@ -18,9 +18,14 @@ label="${3:-$(git -C "$ORACLE_DIR/.." rev-parse --short HEAD)}"
 repo="$(cd "$ORACLE_DIR/.." && pwd)"
 dir="$ORACLE_DATA/$name"
 [ -f "$corpus" ] || die "no corpus $corpus (bun tools/corpus/generate.ts)"
+case "$(docker info --format '{{.Architecture}}')" in
+  x86_64|amd64) zig_target=x86_64-linux-gnu; platform=linux/amd64; prefix=zig-out-linux ;;
+  aarch64|arm64) zig_target=aarch64-linux-gnu; platform=linux/arm64; prefix=zig-out-linux-arm ;;
+  *) die "unsupported Docker host architecture" ;;
+esac
+ORACLE_PLATFORM="$platform"
 ensure_built "$name"
 ORACLE_IMAGE=$(oracle_compose "$name" default 8102 config --images oracle)
-platform=linux/arm64
 cpus=$(docker info --format '{{.NCPU}}')
 workers=$(( cpus > 2 ? cpus - 2 : 1 ))   # leave the client two CPUs
 duration="${DURATION:-10s}"
@@ -29,8 +34,8 @@ mkdir -p "$out"
 
 ZIG="${ZIG:-zig}"
 command -v "$ZIG" >/dev/null 2>&1 || ZIG="$HOME/.local/share/zig-0.17-master/zig"
-(cd "$repo" && "$ZIG" build -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseFast --prefix zig-out-linux-arm) || die "zr build failed"
-bin="$repo/zig-out-linux-arm/bin"
+(cd "$repo" && "$ZIG" build -Dtarget="$zig_target" -Doptimize=ReleaseFast --prefix "$prefix") || die "zr build failed"
+bin="$repo/$prefix/bin"
 
 docker network create zrbench >/dev/null 2>&1 || true
 cleanup() { docker rm -f zrb-valhalla zrb-zr >/dev/null 2>&1 || true; }
