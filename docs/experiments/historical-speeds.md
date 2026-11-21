@@ -66,7 +66,8 @@ route-style reachability before either edge walking or map snapping.
 On the noisy corpus, the remaining cost concentrates in directed
 transition expansion, endpoint correlation, and candidate-grid search.
 [#257](https://github.com/zig-utils/zig-routing/issues/257) tracks the
-one-million-point target for that workload.
+one-million-point target for that workload. See the [final throughput
+measurements](#historical-learning-throughput).
 
 ## Exact matching improvements on noisy traces
 
@@ -97,7 +98,7 @@ publication.
 
 Noisy wall time fell 33.2%. Median process CPU time fell from 14.925 s
 to 9.960 s. Median maximum resident memory moved from 130.11 MiB to
-132.30 MiB. The one-million-point gate requires 1.024 s and remains open.
+132.30 MiB. This build still needed to reach the 1.024 s gate.
 
 Separate one-second CPU samples at 1 ms intervals recorded 393 and 243
 top-of-stack samples in endpoint correlation before and after. Insertion
@@ -261,3 +262,17 @@ ranked action results. All 39 native test steps passed, with 634 tests
 passing and two skips. Eleven Linux x86-64 binaries cross-compiled.
 The Linux ReleaseFast binary is 14,440,904 bytes with five search
 instantiations and five costing kernels.
+
+
+## Historical speed acceptance
+
+The eight-worker noisy replay completed at 1,011,528 points per second,
+including parsing, matching, fitting and overlay publication. The
+published report and overlay retained the same aggregate counts and
+bytes across every paired run.
+
+The historical traffic Gurka test compares serial and parallel sample
+output, learns the known speed on the interior edge and confirms that
+the start and end edges receive no learned profile. It verifies the
+weekly DCT round trip within 5% in every supported bucket, even with
+outliers in the input. The final native suite passed these checks.
