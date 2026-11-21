@@ -59,7 +59,7 @@ Each scheduled ride is stored as a line and its departures. Directed
 walking connectors remain in the graph with their source access and
 geometry.
 
-The 100 requests supplied 506 directed cuts. Valhalla returned 100
+At the initial replay baseline, the 100 requests supplied 506 directed cuts. Valhalla returned 100
 itineraries and native returned 97. Three native searches reached the
 request arena limit. Forty itineraries matched the routes, ordered stops
 and exact timetable instants. Thirty-nine also matched the displayed
@@ -76,6 +76,14 @@ trip-leg display rounds the waiting duration and can show a later minute.
 These counts describe the shared topology replay.
 The independent [itinerary parity gate][gate] still uses its original
 threshold.
+
+With the origin and destination costing corrections, 43 itineraries
+matched at exact departure times and 42 matched the trip-leg displays.
+The native replay priced 93 of the 100 reference paths within 0.01 of
+their Valhalla weights. The largest difference was 8.012 cost units.
+In the 55 discrepancies with routes from both engines, the native path
+cost less under native costing. Its median advantage was 653.947 cost
+units. Three native requests still reached the arena limit.
 
 ## Overtaking fixture
 
@@ -111,7 +119,7 @@ walking approaches in each engine.
 | Engine | First offer cost | Later offer cost | Selected trip |
 | --- | ---: | ---: | ---: |
 | Valhalla 3.9.3 | 9,482.293 | 1,039.627 | 1 |
-| zig-routing | 9,488.126 | 1,045.460 | 2 |
+| zig-routing | 9,482.293 | 1,039.627 | 2 |
 
 [streets]: https://download.geofabrik.de/north-america/us/massachusetts/massachusetts-261119.osm.pbf
 [feed]: https://data.trilliumtransit.com/gtfs/brockton-ma-us/brockton-ma-us.zip

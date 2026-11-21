@@ -237,6 +237,15 @@ fn checkScheduledRoute(view: *const graph.reader.View) !void {
         try testing.expectEqual(scheduled.unix_time + 300, ride.arrival_time);
         try testing.expectEqual(360, path.total.secs);
         try checkTripLeg(a, view, path, departure_edge, arrival_edge, start);
+        if (pass == 0) {
+            var cut = destination.all[0];
+            cut.score = 10_000;
+            var scored = destination;
+            scored.all = &.{cut};
+            const signed = try search.run(&scratch, origin, scored, options, .{});
+            try testing.expect(signed.total.cost < 0);
+            try checkTripLeg(a, view, signed, departure_edge, arrival_edge, start);
+        }
         options.timing.start = try graph.time_info.TimeInfo.fromLocal(rules, "2026-03-10T06:59", london, graph.timezone.utc, 0, .none);
         try testing.expectError(error.NoPath, search.run(&scratch, origin, destination, options, .{}));
         try testing.expectError(error.Cancelled, search.run(&scratch, origin, destination, options, .{ .deadline = .{ .at_ns = 0 } }));
@@ -245,6 +254,41 @@ fn checkScheduledRoute(view: *const graph.reader.View) !void {
 
     scratch.reset();
     try checkOvertaking(&scratch, view, origin, destination, london);
+    scratch.reset();
+    try checkOriginWalkCost(&scratch, view, london);
+}
+
+fn checkOriginWalkCost(arena: *routing.infra.arena.Arena, view: *const graph.reader.View, london: graph.timezone.Id) !void {
+    const a = arena.allocator();
+    var warnings: std.ArrayList(routing.costing.base.Warning) = .empty;
+    var model = try routing.costing.multimodal.parse(a, .null, &warnings, .none);
+    model.pedestrian.mode_factor = 2;
+    const kernel = try routing.costing.multimodal.Kernel.init(a, view, model, .none);
+    const engine = try routing.search.multimodal.Search.init(a, view, &kernel, .{});
+    const start = try graph.time_info.TimeInfo.fromLocal(&view.tz_rules.?, "2026-03-09T06:59", london, graph.timezone.utc, 0, .none);
+    const id: graph.format.EdgeId = for (view.edges, 0..) |edge, i| {
+        const class = try view.class(edge.cls.class_id);
+        if (edge.geom.len_m == 0 or class.category.use != @backingInt(graph.constants.Use.road) or
+            !kernel.walking.allowedCandidate(class, .{}, .{}, false)) continue;
+        break @fromBackingInt(@as(u32, @intCast(i)));
+    } else return error.MissingWalkingStreet;
+    const origin: routing.search.endpoints.Ranked = .{
+        .all = &.{.{ .edge = id, .fraction = 0.25, .score = 0, .begin_node = false, .end_node = false }},
+        .preferred_count = 1,
+        .ignored_filter = false,
+    };
+    const destination: routing.search.endpoints.Ranked = .{
+        .all = &.{.{ .edge = id, .fraction = 0.75, .score = 0, .begin_node = false, .end_node = false }},
+        .preferred_count = 1,
+        .ignored_filter = false,
+    };
+    const path = try engine.run(arena, origin, destination, .{ .costing = .multimodal, .timing = .{ .start = start } }, .{});
+    try testing.expectEqual(1, path.steps.len);
+    const edge = try view.edge(id);
+    const class = try view.class(edge.cls.class_id);
+    const base_cost = routing.costing.pedestrian.Kernel.edgeCost(&kernel.walking, &kernel.walking_table, class, edge.*, 0, .{});
+    try testing.expectEqual(base_cost.cost * 0.5, path.total.cost);
+    try testing.expectEqual(base_cost.secs * 0.5, path.total.secs);
 }
 
 fn checkOvertaking(arena: *routing.infra.arena.Arena, original: *const graph.reader.View, origin: routing.search.endpoints.Ranked, destination: routing.search.endpoints.Ranked, london: graph.timezone.Id) !void {
@@ -274,6 +318,17 @@ fn checkOvertaking(arena: *routing.infra.arena.Arena, original: *const graph.rea
     const path = try search.run(arena, origin, destination, .{ .costing = .transit, .timing = .{ .start = start } }, .{});
     try testing.expectEqual(departures[1].trip, path.steps[1].movement.ride.departure.trip);
     try testing.expectEqual(240, path.total.secs);
+
+    // Valhalla subtracts the destination score with the untraversed tail.
+    // A negative total still selects the same minimum-cost departure.
+    var terminal = destination.all[0];
+    terminal.score = 10_000;
+    var scored = destination;
+    scored.all = &.{terminal};
+    const priced = try search.run(arena, origin, scored, .{ .costing = .transit, .timing = .{ .start = start } }, .{});
+    try testing.expectEqual(departures[1].trip, priced.steps[1].movement.ride.departure.trip);
+    try testing.expectEqual(path.total.secs, priced.total.secs);
+    try testing.expectEqual(path.total.cost - terminal.score, priced.total.cost);
 }
 
 fn checkTripLeg(a: std.mem.Allocator, view: *const graph.reader.View, path: routing.search.multimodal.Path, from: graph.format.EdgeId, to: graph.format.EdgeId, start: graph.time_info.TimeInfo) !void {

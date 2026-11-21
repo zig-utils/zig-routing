@@ -373,7 +373,7 @@ fn scheduledLeg(a: std.mem.Allocator, view: *const View, paths: []const multimod
                 .id = segment.edge,
                 .ride = if (step.movement == .ride) step.movement.ride else null,
                 .length_m = metres,
-                .elapsed = offset.add(step.elapsed),
+                .elapsed = addScheduledCost(offset, step.elapsed),
                 .transition = step.transition,
                 .full_travel_secs = vehicle_time,
                 .shape_begin = begin,
@@ -383,7 +383,7 @@ fn scheduledLeg(a: std.mem.Allocator, view: *const View, paths: []const multimod
             prior_secs = step.elapsed.secs;
             index += 1;
         }
-        offset = offset.add(path.total);
+        offset = addScheduledCost(offset, path.total);
     }
     if (shape.items.len == 0) return error.InvalidRoute;
     summary.time = offset.secs;
@@ -395,6 +395,11 @@ fn scheduledLeg(a: std.mem.Allocator, view: *const View, paths: []const multimod
         .segments = segments,
         .contexts = contexts,
     };
+}
+
+fn addScheduledCost(a: Cost, b: Cost) Cost {
+    const limit = std.math.floatMax(f32);
+    return .{ .cost = std.math.clamp(a.cost + b.cost, -limit, limit), .secs = @min(a.secs + b.secs, limit) };
 }
 
 fn projected(location: snap.PathLocation, edge: EdgeId, fraction: f32, control: search.Control) !geo.PointLL {

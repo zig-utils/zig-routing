@@ -150,8 +150,16 @@ pub const Kernel = struct {
         return pedestrian.Kernel.allowed(&self.walking, previous, next, edge, check);
     }
 
+    pub fn baseWalkCost(self: *const Kernel, class: *const graph.class_table.EdgeClass, edge: graph.format.EdgeHot, ferry_speed: u8, effects: compiled.Effects) Cost {
+        return pedestrian.Kernel.edgeCost(&self.walking, &self.walking_table, class, edge, ferry_speed, effects);
+    }
+
     pub fn walkCost(self: *const Kernel, class: *const graph.class_table.EdgeClass, edge: graph.format.EdgeHot, ferry_speed: u8, effects: compiled.Effects) Cost {
-        var edge_cost = pedestrian.Kernel.edgeCost(&self.walking, &self.walking_table, class, edge, ferry_speed, effects);
+        return self.scaleWalkCost(self.baseWalkCost(class, edge, ferry_speed, effects));
+    }
+
+    pub fn scaleWalkCost(self: *const Kernel, base_cost: Cost) Cost {
+        var edge_cost = base_cost;
         edge_cost.cost *= self.walking_mode_factor;
         return edge_cost;
     }
@@ -201,3 +209,10 @@ pub const Kernel = struct {
         return .{};
     }
 };
+
+/// SetDestination stores the base cost after the cut and the destination
+/// score together. ExpandForward subtracts both from the completed edge.
+pub fn destinationRemainder(base_cost: Cost, fraction: f32, score: f32) Cost {
+    const remaining = 1 - fraction;
+    return .{ .cost = base_cost.cost * remaining + score, .secs = base_cost.secs * remaining };
+}

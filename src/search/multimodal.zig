@@ -557,19 +557,25 @@ const Query = struct {
     labels: paged.Array(Label, undefined) = .{},
     label_count: u32 = 0,
     pending: queue.Heap = .{},
-    terminal_cost: f32 = std.math.inf(f32),
+    terminal: ?Label = null,
 
     fn finish(self: *Query) !Path {
         while (self.pending.pop()) |item| {
             try self.control.check();
+            if (@as(f32, @bitCast(item.key)) >= self.bestPriority()) break;
             const label = self.labels.get(item.label);
             if (label.inactive) continue;
-            if (label.terminal) return self.trace(item.label);
             if (!try self.canEnter(label.node)) continue;
             try self.expandWalk(item.label, label, self);
             if (label.can_board) try self.expandRides(item.label, label, self);
         }
+        if (self.terminal) |label| return self.trace(try self.appendLabel(label));
         return if (self.ceiling_hit) error.CostCeilingReached else error.NoPath;
+    }
+
+    fn bestPriority(self: *const Query) f64 {
+        const label = self.terminal orelse return std.math.inf(f64);
+        return @as(f64, label.step.elapsed.cost) + self.potential.terminal_shift;
     }
 
     fn canEnter(self: *const Query, node: NodeId) !bool {
@@ -612,12 +618,12 @@ const Query = struct {
         return .{ .steps = steps, .total = self.labels.get(end).step.elapsed, .ignored_filter = self.ignored_filter };
     }
 
-    fn insert(self: *Query, label: Label, priority: f32) !void {
+    fn appendLabel(self: *Query, label: Label) !u32 {
         const next = self.label_count;
         if (next == no_label) return error.TooManySearchLabels;
         (try self.labels.at(self.a, next)).* = label;
         self.label_count += 1;
-        try self.pending.push(self.a, queue.Entry.init(priority, next));
+        return next;
     }
 
     fn journey(self: *const Query, id: u32) Journey {
@@ -632,16 +638,18 @@ const Query = struct {
     fn offer(self: *Query, offered: Label, ride: ?Ride) !void {
         var candidate = offered;
         const cost = candidate.step.elapsed.cost;
-        if (cost >= self.terminal_cost) return;
-        const priority = if (candidate.terminal) cost else core.roundedDown(@as(f64, cost) + self.potential.estimate(candidate.node));
-        if (priority >= self.terminal_cost) return;
+        const priority = if (candidate.terminal)
+            @as(f64, cost) + self.potential.terminal_shift
+        else
+            @as(f64, core.roundedDown(@as(f64, cost) + self.potential.estimate(candidate.node)));
+        if (priority >= self.bestPriority()) return;
         if (priority > self.ceiling) {
             self.ceiling_hit = true;
             return;
         }
         if (candidate.terminal) {
-            self.terminal_cost = cost;
-            return self.insert(candidate, priority);
+            self.terminal = candidate;
+            return;
         }
         if (candidate.step.movement == .walk) {
             const walking_limit = self.search.kernel.walking_limit;
@@ -704,8 +712,8 @@ const Query = struct {
             label.step.movement.ride = std.math.cast(u32, self.rides.items.len) orelse return error.TooManySearchLabels;
             try self.rides.append(self.a, run);
         }
-        const index = self.label_count;
-        try self.insert(label, priority);
+        const index = try self.appendLabel(label);
+        try self.pending.push(self.a, queue.Entry.init(@floatCast(priority), index));
         slot.* = @intCast(index + 1);
     }
 
@@ -734,11 +742,6 @@ const Query = struct {
         return self.search.timed_walking.within(label.node, self.search.kernel.walking_limit -| label.walk_distance);
     }
 
-    fn walkCost(self: *const Query, edge: *const EdgeHot, class: *const graph.class_table.EdgeClass) Cost {
-        const kernel = self.search.kernel;
-        return kernel.walkCost(class, edge.*, kernel.walking.untimedFerrySpeed(edge.*), .{});
-    }
-
     fn partial(cost: Cost, fraction: f32, score: f32) Cost {
         return .{ .cost = cost.cost * fraction + score, .secs = cost.secs * fraction };
     }
@@ -754,7 +757,10 @@ const Query = struct {
         const node: NodeId = @fromBackingInt(edge.head);
         const forbidden = self.excluded.get(start.edge);
         if (forbidden != null and forbidden.? >= start.fraction) return;
-        const cost = self.walkCost(edge, try view.class(edge.cls.class_id));
+        // Valhalla's SetOrigin clips the base pedestrian cost. The walking
+        // mode factor first applies to edges reached by expansion.
+        const kernel = self.search.kernel;
+        const cost = kernel.baseWalkCost(try view.class(edge.cls.class_id), edge.*, kernel.walking.untimedFerrySpeed(edge.*), .{});
         if (!std.math.isFinite(cost.cost)) return;
         const tail: NodeId = @fromBackingInt((try view.edge(try view.oppEdge(start.edge))).head);
         const access = try self.restrictions.access.evaluate(start.edge, edge, tail, .{}, .start);
@@ -816,7 +822,8 @@ const Query = struct {
             const turn = try self.restrictions.advance(label.turn, road, label.node, id);
             if (turn.blocked()) continue;
             const forbidden = self.excluded.get(id);
-            const cost = self.walkCost(edge, class);
+            const base_cost = kernel.baseWalkCost(class, edge.*, kernel.walking.untimedFerrySpeed(edge.*), .{});
+            const cost = kernel.scaleWalkCost(base_cost);
             if (!std.math.isFinite(cost.cost)) continue;
             const transition: Cost = if (previous != null)
                 costing.pedestrian.Kernel.turnCost(&kernel.walking, node, incoming, class, try costing.pedestrian.Turn.read(view, label.node, road.edgeId(), id))
@@ -843,7 +850,11 @@ const Query = struct {
                     var terminal = next;
                     terminal.terminal = true;
                     terminal.step.movement.walk.end = target.fraction;
-                    terminal.step.elapsed = elapsed.add(partial(cost, target.fraction, target.score));
+                    const remainder = costing.multimodal.destinationRemainder(base_cost, target.fraction, target.score);
+                    terminal.step.elapsed = .{
+                        .cost = next.step.elapsed.cost - remainder.cost,
+                        .secs = next.step.elapsed.secs - remainder.secs,
+                    };
                     try sink.offer(terminal, null);
                 };
             }

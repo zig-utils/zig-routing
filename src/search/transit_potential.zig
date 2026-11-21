@@ -1,7 +1,9 @@
 //! Reverse costs on a relaxed graph of walking and scheduled rides.
 const std = @import("std");
 const graph = @import("../graph/root.zig");
-const Kernel = @import("../costing/multimodal.zig").Kernel;
+const costing = @import("../costing/multimodal.zig");
+const Kernel = costing.Kernel;
+const Cost = @import("../costing/compiled.zig").Cost;
 const core = @import("search.zig");
 const endpoints = @import("endpoints.zig");
 const paged = @import("paged.zig");
@@ -17,16 +19,33 @@ const Status = struct { cost: f32 = infinity, settled: bool = false };
 pub const Potential = struct {
     nodes: paged.Array(Status, .{}) = .{},
     unsettled_floor: f32 = 0,
+    /// Add the same offset to every complete path so the reverse search
+    /// can represent negative terminal costs on its nonnegative queue.
+    terminal_shift: f64 = 0,
 
     pub fn init(a: Allocator, view: *const View, kernel: *const Kernel, timetable: anytype, minimum_ride: []const f32, targets: *const endpoints.Targets, ceiling: f32, control: core.Control) !Potential {
+        var result: Potential = .{};
+        var max_remainder: f32 = 0;
+        for (targets.entries) |item| {
+            try control.check();
+            const candidate = item.candidate;
+            const edge = try view.edge(candidate.edge);
+            const base_cost = try walkBase(view, kernel, edge);
+            const full = kernel.scaleWalkCost(base_cost).cost;
+            if (!std.math.isFinite(full)) continue;
+            const remainder = costing.destinationRemainder(base_cost, candidate.fraction, candidate.score).cost;
+            max_remainder = @max(max_remainder, remainder);
+            result.terminal_shift = @max(result.terminal_shift, @as(f64, remainder) - full);
+        }
         // Any competing path below the ceiling loses at most one float
         // spacing per addition. Removing that spacing from each increment
         // bounds its cost even when the reverse traversal sums in a
-        // different order. Omitted waits, turns and transfers are nonnegative.
-        const bits: u32 = @bitCast(ceiling);
+        // different order. The last addition can be larger than the ceiling
+        // by the destination remainder. Waits, turns and transfers are nonnegative.
+        const bound = core.roundedDown(@as(f64, ceiling) + max_remainder);
+        const bits: u32 = @bitCast(bound);
         const next: f32 = @bitCast(bits + 1);
-        const spacing = if (std.math.isFinite(next)) @as(f64, next) - ceiling else @as(f64, ceiling) - @as(f32, @bitCast(bits - 1));
-        var result: Potential = .{};
+        const spacing = if (std.math.isFinite(next)) @as(f64, next) - bound else @as(f64, bound) - @as(f32, @bitCast(bits - 1));
         var pending: queue.Heap = .{};
         defer pending.items.deinit(a);
         for (targets.entries) |item| {
@@ -34,10 +53,12 @@ pub const Potential = struct {
             const candidate = item.candidate;
             const edge = try view.edge(candidate.edge);
             const from = try view.edge(try view.oppEdge(candidate.edge));
-            const full = try walkCost(view, kernel, edge);
+            const base_cost = try walkBase(view, kernel, edge);
+            const full = kernel.scaleWalkCost(base_cost).cost;
             if (!std.math.isFinite(full)) continue;
-            const partial = full * candidate.fraction + candidate.score;
-            try result.offer(a, &pending, from.head, @max(0, @as(f64, partial) - spacing), ceiling);
+            const remainder = costing.destinationRemainder(base_cost, candidate.fraction, candidate.score);
+            const partial = @as(f64, full) - remainder.cost;
+            try result.offer(a, &pending, from.head, @max(0, partial + result.terminal_shift - 2 * spacing), ceiling);
         }
 
         // Distance to an unsettled node is at least the last settled cost.
@@ -57,7 +78,7 @@ pub const Potential = struct {
             for (view.edges[range.first..range.end], range.first..) |edge, i| {
                 const id: EdgeId = @fromBackingInt(@as(u32, @intCast(i)));
                 const forward = try view.edge(try view.oppEdge(id));
-                const increment = try walkCost(view, kernel, forward);
+                const increment = kernel.scaleWalkCost(try walkBase(view, kernel, forward)).cost;
                 try result.offer(a, &pending, edge.head, cost + @max(0, @as(f64, increment) - spacing), ceiling);
             }
             if (timetable) |index| {
@@ -91,7 +112,7 @@ pub const Potential = struct {
     }
 };
 
-fn walkCost(view: *const View, kernel: *const Kernel, edge: *const graph.format.EdgeHot) !f32 {
+fn walkBase(view: *const View, kernel: *const Kernel, edge: *const graph.format.EdgeHot) !Cost {
     const class = try view.class(edge.cls.class_id);
-    return kernel.walkCost(class, edge.*, kernel.walking.untimedFerrySpeed(edge.*), .{}).cost;
+    return kernel.baseWalkCost(class, edge.*, kernel.walking.untimedFerrySpeed(edge.*), .{});
 }
