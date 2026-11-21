@@ -429,6 +429,8 @@ pub fn RoutingCosts(comptime K: type) type {
         const Self = @This();
         const Router = routing.Router(K);
         const retained_path_budget = 1024 * 1024;
+        const column_cache_budget = 512 * 1024;
+        const largest_cached_column = 64;
         const Move = struct { score: f32, arrival: ?EdgeId = null };
         const Row = struct {
             moves: []const Move,
@@ -443,6 +445,8 @@ pub fn RoutingCosts(comptime K: type) type {
         observations: Emission,
         movements: Transition,
         rows: [][]?Row,
+        columns: []?*routing.DestinationColumn,
+        column_bytes: usize = 0,
         retained_path_bytes: usize = 0,
 
         pub fn init(arena: *memory.Arena, states: *const StateContainer, router: *Router, kernel: K, observations: Emission, movements: Transition, control: Control) !Self {
@@ -450,8 +454,10 @@ pub fn RoutingCosts(comptime K: type) type {
             errdefer arena.rewind(mark);
             const a = arena.allocator();
             const rows = try a.alloc([]?Row, states.columns.items.len);
+            const columns = try a.alloc(?*routing.DestinationColumn, states.columns.items.len);
             for (rows, states.columns.items, 0..) |*row, column, time| {
                 if (time % 256 == 0) try control.check();
+                columns[time] = null;
                 row.* = try a.alloc(?Row, column.candidates.len);
                 for (row.*, 0..) |*cell, i| {
                     if (i % 256 == 0) try control.check();
@@ -466,6 +472,7 @@ pub fn RoutingCosts(comptime K: type) type {
                 .observations = observations,
                 .movements = movements,
                 .rows = rows,
+                .columns = columns,
             };
         }
 
@@ -501,6 +508,7 @@ pub fn RoutingCosts(comptime K: type) type {
         }
 
         fn routeRow(self: *Self, from: StateId, time: u32, previous: StateId, control: Control) !Row {
+            const prepared = try self.prepareColumn(from, time, control);
             const mark = self.arena.mark();
             errdefer self.arena.rewind(mark);
             const right = self.states.columns.items[time];
@@ -510,7 +518,10 @@ pub fn RoutingCosts(comptime K: type) type {
                 null;
             const prices = try self.arena.allocator().alloc(Move, right.candidates.len);
             const temporary = self.arena.mark();
-            const paths = try self.connect(self.arena, from, time, right.candidates, arrival, control);
+            const paths = if (prepared) |column|
+                try self.router.connectPrepared(self.arena, self.kernel, &self.movements, self.origin(from, arrival), column, control)
+            else
+                try self.connect(self.arena, from, time, right.candidates, arrival, control);
             for (paths, prices, 0..) |path, *price, i| {
                 if (i % 256 == 0) try control.check();
                 price.* = if (path) |route| .{ .score = route.score, .arrival = route.last_edge } else .{ .score = -1 };
@@ -528,14 +539,71 @@ pub fn RoutingCosts(comptime K: type) type {
             return .{ .moves = prices, .incoming = arrival };
         }
 
-        fn connect(self: *Self, arena: *memory.Arena, from: StateId, time: u32, targets: []const Candidate, arrival: ?EdgeId, control: Control) ![]const ?routing.Route {
+        fn prepareColumn(self: *Self, from: StateId, time: u32, control: Control) !?*routing.DestinationColumn {
+            const slot = &self.columns[time];
+            const budget = @min(column_cache_budget, self.arena.options.cap_bytes / 32);
+            const remaining = budget - self.column_bytes;
+            if (slot.*) |column| {
+                if (column.needsBounds() and remaining >= 2048) {
+                    const mark = self.arena.mark();
+                    column.bounds = self.router.prepareBounds(self.arena.allocator(), column, control) catch |err| blk: {
+                        self.arena.rewind(mark);
+                        if (err != error.OutOfMemory) return err;
+                        break :blk null;
+                    };
+                    column.built_bounds = true;
+                    const bytes = self.arena.used - mark.used;
+                    if (bytes <= remaining) {
+                        self.column_bytes += bytes;
+                    } else {
+                        self.arena.rewind(mark);
+                        column.bounds = null;
+                    }
+                }
+                return column;
+            }
             const left = self.states.columns.items[from.time];
             const right = self.states.columns.items[time];
-            return self.router.connect(arena, self.kernel, &self.movements, .{
+            if (left.candidates.len < 2 or right.candidates.len > largest_cached_column or remaining < 4096) return null;
+            const mark = self.arena.mark();
+            errdefer self.arena.rewind(mark);
+            const a = self.arena.allocator();
+            const column = a.create(routing.DestinationColumn) catch {
+                self.arena.rewind(mark);
+                return null;
+            };
+            column.* = self.router.prepareColumn(a, &self.movements, right.candidates, measurements(left, right), control) catch |err| {
+                if (err != error.OutOfMemory) return err;
+                self.arena.rewind(mark);
+                return null;
+            };
+            const bytes = self.arena.used - mark.used;
+            if (bytes > remaining) {
+                self.arena.rewind(mark);
+                return null;
+            }
+            slot.* = column;
+            self.column_bytes += bytes;
+            return column;
+        }
+
+        fn origin(self: *const Self, from: StateId, arrival: ?EdgeId) routing.Origin {
+            const left = self.states.columns.items[from.time];
+            return .{
                 .candidate = left.candidates[from.id],
                 .stop_type = left.measurement.stop_type,
                 .previous_edge = arrival,
-            }, targets, .{ .left = left.measurement, .right = right.measurement, .leave_time = left.leave_time }, control);
+            };
+        }
+
+        fn measurements(left: StateContainer.Column, right: StateContainer.Column) routing.Measurements {
+            return .{ .left = left.measurement, .right = right.measurement, .leave_time = left.leave_time };
+        }
+
+        fn connect(self: *Self, arena: *memory.Arena, from: StateId, time: u32, targets: []const Candidate, arrival: ?EdgeId, control: Control) ![]const ?routing.Route {
+            const left = self.states.columns.items[from.time];
+            const right = self.states.columns.items[time];
+            return self.router.connect(arena, self.kernel, &self.movements, self.origin(from, arrival), targets, measurements(left, right), control);
         }
     };
 }

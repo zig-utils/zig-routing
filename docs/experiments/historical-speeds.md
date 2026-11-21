@@ -120,5 +120,74 @@ stitched traces. A separate action replay reproduced all 360 primary and
 ranked results from the earlier trace-attributes audit. The historical
 accuracy and privacy tests remain in the full native suite.
 
-[#259](https://github.com/zig-utils/zig-routing/issues/259) tracks
-sharing exact transition bounds across origins of a destination column.
+## Shared destination columns
+
+The destination index, measurement distance and clock limits are prepared
+once for a column when several source candidates may use it. If the first
+sweep pops at least 32 labels, the next origin can reuse a reverse distance
+bound. This reverse search starts at target nodes and the tails of
+fractional target edges. It relaxes a superset of legal moves. It floors the
+same f32 fractional cost as the forward search, then adds integer edge
+lengths. Below 2^24 metres, the sum of the floors is representable in f32
+and bounds the rounded forward sum. Unvisited nodes use the lower bound
+from the reverse frontier. [#259](https://github.com/zig-utils/zig-routing/issues/259).
+
+Actual directed cuts, successor access, predecessor contexts and clock
+limits are evaluated in the forward expansion. Partial seeds still offer
+destinations they encounter along their own edge. A smaller heap orders
+forward labels by the same cost key and insertion order. The attempt to
+query the bound on every outgoing arc measured 1.320 s against its 1.290 s
+baseline, so the adopted version checks seeds and settled nodes.
+
+Six paired trials alternated the #257 build at `b2bd48a` and this change
+on native ARM64 macOS with eight workers on the same Apple M3 Pro. Each
+timed the full command through publishing the learned overlay.
+
+| Corpus | Base wall | New wall | Base points/s | New points/s |
+| --- | ---: | ---: | ---: | ---: |
+| Noisy GPS | 1.300 s | 1.220 s | 787,760 | 839,416 |
+| Geometry-aligned | 0.280 s | 0.270 s | 3,657,457 | 3,792,919 |
+
+Noisy wall time fell 6.2%. Median process CPU time fell from 9.490 s to
+8.825 s, and median peak RSS moved from 131.81 MiB to 132.94 MiB. Every
+report and learned overlay matched byte for byte. The original throughput
+gate requires 1.024 seconds for this input.
+
+Six separately instrumented trials per configuration rotated the base, the
+new build with reverse bounds disabled, and the new build with bounds enabled.
+They scored 835,123 destination columns each. Of those, 348,424 had more than
+one scored origin. These are sums across eight workers, with medians across
+trials. The aligned replay spent no time in transition search.
+
+| Noisy replay | Base | New heap and shared destinations | New heap, shared destinations and reverse bounds |
+| --- | ---: | ---: | ---: |
+| Destination index construction | 70.713 ms | 39.705 ms | 39.198 ms |
+| Forward traversal | 4.927 s | 4.431 s | 4.044 s |
+| Forward traversal per destination column | 5.900 µs | 5.306 µs | 4.843 µs |
+| Reverse bound construction | - | - | 153.810 ms |
+| Settled labels | 21,091,621 | 21,091,621 | 19,247,268 |
+| Peak transition scratch bytes per worker | 212,952 | 177,560 | 177,560 |
+| Peak cached column bytes per request | - | 88,736 | 92,448 |
+
+The shared index was built once per scored destination column. In the final
+configuration, 24,215 reverse builds served 40,767 origin rows. The bounds
+cut settled labels by 8.7% with the heap and shared destination index held
+constant. Forward time fell 386.920 ms, and the reverse search used
+153.810 ms to prepare the bounds.
+
+For reproduction, alternate the two uninstrumented builds using the same
+commands and corpora as the preceding experiment. Start every run from a
+clean Utrecht bundle and compare the JSON report and `traffic-pred.bin`
+after each run. For the instrumented replay, time destination index
+construction, `Router.prepareBounds` and `Expansion.runDistance` separately
+and sum the per-worker measurements. Disable `DestinationColumn.needsBounds`
+in the control build to hold the destination index and queue constant.
+
+The ordered candidate comparison reproduced all 156 measurements. The
+directed auditor matched all 186 ranked state paths, with a maximum score
+difference of `1.049e-5`. The 120 stitched traces and 360 primary and
+ranked action results matched the verified native reference byte for byte.
+All 39 native test steps passed with 612 tests passing and two skips.
+Eleven Linux x86-64 executables cross-compiled. The Linux ReleaseFast
+binary size was 14,444,792 bytes, with five search instantiations and five
+costing kernels.

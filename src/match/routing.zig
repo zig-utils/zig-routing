@@ -9,6 +9,7 @@ const queue = @import("../search/queue.zig");
 const memory = @import("../infra/arena.zig");
 const request = @import("../api/request.zig");
 const transition = @import("transition.zig");
+const transition_bounds = @import("transition_bounds.zig");
 const candidates = @import("candidates.zig");
 const View = graph.reader.View;
 const NodeId = graph.format.NodeId;
@@ -152,6 +153,22 @@ const TraceOrder = struct {
     }
 };
 
+pub const DestinationColumn = struct {
+    target_count: usize,
+    targets: Destinations,
+    observed: f32,
+    limits: transition.Limits,
+    ordering: TraceOrder,
+    first_popped: ?usize = null,
+    bounds: ?transition_bounds.Bounds = null,
+    built_bounds: bool = false,
+
+    pub fn needsBounds(self: DestinationColumn) bool {
+        // Short sweeps are cheaper than building a second search frontier.
+        return !self.built_bounds and (self.first_popped orelse 0) >= 32;
+    }
+};
+
 fn Collector(comptime K: type) type {
     return struct {
         const Self = @This();
@@ -162,6 +179,7 @@ fn Collector(comptime K: type) type {
         choices: []?Choice,
         outstanding: usize,
         greatest: f32 = 0,
+        bounds: ?transition_bounds.Bounds,
         control: core.Control,
 
         fn record(self: *Self, i: usize, choice: Choice) void {
@@ -184,6 +202,9 @@ fn Collector(comptime K: type) type {
         pub fn visit(self: *Self, event: expand.Visit) !expand.Decision {
             // Later queue entries can still have shorter routed distances.
             if (self.outstanding == 0 and event.label.cost >= self.greatest) return .prune;
+            if (self.bounds) |bounds| {
+                if (bounds.rulesOut(event.node, event.label.cost, self.distanceLimit())) return .prune;
+            }
             if (self.limits.allows(event.label.cost, event.label.secs)) {
                 try self.node(event.node, .{ .metres = event.label.cost, .seconds = event.label.secs, .predecessor = event.index });
             }
@@ -227,7 +248,7 @@ fn Collector(comptime K: type) type {
 pub fn Router(comptime K: type) type {
     return struct {
         const Self = @This();
-        const Engine = expand.Expansion(K, queue.BucketQueue);
+        const Engine = expand.Expansion(K, queue.Heap);
         pub const default_scratch_bytes: usize = 8 * 1024 * 1024;
 
         view: *const View,
@@ -249,40 +270,82 @@ pub fn Router(comptime K: type) type {
 
         pub fn connect(self: *Self, output: *memory.Arena, kernel: K, model: *const transition.Model, from: Origin, targets: []const candidates.Candidate, measurements: Measurements, control: core.Control) ![]const ?Route {
             self.scratch.reset();
+            var column = self.prepareColumn(self.scratch.allocator(), model, targets, measurements, control) catch |err| {
+                if (self.scratch.cap_exceeded) return error.TransitionMemoryLimit;
+                return err;
+            };
+            return self.connectInto(output, kernel, model, from, &column, control);
+        }
+
+        pub fn connectPrepared(self: *Self, output: *memory.Arena, kernel: K, model: *const transition.Model, from: Origin, column: *DestinationColumn, control: core.Control) ![]const ?Route {
+            self.scratch.reset();
+            return self.connectInto(output, kernel, model, from, column, control);
+        }
+
+        fn connectInto(self: *Self, output: *memory.Arena, kernel: K, model: *const transition.Model, from: Origin, column: *DestinationColumn, control: core.Control) ![]const ?Route {
             const mark = output.mark();
             errdefer output.rewind(mark);
-            return self.connectWithin(output.allocator(), kernel, model, from, targets, measurements, control) catch |err| {
+            return self.connectWithin(output.allocator(), kernel, model, from, column, control) catch |err| {
                 if (self.scratch.cap_exceeded) return error.TransitionMemoryLimit;
                 return err;
             };
         }
 
-        fn connectWithin(self: *Self, a: Allocator, kernel: K, model: *const transition.Model, from: Origin, targets: []const candidates.Candidate, measurements: Measurements, control: core.Control) ![]const ?Route {
+        pub fn prepareColumn(self: *const Self, a: Allocator, model: *const transition.Model, targets: []const candidates.Candidate, measurements: Measurements, control: core.Control) !DestinationColumn {
             try control.check();
             if (!measurements.left.point.inRange() or !measurements.right.point.inRange()) return error.InvalidMeasurement;
             if (!std.math.isFinite(measurements.right.search_radius) or measurements.right.search_radius < 0) return error.InvalidMeasurement;
             const observed: f32 = @floatCast(measurements.left.point.distance(measurements.right.point));
-            const limits = model.limits(observed, measurements.leave_time orelse measurements.left.epoch_time, measurements.right.epoch_time);
-            const results = try a.alloc(?Route, targets.len);
+            return .{
+                .target_count = targets.len,
+                .targets = if (targets.len == 0) .{ .heads = &.{} } else try .init(a, targets, control),
+                .observed = observed,
+                .limits = model.limits(observed, measurements.leave_time orelse measurements.left.epoch_time, measurements.right.epoch_time),
+                .ordering = .{
+                    .coordinates = self.view.coordinates,
+                    .approx = .init(measurements.right.point),
+                    .radius = measurements.right.search_radius,
+                },
+            };
+        }
+
+        pub fn prepareBounds(self: *Self, a: Allocator, column: *const DestinationColumn, control: core.Control) !?transition_bounds.Bounds {
+            self.scratch.reset();
+            var builder = transition_bounds.Builder.init(self.scratch.allocator(), self.view, column.limits.metres) orelse return null;
+            for (column.targets.rows.items, 0..) |target, i| {
+                if (i % 64 == 0) try control.check();
+                const id: u32 = @intCast(target.key >> 1);
+                if (target.key & 1 == 0)
+                    try builder.addNode(@fromBackingInt(id))
+                else
+                    try builder.addEdge(@fromBackingInt(id), target.fraction);
+            }
+            return builder.finish(a, control);
+        }
+
+        fn connectWithin(self: *Self, a: Allocator, kernel: K, model: *const transition.Model, from: Origin, column: *DestinationColumn, control: core.Control) ![]const ?Route {
+            try control.check();
+            const results = try a.alloc(?Route, column.target_count);
             @memset(results, null);
-            if (targets.len == 0) return results;
+            if (column.target_count == 0) return results;
             const scratch = self.scratch.allocator();
-            const choices = try scratch.alloc(?Choice, targets.len);
+            const choices = try scratch.alloc(?Choice, column.target_count);
             @memset(choices, null);
             var collector: Collector(K) = .{
                 .view = self.view,
                 .kernel = kernel,
-                .limits = limits,
-                .targets = try .init(scratch, targets, control),
+                .limits = column.limits,
+                .targets = column.targets,
                 .choices = choices,
-                .outstanding = targets.len,
+                .outstanding = column.target_count,
+                .bounds = column.bounds,
                 .control = control,
             };
             var origins: [1]NodeId = undefined;
             var starts: [2]endpoints.Candidate = undefined;
             var expansion: expand.Request = .{ .bounds = .{
-                .cost = limits.metres,
-                .seconds = limits.seconds orelse std.math.inf(f32),
+                .cost = column.limits.metres,
+                .seconds = column.limits.seconds orelse std.math.inf(f32),
             } };
             var seeds: [1][]const endpoints.Candidate = undefined;
             if (from.candidate.node) |node| {
@@ -297,6 +360,7 @@ pub fn Router(comptime K: type) type {
                     origins[0] = node;
                     expansion.origins = &origins;
                 }
+                if (column.bounds) |bounds| if (bounds.rulesOut(node, 0, column.limits.metres)) return results;
             } else {
                 if (from.candidate.direction_count > from.candidate.directions.len) return error.InvalidCandidate;
                 var count: usize = 0;
@@ -304,22 +368,33 @@ pub fn Router(comptime K: type) type {
                     if (from.previous_edge) |arrival| {
                         if (!try self.allowedDeparture(kernel, arrival, arc.edge, from.stop_type)) continue;
                     }
+                    if (column.bounds) |bounds| if (try excludesSeed(&collector, arc, bounds)) continue;
                     starts[count] = .{ .edge = arc.edge, .fraction = arc.percent_along, .score = 0, .begin_node = false, .end_node = false };
                     count += 1;
                 }
+                if (count == 0) return results;
                 seeds[0] = starts[0..count];
                 expansion.partial_origins = &seeds;
             }
-            const found = try self.search.runDistance(&self.scratch, kernel, expansion, &collector, TraceOrder{
-                .coordinates = self.view.coordinates,
-                .approx = .init(measurements.right.point),
-                .radius = measurements.right.search_radius,
-            }, control);
+            const found = try self.search.runDistance(&self.scratch, kernel, expansion, &collector, column.ordering, control);
+            if (column.first_popped == null) column.first_popped = found.popped;
             for (choices, results, 0..) |choice, *result, i| {
                 if (i % 64 == 0) try control.check();
-                if (choice) |path| result.* = try self.route(a, found, path, from, observed, model, control);
+                if (choice) |path| result.* = try self.route(a, found, path, from, column.observed, model, control);
             }
             return results;
+        }
+
+        fn excludesSeed(collector: *const Collector(K), arc: candidates.Candidate.Direction, bounds: transition_bounds.Bounds) !bool {
+            if (!(0 <= arc.percent_along and arc.percent_along <= 1)) return error.InvalidCandidate;
+            const edge = try collector.view.edge(arc.edge);
+            const metres = @as(f32, @floatFromInt(edge.geom.len_m)) * (1 - arc.percent_along);
+            if (!bounds.rulesOut(@fromBackingInt(edge.head), metres, collector.limits.metres)) return false;
+            var targets = collector.targets.on(Destinations.edgeKey(arc.edge));
+            while (try targets.next(collector.control)) |target| {
+                if (target.fraction >= arc.percent_along) return false;
+            }
+            return true;
         }
 
         /// Meili carries the predecessor label across a fractional origin.
@@ -527,6 +602,40 @@ test "direct trace cuts obey a separate strict clock bound" {
     measurements.leave_time = 22;
     const rejected = try engine.connect(&output, .{}, &model, origin, &.{onEdge(0, 0.75)}, measurements, .{});
     try t.expect(rejected[0] == null);
+}
+
+test "shared reverse bounds preserve partial cuts and the actual clock limit" {
+    const t = std.testing;
+    var engine = try Router(FixtureKernel).init(t.allocator, &fixture, 1024 * 1024);
+    defer engine.deinit();
+    var prepared_arena: memory.Arena = .init(t.allocator, .{});
+    defer prepared_arena.deinit();
+    var output: memory.Arena = .init(t.allocator, .{});
+    defer output.deinit();
+    const model = try transition.Model.init(.{ .breakage_distance_m = 150, .max_route_time_factor = 1 });
+    var measurements: Measurements = .{
+        .left = .{ .point = .init(0, 0), .epoch_time = 20 },
+        .right = .{ .point = .init(0.001, 0), .epoch_time = 27 },
+    };
+    const targets = &.{ onEdge(2, 0.51), atNode(2) };
+    for ([_]f64{ 20, 21.5 }) |leave_time| {
+        measurements.leave_time = leave_time;
+        var column = try engine.prepareColumn(prepared_arena.allocator(), &model, targets, measurements, .{});
+        column.bounds = try engine.prepareBounds(prepared_arena.allocator(), &column, .{});
+        try t.expect(column.bounds.?.rulesOut(@fromBackingInt(@as(u32, 0)), 0, column.limits.metres));
+        for ([_]Origin{
+            .{ .candidate = atNode(0) },
+            .{ .candidate = onEdge(0, 0.25) },
+            .{ .candidate = onEdge(2, 0.25) },
+            .{ .candidate = atNode(1), .previous_edge = @fromBackingInt(@as(u32, 0)) },
+        }) |origin| {
+            const expected = try engine.connect(&output, .{}, &model, origin, targets, measurements, .{});
+            const bounded = try engine.connectPrepared(&output, .{}, &model, origin, &column, .{});
+            try t.expectEqualDeep(expected, bounded);
+            output.reset();
+        }
+        prepared_arena.reset();
+    }
 }
 
 test "fractional trace departure checks arrival direction before seeding" {
