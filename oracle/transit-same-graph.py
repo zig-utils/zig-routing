@@ -2,6 +2,7 @@
 """Translate Valhalla IDs and score fixed-cut transit comparisons."""
 
 import argparse
+from bisect import bisect_right
 from datetime import date, datetime
 import json
 import math
@@ -107,11 +108,26 @@ def tile_ids(tiles):
             raise ValueError(f"Invalid Valhalla edge ID {edge}")
         return base + local if key & 7 == 2 else walks[edge]
 
-    return edge_id, rides
+    road_bases = sorted((base, key, count) for key, (base, count) in bases.items() if key & 7 == 2)
+    road_starts = [base for base, _, _ in road_bases]
+    walk_edges = {dense: raw for raw, dense in walks.items()}
+    ride_edges = {dense: raw for raw, dense in rides.items()}
+
+    def raw_walk(edge):
+        if edge in walk_edges:
+            return walk_edges[edge]
+        index = bisect_right(road_starts, edge) - 1
+        if index >= 0:
+            base, key, count = road_bases[index]
+            if edge - base < count:
+                return key | (edge - base) << 25
+        raise ValueError(f"Invalid native edge {edge}")
+
+    return edge_id, rides, raw_walk, ride_edges
 
 
 def translate(args):
-    edge_id, rides = tile_ids(args.tiles)
+    edge_id, rides, _, _ = tile_ids(args.tiles)
     with args.reference.open(encoding="utf-8") as reference, args.output.open("w", encoding="utf-8") as out:
         for index, row in enumerate(reference):
             result = json.loads(row)
@@ -129,6 +145,28 @@ def translate(args):
                 else:
                     step["edge"] = edge_id(raw)
             out.write(json.dumps(result, separators=(",", ":")) + "\n")
+
+
+def prepare_audit(args):
+    _, _, raw_walk, ride_edges = tile_ids(args.tiles)
+    with args.native.open(encoding="utf-8") as native, args.output.open("w", encoding="utf-8") as out:
+        for index, row in enumerate(native):
+            result = json.loads(row)
+            if result["index"] != index:
+                raise ValueError(f"Unexpected native case {result['index']}")
+            steps = []
+            for step in result.get("steps", []):
+                if "trip" in step:
+                    steps.append({
+                        "edge": ride_edges[step["line"]], "trip": step["trip"],
+                        "board_time": step["board_time"], "cost": step["cost"], "elapsed": step["elapsed"],
+                    })
+                else:
+                    steps.append({
+                        "edge": raw_walk(step["edge"]), "begin": step["begin"], "end": step["end"],
+                        "cost": step["cost"], "elapsed": step["elapsed"],
+                    })
+            out.write(json.dumps({"index": index, "steps": steps}, separators=(",", ":")) + "\n")
 
 
 def itinerary(steps, boarding="board"):
@@ -213,6 +251,118 @@ def score(args):
     print(json.dumps(output, sort_keys=True))
 
 
+def first_cost_difference(audit, expected):
+    i = audit.get("first_cost_difference")
+    if i is None:
+        return None
+    step = audit["steps"][i]
+    delta = expected[i]["cost"] - step["cost"]
+    kind = "costing"
+    result = {"step": i, "expected": expected[i]["cost"], "pinned": step["cost"]}
+    if "ready" in step:
+        def close(value):
+            return math.isclose(delta, value, rel_tol=0, abs_tol=0.01)
+
+        if step["boarding_transition"] and close(step["boarding_transition"]):
+            kind = "stock_boarding_transition"
+            result["transition_cost"] = step["boarding_transition"]
+        elif step["stock_second"] != step["exact_second"] and close(step["exact_second"] - step["stock_second"]):
+            kind = "stock_seconds_of_week_rounding"
+            result.update(exact_second=step["exact_second"], stock_second=step["stock_second"])
+        elif i and close(int(audit["steps"][i - 1]["elapsed"]) - int(expected[i - 1]["elapsed"])):
+            kind = "boarding_clock_accumulation"
+            result.update(pinned_ready_elapsed=audit["steps"][i - 1]["elapsed"],
+                          original_ready_elapsed=expected[i - 1]["elapsed"])
+    result["kind"] = kind
+    return result
+
+
+def walking_label_witness(row, path):
+    """Find a settled prefix that cannot walk the remaining verified suffix."""
+    audit = row["native_audit"]
+    if "cost" not in audit:
+        return None
+    priced = audit["steps"]
+    labels = row["stock_labels"]
+    last_ride = max((i for i, move in enumerate(path) if "trip" in move), default=-1)
+    limit = audit["walking_limit"]
+    for i in range(max(1, last_ride + 1), len(path) - 1):
+        kept, previous = labels[i], labels[i - 1]
+        if not kept or not previous or not kept["settled"] or not previous["settled"]:
+            continue
+        if kept["trip"] or kept.get("predecessor") == path[i - 1]["edge"]:
+            continue
+        if (previous["trip"] != path[i - 1].get("trip", 0) or
+                previous["walking_distance"] != priced[i - 1]["walking_distance"]):
+            continue
+        if any(not math.isclose(previous[field], priced[i - 1][field], rel_tol=0, abs_tol=0.01)
+               for field in ("cost", "elapsed")):
+            continue
+        suffix = priced[-1]["walking_distance"] - priced[i]["walking_distance"]
+        if (kept["cost"] >= priced[i]["cost"] or
+                kept["walking_distance"] + suffix <= limit or priced[-1]["walking_distance"] > limit):
+            continue
+        return {
+            "step": i, "edge": path[i]["edge"],
+            "stock_label": kept, "native_label": priced[i],
+            "native_predecessor": path[i - 1]["edge"],
+            "remaining_walk": suffix, "walking_limit": limit,
+        }
+    return None
+
+
+def score_audit(args):
+    totals = Counter()
+    details = []
+    with args.oracle.open(encoding="utf-8") as oracle, args.native.open(encoding="utf-8") as native, \
+            args.paths.open(encoding="utf-8") as paths:
+        for index, lines in enumerate(zip(oracle, native, paths, strict=True)):
+            stock, result, raw = map(json.loads, lines)
+            if any(row["index"] != index for row in (stock, result, raw)):
+                raise ValueError(f"Misaligned audit case {index}")
+            totals["requests"] += 1
+            display_match = itinerary(stock["steps"]) == itinerary(result["steps"])
+            exact_match = itinerary(stock["steps"], "board_time") == itinerary(result["steps"], "board_time")
+            totals["stock_itinerary_matches"] += display_match
+            totals["exact_boarding_matches"] += exact_match
+            audits = stock["stock_audit"], stock["native_audit"]
+            entry = {"index": index, "stock_itinerary_match": display_match, "exact_boarding_match": exact_match}
+            for name, audit, original in zip(("stock", "native"), audits, (stock, result)):
+                entry[name] = {k: v for k, v in audit.items() if k != "steps"}
+                diagnosis = first_cost_difference(audit, original["steps"])
+                if diagnosis:
+                    entry[name]["first_difference"] = diagnosis
+                    totals[diagnosis["kind"] if diagnosis["kind"] != "costing" else f"{name}_costing"] += 1
+
+            if all("cost" in audit for audit in audits):
+                totals["repriced_pairs"] += 1
+                stock_cost, native_cost = (audit["cost"] for audit in audits)
+                gap = native_cost - stock_cost
+                comparison = "tie" if abs(gap) <= 0.01 else "native_cheaper" if gap < 0 else "native_miss"
+                entry["comparison"] = comparison
+                totals[comparison] += 1
+                if audits[1].get("terminal_gate"):
+                    totals["stock_full_edge_limit"] += 1
+                if comparison == "native_cheaper":
+                    witness = walking_label_witness(stock, raw["steps"])
+                    if witness:
+                        entry["stock_label_witness"] = witness
+                        totals["stock_label_witnesses"] += 1
+            else:
+                if any("cost" not in audit and "blocked_at" not in audit for audit in audits):
+                    raise ValueError(f"Missing audit result for case {index}")
+                totals["diagnosed_blocked_pairs"] += 1
+            details.append(entry)
+    if len(details) < args.minimum:
+        raise ValueError(f"Expected at least {args.minimum} itinerary audit cases")
+    for key in ("native_cheaper", "native_miss", "tie", "stock_full_edge_limit",
+                "stock_label_witnesses", "diagnosed_blocked_pairs"):
+        totals[key] += 0
+    args.output.write_text(json.dumps({"totals": totals, "cases": details}, indent=2, sort_keys=True) + "\n",
+                           encoding="utf-8")
+    print(json.dumps(totals, sort_keys=True))
+
+
 def check_fixture(args):
     reference = json.loads(args.reference.read_text(encoding="utf-8"))
     native = json.loads(args.native.read_text(encoding="utf-8"))
@@ -247,6 +397,10 @@ def main():
     cuts.add_argument("tiles", type=Path)
     cuts.add_argument("reference", type=Path)
     cuts.add_argument("output", type=Path)
+    audit = commands.add_parser("prepare-audit")
+    audit.add_argument("tiles", type=Path)
+    audit.add_argument("native", type=Path)
+    audit.add_argument("output", type=Path)
     overtaking = commands.add_parser("fixture")
     overtaking.add_argument("directory", type=Path)
     overtaking.add_argument("date", type=date.fromisoformat)
@@ -255,11 +409,17 @@ def main():
     report.add_argument("native", type=Path)
     report.add_argument("output", type=Path)
     report.add_argument("--minimum", type=int, default=100)
+    audit_report = commands.add_parser("score-audit")
+    audit_report.add_argument("oracle", type=Path)
+    audit_report.add_argument("native", type=Path)
+    audit_report.add_argument("paths", type=Path)
+    audit_report.add_argument("output", type=Path)
+    audit_report.add_argument("--minimum", type=int, default=100)
     check = commands.add_parser("check-fixture")
     check.add_argument("reference", type=Path)
     check.add_argument("native", type=Path)
     args = parser.parse_args()
-    {"translate": translate, "score": score, "fixture": fixture, "check-fixture": check_fixture}[args.command](args)
+    {"translate": translate, "prepare-audit": prepare_audit, "score": score, "score-audit": score_audit, "fixture": fixture, "check-fixture": check_fixture}[args.command](args)
 
 
 if __name__ == "__main__":

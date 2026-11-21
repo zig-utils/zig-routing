@@ -129,6 +129,69 @@ zig build check-transit-itineraries -Doptimize=ReleaseFast -- \
   BUNDLE corpus.tsv cuts.jsonl --measure --deadline-ms 20 > deadline-measured.jsonl
 ```
 
+## Pinned costing audit
+
+The audit maps both paths back to the source tiles and checks each
+directed movement, endpoint cut, boarding instant, schedule, transfer
+and walking limit with the Valhalla 3.9.3 costing models. The audit uses
+the traveled fraction at the destination. It records separately when
+the stock search would count the rest of the destination edge against
+its walking limit.
+
+```sh
+python3 oracle/transit-same-graph.py prepare-audit TILES native.jsonl paths.jsonl
+./transit-itinerary-reference CONFIG.json corpus.tsv --audit paths.jsonl > audit.jsonl
+python3 oracle/transit-same-graph.py score-audit audit.jsonl native.jsonl paths.jsonl audit-report.json
+```
+
+| Brockton metric | Requests |
+| --- | ---: |
+| Both paths verified and priced | 100 |
+| Stock itinerary match with displayed times | 42 |
+| Match with exact boarding instants | 43 |
+| Native path cheaper under pinned costing | 66 |
+| Native path within 0.01 cost units of stock | 34 |
+| Stock path cheaper under pinned costing | 0 |
+
+Eleven of the 66 cheaper paths fit within 2,415 m using their final cut
+and exceed the limit when the whole destination edge is counted.
+Fifty-five are cheaper with no final-edge limit difference. Among the
+58 displayed itinerary differences, 47 are in that second group and
+11 have the limit difference. The report keeps those access findings
+and the strict stock match rate alongside the cost comparison.
+
+The first stock cost difference is at boarding step 29, 29, 53 and 38
+in cases 46, 80, 83 and 87 respectively. Each stock increment includes
+the 8.011-unit pinned boarding transition. The stock expansion updates
+its mode as it iterates through outgoing edges, which can make a
+boarding transition depend on an earlier outgoing edge. Case 62 first
+differs at step 19, where the stock seconds-of-week calculation rounds
+readiness to 70,382 while the epoch clock gives 70,381. Native case 46
+first differs at step 52. The prior ride's fractional seconds carry
+through the pinned elapsed time, giving 1,361.049 seconds at boarding
+readiness. Native arrives at 1,360.706 seconds, so its wait costs one
+additional unit for the same scheduled departure.
+
+### Brockton case 0
+
+On directed edge 6057822576026, the pinned search records a permanent
+label with cost 2,054.948 and 1,935 m of walking already used. The
+verified alternative arrives on the same edge with cost 2,557.914 and
+38 m of walking used. Both paths reach their incoming edges under
+pinned costing. The remaining walk along the cheaper complete route
+is 1,526 m. The permanent label would need 3,461 m and the alternative
+needs 1,564 m. The stock search's single label per directed edge keeps
+the cheaper prefix and skips subsequent offers to its permanent edge.
+Its resulting route costs 4,448.231. The feasible alternative costs
+4,187.851. The report finds the same walking-resource conflict in
+43 cases with verified cheaper routes.
+
+The overtaking fixture's audit also verifies both departures with
+pinned costing. `GetNextDeparture` offers trip 1 first from the same
+walking prefix. Trip 2 is feasible and cheaper by 8,442.666 cost
+units. The independent 95% stock itinerary gate in #190 still uses
+its original threshold.
+
 ## Overtaking fixture
 
 Generate two disconnected walking approaches and a GTFS line between

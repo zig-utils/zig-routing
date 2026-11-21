@@ -8,6 +8,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <rapidjson/document.h>
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
 #include <valhalla/baldr/time_info.h>
@@ -16,20 +17,64 @@
 #include <valhalla/thor/triplegbuilder.h>
 #include <valhalla/thor/worker.h>
 
+#include "transit-itinerary-audit.h"
+
 using namespace valhalla;
 using Json = rapidjson::Writer<rapidjson::StringBuffer>;
 
+class ObservedTransit : public thor::MultiModalPathAlgorithm {
+public:
+  using MultiModalPathAlgorithm::MultiModalPathAlgorithm;
+
+  void WriteLabels(Json& out, const std::vector<transit_audit::Movement>& path) const {
+    out.Key("stock_labels");
+    out.StartArray();
+    for (const auto& step : path) {
+      const auto state = edgestatus_.Get(step.edge);
+      if (state.set() != thor::EdgeSet::kTemporary && state.set() != thor::EdgeSet::kPermanent) {
+        out.Null();
+        continue;
+      }
+      const auto& label = edgelabels_.at(state.index());
+      out.StartObject();
+      out.Key("settled");
+      out.Bool(state.set() == thor::EdgeSet::kPermanent);
+      out.Key("cost");
+      out.Double(label.cost().cost);
+      out.Key("elapsed");
+      out.Double(label.cost().secs);
+      out.Key("walking_distance");
+      out.Uint(label.walking_distance());
+      out.Key("trip");
+      out.Uint(label.tripid());
+      if (label.predecessor() != baldr::kInvalidLabel) {
+        out.Key("predecessor");
+        out.Uint64(edgelabels_.at(label.predecessor()).edgeid().value);
+      }
+      out.EndObject();
+    }
+    out.EndArray();
+  }
+};
+
 class TransitReference : public thor::thor_worker_t {
 public:
-  using thor_worker_t::thor_worker_t;
+  explicit TransitReference(const boost::property_tree::ptree& config)
+      : thor_worker_t(config), observed(config.get_child("thor")) {
+  }
 
-  std::vector<thor::PathInfo> Search(Api& api) {
+  std::vector<thor::PathInfo> Search(Api& api, bool audit = false) {
     adjust_locations(api);
     const auto costing = parse_costing(api);
     auto& locations = *api.mutable_options()->mutable_locations();
     if (locations.size() != 2)
       throw std::runtime_error("expected two locations");
     auto* algorithm = get_path_algorithm(costing, locations[0], locations[1], api);
+    if (audit) {
+      if (algorithm != &multi_modal_transit)
+        throw std::runtime_error("expected the scheduled multimodal algorithm");
+      algorithm = &observed;
+    }
     algorithm->Clear();
     auto paths = get_path(algorithm, locations[0], locations[1], costing, api);
     if (paths.empty())
@@ -77,6 +122,40 @@ public:
       times[i] = baldr::DateTime::get_ldt(boarding, zone).get_sys_time().time_since_epoch().count();
     }
     return times;
+  }
+
+  void Audit(Json& out, Api& api, const std::vector<thor::PathInfo>& path,
+             const std::vector<std::optional<int64_t>>& boarding, const rapidjson::Value& native) {
+    std::vector<transit_audit::Movement> stock, other;
+    for (size_t i = 0; i < path.size(); ++i) {
+      transit_audit::Movement step;
+      step.edge = path[i].edgeid;
+      step.expected = path[i].elapsed_cost;
+      if (path[i].mode == sif::TravelMode::kPublicTransit) {
+        step.trip = path[i].trip_id;
+        step.board = boarding[i];
+      }
+      stock.push_back(step);
+    }
+    for (const auto& item : native.GetArray()) {
+      transit_audit::Movement step;
+      step.edge = baldr::GraphId(item["edge"].GetUint64());
+      step.expected.cost = item["cost"].GetFloat();
+      step.expected.secs = item["elapsed"].GetFloat();
+      if (item.HasMember("trip")) {
+        step.trip = item["trip"].GetUint();
+        step.board = item["board_time"].GetInt64();
+      } else {
+        step.begin = item["begin"].GetFloat();
+        step.end = item["end"].GetFloat();
+      }
+      other.push_back(step);
+    }
+    out.Key("stock_audit");
+    WriteAudit(out, transit_audit::replay(*reader, mode_costing, *api.mutable_options(), stock));
+    out.Key("native_audit");
+    WriteAudit(out, transit_audit::replay(*reader, mode_costing, *api.mutable_options(), other));
+    observed.WriteLabels(out, other);
   }
 
   void Offers(Json& out, Api& api, const std::vector<thor::PathInfo>& path) {
@@ -128,6 +207,77 @@ public:
   }
 
 private:
+  ObservedTransit observed;
+
+  static void WriteAudit(Json& out, const transit_audit::Result& result) {
+    out.StartObject();
+    out.Key("walking_limit");
+    out.Uint(result.walking_limit);
+    if (result.blocked) {
+      out.Key("blocked_at");
+      out.Uint64(result.steps.size());
+      out.Key("reason");
+      out.String(result.blocked);
+    } else {
+      out.Key("cost");
+      out.Double(result.steps.back().total.cost);
+      out.Key("elapsed");
+      out.Double(result.steps.back().total.secs);
+    }
+    if (result.first_cost_difference) {
+      out.Key("first_cost_difference");
+      out.Uint64(*result.first_cost_difference);
+    }
+    if (result.terminal_gate) {
+      out.Key("terminal_gate");
+      out.StartObject();
+      out.Key("step");
+      out.Uint64(result.terminal_gate->step);
+      out.Key("full_walk");
+      out.Uint(result.terminal_gate->full_walk);
+      out.Key("clipped_walk");
+      out.Uint(result.terminal_gate->clipped_walk);
+      out.Key("limit");
+      out.Uint(result.terminal_gate->limit);
+      out.EndObject();
+    }
+    out.Key("steps");
+    out.StartArray();
+    for (const auto& step : result.steps) {
+      out.StartObject();
+      out.Key("cost");
+      out.Double(step.total.cost);
+      out.Key("elapsed");
+      out.Double(step.total.secs);
+      out.Key("walking_distance");
+      out.Uint(step.walking_distance);
+      if (step.ready) {
+        out.Key("ready");
+        out.Uint64(*step.ready);
+        out.Key("exact_second");
+        out.Uint(step.exact_second);
+        out.Key("stock_second");
+        out.Uint(step.stock_second);
+        out.Key("boarding_transition");
+        out.Double(step.boarding_transition);
+      }
+      if (step.stock_next) {
+        out.Key("stock_next");
+        out.StartObject();
+        out.Key("trip");
+        out.Uint(step.stock_next->trip);
+        out.Key("departure");
+        out.Uint(step.stock_next->departure);
+        out.Key("elapsed");
+        out.Uint(step.stock_next->elapsed);
+        out.EndObject();
+      }
+      out.EndObject();
+    }
+    out.EndArray();
+    out.EndObject();
+  }
+
   struct TimedRide {
     baldr::graph_tile_ptr tile;
     const baldr::DirectedEdge* edge;
@@ -231,8 +381,9 @@ void write_path(Json& out, const std::vector<thor::PathInfo>& path, const TripLe
 
 int main(int argc, const char** argv) {
   const bool offers = argc == 4 && std::string(argv[3]) == "--offers";
-  if (argc != 3 && !offers) {
-    std::cerr << "usage: transit-itinerary-reference CONFIG CORPUS.tsv [--offers]\n";
+  const bool audit = argc == 5 && std::string(argv[3]) == "--audit";
+  if (argc != 3 && !offers && !audit) {
+    std::cerr << "usage: transit-itinerary-reference CONFIG CORPUS.tsv [--offers | --audit NATIVE.jsonl]\n";
     return 2;
   }
   boost::property_tree::ptree config;
@@ -243,10 +394,24 @@ int main(int argc, const char** argv) {
   std::ifstream corpus(argv[2]);
   if (!corpus)
     return 2;
+  std::ifstream audit_input;
+  if (audit) {
+    audit_input.open(argv[4]);
+    if (!audit_input)
+      return 2;
+  }
   std::string row;
   for (size_t index = 0; std::getline(corpus, row); ++index) {
     if (row.rfind("/route\t", 0) != 0)
       return 2;
+    rapidjson::Document native;
+    if (audit) {
+      std::string input;
+      if (!std::getline(audit_input, input) || native.Parse(input.c_str()).HasParseError() ||
+          !native.IsObject() || !native.HasMember("index") || !native["index"].IsUint64() ||
+          native["index"].GetUint64() != index || !native.HasMember("steps") || !native["steps"].IsArray())
+        return 2;
+    }
     rapidjson::StringBuffer buffer;
     Json out(buffer);
     out.StartObject();
@@ -257,12 +422,14 @@ int main(int argc, const char** argv) {
       ParseApi(row.substr(7), Options::route, api);
       loki.route(api);
       write_cuts(out, api.options());
-      const auto path = thor.Search(api);
+      const auto path = thor.Search(api, audit);
       const auto boarding_times = thor.BoardingTimes(api, path);
       const auto leg = thor.Describe(api, path);
       write_path(out, path, leg, boarding_times);
       if (offers)
         thor.Offers(out, api, path);
+      if (audit)
+        thor.Audit(out, api, path, boarding_times, native["steps"]);
     } catch (const valhalla_exception_t& error) {
       out.Key("error_code");
       out.Uint(error.code);
@@ -275,5 +442,5 @@ int main(int argc, const char** argv) {
     thor.cleanup();
     loki.cleanup();
   }
-  return corpus.eof() && std::cout ? 0 : 2;
+  return corpus.eof() && std::cout && (!audit || audit_input.peek() == EOF) ? 0 : 2;
 }
