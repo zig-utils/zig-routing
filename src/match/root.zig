@@ -6,6 +6,7 @@ pub const emission = @import("emission.zig");
 pub const routing = @import("routing.zig");
 pub const segments = @import("segments.zig");
 pub const transition = @import("transition.zig");
+pub const viterbi = @import("viterbi.zig");
 
 test {
     std.testing.refAllDecls(@This());

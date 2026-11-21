@@ -255,13 +255,11 @@ pub fn Router(comptime K: type) type {
                 }
             } else {
                 if (from.candidate.direction_count > from.candidate.directions.len) return error.InvalidCandidate;
-                const opposing = if (forbidUturn(from.stop_type) and from.previous_edge != null)
-                    try self.view.oppEdge(from.previous_edge.?)
-                else
-                    null;
                 var count: usize = 0;
                 for (from.candidate.arcs()) |arc| {
-                    if (opposing != null and arc.edge == opposing.?) continue;
+                    if (from.previous_edge) |arrival| {
+                        if (!try self.allowedDeparture(kernel, arrival, arc.edge, from.stop_type)) continue;
+                    }
                     starts[count] = .{ .edge = arc.edge, .fraction = arc.percent_along, .score = 0, .begin_node = false, .end_node = false };
                     count += 1;
                 }
@@ -278,6 +276,30 @@ pub fn Router(comptime K: type) type {
                 if (choice) |path| result.* = try self.route(a, found, path, from, observed, model, control);
             }
             return results;
+        }
+
+        /// Meili carries the predecessor label across a fractional origin.
+        /// Continuing on its edge is allowed. Other directions are subject to
+        /// the costing's turn admission before the new traversal is seeded.
+        fn allowedDeparture(self: *const Self, kernel: K, arrival: EdgeId, next: EdgeId, stop_type: request.LocationType) !bool {
+            if (arrival == next) return true;
+            const before = try self.view.edge(arrival);
+            const after = try self.view.edge(next);
+            if (forbidUturn(stop_type) and next == try self.view.oppEdge(arrival)) return false;
+            if (comptime @hasDecl(K, "allowedTurn")) {
+                const node: NodeId = @fromBackingInt(before.head);
+                const row = try self.view.turnRow(node, before.cls.opp_local);
+                return kernel.allowedTurn(self.view, .{
+                    .node = node,
+                    .incoming = arrival,
+                    .incoming_edge = before,
+                    .outgoing = next,
+                    .outgoing_edge = after,
+                    .row = if (after.cls.local < row.len) row[after.cls.local] else 0,
+                    .predecessor_dead_end = if (self.view.classes != null) (try self.view.class(before.cls.class_id)).flags.dead_end else null,
+                }, .{ .edge = @backingInt(arrival) }, .forward);
+            }
+            return true;
         }
 
         fn route(self: *Self, a: Allocator, found: core.Result, choice: Choice, from: Origin, observed: f32, model: *const transition.Model, control: core.Control) !Route {
@@ -346,6 +368,12 @@ fn forbidUturn(stop_type: request.LocationType) bool {
 }
 
 const FixtureKernel = struct {
+    allow_backtrack: bool = true,
+
+    pub fn allowedTurn(self: FixtureKernel, _: *const View, movement: core.Transition, _: core.Label, _: core.Direction) !bool {
+        return self.allow_backtrack or movement.incoming_edge.cls.opp_local != movement.outgoing_edge.cls.local;
+    }
+
     pub fn edgeCost(_: FixtureKernel, _: *const View, _: EdgeId, edge: *const graph.format.EdgeHot, _: core.Direction) !@import("../costing/compiled.zig").Cost {
         const metres: f32 = @floatFromInt(edge.geom.len_m);
         const metres_per_second: f32 = if (edge.speed[0] == 0) 20 else @floatFromInt(edge.speed[0]);
@@ -439,6 +467,27 @@ test "direct trace cuts obey a separate strict clock bound" {
     measurements.leave_time = 22;
     const rejected = try engine.connect(&output, .{}, &model, origin, &.{onEdge(0, 0.75)}, measurements, .{});
     try t.expect(rejected[0] == null);
+}
+
+test "fractional trace departure checks arrival direction before seeding" {
+    const t = std.testing;
+    var engine = try Router(FixtureKernel).init(t.allocator, &fixture, 1024 * 1024);
+    defer engine.deinit();
+    var output = memory.Arena.init(t.allocator, .{});
+    defer output.deinit();
+    const model = try transition.Model.init(.{});
+    const costs: FixtureKernel = .{ .allow_backtrack = false };
+    const measurements: Measurements = .{ .left = .{ .point = .init(0, 0) }, .right = .{ .point = .init(0.001, 0) } };
+    var candidate = onEdge(0, 0.5);
+    candidate.direction_count = 2;
+    candidate.directions[1] = onEdge(1, 0.5).directions[0];
+    const targets = [_]candidates.Candidate{ onEdge(0, 0.75), onEdge(1, 0.75) };
+    const seeded = try engine.connect(&output, costs, &model, .{ .candidate = candidate }, &targets, measurements, .{});
+    try t.expectEqual(@as(f32, 25), seeded[1].?.metres);
+    output.reset();
+    const continued = try engine.connect(&output, costs, &model, .{ .candidate = candidate, .previous_edge = @fromBackingInt(@as(u32, 0)) }, &targets, measurements, .{});
+    try t.expectEqual(@as(f32, 25), continued[0].?.metres);
+    try t.expectEqual(@as(?Route, null), continued[1]);
 }
 
 test "a quicker arrival remains eligible under the same edge and turn state" {

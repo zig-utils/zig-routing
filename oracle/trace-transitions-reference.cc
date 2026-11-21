@@ -89,17 +89,16 @@ int main(int argc, char** argv) {
       destinations.push_back(&target);
     const midgard::DistanceApproximator<midgard::PointLL> approx(right);
     for (size_t s = 0; s < from.size(); ++s) {
-      std::optional<trace_audit::Enumerator> enumerator;
-      const std::vector<trace_audit::Path>* directed = nullptr;
+      std::vector<trace_audit::Path> directed;
       meili::labelset_ptr_t labels;
       std::unordered_map<uint16_t, uint32_t> found;
       destinations[0] = &from[s];
       if (audit) {
         if (selected.erase({row, s}) == 0)
           continue;
-        enumerator.emplace(reader, costing, penalties, to, max_distance, max_time);
-        directed = &enumerator->run(from[s]);
-        std::cerr << "Audited row " << row << " source " << s << " over " << enumerator->prefixes()
+        trace_audit::Enumerator enumerator(reader, costing, penalties, to, max_distance, max_time);
+        directed = enumerator.run(from[s]);
+        std::cerr << "Audited row " << row << " source " << s << " over " << enumerator.prefixes()
                   << " path prefixes\n";
       } else {
         labels = std::make_shared<meili::LabelSet>(max_distance);
@@ -124,7 +123,7 @@ int main(int argc, char** argv) {
             std::reverse(stock.edges.begin(), stock.edges.end());
           }
         }
-        const auto& path = audit ? directed->at(t) : stock;
+        const auto& path = audit ? directed[t] : stock;
         if (!std::isfinite(path.cost.cost)) {
           std::cout << "\t-1\t-1\t-1\t-1\n";
         } else {

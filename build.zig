@@ -445,6 +445,16 @@ pub fn build(b: *std.Build) void {
     run_check_transitions.addPassthruArgs();
     b.step("check-trace-transitions", "Write instrumented emission and transition costs").dependOn(&run_check_transitions.step);
 
+    const check_viterbi = b.addExecutable(.{ .name = "check-viterbi", .root_module = b.createModule(.{
+        .root_source_file = b.path("test/check_viterbi.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{.{ .name = "routing", .module = lib_mod }},
+    }) });
+    const run_check_viterbi = b.addRunArtifact(check_viterbi);
+    run_check_viterbi.addPassthruArgs();
+    b.step("check-viterbi", "Write matched candidate sequences and scores").dependOn(&run_check_viterbi.step);
+
     const bench_gtfs = b.addExecutable(.{ .name = "bench-gtfs", .root_module = b.createModule(.{
         .root_source_file = b.path("test/bench_gtfs.zig"),
         .target = target,

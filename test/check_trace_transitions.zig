@@ -8,7 +8,7 @@ const auto = cost.auto;
 const core = routing.search.search;
 const match = routing.match;
 
-const Kernel = struct {
+pub const Kernel = struct {
     profile: *const auto.Profile,
     tables: *const cost.compiled.Compiled,
 
