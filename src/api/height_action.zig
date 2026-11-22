@@ -18,6 +18,7 @@ const geo = @import("../geo/root.zig");
 const io = @import("../infra/io.zig");
 const PointLL = geo.PointLL;
 const Allocator = std.mem.Allocator;
+const ResponseError = Allocator.Error || error{DeadlineExceeded};
 
 /// tyr::kCoordinatePrecision.
 const coordinate_precision = 6;
@@ -59,15 +60,28 @@ pub fn handle(svc: *service.Service, ctx: *http.Ctx, options: *request.Options, 
     var ranges: []f64 = &.{};
     if (options.range) {
         ranges = try a.alloc(f64, shape.len);
-        ranges[0] = 0;
-        for (1..shape.len) |i| {
-            if (i & 1023 == 0 and ctx.deadline.expired()) return timedOut(res);
-            ranges[i] = ranges[i - 1] + shape[i].distance(shape[i - 1]);
-        }
+        accumulateRanges(shape, ranges, ctx.deadline) catch return timedOut(res);
     }
 
-    try serialize(a, &res.body, options, shape, options.encoded_polyline, heights, ranges);
-    return null;
+    return writeResponse(res, options, shape, options.encoded_polyline, heights, ranges, ctx.deadline);
+}
+
+fn accumulateRanges(shape: []const PointLL, ranges: []f64, deadline: io.Deadline) error{DeadlineExceeded}!void {
+    ranges[0] = 0;
+    if (shape.len == 1) return;
+    var previous = shape[0];
+    var endpoint = geo.point.DistanceEndpoint.init(previous, geo.libm);
+    var range: f64 = 0;
+    for (shape[1..], ranges[1..], 1..) |point, *out, i| {
+        if (i & 1023 == 0 and deadline.expired()) return error.DeadlineExceeded;
+        if (!point.eql(previous)) {
+            const current = geo.point.DistanceEndpoint.init(point, geo.libm);
+            range += current.distance(endpoint, geo.libm);
+            previous = point;
+            endpoint = current;
+        }
+        out.* = range;
+    }
 }
 
 fn resampleLimit(a: Allocator, min: f32) Allocator.Error!errors.Failure {
@@ -118,6 +132,7 @@ const HeightSink = struct {
 fn timedOut(res: *http.Response) Allocator.Error!?errors.Failure {
     res.status = 504;
     res.content_type = "text/plain";
+    res.body.clearRetainingCapacity();
     try res.writeBody("The server didn't respond in time");
     return null;
 }
@@ -152,7 +167,14 @@ fn sampleResampled(limits: service.Limits, deadline: io.Deadline, source: dem.So
             geo.polyline.encode(.polyline, 6, shape, buf)) catch return .{ .code = 599 };
         encoded = buf[0..n];
     }
-    try serialize(a, &res.body, options, shape, encoded, sink.heights.items, sink.ranges.items);
+    return writeResponse(res, options, shape, encoded, sink.heights.items, sink.ranges.items, deadline);
+}
+
+fn writeResponse(res: *http.Response, options: *const request.Options, shape: []const PointLL, encoded: ?[]const u8, heights: []const f64, ranges: []const f64, deadline: io.Deadline) Allocator.Error!?errors.Failure {
+    serializeUntil(res.gpa, &res.body, options, shape, encoded, heights, ranges, deadline) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DeadlineExceeded => return timedOut(res),
+    };
     return null;
 }
 
@@ -161,8 +183,42 @@ fn writeWithPrecision(w: *json_writer.Writer, value: f64, precision: u32) Alloca
     return w.float(value);
 }
 
+fn writeWholeMetreRanges(w: *json_writer.Writer, heights: []const f64, ranges: []const f64, deadline: io.Deadline) ResponseError!void {
+    try w.key("range_height");
+    const buf = try w.rawValue();
+    try buf.append(w.gpa, '[');
+    var num: [24]u8 = undefined;
+    const batch_size = 256;
+    const max_pair_bytes = 2 * num.len + 4;
+    var first: usize = 0;
+    while (first < heights.len) {
+        if (deadline.expired()) return error.DeadlineExceeded;
+        const end = @min(first + batch_size, heights.len);
+        try buf.ensureUnusedCapacity(w.gpa, (end - first) * max_pair_bytes + 1);
+        for (heights[first..end], ranges[first..end], first..) |h, r, i| {
+            if (i != 0) buf.appendAssumeCapacity(',');
+            buf.appendAssumeCapacity('[');
+            buf.appendSliceAssumeCapacity(json_writer.formatInt(@intFromFloat(@round(r)), &num));
+            buf.appendAssumeCapacity(',');
+            const height = if (h == elevation.no_data_value) "null" else json_writer.formatInt(@intFromFloat(@round(h)), &num);
+            buf.appendSliceAssumeCapacity(height);
+            buf.appendAssumeCapacity(']');
+        }
+        first = end;
+    }
+    try buf.append(w.gpa, ']');
+}
+
 /// tyr::serializeHeight.
 pub fn serialize(a: Allocator, out: *std.ArrayList(u8), options: *const request.Options, shape: []const PointLL, encoded: ?[]const u8, heights: []const f64, ranges: []const f64) Allocator.Error!void {
+    serializeUntil(a, out, options, shape, encoded, heights, ranges, .none) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DeadlineExceeded => unreachable,
+    };
+}
+
+fn serializeUntil(a: Allocator, out: *std.ArrayList(u8), options: *const request.Options, shape: []const PointLL, encoded: ?[]const u8, heights: []const f64, ranges: []const f64, deadline: io.Deadline) ResponseError!void {
+    if (deadline.expired()) return error.DeadlineExceeded;
     var w = json_writer.Writer.init(a, out);
     const precision = options.height_precision;
     try w.beginObject();
@@ -177,6 +233,7 @@ pub fn serialize(a: Allocator, out: *std.ArrayList(u8), options: *const request.
         buf.appendAssumeCapacity('[');
         var num: [40]u8 = undefined;
         for (shape, 0..) |p, i| {
+            if (i & 1023 == 0 and deadline.expired()) return error.DeadlineExceeded;
             if (i > 0) buf.appendAssumeCapacity(',');
             buf.appendSliceAssumeCapacity("{\"lat\":");
             buf.appendSliceAssumeCapacity(coordinate(p.lat, &num));
@@ -186,10 +243,13 @@ pub fn serialize(a: Allocator, out: *std.ArrayList(u8), options: *const request.
         }
         buf.appendAssumeCapacity(']');
     }
-    if (ranges.len > 0) {
+    if (ranges.len > 0 and precision == 0) {
+        try writeWholeMetreRanges(&w, heights, ranges, deadline);
+    } else if (ranges.len > 0) {
         try w.beginArrayField("range_height");
         w.setPrecision(@intCast(@max(precision, 1)));
-        for (heights, ranges) |h, r| {
+        for (heights, ranges, 0..) |h, r, i| {
+            if (i & 1023 == 0 and deadline.expired()) return error.DeadlineExceeded;
             try w.beginArray();
             try writeWithPrecision(&w, r, precision);
             if (h == elevation.no_data_value) try w.null_() else try writeWithPrecision(&w, h, precision);
@@ -204,6 +264,7 @@ pub fn serialize(a: Allocator, out: *std.ArrayList(u8), options: *const request.
         buf.appendAssumeCapacity('[');
         var num: [24]u8 = undefined;
         for (heights, 0..) |h, i| {
+            if (i & 1023 == 0 and deadline.expired()) return error.DeadlineExceeded;
             if (i > 0) buf.appendAssumeCapacity(',');
             if (h == elevation.no_data_value) {
                 buf.appendSliceAssumeCapacity("null");
@@ -215,7 +276,8 @@ pub fn serialize(a: Allocator, out: *std.ArrayList(u8), options: *const request.
     } else {
         try w.beginArrayField("height");
         w.setPrecision(@intCast(precision));
-        for (heights) |h| {
+        for (heights, 0..) |h, i| {
+            if (i & 1023 == 0 and deadline.expired()) return error.DeadlineExceeded;
             if (h == elevation.no_data_value) try w.null_() else try writeWithPrecision(&w, h, precision);
         }
         try w.endArray();
@@ -223,7 +285,8 @@ pub fn serialize(a: Allocator, out: *std.ArrayList(u8), options: *const request.
     if (options.id) |id| try w.field("id", id);
     if (options.warnings.items.len > 0) {
         try w.beginArrayField("warnings");
-        for (options.warnings.items) |code| {
+        for (options.warnings.items, 0..) |code, i| {
+            if (i & 1023 == 0 and deadline.expired()) return error.DeadlineExceeded;
             try w.beginObject();
             try w.field("code", @as(u64, code));
             try w.field("text", errors.warningText(code) orelse "");
@@ -239,6 +302,36 @@ pub fn serialize(a: Allocator, out: *std.ArrayList(u8), options: *const request.
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "a height serialization timeout replaces partial output" {
+    var res: http.Response = .{ .gpa = testing.allocator };
+    defer res.body.deinit(res.gpa);
+    try res.writeBody("{\"range_height\":[");
+    const options: request.Options = .{ .action = .height, .range = true };
+    try testing.expectEqual(null, try writeResponse(&res, &options, &.{}, "", &.{}, &.{}, .{ .at_ns = 0 }));
+    try testing.expectEqual(504, res.status);
+    try testing.expectEqualStrings("The server didn't respond in time", res.body.items);
+}
+
+test "cached range endpoints preserve every cumulative distance" {
+    const shape: []const PointLL = &.{
+        .{ .lat = 0, .lng = -0.0 },
+        .{ .lat = -0.0, .lng = 0 },
+        .{ .lat = 89.99999, .lng = 179.99999 },
+        .{ .lat = 89.99999, .lng = 179.99999 },
+        .{ .lat = 89.99999, .lng = -179.99999 },
+        .{ .lat = -89.99999, .lng = 0 },
+        .{ .lat = -89.99999, .lng = 0.00001 },
+    };
+    var ranges: [shape.len]f64 = undefined;
+    try accumulateRanges(shape, &ranges, .none);
+    var expected: f64 = 0;
+    try testing.expectEqual(expected, ranges[0]);
+    for (shape[1..], shape[0 .. shape.len - 1], ranges[1..]) |current, previous, range| {
+        expected += current.distance(previous);
+        try testing.expectEqual(expected, range);
+    }
+}
 
 test "serializer output matches upstream's shape for each precision" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -266,7 +359,7 @@ test "serializer output matches upstream's shape for each precision" {
 
 /// The serializer as written with one writer call per value: the reference
 /// the loops in `serialize` must match byte for byte.
-fn serializeReference(a: Allocator, out: *std.ArrayList(u8), options: *const request.Options, shape: []const PointLL, heights: []const f64) Allocator.Error!void {
+fn serializeReference(a: Allocator, out: *std.ArrayList(u8), options: *const request.Options, shape: []const PointLL, heights: []const f64, ranges: []const f64) Allocator.Error!void {
     var w = json_writer.Writer.init(a, out);
     const precision = options.height_precision;
     try w.beginObject();
@@ -279,10 +372,15 @@ fn serializeReference(a: Allocator, out: *std.ArrayList(u8), options: *const req
         try w.endObject();
     }
     try w.endArray();
-    try w.beginArrayField("height");
+    try w.beginArrayField(if (ranges.len == 0) "height" else "range_height");
     w.setPrecision(@intCast(@max(precision, 1)));
-    for (heights) |h| {
+    for (heights, 0..) |h, i| {
+        if (ranges.len != 0) {
+            try w.beginArray();
+            try writeWithPrecision(&w, ranges[i], precision);
+        }
         if (h == elevation.no_data_value) try w.null_() else try writeWithPrecision(&w, h, precision);
+        if (ranges.len != 0) try w.endArray();
     }
     try w.endArray();
     if (options.id) |id| try w.field("id", id);
@@ -297,7 +395,7 @@ test "the shape and height loops write the same bytes as one writer call per val
     const random = prng.random();
     for (0..3000) |round| {
         _ = arena_state.reset(.retain_capacity);
-        const n = random.uintLessThan(usize, 60);
+        const n = if (round % 30 == 0) 550 else random.uintLessThan(usize, 60);
         const shape = try a.alloc(PointLL, n);
         const heights = try a.alloc(f64, n);
         for (shape, heights) |*p, *h| {
@@ -326,10 +424,12 @@ test "the shape and height loops write the same bytes as one writer call per val
         var o: request.Options = .{ .action = .height };
         o.height_precision = @intCast(round % 3);
         if (round % 4 == 0) o.id = "abc";
+        const ranges = try a.alloc(f64, if (round % 2 == 0) n else 0);
+        for (ranges, 0..) |*r, i| r.* = @as(f64, @floatFromInt(i)) * 110.5;
         var fast: std.ArrayList(u8) = .empty;
-        try serialize(a, &fast, &o, shape, null, heights, &.{});
+        try serialize(a, &fast, &o, shape, null, heights, ranges);
         var ref: std.ArrayList(u8) = .empty;
-        try serializeReference(a, &ref, &o, shape, heights);
+        try serializeReference(a, &ref, &o, shape, heights, ranges);
         try testing.expectEqualStrings(ref.items, fast.items);
     }
 }
