@@ -71,23 +71,39 @@ jq -n --arg dataset "$name" --arg image "$image" --arg build_key "$key" \
   '$ARGS.named' > "$out/run.json"
 
 stable=true
+minimum_requests=1
+if [ "$name" != us-dach ]; then minimum_requests=5000; fi
 cd "$repo"
 while IFS=$'\t' read -r file requests checksum; do
+  # Keep complete corpus cycles while giving small fixtures enough samples.
+  replays=$(( (minimum_requests + requests - 1) / requests ))
+  measured_requests=$(( replays * requests ))
   for connections in "${loads[@]}"; do
     prefix="$out/${file%.tsv}-c$connections"
-    for repeat in 1 2; do
-      "$zr" bench "$url" --corpus "bench/corpora/$file" --requests "$requests" --warmup 2s \
+    pair_stable=false
+    for repeat in 1 2 3 4; do
+      "$zr" bench "$url" --corpus "bench/corpora/$file" --requests "$measured_requests" --warmup 2s \
         --threads 1 --connections "$connections" --dataset "$name" --commit "$version" --out "$prefix-$repeat.tmp"
       jq --arg sha256 "$checksum" 'del(.target) | .corpus.sha256 = $sha256' \
         "$prefix-$repeat.tmp" > "$prefix-$repeat.json"
-      jq -e --argjson requests "$requests" '
+      jq -e --argjson requests "$measured_requests" '
         .requests == $requests and .errors.transport == 0 and .errors.timeouts == 0 and .errors.unsent == 0
       ' "$prefix-$repeat.json" >/dev/null || die "incomplete replay for $file at $connections connections"
       rm -- "$prefix-$repeat.tmp"
+      if [ "$repeat" -eq 1 ]; then continue; fi
+      previous=$(( repeat - 1 ))
+      if jq -es 'map(.latency_us.p50) | max <= (min * 1.05)' \
+          "$prefix-$previous.json" "$prefix-$repeat.json" >/dev/null; then
+        pair_stable=true
+        if [ "$repeat" -gt 2 ]; then
+          jq -n --argjson first "$previous" --argjson second "$repeat" '[$first, $second]' \
+            > "$prefix-accepted.json"
+        fi
+        break
+      fi
     done
-    if ! jq -es 'map(.latency_us.p50) | max <= (min * 1.05)' \
-        "$prefix-1.json" "$prefix-2.json" >/dev/null; then
-      echo "oracle: p50 varied by more than 5% for $file at $connections connections" >&2
+    if ! $pair_stable; then
+      echo "oracle: no consecutive p50 pair agreed within 5% for $file at $connections connections" >&2
       stable=false
     fi
   done

@@ -1066,13 +1066,16 @@ oracle/baseline.sh us-dach bench/results/baseline/us-dach
 ```
 
 The runner checks the build key and corpus checksums. It starts a separate Valhalla 3.9.3
-container with six workers, then sends every corpus request twice at one connection and
-twice at core-count connections. The client uses one thread and a two-second warm-up.
+container with six workers, then measures each corpus at one connection and at core-count
+connections. Each replay covers one complete cycle on US+DACH. Liechtenstein and Utrecht
+repeat complete cycles to reach at least 5,000 requests per replay. The client uses one
+thread and a two-second warm-up.
 Results include latency, throughput, HTTP status counts, kernel, RAM, and the pinned image and
 input checksums. Startup measures container launch through the first successful `/status`
 response using the existing filesystem cache. RSS is the Valhalla process resident memory
-after the replays. The runner reports p50 variations above 5% and writes the results even when
-the timing check fails. Use a fresh output directory for a rerun.
+after the replays. The runner uses the first consecutive pair of replays whose p50 values
+agree within 5%, with up to four replays at each load. It writes every replay and records which
+pair it used if the first two differed by more than 5%. Use a fresh output directory for a rerun.
 
 #### Comparing servers
 
