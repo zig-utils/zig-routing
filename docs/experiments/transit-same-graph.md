@@ -133,6 +133,12 @@ all 100 routes, weights, and boarding instants. With both changes, median search
 CPU time fell 7.72% against the same baseline on Apple M3 Pro. The four paired reductions ranged
 from 3.95% to 11.97%.
 
+Resolving the preceding occurrence of each recurring timezone rule then reduced median userspace
+CPU time by 4.71% against the version with both earlier changes. Across eight alternating pairs,
+the change ranged from an 8.51% reduction to a 2.23% increase. Every itinerary and peak request
+allocation matched the baseline. Recurrence checks covered 81,200 bundled rule boundaries across
+one Gregorian cycle and 150,000 synthetic instants, including transitions that cross year boundaries.
+
 ```sh
 zig build check-transit-itineraries -Doptimize=ReleaseFast -- \
   BUNDLE corpus.tsv cuts.jsonl --measure --repeat 2 > native-measured.jsonl

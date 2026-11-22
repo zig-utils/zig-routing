@@ -58,6 +58,17 @@ const MonthRule = packed struct(u32) {
         if (day >= length) day -= 7;
         return @as(i64, first + day) * seconds_per_day + self.seconds - offset.seconds;
     }
+
+    const Transition = struct { instant: i64, year: i32 };
+
+    fn previous(self: MonthRule, normalized: i64, offset: Offset) Transition {
+        // Remove this rule's offset before choosing its calendar year.
+        // This includes January and December rules that cross a UTC year boundary.
+        const year = cycleYear(normalized - self.seconds + offset.seconds);
+        const current = self.instant(year, offset);
+        if (current <= normalized) return .{ .instant = current, .year = year };
+        return .{ .instant = self.instant(year - 1, offset), .year = year - 1 };
+    }
 };
 
 const Zone = extern struct {
@@ -76,23 +87,14 @@ const Zone = extern struct {
 
         // Gregorian weekdays and leap years repeat every 400 years.
         const normalized = inCycle(instant);
-        const year = cycleYear(normalized);
-        var latest: i64 = std.math.minInt(i64);
-        var present = self.standard;
-        // Rule times can move a January or December change into the adjacent year.
-        for ([_]i32{ year - 1, year, year + 1 }) |candidate| {
-            const start = self.start.instant(candidate, self.standard);
-            const end = self.end.instant(candidate, self.daylight);
-            if (start <= normalized and start > latest) {
-                latest = start;
-                present = self.daylight;
-            }
-            if (end <= normalized and end > latest) {
-                latest = end;
-                present = self.standard;
-            }
-        }
-        return present;
+        const earliest_year = cycleYear(normalized) - 1;
+        const start = self.start.previous(normalized, self.standard);
+        if (start.year < earliest_year) return self.standard;
+        const end = self.end.previous(normalized, self.daylight);
+        // For coincident transitions, retain the first rule in calendar order.
+        if (end.year < earliest_year or start.instant > end.instant or
+            (start.instant == end.instant and start.year <= end.year)) return self.daylight;
+        return self.standard;
     }
 };
 
@@ -375,4 +377,25 @@ test "recurring local times resolve gaps and choose the later overlap" {
 
     const repeated = local.parse("2426-11-01T01:30").?.seconds();
     try testing.expectEqual(@as(?i64, repeated + 5 * 3600), try rules.toUtc(zone, repeated, .none));
+}
+
+test "recurring offset includes rules displaced into adjacent UTC years" {
+    const testing = std.testing;
+    const Local = @import("datetime.zig").Local;
+    const zone: Zone = .{
+        .tag = undefined,
+        .transitions = undefined,
+        .initial = undefined,
+        .standard = .{ .seconds = 0, .daylight_saving = false },
+        .daylight = .{ .seconds = 3600, .daylight_saving = true },
+        .start = .{ .month = 1, .week = 1, .weekday = 0, .seconds = -7 * 86400 },
+        .end = .{ .month = 12, .week = 5, .weekday = 0, .seconds = 7 * 86400 },
+        .name = undefined,
+    };
+    const begins = Local.parse("2025-12-28T00:00").?.seconds();
+    const ends = Local.parse("2026-01-03T23:00").?.seconds();
+    try testing.expectEqual(zone.standard, try zone.recurring(begins - 1));
+    try testing.expectEqual(zone.daylight, try zone.recurring(begins));
+    try testing.expectEqual(zone.daylight, try zone.recurring(ends - 1));
+    try testing.expectEqual(zone.standard, try zone.recurring(ends));
 }
