@@ -122,6 +122,12 @@ microseconds after it. Three 250 ms trials over the original failing
 cases had maxima of 4.042 and 1.250 microseconds respectively. Every
 request in those trials stopped at its deadline.
 
+Deferring trip context storage until a boarding passes the cost bound reduced peak request
+memory on 42 of the same 100 requests. The largest request fell from 136.74 MiB to 135.34 MiB.
+All route steps, weights, and boarding instants were identical across four alternating pairs on
+Apple M3 Pro. Median search-only userspace CPU time changed by -0.28%. The second replay used
+zero backing allocator calls.
+
 ```sh
 zig build check-transit-itineraries -Doptimize=ReleaseFast -- \
   BUNDLE corpus.tsv cuts.jsonl --measure --repeat 2 > native-measured.jsonl

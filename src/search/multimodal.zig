@@ -306,6 +306,7 @@ comptime {
 }
 
 const StoredRide = struct { run: Ride, transition: Cost };
+const Boarding = struct { run: Ride, journey: Journey };
 
 const TransferIndex = struct {
     const Key = struct { from: u32, to: u32 };
@@ -495,7 +496,7 @@ pub const Search = struct {
         var prior: ?Label = null;
         for (steps, 0..) |step, i| {
             try control.check();
-            var sink: ReplaySink = .{ .expected = step, .terminal = i + 1 == steps.len };
+            var sink: ReplaySink = .{ .query = &query, .expected = step, .terminal = i + 1 == steps.len };
             if (prior) |label| {
                 if (!try query.canEnter(label.node)) return .{ .blocked_at = i };
                 switch (step) {
@@ -544,22 +545,24 @@ pub const Search = struct {
 };
 
 const ReplaySink = struct {
+    query: *Query,
     expected: ReplayStep,
     terminal: bool,
     matched: ?Label = null,
 
-    fn offer(self: *ReplaySink, label: Label, ride: ?Ride) !void {
+    fn offer(self: *ReplaySink, label: Label, boarding: ?*const Boarding) !void {
         if (label.terminal != self.terminal) return;
         switch (self.expected) {
             .walk => |walk| if (label.step.movement != .walk or !std.meta.eql(walk, label.step.movement.walk)) return,
             .ride => |expected| {
-                const run = ride orelse return;
+                const run = (boarding orelse return).run;
                 if (run.departure.line != expected.line or run.departure.trip != expected.trip or
                     run.departure_time != expected.board_time) return;
             },
         }
         if (self.matched != null) return error.AmbiguousTransitReplay;
         self.matched = label;
+        if (boarding) |boarded| self.matched.?.journey = try self.query.internJourney(boarded.journey);
     }
 };
 
@@ -773,7 +776,7 @@ const Query = struct {
         return std.math.cast(u32, entry.index + 1) orelse error.TooManySearchLabels;
     }
 
-    fn offer(self: *Query, offered: Label, ride: ?Ride) !void {
+    fn offer(self: *Query, offered: Label, boarding: ?*const Boarding) !void {
         var candidate = offered;
         const cost = candidate.step.elapsed.cost;
         const priority = if (candidate.terminal)
@@ -789,6 +792,8 @@ const Query = struct {
             self.terminal = candidate;
             return;
         }
+        // The cost bound can reject a departure before storing its trip context.
+        if (boarding) |boarded| candidate.journey = try self.internJourney(boarded.journey);
         if (candidate.step.movement == .walk) {
             const walking_limit = self.search.kernel.walking_limit;
             const board_limit = if (candidate.journey != 0) @min(walking_limit, self.search.kernel.transfer_limit) else walking_limit;
@@ -847,9 +852,9 @@ const Query = struct {
             parent = &prior.next_at_edge;
         }
         var label = candidate;
-        if (ride) |run| {
+        if (boarding) |boarded| {
             label.step.movement.ride = std.math.cast(u32, self.rides.items.len) orelse return error.TooManySearchLabels;
-            try self.rides.append(self.a, .{ .run = run, .transition = candidate.step.transition });
+            try self.rides.append(self.a, .{ .run = boarded.run, .transition = candidate.step.transition });
         }
         const index = try self.appendLabel(label, slot.*);
         try self.pending.push(self.a, queue.Entry.init(@floatCast(priority), index));
@@ -1064,9 +1069,11 @@ const Query = struct {
         try sink.offer(.{
             .node = destination,
             .step = .{ .movement = .{ .ride = offered.line }, .elapsed = elapsed, .transition = transition },
-            .journey = try self.internJourney(.{ .stop = table.lines[offered.line].destination, .trip = offered.trip, .route = offered.route, .block = offered.block, .operator = operator, .service_day = scheduled.service_day, .occurrence = occurrence, .arrived = arrival }),
             .predecessor = pred,
-        }, .{ .departure = offered, .ready_time = now, .departure_time = scheduled.instant, .arrival_time = arrival, .service_day = scheduled.service_day });
+        }, &.{
+            .run = .{ .departure = offered, .ready_time = now, .departure_time = scheduled.instant, .arrival_time = arrival, .service_day = scheduled.service_day },
+            .journey = .{ .stop = table.lines[offered.line].destination, .trip = offered.trip, .route = offered.route, .block = offered.block, .operator = operator, .service_day = scheduled.service_day, .occurrence = occurrence, .arrived = arrival },
+        });
     }
 };
 
@@ -1174,4 +1181,51 @@ test "stored transit labels retain wide distances and restriction contexts" {
     try testing.expect(stored.flags.turn_alias);
     try testing.expectEqualDeep(label.access, stored.access());
     try testing.expectEqual(@as(u32, 7), stored.next_at_edge);
+}
+
+test "a cheaper transit prefix cannot discard a label with more walking left" {
+    const testing = std.testing;
+    var arena = Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+    const a = arena.allocator();
+    var kernel: Kernel = undefined;
+    kernel.walking_limit = 2415;
+    var search: Search = undefined;
+    search.kernel = &kernel;
+    search.timed_walking = .{};
+    var query: Query = .{
+        .search = &search,
+        .a = a,
+        .control = .{},
+        .restrictions = undefined,
+        .targets = undefined,
+        .ceiling = 5000,
+        .potential = .{},
+        .ignored_filter = .{ false, false },
+    };
+    var reverse: queue.Heap = .{};
+    const node: NodeId = @fromBackingInt(7);
+    try query.destination.offer(a, &reverse, @backingInt(node), 400);
+    const cheaper: Label = .{
+        .node = node,
+        .step = .{ .movement = .{ .walk = .{ .edge = @fromBackingInt(12), .begin = 0, .end = 1 } }, .elapsed = .{ .cost = 2054.948, .secs = 800 } },
+        .can_board = false,
+        .walk_distance = 1935,
+    };
+    var shorter = cheaper;
+    shorter.step.elapsed = .{ .cost = 2557.914, .secs = 820 };
+    shorter.walk_distance = 38;
+    try query.offer(cheaper, null);
+    try query.offer(shorter, null);
+    try testing.expectEqual(2, query.label_count);
+    try testing.expect(!query.labels.get(0).flags.inactive);
+    try testing.expect(!query.labels.get(1).flags.inactive);
+    try testing.expect(cheaper.walk_distance + 1526 > kernel.walking_limit);
+    try testing.expect(shorter.walk_distance + 1526 <= kernel.walking_limit);
+
+    var dominated = shorter;
+    dominated.walk_distance += 1;
+    dominated.step.elapsed.cost += 1;
+    try query.offer(dominated, null);
+    try testing.expectEqual(2, query.label_count);
 }
