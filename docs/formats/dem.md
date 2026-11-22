@@ -100,6 +100,10 @@ Residuals are coded in groups of 16 posts (the last group may be shorter):
 
 A width of 0 means all 16 residuals are zero (a run that matches the prediction exactly).
 
+A full group takes exactly `2 * width` bytes, so every group starts on a byte boundary. The decoder
+relies on this to unpack each group with one vector shuffle instead of a serial bit reader; a
+format change that breaks it needs a new decoder.
+
 ## Reading
 
 `Pack.open` maps the file, checks the magic, version, offsets and directory hash, and checks

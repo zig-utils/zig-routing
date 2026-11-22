@@ -184,9 +184,185 @@ pub fn encodeBlock(comptime p: Predictor, posts: []const i16, w: usize, h: usize
 pub const DecodeError = error{CorruptBlock};
 
 /// Decodes a payload written by `encodeBlock(p, ...)` into `posts` (w x h):
-/// first the bit-packed codes, then the posts row by row (no per-post
-/// division, predictions from the rows already rebuilt).
+/// first the residuals (`unpackResiduals`), then the posts in wavefronts of
+/// eight rows (`rebuildWavefront`). Exactly the posts and errors of
+/// `decodeBlockScalar`, in less time (measurements on issue #42).
 pub fn decodeBlockWith(comptime p: Predictor, payload: []const u8, w: usize, h: usize, posts: []i16) DecodeError!void {
+    std.debug.assert(posts.len >= w * h);
+    var residuals: [block_dim * block_dim]i16 = undefined;
+    try unpackResiduals(payload, w * h, &residuals);
+    rebuildWavefront(p, &residuals, w, h, posts);
+}
+
+/// Bytes the vector path may read from the start of a group: the last code
+/// of a 16-bit group starts at byte 30 and is read as a u32 (up to byte 33).
+const group_slack = 36;
+
+/// The 16 zigzag codes of one full group at a comptime width, unzigzagged.
+/// A full group is 16 * width bits = exactly 2 * width bytes, so it starts on
+/// a byte boundary; one shuffle gathers each code's bytes into its own lane,
+/// then a per-lane shift and mask isolate it. Reads `group_slack` bytes.
+inline fn unpackGroup(comptime width: u5, src: *const [group_slack]u8, dst: *[group]i16) void {
+    // A lane holds (bit % 8) + width <= 7 + width bits.
+    const Lane = if (width <= 9) u16 else u32;
+    const lane_bytes = @sizeOf(Lane);
+    const gather = comptime blk: {
+        @setEvalBranchQuota(10_000);
+        var m: [group * lane_bytes]i32 = undefined;
+        for (0..group) |j| for (0..lane_bytes) |k| {
+            m[j * lane_bytes + k] = (j * width) / 8 + k;
+        };
+        break :blk m;
+    };
+    const shifts = comptime blk: {
+        var v: [group]std.math.Log2Int(Lane) = undefined;
+        for (0..group) |j| v[j] = (j * width) % 8;
+        break :blk v;
+    };
+    const in: @Vector(group_slack, u8) = src.*;
+    const bytes: @Vector(group * lane_bytes, u8) = @shuffle(u8, in, undefined, gather);
+    const lanes: @Vector(group, Lane) = @bitCast(bytes);
+    const mask: @Vector(group, Lane) = @splat((1 << width) - 1);
+    const codes: @Vector(group, u16) = @truncate((lanes >> shifts) & mask);
+    const one: @Vector(group, u16) = @splat(1);
+    dst.* = @as(@Vector(group, i16), @bitCast(codes >> one)) ^ -@as(@Vector(group, i16), @bitCast(codes & one));
+}
+
+/// Stage 1 of a decode: the n residuals of a payload. Groups take the vector
+/// path while `group_slack` bytes remain, so no read leaves the payload; the
+/// last few go through the serial bit reader, which starts byte-aligned and
+/// fails exactly where `decodeBlockScalar` does. A partial last group on the
+/// vector path writes up to 15 residuals past n; they are never read.
+fn unpackResiduals(payload: []const u8, n: usize, residuals: *[block_dim * block_dim]i16) DecodeError!void {
+    const groups = (n + group - 1) / group;
+    const widths_len = (groups + 1) / 2;
+    if (payload.len < widths_len) return error.CorruptBlock;
+    var pos = widths_len;
+    var g: usize = 0;
+    while (g < groups and pos + group_slack <= payload.len) : (g += 1) {
+        const nibble: u4 = @truncate(payload[g / 2] >> @intCast((g % 2) * 4));
+        const dst = residuals[g * group ..][0..group];
+        const src = payload[pos..][0..group_slack];
+        switch (nibble) {
+            0 => dst.* = @splat(0),
+            inline 1...14 => |width| unpackGroup(width, src, dst),
+            15 => unpackGroup(16, src, dst),
+        }
+        pos += 2 * @as(usize, if (nibble == 15) 16 else nibble);
+    }
+
+    var acc: u64 = 0;
+    var bits: u7 = 0;
+    var i = g * group;
+    while (g < groups) : (g += 1) {
+        const nibble: u4 = @truncate(payload[g / 2] >> @intCast((g % 2) * 4));
+        const width: u5 = if (nibble == 15) 16 else nibble;
+        const hi = @min(n, (g + 1) * group);
+        if (width == 0) {
+            @memset(residuals[i..hi], 0);
+            i = hi;
+            continue;
+        }
+        const mask: u64 = (@as(u64, 1) << width) - 1;
+        while (i < hi) : (i += 1) {
+            if (bits < width) {
+                while (bits <= 56 and pos < payload.len) {
+                    acc |= @as(u64, payload[pos]) << @as(u6, @intCast(bits));
+                    pos += 1;
+                    bits += 8;
+                }
+                if (bits < width) return error.CorruptBlock;
+            }
+            residuals[i] = unzigzag(@intCast(acc & mask));
+            acc >>= @as(u6, width);
+            bits -= width;
+        }
+    }
+}
+
+/// Rows rebuilt together by `rebuildWavefront`: i16 x 8 fills one 128-bit
+/// register (4 and 16 measured slower).
+const wave_rows = 8;
+
+inline fn medPredictVec(comptime V: type, west: V, north: V, north_west: V) V {
+    const mx = @max(west, north);
+    const mn = @min(west, north);
+    return @select(i16, north_west >= mx, mn, @select(i16, north_west <= mn, mx, west +% north -% north_west));
+}
+
+inline fn predictVec(comptime p: Predictor, comptime V: type, west: V, north: V, north_west: V) V {
+    return switch (p) {
+        .med => medPredictVec(V, west, north, north_west),
+        .plane => west +% north -% north_west,
+    };
+}
+
+/// Stage 2 of a decode: the posts from their residuals. Row by row, each
+/// post waits on its west neighbour. Instead a strip of `wave_rows` rows runs
+/// as a wavefront: at step t, lane k rebuilds post (r0 + k, t - k), so its
+/// west is its own lane at step t - 1, its north is lane k - 1 at step t - 1
+/// (the row above for lane 0) and its north-west is lane k - 1 at step t - 2.
+/// Same predictions in the same wrapping arithmetic, so the same posts.
+fn rebuildWavefront(comptime p: Predictor, residuals: *const [block_dim * block_dim]i16, w: usize, h: usize, posts: []i16) void {
+    const K = wave_rows;
+    const V = @Vector(K, i16);
+    posts[0] = residuals[0];
+    for (1..w) |col| posts[col] = residuals[col] +% posts[col - 1];
+
+    const lane: @Vector(K, i32) = std.simd.iota(i32, K);
+    var r0: usize = 1;
+    while (r0 < h) : (r0 += K) {
+        const rows = @min(K, h - r0);
+        const above = (r0 - 1) * w;
+        var prev: V = @splat(0);
+        var prev2: V = @splat(0);
+        const steps = w + rows - 1;
+        // A full strip at least K wide has steps K..w-1 with every lane live
+        // and past column 0: those run without edge checks.
+        const steady = rows == K and w >= K;
+        const steady_lo: usize = if (steady) K else steps;
+        const steady_hi: usize = if (steady) w else steps;
+        var t: usize = 0;
+        while (t < steps) : (t += 1) {
+            if (t == steady_lo) {
+                while (t < steady_hi) : (t += 1) {
+                    const north = std.simd.shiftElementsRight(prev, 1, posts[above + t]);
+                    const north_west = std.simd.shiftElementsRight(prev2, 1, posts[above + t - 1]);
+                    var r: V = undefined;
+                    inline for (0..K) |k| r[k] = residuals[(r0 + k) * w + (t - k)];
+                    const cur = r +% predictVec(p, V, prev, north, north_west);
+                    inline for (0..K) |k| posts[(r0 + k) * w + (t - k)] = cur[k];
+                    prev2 = prev;
+                    prev = cur;
+                }
+                if (t >= steps) break;
+            }
+            // Ramp up and down: lanes outside the block stay dead, and a lane
+            // in column 0 predicts from its north neighbour alone.
+            const col: @Vector(K, i32) = @as(@Vector(K, i32), @splat(@intCast(t))) - lane;
+            const top: i16 = if (t < w) posts[above + t] else 0;
+            const top_west: i16 = if (t >= 1 and t - 1 < w) posts[above + t - 1] else 0;
+            const north = std.simd.shiftElementsRight(prev, 1, top);
+            const north_west = std.simd.shiftElementsRight(prev2, 1, top_west);
+            const pred = @select(i16, col == @as(@Vector(K, i32), @splat(0)), north, predictVec(p, V, prev, north, north_west));
+            var r: V = @splat(0);
+            inline for (0..K) |k| {
+                if (k < rows and t >= k and t - k < w) r[k] = residuals[(r0 + k) * w + (t - k)];
+            }
+            const cur = r +% pred;
+            inline for (0..K) |k| {
+                if (k < rows and t >= k and t - k < w) posts[(r0 + k) * w + (t - k)] = cur[k];
+            }
+            prev2 = prev;
+            prev = cur;
+        }
+    }
+}
+
+/// The reference decoder: a serial bit reader, then the posts row by row.
+/// `decodeBlockWith` must match it exactly, posts and errors; the tests and
+/// the `dem` fuzz target hold it to that.
+pub fn decodeBlockScalar(comptime p: Predictor, payload: []const u8, w: usize, h: usize, posts: []i16) DecodeError!void {
     const n = w * h;
     std.debug.assert(posts.len >= n);
     const groups = (n + group - 1) / group;
@@ -672,6 +848,59 @@ test "block coding round-trips edge sizes, voids and extremes" {
     try testing.expectError(error.CorruptBlock, decodeBlock(.med, buf[0 .. len - 1], 64, 64, &back));
     try testing.expectError(error.CorruptBlock, decodeBlock(.med, buf[0..10], 64, 64, &back));
     try testing.expectError(error.CorruptBlock, decodeBlock(.constant, buf[0..len], 64, 64, &back));
+}
+
+/// Decodes with both decoders and requires the same error or the same posts.
+fn expectSameDecode(comptime p: Predictor, payload: []const u8, w: usize, h: usize) !void {
+    var want: [block_dim * block_dim]i16 = undefined;
+    var got: [block_dim * block_dim]i16 = undefined;
+    const want_ok = if (decodeBlockScalar(p, payload, w, h, &want)) |_| true else |_| false;
+    const got_ok = if (decodeBlockWith(p, payload, w, h, &got)) |_| true else |_| false;
+    try testing.expectEqual(want_ok, got_ok);
+    if (want_ok) try testing.expectEqualSlices(i16, want[0 .. w * h], got[0 .. w * h]);
+}
+
+test "the vector decoder matches the scalar reference, posts and errors" {
+    var prng = std.Random.DefaultPrng.init(42);
+    const random = prng.random();
+    var posts: [block_dim * block_dim]i16 = undefined;
+    var buf: [max_block_payload + 64]u8 = undefined;
+    // Every block shape the wavefront treats differently: thinner and
+    // narrower than a strip, one row past a strip, the 17-post edge blocks.
+    const dims = [_]usize{ 64, 63, 17, 9, 8, 7, 5, 3, 2, 1 };
+    for (0..3000) |iter| {
+        const w = dims[random.uintLessThan(usize, dims.len)];
+        const h = dims[random.uintLessThan(usize, dims.len)];
+        const n = w * h;
+        // Real encodings of terrain-like, noisy and extreme posts.
+        for (posts[0..n], 0..) |*v, i| v.* = switch (iter % 4) {
+            0 => @intCast(@as(i32, @intCast(i % w)) * 3 + @as(i32, @intCast(i / w)) * 2 + 400 + random.intRangeAtMost(i32, -3, 3)),
+            1 => random.int(i16),
+            2 => if (random.boolean()) 32767 else -32768,
+            else => @intCast(1200 + random.intRangeAtMost(i32, -200, 200)),
+        };
+        inline for (.{ Predictor.med, Predictor.plane }) |p| {
+            const len = encodeBlock(p, posts[0..n], w, h, buf[0..max_block_payload]);
+            try expectSameDecode(p, buf[0..len], w, h);
+            // Truncations reach every split between the vector and serial paths.
+            var cut = len;
+            while (cut > 0) : (cut -= 1 + cut / 64) try expectSameDecode(p, buf[0..cut], w, h);
+        }
+        // Arbitrary bytes: random widths, lengths from 40 bytes short to 40 long.
+        random.bytes(&buf);
+        const groups = (n + group - 1) / group;
+        var need_bits: usize = 0;
+        for (0..groups) |g| {
+            const nibble: u4 = if (iter % 2 == 0) random.uintLessThan(u4, 7) else random.int(u4);
+            const shift: u3 = @intCast((g % 2) * 4);
+            buf[g / 2] = (buf[g / 2] & ~(@as(u8, 0xf) << shift)) | (@as(u8, nibble) << shift);
+            need_bits += @as(usize, if (nibble == 15) 16 else nibble) * (@min(n, (g + 1) * group) - g * group);
+        }
+        const exact = (groups + 1) / 2 + (need_bits + 7) / 8;
+        const len = @min(buf.len, (exact + 40) -| random.uintLessThan(usize, 80));
+        try expectSameDecode(.med, buf[0..len], w, h);
+        try expectSameDecode(.plane, buf[0..len], w, h);
+    }
 }
 
 test "zigzag and the median predictor" {

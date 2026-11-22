@@ -2183,8 +2183,9 @@ test "fuzz lz4" {
 
 // ---------------------------------------------------------------------------
 // dem: the packed elevation block decoder on arbitrary payloads, at the
-// first byte's block size and predictor. A block that decodes re-encodes to
-// a payload that decodes to the same posts.
+// first byte's block size and predictor. The vector decoder fails exactly
+// where the scalar reference does and otherwise yields the same posts, and a
+// block that decodes re-encodes to a payload that decodes to the same posts.
 
 pub fn fuzzDem(_: void, s: *Smith) !void {
     var buf: [max_input]u8 = undefined;
@@ -2195,7 +2196,18 @@ pub fn fuzzDem(_: void, s: *Smith) !void {
     const h = sizes[(in[0] >> 2) & 3];
     const kind: dem.BlockKind = @fromBackingInt(@intCast((in[0] >> 4) & 3));
     var posts: [dem.block_dim * dem.block_dim]i16 = undefined;
-    dem.decodeBlock(kind, in[1..], w, h, &posts) catch return;
+    var want: [dem.block_dim * dem.block_dim]i16 = undefined;
+    const want_ok = switch (kind) {
+        .med => if (dem.decodeBlockScalar(.med, in[1..], w, h, &want)) |_| true else |_| false,
+        .plane => if (dem.decodeBlockScalar(.plane, in[1..], w, h, &want)) |_| true else |_| false,
+        else => false,
+    };
+    dem.decodeBlock(kind, in[1..], w, h, &posts) catch {
+        try std.testing.expect(!want_ok);
+        return;
+    };
+    try std.testing.expect(want_ok);
+    try std.testing.expectEqualSlices(i16, want[0 .. w * h], posts[0 .. w * h]);
     var out: [dem.max_block_payload]u8 = undefined;
     const len = dem.encodeBlock(.med, posts[0 .. w * h], w, h, &out);
     var back: [dem.block_dim * dem.block_dim]i16 = undefined;
