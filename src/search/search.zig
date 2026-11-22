@@ -979,7 +979,6 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     null;
                 const predecessor_dead_end: ?bool = dead_end: {
                     if (previous_class == null) break :dead_end null;
-                    if (!expanding and direction == .forward) break :dead_end null;
                     // Reverse labels keep the travel edge on the other side
                     // of the intersection. Read the flag on the outward arc.
                     const geometry_class = if (direction == .forward) previous_class.? else try self.view.class(geometry.cls.class_id);
@@ -1502,7 +1501,8 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 break :blk entry.value_ptr;
             };
             if (@TypeOf(observer) != void) observer.expansionStage(.labels);
-            try labels.append(a, record);
+            if (labels.items.len == labels.capacity) try labels.ensureUnusedCapacity(a, 1);
+            labels.appendAssumeCapacity(record);
             if (@TypeOf(observer) != void) observer.expansionStage(.queue);
             try pending.push(a, queue.Entry.init(roundedDown(@as(f64, label.cost) + estimate), index));
             if (@TypeOf(observer) != void) observer.expansionStage(.status);
