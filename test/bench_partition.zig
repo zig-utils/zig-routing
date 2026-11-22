@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const routing = @import("routing");
 const partition = routing.accel.partition;
 const io = routing.infra.io;
+const adjacent_id_distance = @import("adjacent_id_distance.zig");
 
 const Level = struct {
     cells: u32 = 0,
@@ -50,6 +51,12 @@ pub fn main(init: std.process.Init) !void {
     const elapsed = timer.read();
     defer order.deinit(a);
 
+    const ranks = try init.gpa.alloc(u32, order.nodes.len);
+    defer init.gpa.free(ranks);
+    for (order.nodes, 0..) |node, rank| ranks[@backingInt(node)] = @intCast(rank);
+    const input_distance = try adjacent_id_distance.median(init.gpa, &bundle.view, null);
+    const partition_distance = try adjacent_id_distance.median(init.gpa, &bundle.view, ranks);
+
     var levels: std.ArrayList(Level) = .empty;
     defer levels.deinit(a);
     if (order.cells.len != 0) try measureLevels(0, order.cells, &levels, 0, a);
@@ -68,6 +75,8 @@ pub fn main(init: std.process.Init) !void {
         .leaf_edges = options.leaf_edges,
         .max_side_percent = options.max_side_percent,
         .elapsed_ns = elapsed,
+        .input_median_adjacent_id_distance = input_distance,
+        .partition_median_adjacent_id_distance = partition_distance,
         .top_level_separator_nodes = if (levels.items.len == 0) 0 else levels.items[0].separator_nodes,
         .order_and_tree_xxh3 = std.fmt.hex(hash.final()),
         .levels = levels.items,

@@ -5,6 +5,7 @@ const build = routing.build;
 const graph = routing.graph;
 const dem = routing.elevation;
 const geo = routing.geo;
+const adjacent_id_distance = @import("adjacent_id_distance.zig");
 const open_budget_ns = 50 * std.time.ns_per_ms;
 
 pub fn main(init: std.process.Init) !void {
@@ -73,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
         try validateEnhancement(&warm.view, drive_side);
         const metadata = (warm.view.metadata orelse return error.MissingOrderMetadata)[0];
         if (metadata.ordering() != ordering.kind) return error.OrderingMismatch;
-        break :blk .{ .metadata = metadata, .median_distance = try medianAdjacentIdDistance(init.gpa, &warm.view) };
+        break :blk .{ .metadata = metadata, .median_distance = try adjacent_id_distance.median(init.gpa, &warm.view, null) };
     };
 
     var times: [32]u64 = undefined;
@@ -223,28 +224,6 @@ fn validateEnhancement(view: *const graph.reader.View, drive_side: build.edge_cl
             if (class.flags.not_thru and class.category.road_class <= @backingInt(graph.constants.RoadClass.tertiary)) return error.InvalidNotThru;
         }
     }
-}
-
-fn medianAdjacentIdDistance(allocator: std.mem.Allocator, view: *const graph.reader.View) !f64 {
-    const distances = try allocator.alloc(u32, view.edges.len / 2);
-    defer allocator.free(distances);
-    var count: usize = 0;
-    for (0..view.nodes.len) |i| {
-        const node: u32 = @intCast(i);
-        const range = try view.outEdgeRange(@fromBackingInt(node));
-        for (range.first..range.end) |j| {
-            const id: graph.format.EdgeId = @fromBackingInt(@as(u32, @intCast(j)));
-            if (j >= @backingInt(try view.oppEdge(id))) continue;
-            const head = view.edges[j].head;
-            distances[count] = @max(node, head) - @min(node, head);
-            count += 1;
-        }
-    }
-    if (count != distances.len) return error.InvalidOpposingCount;
-    if (count == 0) return 0;
-    std.mem.sortUnstable(u32, distances, {}, std.sort.asc(u32));
-    const middle = @as(u64, distances[(count - 1) / 2]) + distances[count / 2];
-    return @as(f64, @floatFromInt(middle)) / 2;
 }
 
 fn datasetId(file: io.File, side: build.edge_class.DriveSide, has_dem: bool, ordering: graph.format.OrderingKind) !graph.format.DatasetUuid {
