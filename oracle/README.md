@@ -1050,6 +1050,32 @@ oracles with:
 bun tools/corpus/generate.ts --validate liechtenstein=http://127.0.0.1:8102 --validate utrecht=http://127.0.0.1:8103
 ```
 
+#### Valhalla baseline on the benchmark host
+
+On the native x86-64 Linux host with 8 vCPUs and 16 GB RAM, stage the pinned built datasets
+for Liechtenstein, Utrecht, and US+DACH. Set `ORACLE_DATA` if the data lives outside
+`oracle/data`. Generate the corpora and build the load generator before running each dataset
+with the host otherwise idle.
+
+```bash
+bun tools/corpus/generate.ts
+zig build -Doptimize=ReleaseFast
+oracle/baseline.sh liechtenstein bench/results/baseline/liechtenstein
+oracle/baseline.sh utrecht bench/results/baseline/utrecht
+oracle/baseline.sh us-dach bench/results/baseline/us-dach
+```
+
+The runner checks the build key and corpus checksums. It starts a separate Valhalla 3.9.3
+container with six workers, then sends every corpus request twice at one connection and
+twice at core-count connections. The client uses one thread and a two-second warm-up.
+Results include latency, throughput, HTTP status counts, kernel, RAM, and the pinned image and
+input checksums. Startup measures container launch through the first successful `/status`
+response using the existing filesystem cache. RSS is the Valhalla process resident memory
+after the replays. The runner reports p50 variations above 5% and writes the results even when
+the timing check fails. Use a fresh output directory for a rerun.
+
+#### Comparing servers
+
 For numbers worth quoting, run both servers and the client inside the VM (a Linux `zr` built with
 `-Dtarget=aarch64-linux-gnu`, the oracle with `ORACLE_PLATFORM=linux/arm64`, all on one Docker
 network) so Colima's port forwarding and amd64 emulation do not dominate.
