@@ -1009,6 +1009,8 @@ one client thread at one connection, and two at eight connections. Each gzip run
 pinned gzip files. Every measured request returned HTTP 200 in both configurations.
 The uncompressed Valhalla comparison remains below the 10x target.
 
+#### Request replay
+
 `zr bench` measures throughput and latency against either server. A corpus is one request per
 line, `PATH<TAB>BODY`. The standard corpora come from `tools/corpus/generate.ts` (see
 `bench/corpora/manifest.json` for what each one holds and which dataset it needs):
@@ -1033,9 +1035,16 @@ To replay a corpus exactly once, in order (a parity or acceptance run rather tha
 use one client thread and a request count equal to the line count:
 `--threads 1 --requests $(wc -l < FILE) --warmup 0`.
 
-Generated corpora keep only requests the oracle answers with 200; footpath islands in the test
-extracts make some pedestrian pairs unroutable (Utrecht rejects about 45% of random pedestrian
-candidates). Refresh the recorded rejections against running oracles with:
+On the pinned Liechtenstein, Utrecht and US+DACH oracles, all 16 regional corpora exceeded
+the 95% HTTP 200 threshold. Valhalla returned HTTP 200 for 33,570 of 33,803 requests, with
+a per-corpus minimum of 96.8% and zero transport errors or timeouts. Regenerating with
+seed 1 reproduced the recorded hashes for all 17 corpora, including the unchanged worldwide
+archive. The worldwide replay requires a planet oracle. [Regional replay](https://github.com/zig-utils/zig-routing/issues/7) · [Planet replay](https://github.com/zig-utils/zig-routing/issues/264)
+
+Oracle validation keeps only HTTP 200 candidates in the generated corpora it processes.
+Footpath islands in the test extracts make some pedestrian pairs unroutable. Utrecht rejects
+about 45% of its random pedestrian candidates. Refresh the recorded rejections against running
+oracles with:
 
 ```bash
 bun tools/corpus/generate.ts --validate liechtenstein=http://127.0.0.1:8102 --validate utrecht=http://127.0.0.1:8103
