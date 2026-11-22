@@ -128,6 +128,11 @@ All route steps, weights, and boarding instants were identical across four alter
 Apple M3 Pro. Median search-only userspace CPU time changed by -0.28%. The second replay used
 zero backing allocator calls.
 
+Skipping recurring timezone gap calculations after finding a valid UTC instant preserved
+all 100 routes, weights, and boarding instants. With both changes, median search-only userspace
+CPU time fell 7.72% against the same baseline on Apple M3 Pro. The four paired reductions ranged
+from 3.95% to 11.97%.
+
 ```sh
 zig build check-transit-itineraries -Doptimize=ReleaseFast -- \
   BUNDLE corpus.tsv cuts.jsonl --measure --repeat 2 > native-measured.jsonl

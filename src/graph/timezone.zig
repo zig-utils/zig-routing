@@ -297,6 +297,8 @@ const Resolve = struct {
         if (@as(u32, @bitCast(zone.start)) == 0 and @as(u32, @bitCast(zone.end)) == 0) return;
         if (!zone.start.valid() or !zone.end.valid()) return error.InvalidTimezoneRules;
         try self.candidate(zone.daylight);
+        // A resolved instant takes precedence over any skipped local time.
+        if (self.match != null) return;
         const normalized = inCycle(self.local);
         const base = @as(i128, self.local) - normalized;
         const year = cycleYear(normalized);
@@ -361,4 +363,16 @@ test "pinned IANA instants include historical, fractional and recurring offsets"
         try testing.expectEqual(case.seconds, offset.seconds);
         try testing.expectEqual(case.dst, offset.daylight_saving);
     }
+}
+
+test "recurring local times resolve gaps and choose the later overlap" {
+    const testing = std.testing;
+    const local = @import("datetime.zig").Local;
+    const rules = try Rules.parse(&bundled_rules);
+    const zone = try rules.id("America/New_York");
+    const skipped = local.parse("2426-03-08T02:05").?.seconds();
+    try testing.expectEqual(@as(?i64, 1772953200 + cycle_seconds), try rules.toUtc(zone, skipped, .none));
+
+    const repeated = local.parse("2426-11-01T01:30").?.seconds();
+    try testing.expectEqual(@as(?i64, repeated + 5 * 3600), try rules.toUtc(zone, repeated, .none));
 }
