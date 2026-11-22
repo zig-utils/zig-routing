@@ -988,6 +988,27 @@ bun oracle/compare-height.ts http://127.0.0.1:8102 http://127.0.0.1:18005 4000 9
 Run `zr` on Linux for this (for example the Linux build inside the same image): responses depend on
 the platform libm, and upstream's numbers come from glibc.
 
+#### US+DACH height throughput
+
+Valhalla 3.9.3 and `zr` at `5bedf4f` ran on the same native x86-64 Linux host with eight
+vCPUs, 32 GiB RAM and six workers per server. Both height comparisons passed all 1,000
+requests in `height.us-dach.tsv` with exact status, JSON schema and elevation values.
+The Zig server sampled its 6.14 GB DEM pack derived from all 1,493 pinned elevation files.
+
+| Valhalla input | Connections | Median Valhalla points/s | Median Zig points/s | Median paired speedup |
+|---|---:|---:|---:|---:|
+| Pinned gzip | 1 | 4,346 | 627,214 | 143.42x |
+| Pinned gzip | 8 | 21,311 | 4,149,262 | 197.63x |
+| Uncompressed HGT | 1 | 248,787 | 637,895 | 2.57x |
+| Uncompressed HGT | 8 | 1,846,431 | 4,421,344 | 2.39x |
+
+Each comparison used three alternating `zr bench` pairs after a two-second warm-up,
+one client thread at one connection, and two at eight connections. Each gzip run replayed
+3,000 requests (809,106 points). Each uncompressed run replayed 15,000 requests
+(4,045,530 points). The uncompressed input contained the same HGT bytes expanded from the
+pinned gzip files. Every measured request returned HTTP 200 in both configurations.
+The uncompressed Valhalla comparison remains below the 10x target.
+
 `zr bench` measures throughput and latency against either server. A corpus is one request per
 line, `PATH<TAB>BODY`. The standard corpora come from `tools/corpus/generate.ts` (see
 `bench/corpora/manifest.json` for what each one holds and which dataset it needs):
