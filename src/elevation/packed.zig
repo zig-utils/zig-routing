@@ -510,12 +510,14 @@ pub const Sampler = struct {
     pub fn sample(self: *Sampler, p: hgt.GridPosition) f64 {
         const posts = &self.posts.?;
         if (posts.entry.kind == .constant) return hgt.interpolateWith(ConstantPosts{ .value = posts.entry.constant }, p.u, p.v);
+        posts.checkLastBlock();
         return hgt.interpolateWith(posts, p.u, p.v);
     }
 
     pub fn sampleBatch(self: *Sampler, points: *const [hgt.batch_width]hgt.GridPosition) [hgt.batch_width]f64 {
         const posts = &self.posts.?;
         if (posts.entry.kind == .constant) return hgt.interpolateBatch(ConstantPosts{ .value = posts.entry.constant }, points);
+        posts.checkLastBlock();
         return hgt.interpolateBatch(posts, points);
     }
 
@@ -551,6 +553,15 @@ const TilePosts = struct {
     last_block: usize = std.math.maxInt(usize),
     last_posts: *const [block_dim * block_dim]i16 = undefined,
     last_constant: ?i16 = null,
+    last_slot_key: ?*const u64 = null,
+    last_key: u64 = 0,
+
+    fn checkLastBlock(self: *TilePosts) void {
+        // Another sampler on this thread can replace the cached block between calls.
+        if (self.last_slot_key) |key| {
+            if (key.* != self.last_key) self.last_block = std.math.maxInt(usize);
+        }
+    }
 
     pub fn sample(self: *TilePosts, i: usize) i16 {
         const r = i / tile_dim;
@@ -562,32 +573,60 @@ const TilePosts = struct {
             const b = &self.pack.blocks[self.entry.first_block + block];
             self.last_block = block;
             self.last_constant = if (b.kind == .constant) b.constant else null;
-            if (b.kind != .constant) self.last_posts = cache.posts(self.pack, self.entry, br, bc, b);
+            self.last_slot_key = null;
+            if (b.kind != .constant) {
+                const slot = cache.posts(self.pack, self.entry, br, bc, b);
+                self.last_posts = slot.posts;
+                self.last_slot_key = slot.key;
+                self.last_key = slot.key.*;
+            }
         }
         if (self.last_constant) |value| return value;
         return self.last_posts[(r % block_dim) * blockSize(bc) + col % block_dim];
     }
 };
 
-/// Direct-mapped cache of decoded blocks, one per thread: 256 blocks, 2 MiB.
+/// Two-way cache of decoded blocks, one per thread: 256 blocks, 2 MiB of posts.
+/// Replace the way least recently looked up in its set.
 const Cache = struct {
-    const ways = 256;
-    keys: [ways]u64 = @splat(0),
-    data: [ways][block_dim * block_dim]i16 = undefined,
+    const sets = 128;
+    const ways = 2;
+    keys: [sets][ways]u64 = @splat(@splat(0)),
+    replace: [sets]u1 = @splat(0),
+    data: [sets][ways][block_dim * block_dim]i16 = undefined,
 
-    fn posts(self: *Cache, pack: *const Pack, e: *const TileEntry, br: usize, bc: usize, b: *const BlockEntry) *const [block_dim * block_dim]i16 {
+    const Slot = struct {
+        key: *const u64,
+        posts: *const [block_dim * block_dim]i16,
+    };
+
+    fn blockKey(pack: *const Pack, tile: u32, block: usize) u64 {
         // Key: pack id, tile and block; never 0 because the id starts at 1.
-        const key = (@as(u64, pack.id) << 44) | (@as(u64, e.tile) << 12) | (br * blocks_per_side + bc);
-        const slot = std.hash.int(key) % ways;
-        if (self.keys[slot] != key) {
-            // The directory was validated at open; the payload was CRC-checked
-            // by `zr dem verify`. A block that still fails to decode reads as
-            // no data rather than garbage.
-            decodeBlock(b.kind, pack.blockPayload(b), blockSize(bc), blockSize(br), &self.data[slot]) catch
-                @memset(&self.data[slot], std.math.minInt(i16));
-            self.keys[slot] = key;
+        return (@as(u64, pack.id) << 44) | (@as(u64, tile) << 12) | block;
+    }
+
+    fn posts(self: *Cache, pack: *const Pack, e: *const TileEntry, br: usize, bc: usize, b: *const BlockEntry) Slot {
+        const key = blockKey(pack, e.tile, br * blocks_per_side + bc);
+        const set = std.hash.int(key) % sets;
+        const keys = &self.keys[set];
+        if (keys[0] == key) {
+            self.replace[set] = 1;
+            return .{ .key = &keys[0], .posts = &self.data[set][0] };
         }
-        return &self.data[slot];
+        if (keys[1] == key) {
+            self.replace[set] = 0;
+            return .{ .key = &keys[1], .posts = &self.data[set][1] };
+        }
+
+        const way = self.replace[set];
+        const decoded = &self.data[set][way];
+        // The directory was validated at open; the payload was CRC-checked
+        // by `zr dem verify`. A block that still fails to decode reads as no data.
+        decodeBlock(b.kind, pack.blockPayload(b), blockSize(bc), blockSize(br), decoded) catch
+            @memset(decoded, std.math.minInt(i16));
+        keys[way] = key;
+        self.replace[set] = way ^ 1;
+        return .{ .key = &keys[way], .posts = decoded };
     }
 };
 
@@ -742,6 +781,33 @@ test "a pack samples bit-identically to its source tiles on 10^6 points" {
     }
     try testing.expectEqual(hgt.get(&tiles, pts[5]), pack.get(pts[5]));
     try testing.expectEqual(hgt.no_data_value, pack.get(.{ .lng = 20.5, .lat = 10.5 }));
+
+    // Two samplers on one thread share the cache. Evict the first sampler's
+    // last block, then sample it again without changing its selected tile.
+    const tile = indices[2];
+    const entry = pack.entry(tile).?;
+    const origin: hgt.GridPosition = .{ .tile = tile, .u = 12.25, .v = 12.25 };
+    var first: Sampler = .{ .pack = &pack };
+    var other: Sampler = .{ .pack = &pack };
+    try testing.expect(first.select(tile));
+    try testing.expect(other.select(tile));
+    const expected = first.sample(origin);
+    const set = std.hash.int(Cache.blockKey(&pack, tile, 0)) % Cache.sets;
+    var replacements: usize = 0;
+    for (1..blocks_per_tile) |block| {
+        if (std.hash.int(Cache.blockKey(&pack, tile, block)) % Cache.sets != set or
+            pack.blocks[entry.first_block + block].kind == .constant) continue;
+        _ = other.sample(.{
+            .tile = tile,
+            .u = @floatFromInt((block % blocks_per_side) * block_dim + 12),
+            .v = @floatFromInt((block / blocks_per_side) * block_dim + 12),
+        });
+        replacements += 1;
+        if (replacements == Cache.ways) break;
+    }
+    try testing.expectEqual(Cache.ways, replacements);
+    try testing.expect(first.posts.?.last_slot_key.?.* != first.posts.?.last_key);
+    try testing.expectEqual(expected, first.sampleBatch(&@as([hgt.batch_width]hgt.GridPosition, @splat(origin)))[0]);
 }
 
 test "a damaged pack is rejected at open" {
