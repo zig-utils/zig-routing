@@ -590,7 +590,8 @@ pub fn run(gpa: Allocator, opts: Options, corpus: *const Corpus) !Result {
 
     var result: Result = undefined;
     result.reset(threads);
-    var client_counters: ?perf.Counts = if (opts.measure_counters and (opts.requests orelse 1) != 0) .{} else null;
+    var counters_complete = opts.measure_counters and (opts.requests orelse 1) != 0;
+    var client_counters: ?perf.Counts = null;
     var last_done: u64 = 0;
     for (workers) |*w| {
         if (w.err) |e| return e;
@@ -601,18 +602,16 @@ pub fn run(gpa: Allocator, opts: Options, corpus: *const Corpus) !Result {
         result.unsent += w.result.unsent;
         result.bytes_in += w.result.bytes_in;
         last_done = @max(last_done, w.last_done_ns);
-        if (w.quota != 0) {
-            if (client_counters) |*total| {
-                if (w.result.client_counters) |counts| {
-                    total.add(counts);
-                } else {
-                    // Partial worker totals would understate work per request.
-                    client_counters = null;
-                }
+        if (counters_complete and w.quota != 0) {
+            if (w.result.client_counters) |counts| {
+                if (client_counters) |*total| total.add(counts) else client_counters = counts;
+            } else {
+                // Partial worker totals would understate work per request.
+                counters_complete = false;
             }
         }
     }
-    result.client_counters = client_counters;
+    result.client_counters = if (counters_complete) client_counters else null;
     result.window_ns = last_done -| clock.warm_end_ns;
     return result;
 }
@@ -678,7 +677,7 @@ pub fn writeResult(gpa: Allocator, out: *std.ArrayList(u8), meta: Meta, opts: Op
         try w.key("client_hardware_counters");
         if (r.client_counters) |counts| {
             try w.beginObject();
-            const fields = .{ "cycles", "instructions", "cache_misses", "branch_misses" };
+            const fields = .{ "cycles", "instructions", "cache_misses", "branch_misses", "l1_data_load_misses" };
             inline for (fields) |field| try w.field(field, @field(counts, field));
             if (counts.perUnit(r.hist.total)) |per_request| {
                 try w.beginObjectField("per_request");
@@ -875,6 +874,8 @@ pub fn runCommand(gpa: Allocator, opts: Options, meta: Meta, endpoint: []const u
                 try out.print(arena, "client per completed request: {d:.1} cycles, {d:.1} instructions, {d:.1} cache misses, {d:.1} branch misses\n", .{
                     per.cycles, per.instructions, per.cache_misses, per.branch_misses,
                 });
+                if (per.l1_data_load_misses) |misses|
+                    try out.print(arena, "client per completed request: {d:.1} L1 data load misses\n", .{misses});
             }
         } else {
             try out.appendSlice(arena, "client hardware counters unavailable\n");
@@ -1028,12 +1029,13 @@ test "closed loop drives a server and counts statuses" {
     try writeResult(arena_state.allocator(), &out, meta, opts, &corpus, result);
     try testing.expect(std.mem.indexOf(u8, out.items, "\"client_hardware_counters\":null") != null);
 
-    result.client_counters = .{ .instructions = 12_000, .cache_misses = 1_500 };
+    result.client_counters = .{ .instructions = 12_000, .cache_misses = 1_500, .l1_data_load_misses = 600 };
     out.clearRetainingCapacity();
     try writeResult(arena_state.allocator(), &out, meta, opts, &corpus, result);
     const measured = try json.parse(arena_state.allocator(), out.items);
     try testing.expectEqual(12_000, json.get(i64, measured, "/client_hardware_counters/instructions", -1));
     try testing.expectEqual(5, json.get(f64, measured, "/client_hardware_counters/per_request/cache_misses", -1));
+    try testing.expectEqual(2, json.get(f64, measured, "/client_hardware_counters/per_request/l1_data_load_misses", -1));
 }
 
 test "open loop holds the requested rate" {

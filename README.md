@@ -109,6 +109,7 @@ In a build configuration, `zig_routing.build` accepts `inputs`, `dem_dir`,
 
 `zr bench --counters` records cycles, instructions, cache misses and branch misses for the Linux
 load-generator threads after warm-up. Its JSON includes totals and counts per completed request.
+On PMUs that expose the L1 data load miss event, `l1_data_load_misses` reports it separately.
 When counters are unavailable, latency and throughput are still reported and
 `client_hardware_counters` is `null`. `zig build bench-lz4` reports the same counters per
 checksummed decompression iteration when the hardware supports them.

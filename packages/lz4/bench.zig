@@ -80,6 +80,8 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("checksummed decompression per iteration: {d:.1} cycles, {d:.1} instructions, {d:.1} cache misses, {d:.1} branch misses\n", .{
             per.cycles, per.instructions, per.cache_misses, per.branch_misses,
         });
+        if (per.l1_data_load_misses) |misses|
+            std.debug.print("checksummed decompression per iteration: {d:.1} L1 data load misses\n", .{misses});
     }
 
     if (args.len > 1) {
