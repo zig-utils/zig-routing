@@ -10,6 +10,7 @@ P0.03 | Read-only inventory of the production routing box (Valhalla version, con
 P0.04 | Docker Valhalla oracle: pinned 3.9.3 image, test extracts and a pruning check | infra | infra | M | P0.01
 P0.13 | Build the Germany and US+DACH Valhalla oracle datasets | infra | infra | M | P0.03 P0.04
 P0.05 | Request corpora: upstream test_requests, de_benchmark_routes and a production-shaped corpus | cli | test | M | P0.04 P0.13
+P0.05a | Replay the full upstream request archive on a planet oracle | cli | test | L | P0.04 P0.13 | needs-human
 P0.06 | zr bench: load generator with latency histograms and machine-readable results | cli | new | M | P0.01
 P0.07 | zr diff: replay a corpus against two servers and score parity | cli | new | M | P0.06
 P0.08 | Baseline scoreboard: Valhalla 3.9.3 on the bench box, committed as docs/SCOREBOARD.md | infra | perf | M | P0.04 P0.05 P0.06 P0.13
