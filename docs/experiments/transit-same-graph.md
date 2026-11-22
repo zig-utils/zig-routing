@@ -141,7 +141,7 @@ its walking limit.
 ```sh
 python3 oracle/transit-same-graph.py prepare-audit TILES native.jsonl paths.jsonl
 ./transit-itinerary-reference CONFIG.json corpus.tsv --audit paths.jsonl > audit.jsonl
-python3 oracle/transit-same-graph.py score-audit audit.jsonl native.jsonl paths.jsonl audit-report.json
+python3 oracle/transit-same-graph.py score-audit audit.jsonl native.jsonl paths.jsonl audit-report.json --require-verified-cost
 ```
 
 | Brockton metric | Requests |
@@ -152,6 +152,11 @@ python3 oracle/transit-same-graph.py score-audit audit.jsonl native.jsonl paths.
 | Native path cheaper under pinned costing | 66 |
 | Native path within 0.01 cost units of stock | 34 |
 | Stock path cheaper under pinned costing | 0 |
+
+The cost check requires a complete pinned audit for every path pair. It fails if a path
+cannot be audited, the native path differs from the audit input, or the native cost exceeds
+the stock path cost by more than 0.01. Stock itinerary and exact boarding matches remain in the
+report.
 
 Eleven of the 66 cheaper paths fit within 2,415 m using their final cut
 and exceed the limit when the whole destination edge is counted.

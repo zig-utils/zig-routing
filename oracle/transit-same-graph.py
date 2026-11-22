@@ -326,6 +326,15 @@ def score_audit(args):
             totals["stock_itinerary_matches"] += display_match
             totals["exact_boarding_matches"] += exact_match
             audits = stock["stock_audit"], stock["native_audit"]
+            if args.require_verified_cost:
+                fields = ("cost", "elapsed", "trip", "board_time", "begin", "end")
+                native_path = [tuple(step.get(field) for field in fields) for step in result["steps"]]
+                audited_path = [tuple(step.get(field) for field in fields) for step in raw["steps"]]
+                if not native_path or native_path != audited_path:
+                    raise ValueError(f"Native path does not match audit input in case {index}")
+                for audit, expected in zip(audits, (stock["steps"], raw["steps"])):
+                    if "cost" in audit and (len(audit["steps"]) != len(expected) or not math.isfinite(audit["cost"])):
+                        raise ValueError(f"Incomplete pinned cost in case {index}")
             entry = {"index": index, "stock_itinerary_match": display_match, "exact_boarding_match": exact_match}
             for name, audit, original in zip(("stock", "native"), audits, (stock, result)):
                 entry[name] = {k: v for k, v in audit.items() if k != "steps"}
@@ -361,6 +370,9 @@ def score_audit(args):
     args.output.write_text(json.dumps({"totals": totals, "cases": details}, indent=2, sort_keys=True) + "\n",
                            encoding="utf-8")
     print(json.dumps(totals, sort_keys=True))
+    if args.require_verified_cost and (totals["diagnosed_blocked_pairs"] or totals["native_miss"]):
+        raise SystemExit(f"Pinned cost comparison failed for {totals['diagnosed_blocked_pairs']} blocked pairs "
+                         f"and {totals['native_miss']} higher-cost native paths")
 
 
 def check_fixture(args):
@@ -415,6 +427,8 @@ def main():
     audit_report.add_argument("paths", type=Path)
     audit_report.add_argument("output", type=Path)
     audit_report.add_argument("--minimum", type=int, default=100)
+    audit_report.add_argument("--require-verified-cost", action="store_true",
+                              help="require legal paths with pinned costs and native cost within 0.01 of stock or lower")
     check = commands.add_parser("check-fixture")
     check.add_argument("reference", type=Path)
     check.add_argument("native", type=Path)
