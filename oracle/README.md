@@ -716,6 +716,30 @@ final source node. It retains up to 32 arcs at each node. Higher-degree junction
 linked by zero-length arcs, with slots reserved at both ends of each link. The class table marks
 these arcs explicitly. All real segments use Valhalla's minimum stored length of one metre.
 
+### Germany build reproducibility
+
+The January 1, 2026 Germany extract and its 107 pinned SRTM tiles produced the same
+26 section SHA-256 hashes on macOS ARM64 with ten workers and Linux x86-64 with eight
+workers. Both ReleaseFast builds verified 23,098,100 nodes and 58,764,002 directed edges
+with dataset UUID `5824147f09d28d8f8c9cf34cf92feb6e` and Hilbert ordering hash
+`299c120d94338f39`. The builder source was identical at `68e78f7` and `ccbde15`,
+and both hosts used Zig `0.17.0-dev.1857+3c46da14d`.
+[Linux section hashes](https://github.com/zig-utils/zig-routing/issues/109#issuecomment-7083762215) ·
+[macOS section hashes](https://github.com/zig-utils/zig-routing/issues/109#issuecomment-7083897830)
+
+```bash
+oracle/fetch.sh germany
+zig build -Doptimize=ReleaseFast
+work=$(mktemp -d)
+zig-out/bin/zr build oracle/data/germany/extract.osm.pbf --dem oracle/data/germany/elevation \
+  --output "$work/bundle" --work-dir "$work/stages" --threads 8
+zig-out/bin/zr inspect --verify "$work/bundle"
+(cd "$work/bundle" && shasum -a 256 *.bin | LC_ALL=C sort -k2 | shasum -a 256)
+```
+
+The sorted hash list has SHA-256
+`5de17039bb10e65fbc70dfe0e1d374ab95c6dbb798435a1be2735545df529ee6`.
+
 ### Turn tables
 
 Each node's `turn_off` selects a dense matrix in `turns.bin`. The incoming row uses the
