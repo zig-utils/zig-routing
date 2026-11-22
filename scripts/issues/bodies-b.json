@@ -750,6 +750,22 @@
     ]
   },
   {
+    "key": "P3.36a",
+    "goal": "Bring native edge-based Dijkstra on the pinned Germany bundle under the E1 budget of 150 ns per settled label for both kernels.",
+    "scope": [
+      "Profile hot edge and label records, paged status, turn table lookups and queue on the pinned Germany workload.",
+      "Improve the measured bottleneck in the search core while preserving exact costs, label counts, path choices and request memory behavior.",
+      "Record paired before and after timings and hardware counters on the same host, graph and ten source nodes."
+    ],
+    "out_of_scope": ["The matched Valhalla throughput comparison remains part of P3.36."],
+    "notes": ["The median native E1 trials measured 252.181 ns per pedestrian label and 238.141 ns per stub-motor label."],
+    "accept": [
+      "A reproducible Germany profile identifies the cost.",
+      "Both kernels meet 150 ns per settled label.",
+      "Exact search tests and `zig build test` pass."
+    ]
+  },
+  {
     "key": "P3.37",
     "goal": "Tests that prove `/height` and `/route` allocate nothing from the heap once warm, locking in the per-request arena design.",
     "upstream": [],

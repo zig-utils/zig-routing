@@ -53,6 +53,22 @@
     ]
   },
   {
+    "key": "P4.02a",
+    "goal": "Choose a deterministic order within nested-dissection leaves that lowers the median adjacent node ID distance below the Hilbert baseline on Germany.",
+    "scope": [
+      "Refine the order within each leaf while preserving cell ranges and the ranks of separator nodes.",
+      "Compare median and tail adjacent ID distances on the same pinned Germany topology.",
+      "Keep the output deterministic across worker counts and preserve leaf size and balance bounds."
+    ],
+    "out_of_scope": ["Build renumbering, the cell table and cold-data chunking remain part of P4.02."],
+    "notes": ["The Hilbert and current nested-dissection ranks both measure a median adjacent ID distance of 2 on Germany."],
+    "accept": [
+      "The Germany median is below the Hilbert median of 2 and tail distances are recorded.",
+      "Tests verify the permutation, unchanged leaf membership and separator ranks, and determinism across worker counts.",
+      "`zig build test` passes."
+    ]
+  },
+  {
     "key": "P4.03",
     "goal": "The customizable contraction hierarchy topology for a bundle: the chordal supergraph produced by contracting nodes in id order, its elimination tree, and a versioned `cch.topo` section that every metric refers to.",
     "upstream": [],

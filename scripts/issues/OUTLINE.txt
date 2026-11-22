@@ -92,6 +92,7 @@ P3.34 | zr import-valhalla: test-only reader of Valhalla tiles into our format |
 P3.34a | Preserve complex turn and access restrictions in the Valhalla test importer | cli | port | L | P3.34 P5.09 P5.10 P5.20a
 P3.35 | Costing parity harness (gate A): per-call edge and transition cost against the oracle | costing | test | M | P3.27 P3.28 P0.04
 P3.36 | Experiment E1: label throughput of the search core on Germany | search | experiment | S | P3.29 P3.22 P0.12 P0.13
+P3.36a | Reduce native Dijkstra label cost on the Germany graph | search | perf | M | P3.29 P0.13
 P3.37 | Zero steady-state allocation tests for /height and /route | infra | perf | S | P3.33
 P3.38 | Fuzzing: PBF reader and graph format loader | infra | test | S | P3.02 P3.13
 P3.39 | Port the gurka suites that cover pedestrian and bicycle behaviour | infra | test | L | P3.33 P1.18 P3.22
@@ -101,7 +102,8 @@ P3.42 | Cut over /route for the consuming apps with Valhalla as fallback | infra
 
 ## P4 | P4 Acceleration and scale | Customised potentials, node ordering, lazy loading and planet-scale builds.
 P4.01 | Separator partitioner (inertial flow) and nested-dissection order | accel | new | L | P3.15 P0.13
-P4.02 | Make the nested-dissection order the graph id order, with cells as contiguous ranges | build | new | M | P4.01 P3.21
+P4.02 | Make the nested-dissection order the graph id order, with cells as contiguous ranges | build | new | M | P4.01 P3.21 P4.02a
+P4.02a | Improve adjacent node locality within nested-dissection leaves | accel | perf | M | P4.01
 P4.03 | CCH topology: contraction over the order, elimination tree, cch.topo section | accel | new | L | P4.02
 P4.04 | Metric customisation: lower-bound weights from compiled costing, parallel triangle relaxation | accel | new | L | P4.03 P3.25
 P4.05 | Metric keys and metric files: 128-bit key, u16 minifloat storage, mmap, versioning | accel | new | M | P4.04
