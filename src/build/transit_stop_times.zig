@@ -16,7 +16,6 @@ pub const Timing = struct {
 pub const Visit = struct {
     stop: StopId,
     timing: ?Timing,
-    headsign: ?gtfs.Text,
 };
 
 const Keys = struct {
@@ -74,7 +73,6 @@ pub fn visits(
     const stops = table.items(.stop_id);
     const arrivals = table.items(.arrival_time);
     const departures = table.items(.departure_time);
-    const headsigns = table.items(.stop_headsign);
     for (rows, out.items, 0..) |row, *visit, i| {
         if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
         if (row >= table.len) return error.InvalidTransitStopTimeRow;
@@ -85,7 +83,6 @@ pub fn visits(
         visit.* = .{
             .stop = id,
             .timing = if (arrival) |time| .{ .arrival = time.seconds, .departure = departure.?.seconds } else null,
-            .headsign = headsigns[row],
         };
     }
     if (out.items[0].timing == null or out.items[out.items.len - 1].timing == null) return error.UntimedTransitEndpoint;

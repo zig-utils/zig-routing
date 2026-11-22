@@ -138,6 +138,11 @@ const Builder = struct {
         }
         const pattern = try self.patternId(.{ .route = route, .shape = shape, .direction = trip.direction_id, .stops = self.pattern_stops.items });
         const first_departure = visits[0].timing.?.departure;
+        // Valhalla's stop pairs carry the trip's headsign.
+        const headsign: transit.Text = if (trip.trip_headsign) |text|
+            @fromBackingInt(@backingInt(try self.strings.intern(source.text(text))))
+        else
+            .none;
         for (visits[0 .. visits.len - 1], visits[1..], 0..) |origin, destination, leg| {
             if (self.deadline.expired()) return error.DeadlineExceeded;
             const from = ids.stops[origin.stop.value];
@@ -149,10 +154,6 @@ const Builder = struct {
             const line = try self.lineId(pattern, @intCast(leg), from, to, route, shape);
             const boarding = origin.timing.?.departure;
             const arrival = destination.timing.?.arrival;
-            const headsign = if (origin.headsign orelse trip.trip_headsign) |text|
-                @as(transit.Text, @fromBackingInt(@backingInt(try self.strings.intern(source.text(text)))))
-            else
-                .none;
             const scheduled: transit.Departure = .{
                 .line = line,
                 .route = route,

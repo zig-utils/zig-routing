@@ -244,6 +244,17 @@ walking approaches in each engine.
 | Valhalla 3.9.3 | 9,482.293 | 1,039.627 | 1 |
 | zig-routing | 9,482.293 | 1,039.627 | 2 |
 
+## Toronto scheduled routes
+
+The Gurka test ports the scheduled paths in Valhalla's `route_trip1` and `route_trip4`
+to fixed-date feeds. The native route action boards at 07:00, continues through the
+07:03 stop, and arrives at 07:06 on the first request. The second boards at 23:58
+and arrives at 00:02 the next day. The tests check ordered stops, trip headsigns,
+and leg lengths to the upstream one-metre tolerance. Native total elapsed time
+was 0.764 s lower on the first request and 0.720 s lower on the second than the
+upstream summary values. [Pinned Gurka scenarios][toronto]
+
 [streets]: https://download.geofabrik.de/north-america/us/massachusetts/massachusetts-261119.osm.pbf
 [feed]: https://data.trilliumtransit.com/gtfs/brockton-ma-us/brockton-ma-us.zip
 [gate]: https://github.com/zig-utils/zig-routing/issues/190
+[toronto]: https://github.com/valhalla/valhalla/blob/3.9.3/test/gurka/test_gtfs.cc#L996-L1103

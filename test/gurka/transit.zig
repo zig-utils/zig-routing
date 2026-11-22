@@ -7,6 +7,149 @@ const graph = routing.graph;
 const testing = std.testing;
 const feed = @embedFile("transit.zip");
 
+// Ported from test/gurka/test_gtfs.cc (Valhalla 3.9.3), route_trip1 and route_trip4.
+test "Toronto scheduled routes continue across stops and across midnight" {
+    var memory = std.heap.ArenaAllocator.init(testing.allocator);
+    defer memory.deinit();
+    const a = memory.allocator();
+    const parent = try io.Directory.open(".");
+    defer parent.close();
+    const scratch = try parent.temporaryChild();
+    defer parent.deleteDir(&scratch.name) catch {};
+    defer scratch.dir.close();
+    defer {
+        deleteBundle(scratch.dir, "bundle");
+        deleteWork(scratch.dir, "work");
+        for ([_][:0]const u8{ "street.osm.pbf", "toronto-1.zip", "toronto-2.zip", "zones.json" }) |name|
+            scratch.dir.deleteFile(name) catch {};
+    }
+
+    const layout = try gurka.mapToCoordinatesAt(
+        \\       a******************************b********d
+        \\       *                              *        *
+        \\A---B--1-------------C----------g--D--2---E    *
+        \\                                      *   |    *
+        \\                                      *   |    *
+        \\                                      *   |    *
+        \\                                      *   |    *
+        \\                                      *   4****e
+        \\                                      *   |
+        \\                                      c***3
+        \\                                          |
+        \\                                          F
+        \\                                          |
+        \\                                          h
+        \\                                          |
+        \\                                          G
+    , 1000, .{ .lng = -79.249, .lat = 43.749 });
+    const primary: gurka.Tags = &.{.{ .key = "highway", .value = "primary" }};
+    const map = try gurka.Map.init(a, layout, &.{
+        .{ .label = "AB", .tags = primary }, .{ .label = "BC", .tags = primary },
+        .{ .label = "CD", .tags = primary }, .{ .label = "DE", .tags = primary },
+        .{ .label = "EF", .tags = primary }, .{ .label = "FG", .tags = primary },
+    }, &.{}, &.{});
+    const street = try std.fs.path.join(a, &.{ &scratch.name, "street.osm.pbf" });
+    const first = try std.fs.path.join(a, &.{ &scratch.name, "toronto-1.zip" });
+    const second = try std.fs.path.join(a, &.{ &scratch.name, "toronto-2.zip" });
+    const zones = try std.fs.path.join(a, &.{ &scratch.name, "zones.json" });
+    const work = try std.fs.path.join(a, &.{ &scratch.name, "work" });
+    const bundle_path = try std.fs.path.join(a, &.{ &scratch.name, "bundle" });
+    try map.osm.writePbf(a, street);
+    try io.writeFile(first, @embedFile("transit-toronto-1.zip"));
+    try io.writeFile(second, @embedFile("transit-toronto-2.zip"));
+    try io.writeFile(zones,
+        \\{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"tzid":"America/Toronto"},"geometry":{"type":"Polygon","coordinates":[[[-80,43],[-78,43],[-78,45],[-80,45],[-80,43]]]}}]}
+    );
+    var diagnostic: build.driver.Diagnostic = .{};
+    const built = try build.driver.run(testing.allocator, .{
+        .inputs = &.{street},
+        .gtfs_inputs = &.{ first, second },
+        .timezone_geojson = zones,
+        .timezone_rules = "src/graph/timezones/iana-2026f.ztz",
+        .work_dir = work,
+        .output = bundle_path,
+        .workers = 1,
+    }, null, &diagnostic);
+    defer built.deinit(testing.allocator);
+    var bundle = try graph.reader.Bundle.openVerified(bundle_path, .none, null);
+    defer bundle.close();
+    var arena = routing.infra.arena.Arena.init(testing.allocator, .{});
+    defer arena.deinit();
+
+    const Case = struct {
+        origin: []const u8,
+        destination: []const u8,
+        request_time: []const u8,
+        departures: []const []const u8,
+        arrivals: []const []const u8,
+        stops: []const []const u8,
+        headsign: []const u8,
+        length_km: f32,
+    };
+    const cases = [_]Case{
+        .{
+            .origin = "A",
+            .destination = "G",
+            .request_time = "2023-02-27T05:50",
+            .departures = &.{ "2023-02-27T07:00-05:00", "2023-02-27T07:03-05:00", "" },
+            .arrivals = &.{ "", "2023-02-27T07:03-05:00", "2023-02-27T07:06-05:00" },
+            .stops = &.{ "FIRST STOP", "SECOND STOP", "THIRD STOP" },
+            .headsign = "hello",
+            .length_km = 41.036,
+        },
+        .{
+            .origin = "g",
+            .destination = "h",
+            .request_time = "2023-02-27T22:50",
+            .departures = &.{ "2023-02-27T23:58-05:00", "" },
+            .arrivals = &.{ "", "2023-02-28T00:02-05:00" },
+            .stops = &.{ "SECOND STOP", "FOURTH STOP" },
+            .headsign = "grüß gott!",
+            .length_km = 16.115,
+        },
+    };
+    for (cases) |case| {
+        arena.reset();
+        const from = layout.get(case.origin).?;
+        const to = layout.get(case.destination).?;
+        var locations = [_]routing.api.request.Location{
+            .{ .lat = from.lat, .lng = from.lng, .date_time = case.request_time },
+            .{ .lat = to.lat, .lng = to.lng, .original_index = 1 },
+        };
+        const options: routing.api.request.Options = .{
+            .action = .route,
+            .costing = .multimodal,
+            .locations = &locations,
+            .date_time_type = .depart_at,
+            .costing_options = try routing.api.json.parse(arena.allocator(),
+                \\{"pedestrian":{"transit_start_end_max_distance":20000}}
+            ),
+        };
+        const result = try routing.api.route_action.route(&bundle.view, &arena, &options, null, .{});
+        try testing.expectEqual(.scheduled, std.meta.activeTag(result));
+        const legs = try result.scheduled.trip(arena.allocator(), &bundle.view, &options, .{});
+        try testing.expectEqual(1, legs.len);
+        try testing.expectApproxEqAbs(case.length_km, legs[0].summary.?.length, 0.001);
+        var count: usize = 0;
+        for (legs[0].node) |node| {
+            const platform = node.transit_platform_info orelse continue;
+            if (platform.arrival_date_time.len == 0 and platform.departure_date_time.len == 0) continue;
+            try testing.expect(count < case.stops.len);
+            try testing.expectEqualStrings(case.stops[count], platform.name);
+            try testing.expectEqualStrings(case.arrivals[count], platform.arrival_date_time);
+            try testing.expectEqualStrings(case.departures[count], platform.departure_date_time);
+            count += 1;
+            if (node.edge) |edge| {
+                if (edge.travel_mode == .kTransit) {
+                    try testing.expectEqual(.kMetro, edge.transit_type);
+                    try testing.expectEqualStrings(case.headsign, edge.transit_route_info.?.headsign);
+                }
+            }
+        }
+        try testing.expectEqual(case.stops.len, count);
+    }
+}
+
 test "GTFS transit prepares a restartable graph with the same bytes across worker counts" {
     var memory: std.heap.ArenaAllocator = .init(testing.allocator);
     defer memory.deinit();
@@ -92,7 +235,7 @@ test "GTFS transit prepares a restartable graph with the same bytes across worke
     const frequency = (try transit.nextDeparture(0, 9 * 3600 + 5)).?;
     try testing.expectEqual(9 * 3600 + 1800, frequency.time);
     try testing.expect(frequency.departure.flags.bicycle);
-    try testing.expectEqualStrings("Express", (try transit.text(frequency.departure.headsign)).?);
+    try testing.expectEqualStrings("Northbound", (try transit.text(frequency.departure.headsign)).?);
     try testing.expect(try transit.scheduleActive(fixed.departure.schedule, transit.metadata.start_day + 64, .friday));
     try testing.expect(!try transit.scheduleActive(fixed.departure.schedule, transit.metadata.start_day + 68, .tuesday));
     try testing.expectEqual(2, transit.transfers.len);
