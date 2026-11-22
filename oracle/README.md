@@ -1082,6 +1082,15 @@ for Liechtenstein, Utrecht, and US+DACH. Set `ORACLE_DATA` if the data lives out
 with the host otherwise idle.
 
 ```bash
+oracle/fetch.sh us-dach
+python3 oracle/baseline-build.py us-dach bench/results/baseline/build.json
+```
+
+Run the build measurement with freshly fetched inputs. It invokes the same tile builder,
+records its wall time, and samples intermediate tile files and filesystem usage every
+five seconds. The build log is saved alongside the JSON report.
+
+```bash
 bun tools/corpus/generate.ts
 zig build -Doptimize=ReleaseFast
 oracle/baseline.sh liechtenstein bench/results/baseline/liechtenstein
