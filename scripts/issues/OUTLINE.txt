@@ -223,6 +223,7 @@ P9.05 | Multimodal search: port of multimodal_astar and multimodal_transit | sea
 P9.05a | Import Valhalla transit tiles for same-graph itinerary parity | cli | test | L | P3.34a P9.03 P9.04
 P9.05b | Keep exact transit routing within the request arena | search | perf | M | P9.05a
 P9.05c | Validate exact transit itinerary differences with Valhalla costing | search | test | M | P9.05a P9.05b
+P9.05d | Drive-to-parking routing with auto_pedestrian costing | search | port | L | P3.27 P5.11 P6.13 P7.12
 P9.06 | Transit narrative and transit info in serializers | narrative | port | M | P9.05 P6.12
 P9.07 | Bike share: stations, costing and the bike-share matrix | costing | port | M | P3.28 P7.03
 P9.08 | /transit_available | api | port | S | P9.03

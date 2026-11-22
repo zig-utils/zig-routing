@@ -108,13 +108,13 @@
       "Route action dispatch: multimodal and transit costing select this search",
       "Trip-leg output with transit route info for the narrative"
     ],
-    "out_of_scope": ["Transit instructions text (P9.06)", "Bike share mode (P9.07)"],
+    "out_of_scope": ["Transit instructions text (P9.06)", "Bike share mode (P9.07)", "Drive-to-parking routing (P9.05d)"],
     "notes": [
       "Reuses the search core's arena, paged status arrays and cancellation checks",
       "See docs/upstream/valhalla-architecture.md section 4 for MMEdgeLabel fields"
     ],
     "accept": [
-      "Upstream multimodal unit and gurka scenarios ported and green",
+      "Upstream scheduled transit unit and gurka scenarios ported and green",
       "Itinerary equality (lines, stops, departure times) with the oracle on at least 95% of a transit corpus",
       "No allocation after warm-up; deadline honoured within 5 ms",
       "zig build test green"
@@ -178,6 +178,29 @@
       "The report records the stock match rate, verified cheaper routes and ties, and native misses",
       "At least one real case and the overtaking fixture explain a stock search decision",
       "Native regressions and the oracle replay pass"
+    ]
+  },
+  {
+    "key": "P9.05d",
+    "goal": "Route with auto_pedestrian costing from the driving origin through a legal parking node to the pedestrian destination.",
+    "upstream": [
+      "src/thor/multimodal_astar.cc",
+      "src/thor/route_action.cc",
+      "test/multimodal_astar.cc (UtrechtMultiModalAStar)",
+      "test/gurka/test_multimodal_astar.cc"
+    ],
+    "scope": [
+      "Dispatch auto_pedestrian on /route. Use the auto and pedestrian costing options and correlate each endpoint for its travel mode",
+      "Allow the driving-to-walking transition at parking nodes and preserve the travel mode through trip building",
+      "Choose the minimum-cost legal path across all admissible parking nodes and emit the park vehicle maneuver",
+      "Port the pinned drive-to-parking route and locate tests"
+    ],
+    "out_of_scope": ["Scheduled transit (P9.05)", "Bike share (P9.07)"],
+    "accept": [
+      "The pinned simple, optimal parking, trivial route, locate and Utrecht scenarios are green",
+      "On a shared graph, parking selection, mode changes and route errors agree with the pinned oracle on those cases",
+      "The search checks cancellation and makes zero backing allocator calls after warm-up",
+      "zig build test green"
     ]
   },
   {
