@@ -101,16 +101,25 @@ Residuals are coded in groups of 16 posts (the last group may be shorter):
 A width of 0 means all 16 residuals are zero (a run that matches the prediction exactly).
 
 A full group takes exactly `2 * width` bytes, so every group starts on a byte boundary. The decoder
-relies on this to unpack each group with one vector shuffle instead of a serial bit reader; a
-format change that breaks it needs a new decoder.
+relies on this to unpack each group with one vector shuffle instead of a serial bit reader, and
+the sampler relies on it to find any group's first byte from the widths alone (below); a format
+change that breaks it needs a new decoder.
 
 ## Reading
 
 `Pack.open` maps the file, checks the magic, version, offsets and directory hash, and checks
 that every slot, entry and block reference stays inside the file, so the sampling path never
 bounds-checks again. A sample finds its tile through the slot table, its block through the
-tile's entry, and reads posts from a per-thread direct-mapped cache of 256 decoded blocks
-(2 MiB per thread). Interpolation is `hgt.interpolateWith`, the same code as the tile reader.
+tile's entry, and reads posts from a per-thread two-way cache of 256 blocks (2 MiB of posts per
+thread). Interpolation is `hgt.interpolateWith`, the same code as the tile reader.
+
+A cached block is decoded lazily, because a trail reads only a few of a block's posts and a post
+depends only on the posts above and to the left of it. The first sample checks that the payload
+holds every bit its widths call for (exactly the condition under which a whole-block decode
+succeeds; a block that fails reads as all no data, as before). Posts are then rebuilt as far
+down and across as samples have reached: row 0, then strips of eight rows, and in a 64-wide block
+16 columns at a time before the rest of the strip. On the US+DACH /height corpus that decodes
+about half of each block's posts.
 
 ## Measurements
 

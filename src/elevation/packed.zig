@@ -185,13 +185,32 @@ pub const DecodeError = error{CorruptBlock};
 
 /// Decodes a payload written by `encodeBlock(p, ...)` into `posts` (w x h):
 /// first the residuals (`unpackResiduals`), then the posts in wavefronts of
-/// eight rows (`rebuildWavefront`). Exactly the posts and errors of
+/// eight rows (`rebuildRows`). Exactly the posts and errors of
 /// `decodeBlockScalar`, in less time (measurements on issue #42).
 pub fn decodeBlockWith(comptime p: Predictor, payload: []const u8, w: usize, h: usize, posts: []i16) DecodeError!void {
     std.debug.assert(posts.len >= w * h);
     var residuals: [block_dim * block_dim]i16 = undefined;
     try unpackResiduals(payload, w * h, &residuals);
-    rebuildWavefront(p, &residuals, w, h, posts);
+    rebuildRows(p, &residuals, w, h, posts);
+}
+
+/// Whether a payload holds every bit its widths call for: exactly when
+/// `decodeBlockScalar` succeeds (it fails only by running out of bits), so a
+/// lazy decode can check once and then never fail part way. Also writes each
+/// group's first byte to `offsets` when given (meaningful only while every
+/// earlier group is full, which holds in blocks a whole number of groups wide).
+pub fn payloadFits(payload: []const u8, n: usize, offsets: ?*[block_dim * block_dim / group]u16) bool {
+    const groups = (n + group - 1) / group;
+    const widths_len = (groups + 1) / 2;
+    if (payload.len < widths_len) return false;
+    var bits: usize = 0;
+    for (0..groups) |g| {
+        if (offsets) |o| o[g] = @truncate(widths_len + bits / 8);
+        const nibble: u4 = @truncate(payload[g / 2] >> @intCast((g % 2) * 4));
+        const width: usize = if (nibble == 15) 16 else nibble;
+        bits += width * (@min(n, (g + 1) * group) - g * group);
+    }
+    return bits <= 8 * (payload.len - widths_len);
 }
 
 /// Bytes the vector path may read from the start of a group: the last code
@@ -237,9 +256,17 @@ fn unpackResiduals(payload: []const u8, n: usize, residuals: *[block_dim * block
     const groups = (n + group - 1) / group;
     const widths_len = (groups + 1) / 2;
     if (payload.len < widths_len) return error.CorruptBlock;
-    var pos = widths_len;
-    var g: usize = 0;
-    while (g < groups and pos + group_slack <= payload.len) : (g += 1) {
+    _ = try unpackGroups(payload, n, residuals, 0, groups, widths_len);
+}
+
+/// Groups [g_from, g_to) of a payload whose widths are already in bounds,
+/// starting at byte `pos` (group g_from's first byte). Returns the first byte
+/// of group g_to, so a later call can resume there: every group but the last
+/// is a whole number of bytes.
+fn unpackGroups(payload: []const u8, n: usize, residuals: *[block_dim * block_dim]i16, g_from: usize, g_to: usize, pos_from: usize) DecodeError!usize {
+    var pos = pos_from;
+    var g = g_from;
+    while (g < g_to and pos + group_slack <= payload.len) : (g += 1) {
         const nibble: u4 = @truncate(payload[g / 2] >> @intCast((g % 2) * 4));
         const dst = residuals[g * group ..][0..group];
         const src = payload[pos..][0..group_slack];
@@ -254,7 +281,7 @@ fn unpackResiduals(payload: []const u8, n: usize, residuals: *[block_dim * block
     var acc: u64 = 0;
     var bits: u7 = 0;
     var i = g * group;
-    while (g < groups) : (g += 1) {
+    while (g < g_to) : (g += 1) {
         const nibble: u4 = @truncate(payload[g / 2] >> @intCast((g % 2) * 4));
         const width: u5 = if (nibble == 15) 16 else nibble;
         const hi = @min(n, (g + 1) * group);
@@ -278,9 +305,11 @@ fn unpackResiduals(payload: []const u8, n: usize, residuals: *[block_dim * block
             bits -= width;
         }
     }
+    // Whole bytes still in the accumulator belong to group g_to.
+    return pos - bits / 8;
 }
 
-/// Rows rebuilt together by `rebuildWavefront`: i16 x 8 fills one 128-bit
+/// Rows rebuilt together by `rebuildStrip`: i16 x 8 fills one 128-bit
 /// register (4 and 16 measured slower).
 const wave_rows = 8;
 
@@ -297,65 +326,105 @@ inline fn predictVec(comptime p: Predictor, comptime V: type, west: V, north: V,
     };
 }
 
-/// Stage 2 of a decode: the posts from their residuals. Row by row, each
-/// post waits on its west neighbour. Instead a strip of `wave_rows` rows runs
-/// as a wavefront: at step t, lane k rebuilds post (r0 + k, t - k), so its
-/// west is its own lane at step t - 1, its north is lane k - 1 at step t - 1
-/// (the row above for lane 0) and its north-west is lane k - 1 at step t - 2.
-/// Same predictions in the same wrapping arithmetic, so the same posts.
-fn rebuildWavefront(comptime p: Predictor, residuals: *const [block_dim * block_dim]i16, w: usize, h: usize, posts: []i16) void {
+/// Stage 2 of a decode: the posts from their residuals, row 0 and then one
+/// `rebuildStrip` per strip of `wave_rows` rows.
+fn rebuildRows(comptime p: Predictor, residuals: *const [block_dim * block_dim]i16, w: usize, h: usize, posts: []i16) void {
+    rebuildFirstRow(residuals, 0, w, posts);
+    var r0: usize = 1;
+    while (r0 < h) : (r0 += wave_rows) rebuildStrip(p, residuals, w, r0, @min(wave_rows, h - r0), 0, w, posts);
+}
+
+/// Columns [c_from, c_to) of row 0, given columns [0, c_from) done.
+fn rebuildFirstRow(residuals: *const [block_dim * block_dim]i16, c_from: usize, c_to: usize, posts: []i16) void {
+    var col = c_from;
+    if (col == 0 and c_to > 0) {
+        posts[0] = residuals[0];
+        col = 1;
+    }
+    while (col < c_to) : (col += 1) posts[col] = residuals[col] +% posts[col - 1];
+}
+
+/// Row by row, each post waits on its west neighbour. Instead a strip of
+/// `wave_rows` rows runs as a wavefront: at step t, lane k rebuilds post
+/// (r0 + k, c_from + t - k), so its west is its own lane at step t - 1, its
+/// north is lane k - 1 at step t - 1 (the row above for lane 0) and its
+/// north-west is lane k - 1 at step t - 2. Same predictions in the same
+/// wrapping arithmetic, so the same posts.
+///
+/// Rebuilds columns [c_from, c_to) of rows [r0, r0 + rows), given columns
+/// [0, c_from) of those rows and [0, c_to) of row r0 - 1 done, so a block can
+/// be rebuilt in pieces. At column c_from a lane takes its west and
+/// north-west from the finished columns. `residuals` may be `posts` itself:
+/// each post is read as a residual just before it is written, and only
+/// finished posts are read as neighbours.
+fn rebuildStrip(comptime p: Predictor, residuals: *const [block_dim * block_dim]i16, w: usize, r0: usize, rows: usize, c_from: usize, c_to: usize, posts: []i16) void {
     const K = wave_rows;
     const V = @Vector(K, i16);
-    posts[0] = residuals[0];
-    for (1..w) |col| posts[col] = residuals[col] +% posts[col - 1];
-
+    const width = c_to - c_from;
+    if (width == 0) return;
     const lane: @Vector(K, i32) = std.simd.iota(i32, K);
-    var r0: usize = 1;
-    while (r0 < h) : (r0 += K) {
-        const rows = @min(K, h - r0);
-        const above = (r0 - 1) * w;
-        var prev: V = @splat(0);
-        var prev2: V = @splat(0);
-        const steps = w + rows - 1;
-        // A full strip at least K wide has steps K..w-1 with every lane live
-        // and past column 0: those run without edge checks.
-        const steady = rows == K and w >= K;
-        const steady_lo: usize = if (steady) K else steps;
-        const steady_hi: usize = if (steady) w else steps;
-        var t: usize = 0;
-        while (t < steps) : (t += 1) {
-            if (t == steady_lo) {
-                while (t < steady_hi) : (t += 1) {
-                    const north = std.simd.shiftElementsRight(prev, 1, posts[above + t]);
-                    const north_west = std.simd.shiftElementsRight(prev2, 1, posts[above + t - 1]);
-                    var r: V = undefined;
-                    inline for (0..K) |k| r[k] = residuals[(r0 + k) * w + (t - k)];
-                    const cur = r +% predictVec(p, V, prev, north, north_west);
-                    inline for (0..K) |k| posts[(r0 + k) * w + (t - k)] = cur[k];
-                    prev2 = prev;
-                    prev = cur;
-                }
-                if (t >= steps) break;
+    const above = (r0 - 1) * w;
+    // West and north-west of each lane's first post, when that is not column 0.
+    var west_in: V = @splat(0);
+    var north_west_in: V = @splat(0);
+    if (c_from > 0) {
+        inline for (0..K) |k| {
+            if (k < rows) {
+                west_in[k] = posts[(r0 + k) * w + c_from - 1];
+                north_west_in[k] = posts[(r0 + k - 1) * w + c_from - 1];
             }
-            // Ramp up and down: lanes outside the block stay dead, and a lane
-            // in column 0 predicts from its north neighbour alone.
-            const col: @Vector(K, i32) = @as(@Vector(K, i32), @splat(@intCast(t))) - lane;
-            const top: i16 = if (t < w) posts[above + t] else 0;
-            const top_west: i16 = if (t >= 1 and t - 1 < w) posts[above + t - 1] else 0;
-            const north = std.simd.shiftElementsRight(prev, 1, top);
-            const north_west = std.simd.shiftElementsRight(prev2, 1, top_west);
-            const pred = @select(i16, col == @as(@Vector(K, i32), @splat(0)), north, predictVec(p, V, prev, north, north_west));
-            var r: V = @splat(0);
-            inline for (0..K) |k| {
-                if (k < rows and t >= k and t - k < w) r[k] = residuals[(r0 + k) * w + (t - k)];
-            }
-            const cur = r +% pred;
-            inline for (0..K) |k| {
-                if (k < rows and t >= k and t - k < w) posts[(r0 + k) * w + (t - k)] = cur[k];
-            }
-            prev2 = prev;
-            prev = cur;
         }
+    }
+    var prev: V = @splat(0);
+    var prev2: V = @splat(0);
+    const steps = width + rows - 1;
+    // A full strip at least K wide has steps K..width-1 with every lane live
+    // and past its first column: those run without edge checks.
+    const steady = rows == K and width >= K;
+    const steady_lo: usize = if (steady) K else steps;
+    const steady_hi: usize = if (steady) width else steps;
+    var t: usize = 0;
+    while (t < steps) : (t += 1) {
+        if (t == steady_lo) {
+            while (t < steady_hi) : (t += 1) {
+                const c = c_from + t;
+                const north = std.simd.shiftElementsRight(prev, 1, posts[above + c]);
+                const north_west = std.simd.shiftElementsRight(prev2, 1, posts[above + c - 1]);
+                var r: V = undefined;
+                inline for (0..K) |k| r[k] = residuals[(r0 + k) * w + (c - k)];
+                const cur = r +% predictVec(p, V, prev, north, north_west);
+                inline for (0..K) |k| posts[(r0 + k) * w + (c - k)] = cur[k];
+                prev2 = prev;
+                prev = cur;
+            }
+            if (t >= steps) break;
+        }
+        // Ramp up and down: lanes outside the range stay dead, and a lane at
+        // its first column takes its west from the finished columns, or in
+        // column 0 predicts from its north neighbour alone.
+        const step: @Vector(K, i32) = @as(@Vector(K, i32), @splat(@intCast(t))) - lane;
+        const first = step == @as(@Vector(K, i32), @splat(0));
+        const c = c_from + t;
+        const top: i16 = if (t < width) posts[above + c] else 0;
+        const top_west: i16 = if (c >= 1 and t < width) posts[above + c - 1] else 0;
+        const north = std.simd.shiftElementsRight(prev, 1, top);
+        var north_west = std.simd.shiftElementsRight(prev2, 1, top_west);
+        const pred = if (c_from == 0)
+            @select(i16, first, north, predictVec(p, V, prev, north, north_west))
+        else blk: {
+            north_west = @select(i16, first, north_west_in, north_west);
+            break :blk predictVec(p, V, @select(i16, first, west_in, prev), north, north_west);
+        };
+        var r: V = @splat(0);
+        inline for (0..K) |k| {
+            if (k < rows and t >= k and t - k < width) r[k] = residuals[(r0 + k) * w + (c - k)];
+        }
+        const cur = r +% pred;
+        inline for (0..K) |k| {
+            if (k < rows and t >= k and t - k < width) posts[(r0 + k) * w + (c - k)] = cur[k];
+        }
+        prev2 = prev;
+        prev = cur;
     }
 }
 
@@ -727,7 +796,9 @@ const TilePosts = struct {
     pack: *const Pack,
     entry: *const TileEntry,
     last_block: usize = std.math.maxInt(usize),
-    last_posts: *const [block_dim * block_dim]i16 = undefined,
+    last_posts: *[block_dim * block_dim]i16 = undefined,
+    last_lazy: *LazyBlock = undefined,
+    last_entry: *const BlockEntry = undefined,
     last_constant: ?i16 = null,
     last_slot_key: ?*const u64 = null,
     last_key: u64 = 0,
@@ -753,27 +824,130 @@ const TilePosts = struct {
             if (b.kind != .constant) {
                 const slot = cache.posts(self.pack, self.entry, br, bc, b);
                 self.last_posts = slot.posts;
+                self.last_lazy = slot.lazy;
+                self.last_entry = b;
                 self.last_slot_key = slot.key;
                 self.last_key = slot.key.*;
             }
         }
         if (self.last_constant) |value| return value;
-        return self.last_posts[(r % block_dim) * blockSize(bc) + col % block_dim];
+        const row = r % block_dim;
+        const c = col % block_dim;
+        const w = blockSize(bc);
+        if (!self.last_lazy.done(row, c)) self.last_lazy.extend(self.last_entry.kind, self.pack.blockPayload(self.last_entry), w, blockSize(br), row, c, self.last_posts);
+        return self.last_posts[row * w + c];
     }
 };
 
-/// Two-way cache of decoded blocks, one per thread: 256 blocks, 2 MiB of posts.
+/// How far a cached block is decoded. A trail through a block reads a few
+/// of its posts, and a post needs only the posts above and to the left of it,
+/// so a block is rebuilt in pieces, as far down and across as samples have
+/// reached: on the us-dach /height corpus about half of its posts. Pieces
+/// are strips of `wave_rows` rows (row 0 alone first) and, in a block a
+/// whole number of groups wide, groups of 16 columns, whose residuals are
+/// unpacked by group offset. Residuals are unpacked into the posts buffer,
+/// just ahead of the posts rebuilt from them.
+pub const LazyBlock = struct {
+    const strips = 1 + (block_dim - 1 + wave_rows - 1) / wave_rows;
+    const max_groups = block_dim * block_dim / group;
+
+    /// Columns [0, cols[s]) of strip s are posts. Never fewer than the
+    /// strip below, so each strip's north row is done wherever it is read.
+    cols: [strips]u8 = @splat(0),
+    /// Blocks not a whole number of groups wide unpack in order: the next
+    /// group and its first byte.
+    group: u16 = 0,
+    pos: u16 = 0,
+    /// First byte of each group, for blocks a whole number of groups wide.
+    offsets: [max_groups]u16 = undefined,
+
+    pub inline fn strip(row: usize) usize {
+        return (row + wave_rows - 1) / wave_rows;
+    }
+
+    pub inline fn done(self: *const LazyBlock, row: usize, col: usize) bool {
+        return col < self.cols[strip(row)];
+    }
+
+    /// Starts a block, checking its payload once as `decodeBlockScalar`
+    /// would (it fails only by running out of bits), so the pieces never
+    /// fail; a block that would fail reads as all no data.
+    pub fn begin(self: *LazyBlock, kind: BlockKind, payload: []const u8, w: usize, h: usize, posts: *[block_dim * block_dim]i16) void {
+        const n = w * h;
+        self.cols = @splat(0);
+        self.group = 0;
+        self.pos = @intCast(((n + group - 1) / group + 1) / 2);
+        const ok = (kind == .med or kind == .plane) and
+            payloadFits(payload, n, if (w % group == 0) &self.offsets else null);
+        if (!ok) self.fail(w, h, posts);
+    }
+
+    fn fail(self: *LazyBlock, w: usize, h: usize, posts: *[block_dim * block_dim]i16) void {
+        @memset(posts[0 .. w * h], std.math.minInt(i16));
+        self.cols = @splat(@intCast(w));
+    }
+
+    /// Decodes on until post (row, col) is done. `begin` already checked
+    /// that every bit is present, so the pieces do not fail; the fallback to
+    /// no data is only a guard.
+    pub noinline fn extend(self: *LazyBlock, kind: BlockKind, payload: []const u8, w: usize, h: usize, row: usize, col: usize, posts: *[block_dim * block_dim]i16) void {
+        switch (kind) {
+            .plane => self.extendWith(.plane, payload, w, h, row, col, posts) catch self.fail(w, h, posts),
+            else => self.extendWith(.med, payload, w, h, row, col, posts) catch self.fail(w, h, posts),
+        }
+    }
+
+    fn extendWith(self: *LazyBlock, comptime p: Predictor, payload: []const u8, w: usize, h: usize, row: usize, col: usize, posts: *[block_dim * block_dim]i16) DecodeError!void {
+        const n = w * h;
+        const aligned = w % group == 0;
+        const per_row = w / group;
+        // Columns go 16 at a time once, then to the end: a trail crossing a
+        // block would otherwise rebuild each strip in four short pieces, which
+        // cost more than one whole strip (most of their steps are ramp).
+        const to = if (aligned and self.cols[strip(row)] == 0) @min(w, (col / group + 1) * group) else w;
+        for (0..strip(row) + 1) |s| {
+            const from: usize = self.cols[s];
+            if (from >= to) continue;
+            const r0 = if (s == 0) 0 else 1 + (s - 1) * wave_rows;
+            const r1 = if (s == 0) 1 else @min(h, r0 + wave_rows);
+            if (aligned and from == 0 and to == w) {
+                // Whole rows: one run of groups.
+                _ = try unpackGroups(payload, n, posts, r0 * per_row, r1 * per_row, self.offsets[r0 * per_row]);
+            } else if (aligned) {
+                // Each row's groups for the new columns, by offset.
+                for (r0..r1) |r| {
+                    const g = r * per_row + from / group;
+                    _ = try unpackGroups(payload, n, posts, g, r * per_row + to / group, self.offsets[g]);
+                }
+            } else {
+                // In order, so a group across two rows is unpacked once.
+                const g_to = (r1 * w + group - 1) / group;
+                if (g_to > self.group) {
+                    self.pos = @intCast(try unpackGroups(payload, n, posts, self.group, g_to, self.pos));
+                    self.group = @intCast(g_to);
+                }
+            }
+            if (s == 0) rebuildFirstRow(posts, from, to, posts) else rebuildStrip(p, posts, w, r0, r1 - r0, from, to, posts);
+            self.cols[s] = @intCast(to);
+        }
+    }
+};
+
+/// Two-way cache of lazily decoded blocks, one per thread: 256 blocks, 2 MiB
+/// of posts and about 130 KiB of `LazyBlock` state.
 /// Replace the way least recently looked up in its set.
 const Cache = struct {
     const sets = 128;
     const ways = 2;
     keys: [sets][ways]u64 = @splat(@splat(0)),
     replace: [sets]u1 = @splat(0),
+    lazy: [sets][ways]LazyBlock = undefined,
     data: [sets][ways][block_dim * block_dim]i16 = undefined,
 
     const Slot = struct {
         key: *const u64,
-        posts: *const [block_dim * block_dim]i16,
+        posts: *[block_dim * block_dim]i16,
+        lazy: *LazyBlock,
     };
 
     fn blockKey(pack: *const Pack, tile: u32, block: usize) u64 {
@@ -787,22 +961,20 @@ const Cache = struct {
         const keys = &self.keys[set];
         if (keys[0] == key) {
             self.replace[set] = 1;
-            return .{ .key = &keys[0], .posts = &self.data[set][0] };
+            return .{ .key = &keys[0], .posts = &self.data[set][0], .lazy = &self.lazy[set][0] };
         }
         if (keys[1] == key) {
             self.replace[set] = 0;
-            return .{ .key = &keys[1], .posts = &self.data[set][1] };
+            return .{ .key = &keys[1], .posts = &self.data[set][1], .lazy = &self.lazy[set][1] };
         }
 
         const way = self.replace[set];
-        const decoded = &self.data[set][way];
         // The directory was validated at open; the payload was CRC-checked
         // by `zr dem verify`. A block that still fails to decode reads as no data.
-        decodeBlock(b.kind, pack.blockPayload(b), blockSize(bc), blockSize(br), decoded) catch
-            @memset(decoded, std.math.minInt(i16));
+        self.lazy[set][way].begin(b.kind, pack.blockPayload(b), blockSize(bc), blockSize(br), &self.data[set][way]);
         keys[way] = key;
         self.replace[set] = way ^ 1;
-        return .{ .key = &keys[way], .posts = decoded };
+        return .{ .key = &keys[way], .posts = &self.data[set][way], .lazy = &self.lazy[set][way] };
     }
 };
 
@@ -857,7 +1029,46 @@ fn expectSameDecode(comptime p: Predictor, payload: []const u8, w: usize, h: usi
     const want_ok = if (decodeBlockScalar(p, payload, w, h, &want)) |_| true else |_| false;
     const got_ok = if (decodeBlockWith(p, payload, w, h, &got)) |_| true else |_| false;
     try testing.expectEqual(want_ok, got_ok);
+    try testing.expectEqual(want_ok, payloadFits(payload, w * h, null));
     if (want_ok) try testing.expectEqualSlices(i16, want[0 .. w * h], got[0 .. w * h]);
+    try expectSameLazyDecode(p, payload, w, h, if (want_ok) &want else null);
+}
+
+/// Decodes lazily, posts asked for in a scrambled (row, col) order, and
+/// requires every decoded post to match `want` (null: the block must read as
+/// no data). The whole block is checked each time a piece is decoded, so a
+/// later piece that disturbs an earlier one is caught.
+fn expectSameLazyDecode(comptime p: Predictor, payload: []const u8, w: usize, h: usize, want: ?*const [block_dim * block_dim]i16) !void {
+    const kind: BlockKind = if (p == .med) .med else .plane;
+    var posts: [block_dim * block_dim]i16 = undefined;
+    var lazy: LazyBlock = .{};
+    lazy.begin(kind, payload, w, h, &posts);
+    try expectLazyPosts(&lazy, &posts, w, h, want);
+    // A block that fails reads as no data from the start; nothing more to learn.
+    if (want == null) return;
+    var row: usize = (w * 7 + h * 3) % h;
+    var col: usize = (w * 3 + h * 5) % w;
+    for (0..h + w) |_| {
+        if (!lazy.done(row, col)) {
+            lazy.extend(kind, payload, w, h, row, col, &posts);
+            try expectLazyPosts(&lazy, &posts, w, h, want);
+        }
+        try testing.expect(lazy.done(row, col));
+        row = (row * 5 + 3) % h;
+        col = (col * 7 + 5) % w;
+    }
+}
+
+/// Every done post of a lazy block, and the staircase shape.
+fn expectLazyPosts(lazy: *const LazyBlock, posts: *const [block_dim * block_dim]i16, w: usize, h: usize, want: ?*const [block_dim * block_dim]i16) !void {
+    for (0..h) |r| {
+        const cols = lazy.cols[LazyBlock.strip(r)];
+        if (r > 0) try testing.expect(cols <= lazy.cols[LazyBlock.strip(r - 1)]);
+        const got = posts[r * w ..][0..cols];
+        if (want) |posts_want| {
+            try testing.expectEqualSlices(i16, posts_want[r * w ..][0..cols], got);
+        } else for (got) |v| try testing.expectEqual(std.math.minInt(i16), v);
+    }
 }
 
 test "the vector decoder matches the scalar reference, posts and errors" {

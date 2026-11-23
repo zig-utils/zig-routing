@@ -2184,8 +2184,10 @@ test "fuzz lz4" {
 // ---------------------------------------------------------------------------
 // dem: the packed elevation block decoder on arbitrary payloads, at the
 // first byte's block size and predictor. The vector decoder fails exactly
-// where the scalar reference does and otherwise yields the same posts, and a
-// block that decodes re-encodes to a payload that decodes to the same posts.
+// where the scalar reference does and otherwise yields the same posts; so does
+// the sampler's lazy decoder, asked for posts in an order drawn from the
+// input; and a block that decodes re-encodes to a payload that decodes to the
+// same posts.
 
 pub fn fuzzDem(_: void, s: *Smith) !void {
     var buf: [max_input]u8 = undefined;
@@ -2202,6 +2204,24 @@ pub fn fuzzDem(_: void, s: *Smith) !void {
         .plane => if (dem.decodeBlockScalar(.plane, in[1..], w, h, &want)) |_| true else |_| false,
         else => false,
     };
+    // The sampler's lazy decoder, asked for posts in an order drawn from the
+    // input, then for the whole block: the same posts, or all no data.
+    var lazy_posts: [dem.block_dim * dem.block_dim]i16 = undefined;
+    var lazy: dem.LazyBlock = undefined;
+    lazy.begin(kind, in[1..], w, h, &lazy_posts);
+    var pick: usize = @truncate(std.hash.Wyhash.hash(0, in));
+    for (0..6) |_| {
+        pick = pick *% 1103515245 +% 12345;
+        const row = (pick >> 8) % h;
+        const col = (pick >> 20) % w;
+        if (!lazy.done(row, col)) lazy.extend(kind, in[1..], w, h, row, col, &lazy_posts);
+        try std.testing.expect(lazy.done(row, col));
+    }
+    if (!lazy.done(h - 1, w - 1)) lazy.extend(kind, in[1..], w, h, h - 1, w - 1, &lazy_posts);
+    if (want_ok) {
+        try std.testing.expectEqualSlices(i16, want[0 .. w * h], lazy_posts[0 .. w * h]);
+    } else for (lazy_posts[0 .. w * h]) |v| try std.testing.expectEqual(std.math.minInt(i16), v);
+
     dem.decodeBlock(kind, in[1..], w, h, &posts) catch {
         try std.testing.expect(!want_ok);
         return;
