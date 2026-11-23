@@ -1,0 +1,45 @@
+{
+  "tool": "zr bench",
+  "dataset": "liechtenstein",
+  "commit": "3.9.3",
+  "label": "",
+  "corpus": {
+    "path": "bench/corpora/route-foot-bike.liechtenstein.tsv",
+    "requests": 1000,
+    "hash": "7b1d3252ec7240e6",
+    "sha256": "e98dbc9f56d6745040b99e9af343e9e921c0f6f39d89e3b18de1877c57cffaaa"
+  },
+  "hardware": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpus": 8,
+    "cpu": "AMD EPYC 9R14"
+  },
+  "mode": "closed",
+  "connections": 1,
+  "threads": 1,
+  "rate": null,
+  "warmup_s": 2.0,
+  "window_s": 12.42,
+  "requests": 5000,
+  "throughput_rps": 402.559,
+  "bytes_in": 18485410,
+  "errors": {
+    "total": 0,
+    "transport": 0,
+    "timeouts": 0,
+    "unsent": 0,
+    "status": {
+      "200": 5000
+    }
+  },
+  "latency_us": {
+    "min": 449.07,
+    "mean": 2484.001,
+    "p50": 2027.519,
+    "p90": 4636.671,
+    "p99": 8175.615,
+    "p999": 13664.255,
+    "max": 13823.055
+  }
+}

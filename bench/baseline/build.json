@@ -1,0 +1,14 @@
+{
+  "dataset": "us-dach",
+  "started_at": "2026-11-22T22:37:15.528746+00:00",
+  "oracle_build_key": "4ed3461e0a6cb8a1ad2d0bf99f0159514126fd6a69beb8b9757280845e79ea55",
+  "build_seconds": 9620,
+  "total_seconds_including_input_check": 9766.67,
+  "sample_interval_seconds": 5,
+  "peak_intermediate_tile_files_bytes": 82543650618,
+  "initial_filesystem_used_bytes": 94405726208,
+  "peak_filesystem_used_bytes": 200297676800,
+  "peak_added_disk_bytes": 105891950592,
+  "tile_archive_bytes": 26816030720,
+  "graph_tiles": 18630
+}

@@ -1,0 +1,45 @@
+{
+  "tool": "zr bench",
+  "dataset": "utrecht",
+  "commit": "3.9.3",
+  "label": "",
+  "corpus": {
+    "path": "bench/corpora/upstream.utrecht.tsv",
+    "requests": 13,
+    "hash": "a4095b26c867dde2",
+    "sha256": "f0f9544f355d4120acce7be2805b733750c6ddc57099bf263887ab2ba4475e1e"
+  },
+  "hardware": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpus": 8,
+    "cpu": "AMD EPYC 9R14"
+  },
+  "mode": "closed",
+  "connections": 8,
+  "threads": 1,
+  "rate": null,
+  "warmup_s": 2.0,
+  "window_s": 2.311,
+  "requests": 5005,
+  "throughput_rps": 2164.962,
+  "bytes_in": 19424020,
+  "errors": {
+    "total": 0,
+    "transport": 0,
+    "timeouts": 0,
+    "unsent": 0,
+    "status": {
+      "200": 5005
+    }
+  },
+  "latency_us": {
+    "min": 1437.98,
+    "mean": 3686.0,
+    "p50": 2793.471,
+    "p90": 4997.119,
+    "p99": 15040.511,
+    "p999": 17498.111,
+    "max": 17887.466
+  }
+}

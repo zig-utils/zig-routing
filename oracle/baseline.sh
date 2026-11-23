@@ -2,9 +2,27 @@
 # Run the pinned Valhalla baseline for one prebuilt regional dataset on native Linux.
 source "$(dirname "$0")/lib.sh"
 
-[ "$#" -eq 2 ] || die "usage: baseline.sh <dataset> <output-directory>"
+[ "$#" -ge 2 ] || die "usage: baseline.sh <dataset> <output-directory> [--corpus FILE] [--connections N] [--minimum-requests N] [--warmup TIME]"
 name="$1"
 out="$2"
+shift 2
+selected_corpus=
+selected_load=
+warmup=2s
+minimum_requests=1
+if [ "$name" != us-dach ]; then minimum_requests=5000; fi
+while [ "$#" -gt 0 ]; do
+  [ "$#" -ge 2 ] && [ -n "$2" ] || die "missing value for $1"
+  case "$1" in
+    --corpus) selected_corpus="$2" ;;
+    --connections) selected_load="$2" ;;
+    --minimum-requests) minimum_requests="$2" ;;
+    --warmup) warmup="$2" ;;
+    *) die "unknown option $1" ;;
+  esac
+  shift 2
+done
+[[ "$minimum_requests" =~ ^[1-9][0-9]*$ ]] || die "minimum requests must be positive"
 [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] || die "run on the native x86-64 Linux benchmark host"
 repo="$(cd "$ORACLE_DIR/.." && pwd)"
 zr="${ZR:-$repo/zig-out/bin/zr}"
@@ -18,8 +36,8 @@ key=$(build_key "$name")
   die "build the pinned $name dataset before running the benchmark"
 
 manifest="$repo/bench/corpora/manifest.json"
-corpora=$(jq -er --arg name "$name" '
-  .corpora[] | select(.dataset == $name) | [.file, .requests, .sha256] | @tsv
+corpora=$(jq -er --arg name "$name" --arg file "$selected_corpus" '
+  .corpora[] | select(.dataset == $name and ($file == "" or .file == $file)) | [.file, .requests, .sha256] | @tsv
 ' "$manifest") || die "no regional corpora for $name"
 while IFS=$'\t' read -r file requests checksum; do
   corpus="$repo/bench/corpora/$file"
@@ -36,6 +54,10 @@ image=$(oracle_compose "$name" default 8102 config --images oracle)
 cpus=$(nproc)
 loads=(1)
 [ "$cpus" -eq 1 ] || loads+=("$cpus")
+if [ -n "$selected_load" ]; then
+  [ "$selected_load" = 1 ] || [ "$selected_load" = "$cpus" ] || die "connections must be 1 or the CPU count"
+  loads=("$selected_load")
+fi
 workers=6
 container=
 cleanup() { if [ -n "$container" ]; then docker stop "$container" >/dev/null; fi; }
@@ -71,8 +93,6 @@ jq -n --arg dataset "$name" --arg image "$image" --arg build_key "$key" \
   '$ARGS.named' > "$out/run.json"
 
 stable=true
-minimum_requests=1
-if [ "$name" != us-dach ]; then minimum_requests=5000; fi
 cd "$repo"
 while IFS=$'\t' read -r file requests checksum; do
   # Keep complete corpus cycles while giving small fixtures enough samples.
@@ -82,7 +102,7 @@ while IFS=$'\t' read -r file requests checksum; do
     prefix="$out/${file%.tsv}-c$connections"
     pair_stable=false
     for repeat in 1 2 3 4; do
-      "$zr" bench "$url" --corpus "bench/corpora/$file" --requests "$measured_requests" --warmup 2s \
+      "$zr" bench "$url" --corpus "bench/corpora/$file" --requests "$measured_requests" --warmup "$warmup" \
         --threads 1 --connections "$connections" --dataset "$name" --commit "$version" --out "$prefix-$repeat.tmp"
       jq --arg sha256 "$checksum" 'del(.target) | .corpus.sha256 = $sha256' \
         "$prefix-$repeat.tmp" > "$prefix-$repeat.json"

@@ -1,0 +1,45 @@
+{
+  "tool": "zr bench",
+  "dataset": "liechtenstein",
+  "commit": "3.9.3",
+  "label": "",
+  "corpus": {
+    "path": "bench/corpora/upstream.liechtenstein.tsv",
+    "requests": 240,
+    "hash": "50cc2da29090e336",
+    "sha256": "64a03cb84572998b2cbf57353bdf746cd428de1b4aff6e5879e7a7ec821423bb"
+  },
+  "hardware": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpus": 8,
+    "cpu": "AMD EPYC 9R14"
+  },
+  "mode": "closed",
+  "connections": 8,
+  "threads": 1,
+  "rate": null,
+  "warmup_s": 2.0,
+  "window_s": 3.238,
+  "requests": 5040,
+  "throughput_rps": 1556.208,
+  "bytes_in": 50777055,
+  "errors": {
+    "total": 0,
+    "transport": 0,
+    "timeouts": 0,
+    "unsent": 0,
+    "status": {
+      "200": 5040
+    }
+  },
+  "latency_us": {
+    "min": 1045.59,
+    "mean": 5135.193,
+    "p50": 4898.815,
+    "p90": 7520.255,
+    "p99": 9994.239,
+    "p999": 11698.175,
+    "max": 12622.036
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "dataset": "liechtenstein",
+  "image": "ghcr.io/valhalla/valhalla@sha256:cf618ccafdead96829282acc81a70aa00947c2f28ddcf118f0194acf2fbc7e9d",
+  "build_key": "e397ac4870e65495c30ed1c83ee46a91996e7ce6317ea7f1726616c92784bc66",
+  "extract_sha256": "b8b6c7f2122bd46a65b1d1c669b47c20df4f784a501ace3221d5ea6053121ecc",
+  "secondary_sha256": "",
+  "elevation_manifest_sha256": "825b584b5b0dad8607af5ef9e615a291285d9199e88e6f5948ded3a2c043a606",
+  "configuration_sha256": "e3501e0d7c3dc63a701de4907041ee93bfd27e8d167fe34d977b1841691b9c20",
+  "kernel": "7.0.0-1018-aws",
+  "cpus": 8,
+  "memory_bytes": 16372629504,
+  "workers": 6,
+  "startup_ns": 1171726507
+}

@@ -1,0 +1,45 @@
+{
+  "tool": "zr bench",
+  "dataset": "utrecht",
+  "commit": "3.9.3",
+  "label": "",
+  "corpus": {
+    "path": "bench/corpora/route-auto-10km.utrecht.tsv",
+    "requests": 300,
+    "hash": "cde45c37c0af9246",
+    "sha256": "0870f47e6889c142d7805c4cbfa9b9b3718bcc7e737fcb957ecaecfb985ff886"
+  },
+  "hardware": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpus": 8,
+    "cpu": "AMD EPYC 9R14"
+  },
+  "mode": "closed",
+  "connections": 8,
+  "threads": 1,
+  "rate": null,
+  "warmup_s": 2.0,
+  "window_s": 7.065,
+  "requests": 5100,
+  "throughput_rps": 721.865,
+  "bytes_in": 10880833,
+  "errors": {
+    "total": 0,
+    "transport": 0,
+    "timeouts": 0,
+    "unsent": 0,
+    "status": {
+      "200": 5100
+    }
+  },
+  "latency_us": {
+    "min": 4155.309,
+    "mean": 11062.042,
+    "p50": 10059.775,
+    "p90": 16547.839,
+    "p99": 23265.279,
+    "p999": 26804.223,
+    "max": 29432.971
+  }
+}

@@ -1098,6 +1098,7 @@ bun tools/corpus/generate.ts --validate liechtenstein=http://127.0.0.1:8102 --va
 
 #### Valhalla baseline on the benchmark host
 
+The [baseline scoreboard](../docs/SCOREBOARD.md) links the raw results for the pinned corpora.
 On the native x86-64 Linux host with 8 vCPUs and 16 GB RAM, stage the pinned built datasets
 for Liechtenstein, Utrecht, and US+DACH. Set `ORACLE_DATA` if the data lives outside
 `oracle/data`. Generate the corpora and build the load generator before running each dataset
@@ -1131,6 +1132,11 @@ response using the existing filesystem cache. RSS is the Valhalla process reside
 after the replays. The runner uses the first consecutive pair of replays whose p50 values
 agree within 5%, with up to four replays at each load. It writes every replay and records which
 pair it used if the first two differed by more than 5%. Use a fresh output directory for a rerun.
+
+Use `--corpus` with a manifest filename and `--connections` with 1 or the CPU count
+to rerun one measurement. `--minimum-requests` rounds up to whole corpus cycles.
+`--warmup` sets the client's warm-up duration. Keep the earlier results alongside
+longer measurements when calibrating a workload with unstable p50.
 
 #### Comparing servers
 

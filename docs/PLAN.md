@@ -61,8 +61,8 @@ design that is only fast for default profiles does not count.
 
 ## Scoreboard: what "beat their perf" means
 
-Phase 0 measures Valhalla 3.9.3 on the same box class and the same US+DACH extract; these are the
-targets we gate on (targets, not yet measurements):
+Phase 0 measured Valhalla 3.9.3 on the production box class and the US+DACH extract.
+The [baseline scoreboard](SCOREBOARD.md) records those measurements alongside the targets below.
 
 | Axis | Upstream reference | zig-routing target |
 |---|---|---|

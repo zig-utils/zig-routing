@@ -1,0 +1,14 @@
+{
+  "dataset": "utrecht",
+  "image": "ghcr.io/valhalla/valhalla@sha256:cf618ccafdead96829282acc81a70aa00947c2f28ddcf118f0194acf2fbc7e9d",
+  "build_key": "d0f8bcff9cc233c5541c83eaa4db2416fd92ad9249984471af4587afdde42357",
+  "extract_sha256": "8522f893d9c9c201d19d8fc0e39a038ad25fb21f6832370d4d257b4b495b9fa7",
+  "secondary_sha256": "",
+  "elevation_manifest_sha256": "a7a34951f71ac1ecee41d22882c3071b8d61e4e5e92937f784402947b7bf27b3",
+  "configuration_sha256": "e3501e0d7c3dc63a701de4907041ee93bfd27e8d167fe34d977b1841691b9c20",
+  "kernel": "7.0.0-1018-aws",
+  "cpus": 8,
+  "memory_bytes": 16372629504,
+  "workers": 6,
+  "startup_ns": 240891254
+}

@@ -1,0 +1,45 @@
+{
+  "tool": "zr bench",
+  "dataset": "utrecht",
+  "commit": "3.9.3",
+  "label": "",
+  "corpus": {
+    "path": "bench/corpora/route-foot-bike.utrecht.tsv",
+    "requests": 1000,
+    "hash": "ee57a8f929e7d7e3",
+    "sha256": "d97ce00729b4940eb11992184c2a428bb844072b4e79b2894fd0d6903685931c"
+  },
+  "hardware": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpus": 8,
+    "cpu": "AMD EPYC 9R14"
+  },
+  "mode": "closed",
+  "connections": 1,
+  "threads": 1,
+  "rate": null,
+  "warmup_s": 2.0,
+  "window_s": 32.253,
+  "requests": 5000,
+  "throughput_rps": 155.022,
+  "bytes_in": 8619925,
+  "errors": {
+    "total": 0,
+    "transport": 0,
+    "timeouts": 0,
+    "unsent": 0,
+    "status": {
+      "200": 5000
+    }
+  },
+  "latency_us": {
+    "min": 999.82,
+    "mean": 6449.583,
+    "p50": 5455.871,
+    "p90": 12156.927,
+    "p99": 19726.335,
+    "p999": 25099.443,
+    "max": 25099.443
+  }
+}

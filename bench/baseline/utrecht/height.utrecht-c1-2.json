@@ -1,0 +1,45 @@
+{
+  "tool": "zr bench",
+  "dataset": "utrecht",
+  "commit": "3.9.3",
+  "label": "",
+  "corpus": {
+    "path": "bench/corpora/height.utrecht.tsv",
+    "requests": 300,
+    "hash": "c266bfa77147ca7d",
+    "sha256": "b66870015ebd3740e3ba815c3818e659eed444b2ec0dccc792548b1d63d20c60"
+  },
+  "hardware": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpus": 8,
+    "cpu": "AMD EPYC 9R14"
+  },
+  "mode": "closed",
+  "connections": 1,
+  "threads": 1,
+  "rate": null,
+  "warmup_s": 2.0,
+  "window_s": 2.452,
+  "requests": 5100,
+  "throughput_rps": 2079.106,
+  "bytes_in": 37939070,
+  "errors": {
+    "total": 0,
+    "transport": 0,
+    "timeouts": 0,
+    "unsent": 0,
+    "status": {
+      "200": 5100
+    }
+  },
+  "latency_us": {
+    "min": 119.67,
+    "mean": 480.945,
+    "p50": 269.311,
+    "p90": 849.919,
+    "p99": 1708.031,
+    "p999": 2093.055,
+    "max": 2123.859
+  }
+}

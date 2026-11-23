@@ -1,0 +1,46 @@
+{
+  "tool": "zr bench",
+  "dataset": "us-dach",
+  "commit": "3.9.3",
+  "label": "",
+  "corpus": {
+    "path": "bench/corpora/route-foot-bike.us-dach.tsv",
+    "requests": 5000,
+    "hash": "24d7565651ce1d3a",
+    "sha256": "aed773d37f1d6b97d1cc651b634c8a394ca3380df759fb20119c5272c3ade5fa"
+  },
+  "hardware": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpus": 8,
+    "cpu": "AMD EPYC 9R14"
+  },
+  "mode": "closed",
+  "connections": 8,
+  "threads": 1,
+  "rate": null,
+  "warmup_s": 2.0,
+  "window_s": 62.571,
+  "requests": 5000,
+  "throughput_rps": 79.909,
+  "bytes_in": 21097938,
+  "errors": {
+    "total": 63,
+    "transport": 0,
+    "timeouts": 0,
+    "unsent": 0,
+    "status": {
+      "200": 4937,
+      "400": 63
+    }
+  },
+  "latency_us": {
+    "min": 885.42,
+    "mean": 99209.174,
+    "p50": 42336.255,
+    "p90": 231211.007,
+    "p99": 782237.695,
+    "p999": 2608857.087,
+    "max": 12744361.439
+  }
+}

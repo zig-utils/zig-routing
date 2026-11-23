@@ -1,0 +1,46 @@
+{
+  "tool": "zr bench",
+  "dataset": "us-dach",
+  "commit": "3.9.3",
+  "label": "",
+  "corpus": {
+    "path": "bench/corpora/route-auto-200km.us-dach.tsv",
+    "requests": 500,
+    "hash": "3a0c7b0aab7cff70",
+    "sha256": "c2ca1dced62818f5f4c38a8631280d47ed65fe520241725388ac514bd22f1651"
+  },
+  "hardware": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpus": 8,
+    "cpu": "AMD EPYC 9R14"
+  },
+  "mode": "closed",
+  "connections": 1,
+  "threads": 1,
+  "rate": null,
+  "warmup_s": 2.0,
+  "window_s": 31.458,
+  "requests": 500,
+  "throughput_rps": 15.894,
+  "bytes_in": 10243431,
+  "errors": {
+    "total": 16,
+    "transport": 0,
+    "timeouts": 0,
+    "unsent": 0,
+    "status": {
+      "200": 484,
+      "400": 16
+    }
+  },
+  "latency_us": {
+    "min": 5498.369,
+    "mean": 62635.256,
+    "p50": 49414.143,
+    "p90": 118751.231,
+    "p99": 222822.399,
+    "p999": 527127.673,
+    "max": 527127.673
+  }
+}

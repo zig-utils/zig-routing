@@ -1,0 +1,45 @@
+{
+  "tool": "zr bench",
+  "dataset": "liechtenstein",
+  "commit": "3.9.3",
+  "label": "",
+  "corpus": {
+    "path": "bench/corpora/height.liechtenstein.tsv",
+    "requests": 300,
+    "hash": "fb2cee8fb66a4797",
+    "sha256": "7718772a0ea1730e838f7be6e4c1eb3deca5bfaa4f8d3ba0f3a25d7c01c2afa3"
+  },
+  "hardware": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpus": 8,
+    "cpu": "AMD EPYC 9R14"
+  },
+  "mode": "closed",
+  "connections": 8,
+  "threads": 1,
+  "rate": null,
+  "warmup_s": 2.0,
+  "window_s": 0.555,
+  "requests": 5100,
+  "throughput_rps": 9180.742,
+  "bytes_in": 39433013,
+  "errors": {
+    "total": 0,
+    "transport": 0,
+    "timeouts": 0,
+    "unsent": 0,
+    "status": {
+      "200": 5100
+    }
+  },
+  "latency_us": {
+    "min": 140.52,
+    "mean": 869.507,
+    "p50": 772.095,
+    "p90": 1609.727,
+    "p99": 2531.327,
+    "p999": 3399.679,
+    "max": 3721.399
+  }
+}

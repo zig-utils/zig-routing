@@ -1,0 +1,45 @@
+{
+  "tool": "zr bench",
+  "dataset": "us-dach",
+  "commit": "3.9.3",
+  "label": "",
+  "corpus": {
+    "path": "bench/corpora/de-benchmark.us-dach.tsv",
+    "requests": 2550,
+    "hash": "062d8ca4baba5c1d",
+    "sha256": "ba9c199d838de04d0b62404d9dd16ffbae3534ff96285b9c3a860c660c4699bb"
+  },
+  "hardware": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpus": 8,
+    "cpu": "AMD EPYC 9R14"
+  },
+  "mode": "closed",
+  "connections": 1,
+  "threads": 1,
+  "rate": null,
+  "warmup_s": 2.0,
+  "window_s": 107.431,
+  "requests": 2550,
+  "throughput_rps": 23.736,
+  "bytes_in": 61945582,
+  "errors": {
+    "total": 0,
+    "transport": 0,
+    "timeouts": 0,
+    "unsent": 0,
+    "status": {
+      "200": 2550
+    }
+  },
+  "latency_us": {
+    "min": 10581.928,
+    "mean": 42088.619,
+    "p50": 38666.239,
+    "p90": 65142.783,
+    "p99": 114556.927,
+    "p999": 221773.823,
+    "max": 371731.009
+  }
+}

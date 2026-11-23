@@ -1,0 +1,45 @@
+{
+  "tool": "zr bench",
+  "dataset": "us-dach",
+  "commit": "3.9.3",
+  "label": "",
+  "corpus": {
+    "path": "bench/corpora/height.us-dach.tsv",
+    "requests": 1000,
+    "hash": "cc75ba7ab351a7fe",
+    "sha256": "b07d16d8ec9283bb13dbd62899503e465bc8c1c7fc0a21cc5fa0f10ff121cd21"
+  },
+  "hardware": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpus": 8,
+    "cpu": "AMD EPYC 9R14"
+  },
+  "mode": "closed",
+  "connections": 1,
+  "threads": 1,
+  "rate": null,
+  "warmup_s": 2.0,
+  "window_s": 37.441,
+  "requests": 1000,
+  "throughput_rps": 26.708,
+  "bytes_in": 8943924,
+  "errors": {
+    "total": 0,
+    "transport": 0,
+    "timeouts": 0,
+    "unsent": 0,
+    "status": {
+      "200": 1000
+    }
+  },
+  "latency_us": {
+    "min": 158.97,
+    "mean": 37406.017,
+    "p50": 32440.319,
+    "p90": 87293.951,
+    "p99": 172490.751,
+    "p999": 263524.481,
+    "max": 263524.481
+  }
+}

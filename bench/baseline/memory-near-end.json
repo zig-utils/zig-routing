@@ -1,0 +1,14 @@
+{
+  "RssAnon": 1673998336,
+  "RssFile": 94020939776,
+  "RssShmem": 0,
+  "VmRSS": 95694938112,
+  "VmSwap": 8017555456,
+  "sampled_at_unix_ns": 1795402963300214827,
+  "cgroup_current_bytes": 15195017216,
+  "cgroup_swap_bytes": 8379727872,
+  "cgroup_anon_bytes": 1673998336,
+  "cgroup_file_bytes": 13054283776,
+  "cgroup_file_mapped_bytes": 12649340928,
+  "seconds_before_final_rss": 4.623
+}

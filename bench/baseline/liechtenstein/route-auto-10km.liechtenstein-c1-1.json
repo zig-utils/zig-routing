@@ -1,0 +1,45 @@
+{
+  "tool": "zr bench",
+  "dataset": "liechtenstein",
+  "commit": "3.9.3",
+  "label": "",
+  "corpus": {
+    "path": "bench/corpora/route-auto-10km.liechtenstein.tsv",
+    "requests": 300,
+    "hash": "213ff0e7e99670a6",
+    "sha256": "5467bb3e0cf5f50d8f96d8dd09dafd3be22afa707fa948c5e145a38305c1120e"
+  },
+  "hardware": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpus": 8,
+    "cpu": "AMD EPYC 9R14"
+  },
+  "mode": "closed",
+  "connections": 1,
+  "threads": 1,
+  "rate": null,
+  "warmup_s": 2.0,
+  "window_s": 16.383,
+  "requests": 5100,
+  "throughput_rps": 311.28,
+  "bytes_in": 20510313,
+  "errors": {
+    "total": 0,
+    "transport": 0,
+    "timeouts": 0,
+    "unsent": 0,
+    "status": {
+      "200": 5100
+    }
+  },
+  "latency_us": {
+    "min": 1291.689,
+    "mean": 3212.25,
+    "p50": 3071.999,
+    "p90": 4538.367,
+    "p99": 6569.983,
+    "p999": 6766.591,
+    "max": 6816.619
+  }
+}
