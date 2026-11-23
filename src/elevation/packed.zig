@@ -1087,32 +1087,63 @@ const TilePosts = struct {
         }
     }
 
+    /// Makes block (br, bc) the remembered one.
+    inline fn use(self: *TilePosts, br: usize, bc: usize) void {
+        const block = br * blocks_per_side + bc;
+        if (block == self.last_block) return;
+        const b = &self.pack.blocks[self.entry.first_block + block];
+        self.last_block = block;
+        self.last_constant = if (b.kind == .constant) b.constant else null;
+        self.last_slot_key = null;
+        if (b.kind != .constant) {
+            const slot = cache.posts(self.pack, self.entry, br, bc, b);
+            self.last_posts = slot.posts;
+            self.last_lazy = slot.lazy;
+            self.last_entry = b;
+            self.last_slot_key = slot.key;
+            self.last_key = slot.key.*;
+        }
+    }
+
+    /// Decodes the remembered block on until post (row, col) is done.
+    inline fn reach(self: *TilePosts, br: usize, bc: usize, row: usize, col: usize) void {
+        if (!self.last_lazy.done(row, col)) self.last_lazy.extend(self.last_entry.kind, self.pack.blockPayload(self.last_entry), blockSize(bc), blockSize(br), row, col, self.last_posts);
+    }
+
     pub fn sample(self: *TilePosts, i: usize) i16 {
         const r = i / tile_dim;
         const col = i % tile_dim;
         const br = r / block_dim;
         const bc = col / block_dim;
-        const block = br * blocks_per_side + bc;
-        if (block != self.last_block) {
-            const b = &self.pack.blocks[self.entry.first_block + block];
-            self.last_block = block;
-            self.last_constant = if (b.kind == .constant) b.constant else null;
-            self.last_slot_key = null;
-            if (b.kind != .constant) {
-                const slot = cache.posts(self.pack, self.entry, br, bc, b);
-                self.last_posts = slot.posts;
-                self.last_lazy = slot.lazy;
-                self.last_entry = b;
-                self.last_slot_key = slot.key;
-                self.last_key = slot.key.*;
-            }
-        }
+        self.use(br, bc);
         if (self.last_constant) |value| return value;
         const row = r % block_dim;
         const c = col % block_dim;
+        self.reach(br, bc, row, c);
+        return self.last_posts[row * blockSize(bc) + c];
+    }
+
+    /// Posts (x, y), (x + 1, y), (x, y + 1) and (x + 1, y + 1), with x and y
+    /// below the tile's last column and row. Inside one block the lookup and
+    /// the decode check are made once: post (row + 1, col + 1) done means the
+    /// other three are, since a strip is never done further than the one
+    /// above it.
+    pub fn quad(self: *TilePosts, x: usize, y: usize) [4]i16 {
+        std.debug.assert(x < tile_dim - 1 and y < tile_dim - 1);
+        const row = y % block_dim;
+        const c = x % block_dim;
+        if (row == block_dim - 1 or c == block_dim - 1) {
+            const i = y * tile_dim + x;
+            return .{ self.sample(i), self.sample(i + 1), self.sample(i + tile_dim), self.sample(i + tile_dim + 1) };
+        }
+        const br = y / block_dim;
+        const bc = x / block_dim;
+        self.use(br, bc);
+        if (self.last_constant) |value| return @splat(value);
+        self.reach(br, bc, row + 1, c + 1);
         const w = blockSize(bc);
-        if (!self.last_lazy.done(row, c)) self.last_lazy.extend(self.last_entry.kind, self.pack.blockPayload(self.last_entry), w, blockSize(br), row, c, self.last_posts);
-        return self.last_posts[row * w + c];
+        const at = self.last_posts[row * w + c ..];
+        return .{ at[0], at[1], at[w], at[w + 1] };
     }
 };
 
@@ -1511,6 +1542,26 @@ test "a pack samples bit-identically to its source tiles on 10^6 points" {
         for (a, b) |x, y| try testing.expect(@as(u64, @bitCast(x)) == @as(u64, @bitCast(y)));
     }
     try testing.expectEqual(hgt.get(&tiles, pts[5]), pack.get(pts[5]));
+
+    // A square of posts read at once is the four posts of the source, from
+    // cold blocks, near block edges and across them.
+    for (indices) |index| {
+        try testing.expect(tiles.readTile(index, buf));
+        const src = hgt.BigEndianPosts{ .data = buf };
+        const e = pack.entry(index).?;
+        if (e.kind == .constant) continue;
+        cache.keys = @splat(@splat(0));
+        var square: TilePosts = .{ .pack = &pack, .entry = e };
+        for (0..20000) |k| {
+            var x = random.uintLessThan(usize, tile_dim - 1);
+            var y = random.uintLessThan(usize, tile_dim - 1);
+            if (k % 3 == 0) x = @min(tile_dim - 2, x / block_dim * block_dim + block_dim - 1 - k / 3 % 3);
+            if (k % 5 == 0) y = @min(tile_dim - 2, y / block_dim * block_dim + block_dim - 1 - k / 5 % 3);
+            const i = y * tile_dim + x;
+            const want: [4]i16 = .{ src.sample(i), src.sample(i + 1), src.sample(i + tile_dim), src.sample(i + tile_dim + 1) };
+            try testing.expectEqual(want, square.quad(x, y));
+        }
+    }
     try testing.expectEqual(hgt.no_data_value, pack.get(.{ .lng = 20.5, .lat = 10.5 }));
 
     // Two samplers on one thread share the cache. Evict the first sampler's

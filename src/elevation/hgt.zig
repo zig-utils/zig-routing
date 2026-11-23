@@ -424,6 +424,20 @@ inline fn outOfRange(v: i16) bool {
     return v > no_data_high or v < no_data_low;
 }
 
+/// Posts (x, y), (x + 1, y), (x, y + 1) and (x + 1, y + 1), the square
+/// around a sample not in the last row or column, through the source's
+/// `quad` when it has one (a source that looks up a block per post can do
+/// it once).
+inline fn square(src: anytype, x: usize, y: usize) [4]i16 {
+    const Src = switch (@typeInfo(@TypeOf(src))) {
+        .pointer => |info| info.child,
+        else => @TypeOf(src),
+    };
+    if (comptime @hasDecl(Src, "quad")) return src.quad(x, y);
+    const i = y * hgt_dim + x;
+    return .{ src.sample(i), src.sample(i + 1), src.sample(i + hgt_dim), src.sample(i + hgt_dim + 1) };
+}
+
 /// skadi `tile_data::get(u, v)`: bilinear interpolation over the four
 /// neighbouring samples, dropping no-data samples from the weights.
 pub fn interpolate(data: []const u8, u: f64, v: f64) f64 {
@@ -445,15 +459,17 @@ pub fn interpolateWith(src: anytype, u: f64, v: f64) f64 {
     var c_coef = u_inv * v_ratio;
     var d_coef = u_ratio * v_ratio;
     var adjust: f64 = 0;
-    const a = src.sample(y * hgt_dim + x);
-    const b = src.sample(y * hgt_dim + x + 1);
+    const inner = x < hgt_dim - 1 and y < hgt_dim - 1;
+    const posts = if (inner) square(src, x, y) else undefined;
+    const a = if (inner) posts[0] else src.sample(y * hgt_dim + x);
+    const b = if (inner) posts[1] else src.sample(y * hgt_dim + x + 1);
     if (outOfRange(a)) a_coef = 0;
     if (outOfRange(b)) b_coef = 0;
     var value = @as(f64, @floatFromInt(a)) * a_coef + @as(f64, @floatFromInt(b)) * b_coef;
     adjust += a_coef + b_coef;
     if (y < hgt_dim - 1) {
-        const cc = src.sample((y + 1) * hgt_dim + x);
-        const d = src.sample((y + 1) * hgt_dim + x + 1);
+        const cc = if (inner) posts[2] else src.sample((y + 1) * hgt_dim + x);
+        const d = if (inner) posts[3] else src.sample((y + 1) * hgt_dim + x + 1);
         if (outOfRange(cc)) c_coef = 0;
         if (outOfRange(d)) d_coef = 0;
         value += @as(f64, @floatFromInt(cc)) * c_coef + @as(f64, @floatFromInt(d)) * d_coef;
@@ -486,16 +502,16 @@ pub fn interpolateBatch(src: anytype, points: *const [batch_width]GridPosition) 
     }
     const x: Index = @intFromFloat(xl);
     const y: Index = @intFromFloat(yl);
-    const offset = y * @as(Index, @splat(hgt_dim)) + x;
     var a: Posts = undefined;
     var b: Posts = undefined;
     var c: Posts = undefined;
     var d: Posts = undefined;
     inline for (0..batch_width) |i| {
-        a[i] = src.sample(offset[i]);
-        b[i] = src.sample(offset[i] + 1);
-        c[i] = src.sample(offset[i] + hgt_dim);
-        d[i] = src.sample(offset[i] + hgt_dim + 1);
+        const posts = square(src, x[i], y[i]);
+        a[i] = posts[0];
+        b[i] = posts[1];
+        c[i] = posts[2];
+        d[i] = posts[3];
     }
     const low: Posts = @splat(no_data_low);
     const high: Posts = @splat(no_data_high);
