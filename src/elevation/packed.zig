@@ -247,6 +247,91 @@ inline fn unpackGroup(comptime width: u5, src: *const [group_slack]u8, dst: *[gr
     dst.* = @as(@Vector(group, i16), @bitCast(codes >> one)) ^ -@as(@Vector(group, i16), @bitCast(codes & one));
 }
 
+/// Widths whose codes each fit a u16 lane, however the code sits in its
+/// first byte: (bit % 8) + width <= 16 for every code of the group.
+fn fitsHalfLanes(width: usize) bool {
+    for (0..group) |j| if ((j * width) % 8 + width > 16) return false;
+    return true;
+}
+
+/// Per nibble, for `unpackGroupTable`: each u16 lane's two source bytes,
+/// counted from the group start for lanes 0..7 and from byte `width` for lanes
+/// 8..15 (so each half gathers from one 16-byte register), and each lane's
+/// left shift that puts its code's top bit at bit 15; a right shift by
+/// 16 - width then leaves the code alone. Index 0xff (out of range) gathers
+/// a zero byte.
+const HalfLanePlan = struct {
+    gather: [2][16]u8,
+    left: [2][8]i16,
+    right: [8]i16,
+    fits: bool,
+};
+
+const half_lane_plans = blk: {
+    @setEvalBranchQuota(20_000);
+    var plans: [16]HalfLanePlan = undefined;
+    for (0..16) |nibble| {
+        const width = if (nibble == 15) 16 else nibble;
+        var plan: HalfLanePlan = .{
+            .gather = @splat(@splat(0xff)),
+            .left = @splat(@splat(16)),
+            .right = @splat(@as(i16, width) - 16),
+            .fits = fitsHalfLanes(width),
+        };
+        if (width > 0 and plan.fits) for (0..group) |j| {
+            const base = if (j < 8) 0 else width;
+            for (0..2) |k| {
+                const byte = (j * width) / 8 + k;
+                // A second byte past the group holds no bits of the code.
+                if (byte < 2 * width) plan.gather[j / 8][(j % 8) * 2 + k] = byte - base;
+            }
+            plan.left[j / 8][j % 8] = 16 - width - (j * width) % 8;
+        };
+        plans[nibble] = plan;
+    }
+    break :blk plans;
+};
+
+/// The NEON `tbl` of one register: lane i takes table[index[i]], or 0 when
+/// the index is 16 or more. `@shuffle` takes only comptime indices.
+inline fn tbl(table: @Vector(16, u8), index: @Vector(16, u8)) @Vector(16, u8) {
+    return asm ("tbl %[out].16b, {%[table].16b}, %[index].16b"
+        : [out] "=w" (-> @Vector(16, u8)),
+        : [table] "w" (table),
+          [index] "w" (index),
+    );
+}
+
+/// The NEON `ushl` on u16 lanes: each lane shifted left by its signed
+/// shift, right when negative; 16 or more either way gives 0.
+inline fn ushl(v: @Vector(8, u16), shift: @Vector(8, i16)) @Vector(8, u16) {
+    return asm ("ushl %[out].8h, %[v].8h, %[shift].8h"
+        : [out] "=w" (-> @Vector(8, u16)),
+        : [v] "w" (v),
+          [shift] "w" (shift),
+    );
+}
+
+/// Whether `unpackGroupTable` is available: it needs a runtime byte shuffle.
+const table_unpack = builtin.cpu.arch == .aarch64;
+
+/// The same codes as `unpackGroup` for a width whose plan fits u16 lanes,
+/// without branching on the width: the gather indices, shifts and mask come
+/// from `half_lane_plans`, so groups of mixed widths take one straight path.
+/// Reads 2 * width + 16 <= 32 bytes. Width 0 shifts every code out.
+inline fn unpackGroupTable(nibble: u4, src: *const [group_slack]u8, dst: *[group]i16) void {
+    const plan = &half_lane_plans[nibble];
+    const width: usize = if (nibble == 15) 16 else nibble;
+    const lo: @Vector(16, u8) = src[0..16].*;
+    const hi: @Vector(16, u8) = src[width..][0..16].*;
+    const right: @Vector(8, i16) = plan.right;
+    const codes_lo = ushl(ushl(@bitCast(tbl(lo, plan.gather[0])), plan.left[0]), right);
+    const codes_hi = ushl(ushl(@bitCast(tbl(hi, plan.gather[1])), plan.left[1]), right);
+    const codes = std.simd.join(codes_lo, codes_hi);
+    const one: @Vector(group, u16) = @splat(1);
+    dst.* = @as(@Vector(group, i16), @bitCast(codes >> one)) ^ -@as(@Vector(group, i16), @bitCast(codes & one));
+}
+
 /// Stage 1 of a decode: the n residuals of a payload. Groups take the vector
 /// path while `group_slack` bytes remain, so no read leaves the payload; the
 /// last few go through the serial bit reader, which starts byte-aligned and
@@ -270,7 +355,9 @@ fn unpackGroups(payload: []const u8, n: usize, residuals: *[block_dim * block_di
         const nibble: u4 = @truncate(payload[g / 2] >> @intCast((g % 2) * 4));
         const dst = residuals[g * group ..][0..group];
         const src = payload[pos..][0..group_slack];
-        switch (nibble) {
+        if (table_unpack and half_lane_plans[nibble].fits) {
+            unpackGroupTable(nibble, src, dst);
+        } else switch (nibble) {
             0 => dst.* = @splat(0),
             inline 1...14 => |width| unpackGroup(width, src, dst),
             15 => unpackGroup(16, src, dst),
@@ -1433,6 +1520,35 @@ test "the vector decoder matches the scalar reference, posts and errors" {
         const len = @min(buf.len, (exact + 40) -| random.uintLessThan(usize, 80));
         try expectSameDecode(.med, buf[0..len], w, h);
         try expectSameDecode(.plane, buf[0..len], w, h);
+    }
+}
+
+test "the table group unpacker matches the serial bit reader at every width" {
+    if (!table_unpack) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(7);
+    const random = prng.random();
+    var src: [group_slack]u8 = undefined;
+    var got: [group]i16 = undefined;
+    for (0..2000) |iter| {
+        random.bytes(&src);
+        const nibble: u4 = @truncate(iter);
+        const width: usize = if (nibble == 15) 16 else nibble;
+        if (!half_lane_plans[nibble].fits) continue;
+        unpackGroupTable(nibble, &src, &got);
+        // The 16 codes in order, least significant bit first.
+        for (0..group) |j| {
+            var code: u16 = 0;
+            for (0..width) |b| {
+                const bit = j * width + b;
+                code |= @as(u16, (src[bit / 8] >> @intCast(bit % 8)) & 1) << @intCast(b);
+            }
+            try testing.expectEqual(unzigzag(code), got[j]);
+        }
+    }
+    // Widths 11, 13, 14 and 15 put a code across three bytes past bit 16.
+    for (0..16) |nibble| {
+        const width = if (nibble == 15) 16 else nibble;
+        try testing.expectEqual(width != 11 and width < 13 or width == 16, half_lane_plans[nibble].fits);
     }
 }
 
