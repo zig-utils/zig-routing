@@ -458,8 +458,59 @@ fn parseNumber(t: []const u8, i_in: usize, out: *f64) ?usize {
     return i;
 }
 
+/// `parseNumber` for the usual coordinate, `-?d{1,3}.d{1,8}` followed by a
+/// byte that cannot continue a number: the same double (m < 10^11, so one
+/// correctly rounded division), from one eight-byte read of the fraction.
+/// Null for anything else, which `parseNumber` then reads.
+fn parseCoordinate(t: []const u8, i_in: usize, out: *f64) ?usize {
+    var i = i_in;
+    if (i + 13 > t.len) return null;
+    const neg = t[i] == '-';
+    if (neg) i += 1;
+    var int: u64 = t[i] -% '0';
+    if (int > 9) return null;
+    i += 1;
+    var n: u32 = 1;
+    while (n < 3) : (n += 1) {
+        const d = t[i] -% '0';
+        if (d > 9) break;
+        if (int == 0) return null; // leading zero: parseNumber rejects it
+        int = int * 10 + d;
+        i += 1;
+    }
+    if (t[i] != '.') return null;
+    i += 1;
+    if (i + 9 > t.len) return null;
+    const word = std.mem.readInt(u64, t[i..][0..8], .little);
+    const non_digit = ((word +% 0x4646464646464646) | (word -% 0x3030303030303030)) & 0x8080808080808080;
+    if (non_digit == 0) return null; // eight or more digits
+    const k: u32 = @intCast(@ctz(non_digit) / 8);
+    if (k == 0) return null;
+    switch (t[i + k]) {
+        'e', 'E', '.' => return null,
+        else => {},
+    }
+    var x = (word -% 0x3030303030303030) << @intCast((8 - k) * 8);
+    x = ((x & 0x0F0F0F0F0F0F0F0F) *% 2561) >> 8;
+    x = ((x & 0x00FF00FF00FF00FF) *% 6553601) >> 16;
+    x = ((x & 0x0000FFFF0000FFFF) *% 42949672960001) >> 32;
+    const m = int * pow10_u64[k] + x;
+    const v = @as(f64, @floatFromInt(m)) / exact_pow10[k];
+    out.* = if (neg) -v else v;
+    return i + k;
+}
+
 /// One `{"lat":n,"lon":n}` (either order, whitespace allowed) at t[i..].
 fn parsePoint(t: []const u8, i_in: usize, out: *[2]f64) ?usize {
+    // Compact `{"lat":n,"lon":n}`, what clients send: the keys compared as
+    // whole words. Anything else, or a number this path rejects, goes the
+    // general way below, which accepts the same points.
+    if (i_in + 16 <= t.len and std.mem.readInt(u56, t[i_in..][0..7], .little) == comptime std.mem.readInt(u56, "{\"lat\":", .little)) compact: {
+        const j = parseCoordinate(t, i_in + 7, &out[0]) orelse break :compact;
+        if (j + 8 > t.len or std.mem.readInt(u56, t[j..][0..7], .little) != comptime std.mem.readInt(u56, ",\"lon\":", .little)) break :compact;
+        const k = parseCoordinate(t, j + 7, &out[1]) orelse break :compact;
+        if (k < t.len and t[k] == '}') return k + 1;
+    }
     var i = skipWs(t, i_in);
     if (i >= t.len or t[i] != '{') return null;
     var seen: [2]bool = .{ false, false };
@@ -1363,6 +1414,57 @@ test "the /height shape fast path parses exactly like the general parser" {
     }
     // The generator mostly produces plain shapes, so the fast path is exercised.
     try testing.expect(fast_taken > 1000);
+}
+
+test "the coordinate reader agrees with parseNumber wherever it answers" {
+    var prng = std.Random.DefaultPrng.init(23);
+    const random = prng.random();
+    var buf: [48]u8 = undefined;
+    const alphabet = "0123456789000-.eE,}+ ";
+    var taken: usize = 0;
+    for (0..400_000) |round| {
+        var len: usize = undefined;
+        if (round % 2 == 0) {
+            // Coordinate-shaped: sign, 1 to 4 integer digits, point, 0 to 9 digits, terminator.
+            len = 0;
+            if (random.boolean()) {
+                buf[len] = '-';
+                len += 1;
+            }
+            for (0..1 + random.uintLessThan(usize, 4)) |_| {
+                buf[len] = '0' + random.uintLessThan(u8, 10);
+                len += 1;
+            }
+            if (random.uintLessThan(u8, 10) != 0) {
+                buf[len] = '.';
+                len += 1;
+            }
+            for (0..random.uintLessThan(usize, 10)) |_| {
+                buf[len] = '0' + random.uintLessThan(u8, 10);
+                len += 1;
+            }
+            buf[len] = ",}e.5 "[random.uintLessThan(usize, 6)];
+            len += 1;
+        } else {
+            len = random.uintLessThan(usize, 20);
+            for (buf[0..len]) |*c| c.* = alphabet[random.uintLessThan(usize, alphabet.len)];
+        }
+        // Padding after the number (what follows a coordinate in a body), sometimes too little.
+        const pad = if (random.uintLessThan(u8, 8) == 0) random.uintLessThan(usize, 12) else 16;
+        @memset(buf[len..][0..pad], ',');
+        const t = buf[0 .. len + pad];
+        var fast: f64 = undefined;
+        const end = parseCoordinate(t, 0, &fast) orelse continue;
+        taken += 1;
+        var ref: f64 = undefined;
+        const ref_end = parseNumber(t, 0, &ref) orelse {
+            std.debug.print("coordinate reader accepted {s}\n", .{t});
+            return error.TestUnexpectedResult;
+        };
+        try testing.expectEqual(ref_end, end);
+        try testing.expectEqual(@as(u64, @bitCast(ref)), @as(u64, @bitCast(fast)));
+    }
+    try testing.expect(taken > 50_000);
 }
 
 test "digit runs: SWAR and byte-at-a-time agree" {

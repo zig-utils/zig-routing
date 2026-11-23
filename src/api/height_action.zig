@@ -25,15 +25,18 @@ const coordinate_precision = 6;
 /// Longest `{"lat":x,"lon":y}`: two 40-byte numbers at most, plus 15 bytes of keys and braces.
 const max_point_json = 15 + 2 * 40;
 
-/// A coordinate as the writer prints it at `coordinate_precision`; NaN and
-/// infinities as null, as the writer does.
+/// A coordinate as the writer prints it at `coordinate_precision`, written
+/// at the start of `buf`; NaN and infinities as null, as the writer does.
 fn coordinate(v: f64, buf: *[40]u8) []const u8 {
-    if (!std.math.isFinite(v)) return "null";
+    if (!std.math.isFinite(v)) {
+        buf[0..4].* = "null".*;
+        return buf[0..4];
+    }
     // Not a shortcut on m / 1e6 == v: rapidjson's Grisu2 is not always
     // shortest, and near the midpoint between doubles it emits extra digits
     // that the six-decimal truncation turns into a different last digit.
     // dtoa's fixed path already excludes that zone.
-    return json_writer.dtoa(v, buf, coordinate_precision);
+    return json_writer.dtoaFixedDecimals(v, buf, coordinate_precision);
 }
 
 pub fn handle(svc: *service.Service, ctx: *http.Ctx, options: *request.Options, res: *http.Response) Allocator.Error!?errors.Failure {
@@ -183,27 +186,44 @@ fn writeWithPrecision(w: *json_writer.Writer, value: f64, precision: u32) Alloca
     return w.float(value);
 }
 
+/// A whole-metre height written at the start of `dst`, or null for no data;
+/// returns the length.
+fn writeHeight(h: f64, dst: *[24]u8) usize {
+    if (h == elevation.no_data_value) {
+        dst[0..4].* = "null".*;
+        return 4;
+    }
+    return json_writer.writeInt(@intFromFloat(@round(h)), dst);
+}
+
 fn writeWholeMetreRanges(w: *json_writer.Writer, heights: []const f64, ranges: []const f64, deadline: io.Deadline) ResponseError!void {
     try w.key("range_height");
     const buf = try w.rawValue();
     try buf.append(w.gpa, '[');
-    var num: [24]u8 = undefined;
     const batch_size = 256;
-    const max_pair_bytes = 2 * num.len + 4;
+    const max_pair_bytes = 2 * 24 + 4;
     var first: usize = 0;
     while (first < heights.len) {
         if (deadline.expired()) return error.DeadlineExceeded;
         const end = @min(first + batch_size, heights.len);
         try buf.ensureUnusedCapacity(w.gpa, (end - first) * max_pair_bytes + 1);
+        var n = buf.items.len;
+        const dst = buf.allocatedSlice();
         for (heights[first..end], ranges[first..end], first..) |h, r, i| {
-            if (i != 0) buf.appendAssumeCapacity(',');
-            buf.appendAssumeCapacity('[');
-            buf.appendSliceAssumeCapacity(json_writer.formatInt(@intFromFloat(@round(r)), &num));
-            buf.appendAssumeCapacity(',');
-            const height = if (h == elevation.no_data_value) "null" else json_writer.formatInt(@intFromFloat(@round(h)), &num);
-            buf.appendSliceAssumeCapacity(height);
-            buf.appendAssumeCapacity(']');
+            if (i != 0) {
+                dst[n] = ',';
+                n += 1;
+            }
+            dst[n] = '[';
+            n += 1;
+            n += json_writer.writeInt(@intFromFloat(@round(r)), dst[n..][0..24]);
+            dst[n] = ',';
+            n += 1;
+            n += writeHeight(h, dst[n..][0..24]);
+            dst[n] = ']';
+            n += 1;
         }
+        buf.items.len = n;
         first = end;
     }
     try buf.append(w.gpa, ']');
@@ -231,16 +251,26 @@ fn serializeUntil(a: Allocator, out: *std.ArrayList(u8), options: *const request
         const buf = try w.rawValue();
         try buf.ensureUnusedCapacity(a, 2 + shape.len * (max_point_json + 1));
         buf.appendAssumeCapacity('[');
-        var num: [40]u8 = undefined;
+        // Each point is formatted in place at the end of the reserved space:
+        // fixed-size stores for the keys, the numbers written where they go.
+        var n = buf.items.len;
+        const dst = buf.allocatedSlice();
         for (shape, 0..) |p, i| {
             if (i & 1023 == 0 and deadline.expired()) return error.DeadlineExceeded;
-            if (i > 0) buf.appendAssumeCapacity(',');
-            buf.appendSliceAssumeCapacity("{\"lat\":");
-            buf.appendSliceAssumeCapacity(coordinate(p.lat, &num));
-            buf.appendSliceAssumeCapacity(",\"lon\":");
-            buf.appendSliceAssumeCapacity(coordinate(p.lng, &num));
-            buf.appendAssumeCapacity('}');
+            if (i > 0) {
+                dst[n] = ',';
+                n += 1;
+            }
+            dst[n..][0..7].* = "{\"lat\":".*;
+            n += 7;
+            n += coordinate(p.lat, dst[n..][0..40]).len;
+            dst[n..][0..7].* = ",\"lon\":".*;
+            n += 7;
+            n += coordinate(p.lng, dst[n..][0..40]).len;
+            dst[n] = '}';
+            n += 1;
         }
+        buf.items.len = n;
         buf.appendAssumeCapacity(']');
     }
     if (ranges.len > 0 and precision == 0) {
@@ -262,16 +292,17 @@ fn serializeUntil(a: Allocator, out: *std.ArrayList(u8), options: *const request
         const buf = try w.rawValue();
         try buf.ensureUnusedCapacity(a, 2 + heights.len * 25);
         buf.appendAssumeCapacity('[');
-        var num: [24]u8 = undefined;
+        var n = buf.items.len;
+        const dst = buf.allocatedSlice();
         for (heights, 0..) |h, i| {
             if (i & 1023 == 0 and deadline.expired()) return error.DeadlineExceeded;
-            if (i > 0) buf.appendAssumeCapacity(',');
-            if (h == elevation.no_data_value) {
-                buf.appendSliceAssumeCapacity("null");
-            } else {
-                buf.appendSliceAssumeCapacity(json_writer.formatInt(@intFromFloat(@round(h)), &num));
+            if (i > 0) {
+                dst[n] = ',';
+                n += 1;
             }
+            n += writeHeight(h, dst[n..][0..24]);
         }
+        buf.items.len = n;
         buf.appendAssumeCapacity(']');
     } else {
         try w.beginArrayField("height");

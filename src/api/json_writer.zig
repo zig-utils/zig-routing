@@ -521,9 +521,16 @@ pub fn dtoa(value_in: f64, buffer: []u8, max_decimals: u16) []const u8 {
     return dtoaGrisu(value_in, buffer, max_decimals);
 }
 
+/// `dtoa` at a fixed number of decimals, so the fast path's scale is a
+/// constant (its divisions become multiplications). Same bytes as `dtoa`.
+pub fn dtoaFixedDecimals(value_in: f64, buffer: []u8, comptime max_decimals: u16) []const u8 {
+    if (comptime max_decimals <= 15) if (dtoaFixed(value_in, buffer, max_decimals)) |s| return s;
+    return dtoaGrisu(value_in, buffer, max_decimals);
+}
+
 const pow10_f64 = [16]f64{ 1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15 };
 
-fn dtoaFixed(value: f64, buffer: []u8, max_decimals: u16) ?[]const u8 {
+inline fn dtoaFixed(value: f64, buffer: []u8, max_decimals: u16) ?[]const u8 {
     const mag = @abs(value);
     if (!(mag >= 1e-5 and mag < 1e15)) return null;
     const p10 = pow10_f64[max_decimals];
@@ -563,15 +570,38 @@ fn dtoaFixed(value: f64, buffer: []u8, max_decimals: u16) ?[]const u8 {
     }
     const int_part = q / scale;
     var frac = q % scale;
-    var int_buf: [24]u8 = undefined;
-    const int_digits = formatUint(int_part, &int_buf);
-    @memcpy(buffer[i..][0..int_digits.len], int_digits);
-    i += int_digits.len;
+    if (int_part < 10) {
+        buffer[i] = '0' + @as(u8, @intCast(int_part));
+        i += 1;
+    } else if (int_part < 100) {
+        buffer[i..][0..2].* = digit_pairs[2 * @as(usize, @intCast(int_part)) ..][0..2].*;
+        i += 2;
+    } else if (int_part < 1000) {
+        const ip: usize = @intCast(int_part);
+        buffer[i] = '0' + @as(u8, @intCast(ip / 100));
+        buffer[i + 1 ..][0..2].* = digit_pairs[2 * (ip % 100) ..][0..2].*;
+        i += 3;
+    } else {
+        var int_buf: [24]u8 = undefined;
+        const int_digits = formatUint(int_part, &int_buf);
+        @memcpy(buffer[i..][0..int_digits.len], int_digits);
+        i += int_digits.len;
+    }
     buffer[i] = '.';
     i += 1;
     if (frac == 0) {
         buffer[i] = '0';
         return buffer[0 .. i + 1];
+    }
+    if (max_decimals <= 8) {
+        // All eight digits of frac at once, most significant in byte 0, then
+        // shifted so its max_decimals digits start at byte 0. The last
+        // nonzero byte ends the number (frac != 0, so there is one).
+        const shift: u6 = @intCast((8 - max_decimals) * 8);
+        const bin = eightDigits(@intCast(frac)) >> shift;
+        const len = (64 - @clz(bin) + 7) / 8;
+        std.mem.writeInt(u64, buffer[i..][0..8], bin | (@as(u64, 0x3030303030303030) >> shift), .little);
+        return buffer[0 .. i + len];
     }
     var digits: usize = max_decimals;
     while (frac % 10 == 0) {
@@ -586,6 +616,18 @@ fn dtoaFixed(value: f64, buffer: []u8, max_decimals: u16) ?[]const u8 {
     }
     if (j == 1) buffer[i] = '0' + @as(u8, @intCast(frac % 10));
     return buffer[0 .. i + digits];
+}
+
+/// The eight decimal digits of `v` (< 10^8, zero-padded) as byte values 0
+/// to 9, most significant in the lowest byte: four lanes of 4 digits split
+/// into pairs, then into single digits, by multiply-shift division.
+fn eightDigits(v: u32) u64 {
+    const merged: u64 = @as(u64, v / 10000) | (@as(u64, v % 10000) << 32);
+    const top = ((merged *% 10486) >> 20) & ((0x7F << 32) | 0x7F);
+    const hundreds = ((merged -% 100 *% top) << 16) +% top;
+    var tens = ((hundreds *% 103) >> 10) & ((0xF << 48) | (0xF << 32) | (0xF << 16) | 0xF);
+    tens +%= (hundreds -% 10 *% tens) << 8;
+    return tens;
 }
 
 const digit_pairs = blk: {
@@ -623,6 +665,43 @@ pub fn formatInt(v: i64, buf: *[24]u8) []const u8 {
     const start = buf.len - digits.len - 1;
     buf[start] = '-';
     return buf[start..];
+}
+
+/// `formatInt` written at the start of `dst`; returns the length. Values
+/// under 10^4 in magnitude (heights, most ranges) take no loop or copy.
+pub fn writeInt(v: i64, dst: *[24]u8) usize {
+    var i: usize = 0;
+    if (v < 0) {
+        dst[0] = '-';
+        i = 1;
+    }
+    const m = @abs(v);
+    if (m < 10) {
+        dst[i] = '0' + @as(u8, @intCast(m));
+        return i + 1;
+    }
+    if (m < 100) {
+        dst[i..][0..2].* = digit_pairs[2 * @as(usize, @intCast(m)) ..][0..2].*;
+        return i + 2;
+    }
+    if (m < 10000) {
+        const u: usize = @intCast(m);
+        const hi = u / 100;
+        const lo = u % 100;
+        if (hi < 10) {
+            dst[i] = '0' + @as(u8, @intCast(hi));
+            i += 1;
+        } else {
+            dst[i..][0..2].* = digit_pairs[2 * hi ..][0..2].*;
+            i += 2;
+        }
+        dst[i..][0..2].* = digit_pairs[2 * lo ..][0..2].*;
+        return i + 2;
+    }
+    var tmp: [24]u8 = undefined;
+    const digits = formatUint(m, &tmp);
+    @memcpy(dst[i..][0..digits.len], digits);
+    return i + digits.len;
 }
 
 /// Full rapidjson Grisu2 + Prettify.
@@ -868,6 +947,25 @@ test "fast fixed-point path is byte-identical to full Grisu2" {
     try testing.expect(fast_hits > 100_000);
 }
 
+test "eightDigits splits every value below 10^8 into its decimal digits" {
+    // Every value in ReleaseFast (a second or so); a stride elsewhere, with
+    // each 10^4 boundary and its neighbours.
+    const stride: u32 = if (@import("builtin").mode == .fast) 1 else 997;
+    var v: u32 = 0;
+    while (v < 100_000_000) : (v += stride) {
+        for ([_]u32{ v, v -| 1, (v / 10000) * 10000, (v / 10000) * 10000 + 9999 }) |x| {
+            const got = eightDigits(x);
+            var rest = x;
+            var k: u6 = 8;
+            while (k > 0) {
+                k -= 1;
+                try testing.expectEqual(@as(u64, rest % 10), (got >> (@as(u6, k) * 8)) & 0xFF);
+                rest /= 10;
+            }
+        }
+    }
+}
+
 test "integer formatting matches std.fmt" {
     var prng = std.Random.DefaultPrng.init(9);
     const random = prng.random();
@@ -875,9 +973,16 @@ test "integer formatting matches std.fmt" {
     var ref: [24]u8 = undefined;
     const edges = [_]i64{ 0, 1, -1, 9, 10, 99, 100, -100, 999, 1000, std.math.maxInt(i64), std.math.minInt(i64) };
     for (edges) |v| try std.testing.expectEqualStrings(try std.fmt.bufPrint(&ref, "{d}", .{v}), formatInt(v, &buf));
+    var left: [24]u8 = undefined;
+    for (edges) |v| try std.testing.expectEqualStrings(try std.fmt.bufPrint(&ref, "{d}", .{v}), left[0..writeInt(v, &left)]);
+    var small: i64 = -10_050;
+    while (small <= 10_050) : (small += 1) {
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&ref, "{d}", .{small}), left[0..writeInt(small, &left)]);
+    }
     for (0..100_000) |_| {
         const v = random.int(i64) >> random.int(u6);
         try std.testing.expectEqualStrings(try std.fmt.bufPrint(&ref, "{d}", .{v}), formatInt(v, &buf));
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&ref, "{d}", .{v}), left[0..writeInt(v, &left)]);
     }
     try std.testing.expectEqualStrings("18446744073709551615", formatUint(std.math.maxInt(u64), &buf));
 }
