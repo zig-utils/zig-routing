@@ -310,61 +310,358 @@ fn unpackGroups(payload: []const u8, n: usize, residuals: *[block_dim * block_di
 }
 
 /// Rows rebuilt together by `rebuildStrip`: i16 x 8 fills one 128-bit
-/// register (4 and 16 measured slower).
+/// register (4 and 16 measured slower). `rebuildStripPair` runs two such
+/// strips side by side.
 const wave_rows = 8;
 
+/// `medPredict` without selects: clamping c to [min(a, b), max(a, b)] is
+/// the median of a, b and c, and a + b minus that median is min(a, b) when c
+/// is above both, max(a, b) when below and else the plane, all in range, so
+/// the wrapping sum is exact. The median is taken as max(min(a, c),
+/// min(max(a, c), b)) so that only the last two steps wait on the north b.
 inline fn medPredictVec(comptime V: type, west: V, north: V, north_west: V) V {
-    const mx = @max(west, north);
-    const mn = @min(west, north);
-    return @select(i16, north_west >= mx, mn, @select(i16, north_west <= mn, mx, west +% north -% north_west));
+    const median = @max(@min(west, north_west), @min(@max(west, north_west), north));
+    return west +% north -% median;
 }
 
-inline fn predictVec(comptime p: Predictor, comptime V: type, west: V, north: V, north_west: V) V {
-    return switch (p) {
-        .med => medPredictVec(V, west, north, north_west),
-        .plane => west +% north -% north_west,
-    };
-}
-
-/// Stage 2 of a decode: the posts from their residuals, row 0 and then one
-/// `rebuildStrip` per strip of `wave_rows` rows.
+/// Stage 2 of a decode: the posts from their residuals, row 0 and then the
+/// strips of `wave_rows` rows, two at a time under the median predictor.
 fn rebuildRows(comptime p: Predictor, residuals: *const [block_dim * block_dim]i16, w: usize, h: usize, posts: []i16) void {
     rebuildFirstRow(residuals, 0, w, posts);
     var r0: usize = 1;
-    while (r0 < h) : (r0 += wave_rows) rebuildStrip(p, residuals, w, r0, @min(wave_rows, h - r0), 0, w, posts);
+    while (r0 < h) : (r0 += wave_rows) switch (p) {
+        .med => if (h - r0 > wave_rows and pairs(0, w)) {
+            rebuildStripPair(residuals, w, r0, @min(wave_rows, h - r0 - wave_rows), 0, w, posts);
+            r0 += wave_rows;
+        } else rebuildStrip(residuals, w, r0, @min(wave_rows, h - r0), 0, w, posts),
+        .plane => rebuildStripPlane(residuals, w, r0, @min(wave_rows, h - r0), 0, w, posts),
+    };
 }
 
-/// Columns [c_from, c_to) of row 0, given columns [0, c_from) done.
+/// Columns [c_from, c_to) of row 0, given columns [0, c_from) done: a
+/// running sum of the residuals, eight at a time by `prefixSum`.
 fn rebuildFirstRow(residuals: *const [block_dim * block_dim]i16, c_from: usize, c_to: usize, posts: []i16) void {
+    var carry: i16 = if (c_from == 0) 0 else posts[c_from - 1];
     var col = c_from;
-    if (col == 0 and c_to > 0) {
-        posts[0] = residuals[0];
-        col = 1;
+    while (col + wave_rows <= c_to) : (col += wave_rows) {
+        const sum = prefixSum(residuals[col..][0..wave_rows].*) +% @as(@Vector(wave_rows, i16), @splat(carry));
+        posts[col..][0..wave_rows].* = sum;
+        carry = sum[wave_rows - 1];
     }
-    while (col < c_to) : (col += 1) posts[col] = residuals[col] +% posts[col - 1];
+    while (col < c_to) : (col += 1) {
+        carry +%= residuals[col];
+        posts[col] = carry;
+    }
 }
 
-/// Row by row, each post waits on its west neighbour. Instead a strip of
-/// `wave_rows` rows runs as a wavefront: at step t, lane k rebuilds post
-/// (r0 + k, c_from + t - k), so its west is its own lane at step t - 1, its
-/// north is lane k - 1 at step t - 1 (the row above for lane 0) and its
-/// north-west is lane k - 1 at step t - 2. Same predictions in the same
-/// wrapping arithmetic, so the same posts.
+/// The running (inclusive prefix) sums of a vector, in wrapping arithmetic.
+inline fn prefixSum(v: @Vector(wave_rows, i16)) @Vector(wave_rows, i16) {
+    var s = v;
+    comptime var d = 1;
+    inline while (d < wave_rows) : (d *= 2) s +%= std.simd.shiftElementsRight(s, d, 0);
+    return s;
+}
+
+/// The plane predictor needs no wavefront. post = r + west + north -
+/// north-west in every interior post, row 0 sums from the west and column 0
+/// from the north, so in wrapping arithmetic the posts are the 2D running sum
+/// of the residuals: each row is the row above plus the running sum of its
+/// own residuals. Exactly the posts of the scalar recurrence, eight columns
+/// at a time with no lane dependency but the carried sum.
+///
+/// Same contract as `rebuildStrip`: columns [c_from, c_to) of rows
+/// [r0, r0 + rows), r0 >= 1, given the finished posts to the west and above;
+/// the carried sum of a row starts as its difference from the row above in
+/// column c_from - 1. `residuals` may be `posts` itself.
+fn rebuildStripPlane(residuals: *const [block_dim * block_dim]i16, w: usize, r0: usize, rows: usize, c_from: usize, c_to: usize, posts: []i16) void {
+    const K = wave_rows;
+    const V = @Vector(K, i16);
+    for (r0..r0 + rows) |r| {
+        const row = r * w;
+        const above = row - w;
+        var carry: i16 = if (c_from == 0) 0 else posts[row + c_from - 1] -% posts[above + c_from - 1];
+        var col = c_from;
+        while (col + K <= c_to) : (col += K) {
+            const sum = prefixSum(residuals[row + col ..][0..K].*) +% @as(V, @splat(carry));
+            const north: V = posts[above + col ..][0..K].*;
+            posts[row + col ..][0..K].* = north +% sum;
+            carry = sum[K - 1];
+        }
+        while (col < c_to) : (col += 1) {
+            carry +%= residuals[row + col];
+            posts[row + col] = posts[above + col] +% carry;
+        }
+    }
+}
+
+/// The transpose of an 8 x 8 matrix of i16 rows: three rounds of
+/// interleaving pairs of 16-, 32- and 64-bit units (lane pairs taken as
+/// little-endian units by the bitcasts).
+inline fn transpose8(m: [8]@Vector(8, i16)) [8]@Vector(8, i16) {
+    comptime std.debug.assert(builtin.cpu.arch.endian() == .little and wave_rows == 8);
+    const V = @Vector(8, i16);
+    const W = @Vector(4, u32);
+    const Q = @Vector(2, u64);
+    var a: [8]V = undefined;
+    inline for (0..4) |i| {
+        a[2 * i] = @shuffle(i16, m[2 * i], m[2 * i + 1], [8]i32{ 0, -1, 2, -3, 4, -5, 6, -7 });
+        a[2 * i + 1] = @shuffle(i16, m[2 * i], m[2 * i + 1], [8]i32{ 1, -2, 3, -4, 5, -6, 7, -8 });
+    }
+    var b: [8]W = undefined;
+    inline for (0..2) |h| inline for (0..2) |j| {
+        const x: W = @bitCast(a[4 * h + j]);
+        const y: W = @bitCast(a[4 * h + j + 2]);
+        b[4 * h + j] = @shuffle(u32, x, y, [4]i32{ 0, -1, 2, -3 });
+        b[4 * h + j + 2] = @shuffle(u32, x, y, [4]i32{ 1, -2, 3, -4 });
+    };
+    // b[0..4] hold columns {0, 4}, {1, 5}, {2, 6}, {3, 7} of rows 0..3,
+    // b[4..8] the same of rows 4..7.
+    var out: [8]V = undefined;
+    inline for (0..4) |j| {
+        const x: Q = @bitCast(b[j]);
+        const y: Q = @bitCast(b[j + 4]);
+        out[j] = @bitCast(@shuffle(u64, x, y, [2]i32{ 0, -1 }));
+        out[j + 4] = @bitCast(@shuffle(u64, x, y, [2]i32{ 1, -2 }));
+    }
+    return out;
+}
+
+/// The median predictor, row by row, makes each post wait on its west
+/// neighbour. Instead a strip of `wave_rows` rows runs as a wavefront: at
+/// step t, lane k rebuilds post (r0 + k, c_from + t - k), so its west is its
+/// own lane at step t - 1, its north is lane k - 1 at step t - 1 (the row
+/// above for lane 0) and its north-west is lane k - 1 at step t - 2. Same
+/// predictions in the same wrapping arithmetic, so the same posts.
 ///
 /// Rebuilds columns [c_from, c_to) of rows [r0, r0 + rows), given columns
 /// [0, c_from) of those rows and [0, c_to) of row r0 - 1 done, so a block can
 /// be rebuilt in pieces. At column c_from a lane takes its west and
-/// north-west from the finished columns. `residuals` may be `posts` itself:
-/// each post is read as a residual just before it is written, and only
-/// finished posts are read as neighbours.
-fn rebuildStrip(comptime p: Predictor, residuals: *const [block_dim * block_dim]i16, w: usize, r0: usize, rows: usize, c_from: usize, c_to: usize, posts: []i16) void {
+/// north-west from the finished columns, or in column 0 predicts from its
+/// north neighbour alone. `residuals` may be `posts` itself: each post is
+/// read as a residual before it is written, and only finished posts are read
+/// as neighbours.
+fn rebuildStrip(residuals: *const [block_dim * block_dim]i16, w: usize, r0: usize, rows: usize, c_from: usize, c_to: usize, posts: []i16) void {
+    if (c_to - c_from < wave_rows) return rebuildStripNarrow(residuals, w, r0, rows, c_from, c_to, posts);
+    if (rows == wave_rows) return rebuildWave(wave_rows, residuals, w, r0, rows, c_from, c_to, posts);
+    rebuildWave(null, residuals, w, r0, rows, c_from, c_to, posts);
+}
+
+/// How a tile of `wave_rows` steps meets its strip: the ramp up (steps
+/// 0..K-1, lane k live from step k), every lane live, or the ramp down
+/// (steps width..width+K-2, lane k >= 1 live through step k - 1 of them).
+const Tile = enum { up, mid, down };
+
+/// One strip's wavefront, `wave_rows` steps at a time: lane k's residuals
+/// for steps t..t+K-1 are K consecutive ones of its row, so K row loads and
+/// a transpose replace K lane-by-lane gathers, and the posts go back the
+/// same way. In a ramp the lanes outside the strip compute values no live
+/// lane reads, and their posts are blended out before the store. Lanes past
+/// `rows` load zeros and store nothing. The methods are inline so that a
+/// comptime `rows` folds the lane checks.
+const Wave = struct {
+    const K = wave_rows;
+    const V = @Vector(K, i16);
+    const M = @Vector(K, bool);
+    const lane = std.simd.iota(u8, K);
+
+    /// The posts of the last step, and its north: the next step's north-west.
+    prev: V = @splat(0),
+    north: V = @splat(0),
+    /// West and north-west of each lane's first post, when not in column 0.
+    west_in: V = @splat(0),
+    north_west_in: V = @splat(0),
+    /// The tile's residuals by step (after `load`), then its posts by step.
+    in: [K]V = @splat(@splat(0)),
+    cur: [K]V = @splat(@splat(0)),
+
+    inline fn init(posts: []const i16, w: usize, r0: usize, rows: usize, c_from: usize) Wave {
+        var self: Wave = .{};
+        if (c_from > 0) inline for (0..K) |k| if (k < rows) {
+            self.west_in[k] = posts[(r0 + k) * w + c_from - 1];
+            self.north_west_in[k] = posts[(r0 + k - 1) * w + c_from - 1];
+        };
+        return self;
+    }
+
+    /// The residuals of a tile. `c` is c_from for the ramp up, the column
+    /// of lane 0's first step otherwise, and c_to for the ramp down. Each
+    /// row loads K columns inside the strip, moved so that lane j is step j.
+    inline fn load(self: *Wave, comptime tile: Tile, residuals: *const [block_dim * block_dim]i16, w: usize, r0: usize, rows: usize, c: usize) void {
+        inline for (0..K) |k| if (k < rows) switch (tile) {
+            .up => self.in[k] = std.simd.shiftElementsRight(@as(V, residuals[(r0 + k) * w + c ..][0..K].*), k, 0),
+            .mid => self.in[k] = residuals[(r0 + k) * w + c - k ..][0..K].*,
+            .down => if (k > 0) {
+                self.in[k] = std.simd.shiftElementsLeft(@as(V, residuals[(r0 + k) * w + c - K ..][0..K].*), K - k, 0);
+            },
+        };
+        self.in = transpose8(self.in);
+    }
+
+    /// Step i of a tile, `top` the north of lane 0 (the row above).
+    inline fn step(self: *Wave, comptime tile: Tile, comptime i: usize, column0: bool, top: i16) void {
+        const north = std.simd.shiftElementsRight(self.prev, 1, top);
+        const pred = if (tile == .up) blk: {
+            const first: M = lane == @as(@Vector(K, u8), @splat(i));
+            break :blk if (column0)
+                @select(i16, first, north, medPredictVec(V, self.prev, north, self.north))
+            else
+                medPredictVec(V, @select(i16, first, self.west_in, self.prev), north, @select(i16, first, self.north_west_in, self.north));
+        } else medPredictVec(V, self.prev, north, self.north);
+        self.cur[i] = self.in[i] +% pred;
+        self.north = north;
+        self.prev = self.cur[i];
+    }
+
+    /// The posts of a tile, at the columns `load` read.
+    inline fn store(self: *Wave, comptime tile: Tile, posts: []i16, w: usize, r0: usize, rows: usize, c: usize) void {
+        const out = transpose8(self.cur);
+        inline for (0..K) |k| if (k < rows) switch (tile) {
+            .up => {
+                // Lane j of row k is column c + j - k: live for j >= k.
+                const dst = posts[(r0 + k) * w + c ..][0..K];
+                const live: M = lane < @as(@Vector(K, u8), @splat(K - k));
+                dst.* = @select(i16, live, std.simd.shiftElementsLeft(out[k], k, 0), dst.*);
+            },
+            .mid => posts[(r0 + k) * w + c - k ..][0..K].* = out[k],
+            .down => if (k > 0) {
+                // Lane j of row k is column c - K + j: live for j >= K - k.
+                const dst = posts[(r0 + k) * w + c - K ..][0..K];
+                const live: M = lane >= @as(@Vector(K, u8), @splat(K - k));
+                dst.* = @select(i16, live, std.simd.shiftElementsRight(out[k], K - k, 0), dst.*);
+            },
+        };
+    }
+
+    /// One step with every lane live, lane by lane: lane 0 at column c.
+    inline fn single(self: *Wave, residuals: *const [block_dim * block_dim]i16, posts: []i16, w: usize, r0: usize, rows: usize, c: usize, top: i16) void {
+        const north = std.simd.shiftElementsRight(self.prev, 1, top);
+        var r: V = @splat(0);
+        inline for (0..K) |k| if (k < rows) {
+            r[k] = residuals[(r0 + k) * w + (c - k)];
+        };
+        const cur = r +% medPredictVec(V, self.prev, north, self.north);
+        inline for (0..K) |k| if (k < rows) {
+            posts[(r0 + k) * w + (c - k)] = cur[k];
+        };
+        self.north = north;
+        self.prev = cur;
+    }
+};
+
+/// `rebuildStrip` at least `wave_rows` wide, `rows` comptime when `full`
+/// is given: the ramp up, every-lane tiles, single steps for the columns
+/// left over, and the ramp down.
+fn rebuildWave(comptime full: ?usize, residuals: *const [block_dim * block_dim]i16, w: usize, r0: usize, rows_in: usize, c_from: usize, c_to: usize, posts: []i16) void {
+    @setEvalBranchQuota(10_000);
+    const K = wave_rows;
+    const rows = full orelse rows_in;
+    const width = c_to - c_from;
+    const above = (r0 - 1) * w;
+    var a = Wave.init(posts, w, r0, rows, c_from);
+    a.load(.up, residuals, w, r0, rows, c_from);
+    inline for (0..K) |i| a.step(.up, i, c_from == 0, posts[above + c_from + i]);
+    a.store(.up, posts, w, r0, rows, c_from);
+    var t: usize = K;
+    while (t + K <= width) : (t += K) {
+        const c = c_from + t;
+        a.load(.mid, residuals, w, r0, rows, c);
+        inline for (0..K) |i| a.step(.mid, i, false, posts[above + c + i]);
+        a.store(.mid, posts, w, r0, rows, c);
+    }
+    while (t < width) : (t += 1) a.single(residuals, posts, w, r0, rows, c_from + t, posts[above + c_from + t]);
+    a.load(.down, residuals, w, r0, rows, c_to);
+    inline for (0..K - 1) |i| a.step(.down, i, false, 0);
+    a.store(.down, posts, w, r0, rows, c_to);
+}
+
+/// Whether `rebuildStripPair` takes a strip of `wave_rows` rows and the
+/// strip below it over these columns.
+inline fn pairs(c_from: usize, c_to: usize) bool {
+    return c_to - c_from >= wave_rows and (c_to - c_from) % wave_rows == 0;
+}
+
+/// Two strips at once over the same columns: `rebuildStrip` of rows
+/// [r0, r0 + K) and then of [r0 + K, r0 + K + rows_below), as one wavefront
+/// of 2K lanes. The lower strip runs one tile behind, its lane 0 taking the
+/// north from the upper strip's lane K - 1 one step before, still in a
+/// register. The two strips' steps do not wait on each other within a step,
+/// so their latencies overlap. The width is a whole number of tiles (see
+/// `pairs`), so the tiles of both line up.
+fn rebuildStripPair(residuals: *const [block_dim * block_dim]i16, w: usize, r0: usize, rows_below: usize, c_from: usize, c_to: usize, posts: []i16) void {
+    if (rows_below == wave_rows) return rebuildPair(wave_rows, residuals, w, r0, rows_below, c_from, c_to, posts);
+    rebuildPair(null, residuals, w, r0, rows_below, c_from, c_to, posts);
+}
+
+fn rebuildPair(comptime full: ?usize, residuals: *const [block_dim * block_dim]i16, w: usize, r0: usize, rows_in: usize, c_from: usize, c_to: usize, posts: []i16) void {
+    @setEvalBranchQuota(10_000);
+    const K = wave_rows;
+    const rows = full orelse rows_in;
+    const width = c_to - c_from;
+    std.debug.assert(pairs(c_from, c_to));
+    const above = (r0 - 1) * w;
+    const r1 = r0 + K;
+    const column0 = c_from == 0;
+    var a = Wave.init(posts, w, r0, K, c_from);
+    var b = Wave.init(posts, w, r1, rows, c_from);
+    // The upper ramp up alone.
+    a.load(.up, residuals, w, r0, K, c_from);
+    inline for (0..K) |i| a.step(.up, i, column0, posts[above + c_from + i]);
+    a.store(.up, posts, w, r0, K, c_from);
+    // The lower ramp up beside the upper's second tile (or ramp down).
+    b.load(.up, residuals, w, r1, rows, c_from);
+    if (width == K) {
+        a.load(.down, residuals, w, r0, K, c_to);
+        inline for (0..K) |i| {
+            b.step(.up, i, column0, a.prev[K - 1]);
+            if (i < K - 1) a.step(.down, i, false, 0);
+        }
+        a.store(.down, posts, w, r0, K, c_to);
+        b.store(.up, posts, w, r1, rows, c_from);
+    } else {
+        a.load(.mid, residuals, w, r0, K, c_from + K);
+        inline for (0..K) |i| {
+            b.step(.up, i, column0, a.prev[K - 1]);
+            a.step(.mid, i, false, posts[above + c_from + K + i]);
+        }
+        a.store(.mid, posts, w, r0, K, c_from + K);
+        b.store(.up, posts, w, r1, rows, c_from);
+        var t: usize = 2 * K;
+        while (t < width) : (t += K) {
+            const c = c_from + t;
+            a.load(.mid, residuals, w, r0, K, c);
+            b.load(.mid, residuals, w, r1, rows, c - K);
+            inline for (0..K) |i| {
+                b.step(.mid, i, false, a.prev[K - 1]);
+                a.step(.mid, i, false, posts[above + c + i]);
+            }
+            a.store(.mid, posts, w, r0, K, c);
+            b.store(.mid, posts, w, r1, rows, c - K);
+        }
+        // The upper ramp down beside the lower's last full tile.
+        a.load(.down, residuals, w, r0, K, c_to);
+        b.load(.mid, residuals, w, r1, rows, c_to - K);
+        inline for (0..K) |i| {
+            b.step(.mid, i, false, a.prev[K - 1]);
+            if (i < K - 1) a.step(.down, i, false, 0);
+        }
+        a.store(.down, posts, w, r0, K, c_to);
+        b.store(.mid, posts, w, r1, rows, c_to - K);
+    }
+    // The lower ramp down alone.
+    b.load(.down, residuals, w, r1, rows, c_to);
+    inline for (0..K - 1) |i| b.step(.down, i, false, 0);
+    b.store(.down, posts, w, r1, rows, c_to);
+}
+
+/// `rebuildStrip` one step at a time, lane by lane: for strips narrower than
+/// a wavefront, where the K-step tiles would reach outside the strip.
+fn rebuildStripNarrow(residuals: *const [block_dim * block_dim]i16, w: usize, r0: usize, rows: usize, c_from: usize, c_to: usize, posts: []i16) void {
     const K = wave_rows;
     const V = @Vector(K, i16);
     const width = c_to - c_from;
     if (width == 0) return;
     const lane: @Vector(K, i32) = std.simd.iota(i32, K);
     const above = (r0 - 1) * w;
-    // West and north-west of each lane's first post, when that is not column 0.
     var west_in: V = @splat(0);
     var north_west_in: V = @splat(0);
     if (c_from > 0) {
@@ -378,30 +675,10 @@ fn rebuildStrip(comptime p: Predictor, residuals: *const [block_dim * block_dim]
     var prev: V = @splat(0);
     var prev2: V = @splat(0);
     const steps = width + rows - 1;
-    // A full strip at least K wide has steps K..width-1 with every lane live
-    // and past its first column: those run without edge checks.
-    const steady = rows == K and width >= K;
-    const steady_lo: usize = if (steady) K else steps;
-    const steady_hi: usize = if (steady) width else steps;
-    var t: usize = 0;
-    while (t < steps) : (t += 1) {
-        if (t == steady_lo) {
-            while (t < steady_hi) : (t += 1) {
-                const c = c_from + t;
-                const north = std.simd.shiftElementsRight(prev, 1, posts[above + c]);
-                const north_west = std.simd.shiftElementsRight(prev2, 1, posts[above + c - 1]);
-                var r: V = undefined;
-                inline for (0..K) |k| r[k] = residuals[(r0 + k) * w + (c - k)];
-                const cur = r +% predictVec(p, V, prev, north, north_west);
-                inline for (0..K) |k| posts[(r0 + k) * w + (c - k)] = cur[k];
-                prev2 = prev;
-                prev = cur;
-            }
-            if (t >= steps) break;
-        }
-        // Ramp up and down: lanes outside the range stay dead, and a lane at
-        // its first column takes its west from the finished columns, or in
-        // column 0 predicts from its north neighbour alone.
+    for (0..steps) |t| {
+        // Lanes outside the range stay dead, and a lane at its first column
+        // takes its west from the finished columns, or in column 0 predicts
+        // from its north neighbour alone.
         const step: @Vector(K, i32) = @as(@Vector(K, i32), @splat(@intCast(t))) - lane;
         const first = step == @as(@Vector(K, i32), @splat(0));
         const c = c_from + t;
@@ -410,10 +687,10 @@ fn rebuildStrip(comptime p: Predictor, residuals: *const [block_dim * block_dim]
         const north = std.simd.shiftElementsRight(prev, 1, top);
         var north_west = std.simd.shiftElementsRight(prev2, 1, top_west);
         const pred = if (c_from == 0)
-            @select(i16, first, north, predictVec(p, V, prev, north, north_west))
+            @select(i16, first, north, medPredictVec(V, prev, north, north_west))
         else blk: {
             north_west = @select(i16, first, north_west_in, north_west);
-            break :blk predictVec(p, V, @select(i16, first, west_in, prev), north, north_west);
+            break :blk medPredictVec(V, @select(i16, first, west_in, prev), north, north_west);
         };
         var r: V = @splat(0);
         inline for (0..K) |k| {
@@ -905,11 +1182,16 @@ pub const LazyBlock = struct {
         // block would otherwise rebuild each strip in four short pieces, which
         // cost more than one whole strip (most of their steps are ramp).
         const to = if (aligned and self.cols[strip(row)] == 0) @min(w, (col / group + 1) * group) else w;
-        for (0..strip(row) + 1) |s| {
+        const last = strip(row);
+        var s: usize = 0;
+        while (s <= last) : (s += 1) {
             const from: usize = self.cols[s];
             if (from >= to) continue;
             const r0 = if (s == 0) 0 else 1 + (s - 1) * wave_rows;
-            const r1 = if (s == 0) 1 else @min(h, r0 + wave_rows);
+            // The median strip below over the same columns goes along in
+            // one `rebuildStripPair`.
+            const pair = p == .med and s > 0 and s < last and self.cols[s + 1] == from and pairs(from, to);
+            const r1 = if (s == 0) 1 else @min(h, r0 + @as(usize, if (pair) 2 else 1) * wave_rows);
             if (aligned and from == 0 and to == w) {
                 // Whole rows: one run of groups.
                 _ = try unpackGroups(payload, n, posts, r0 * per_row, r1 * per_row, self.offsets[r0 * per_row]);
@@ -927,7 +1209,16 @@ pub const LazyBlock = struct {
                     self.group = @intCast(g_to);
                 }
             }
-            if (s == 0) rebuildFirstRow(posts, from, to, posts) else rebuildStrip(p, posts, w, r0, r1 - r0, from, to, posts);
+            if (s == 0) {
+                rebuildFirstRow(posts, from, to, posts);
+            } else if (pair) {
+                rebuildStripPair(posts, w, r0, r1 - r0 - wave_rows, from, to, posts);
+                self.cols[s] = @intCast(to);
+                s += 1;
+            } else switch (p) {
+                .med => rebuildStrip(posts, w, r0, r1 - r0, from, to, posts),
+                .plane => rebuildStripPlane(posts, w, r0, r1 - r0, from, to, posts),
+            }
             self.cols[s] = @intCast(to);
         }
     }
@@ -1290,4 +1581,79 @@ test "a damaged pack is rejected at open" {
         };
     };
     try testing.expectEqual(@as(usize, 1), failures);
+}
+
+test "the vector median predictor matches the scalar one" {
+    const V = @Vector(wave_rows, i16);
+    var prng = std.Random.DefaultPrng.init(5);
+    const random = prng.random();
+    const edges = [_]i16{ -32768, -32767, -1, 0, 1, 32766, 32767 };
+    for (0..20000) |iter| {
+        var a: V = undefined;
+        var b: V = undefined;
+        var c: V = undefined;
+        inline for (0..wave_rows) |k| {
+            a[k] = if (iter % 3 == 0) edges[random.uintLessThan(usize, edges.len)] else random.int(i16);
+            b[k] = if (iter % 5 == 0) edges[random.uintLessThan(usize, edges.len)] else random.int(i16);
+            c[k] = if (iter % 2 == 0) edges[random.uintLessThan(usize, edges.len)] else random.int(i16);
+        }
+        const got = medPredictVec(V, a, b, c);
+        inline for (0..wave_rows) |k| try testing.expectEqual(medPredict(a[k], b[k], c[k]), got[k]);
+    }
+}
+
+/// The posts of residuals by the scalar recurrence, as `decodeBlockScalar`
+/// rebuilds them.
+fn rebuildScalar(comptime p: Predictor, residuals: []const i16, w: usize, h: usize, posts: []i16) void {
+    for (0..h) |r| for (0..w) |col| {
+        const i = r * w + col;
+        posts[i] = residuals[i] +% predict(p, posts, w, r, col);
+    };
+}
+
+test "the strip kernels match the scalar recurrence in any pieces" {
+    var prng = std.Random.DefaultPrng.init(7);
+    const random = prng.random();
+    var residuals: [block_dim * block_dim]i16 = undefined;
+    var want: [block_dim * block_dim]i16 = undefined;
+    var got: [block_dim * block_dim]i16 = undefined;
+    // Full and edge blocks, widths on and off the tile size, heights that
+    // end a strip short, and strips paired or not.
+    const shapes = [_][2]usize{ .{ 64, 64 }, .{ 17, 17 }, .{ 64, 17 }, .{ 17, 64 }, .{ 24, 12 }, .{ 9, 10 }, .{ 8, 9 }, .{ 16, 25 }, .{ 40, 33 }, .{ 7, 20 } };
+    for (shapes) |shape| {
+        const w = shape[0];
+        const h = shape[1];
+        const n = w * h;
+        for (0..6) |iter| {
+            for (residuals[0..n]) |*v| v.* = switch (iter % 3) {
+                0 => random.int(i16),
+                1 => random.intRangeAtMost(i16, -5, 5),
+                else => if (random.boolean()) 32767 else -32768,
+            };
+            inline for (.{ Predictor.med, Predictor.plane }) |p| {
+                rebuildScalar(p, residuals[0..n], w, h, &want);
+                // Two pieces split at every column, in place or from a
+                // separate residual buffer (the posts start as garbage).
+                for (0..w) |split| for ([_]bool{ true, false }) |in_place| {
+                    if (in_place) @memcpy(got[0..n], residuals[0..n]) else @memset(&got, 0x5555);
+                    const src: *const [block_dim * block_dim]i16 = if (in_place) &got else &residuals;
+                    for ([_][2]usize{ .{ 0, split }, .{ split, w } }) |piece| {
+                        const c_from = piece[0];
+                        const c_to = piece[1];
+                        rebuildFirstRow(src, c_from, c_to, &got);
+                        var r0: usize = 1;
+                        while (r0 < h) : (r0 += wave_rows) {
+                            if (p == .plane) {
+                                rebuildStripPlane(src, w, r0, @min(wave_rows, h - r0), c_from, c_to, &got);
+                            } else if (h - r0 > wave_rows and pairs(c_from, c_to) and (iter + r0 / wave_rows) % 2 == 0) {
+                                rebuildStripPair(src, w, r0, @min(wave_rows, h - r0 - wave_rows), c_from, c_to, &got);
+                                r0 += wave_rows;
+                            } else rebuildStrip(src, w, r0, @min(wave_rows, h - r0), c_from, c_to, &got);
+                        }
+                    }
+                    try testing.expectEqualSlices(i16, want[0..n], got[0..n]);
+                };
+            }
+        }
+    }
 }
