@@ -1033,6 +1033,28 @@ one client thread at one connection, and two at eight connections. Each gzip run
 pinned gzip files. Every measured request returned HTTP 200 in both configurations.
 The uncompressed Valhalla comparison remains below the 10x target.
 
+On a second native x86-64 Linux host with eight AMD EPYC 9R14 vCPUs and 16 GiB RAM,
+Valhalla 3.9.3 read uncompressed HGT. Zig at `942c752` read both the 6.14 GB pack
+and the same uncompressed HGT. The packed DEM and raw HGT both came from the
+1,493 pinned elevation files. All three Zig runs matched Valhalla's status, JSON
+schema and exact elevations for all 1,000 corpus requests.
+
+| Zig input and revision | Connections | Median Valhalla points/s | Median Zig points/s | Median paired speedup |
+| --- | ---: | ---: | ---: | ---: |
+| Packed, `ccbde15` | 1 | 551,730 | 2,460,624 | 4.47x |
+| Packed, `942c752` | 1 | 551,730 | 2,489,279 | 4.51x |
+| Raw HGT, `942c752` | 1 | 551,730 | 4,613,008 | 8.37x |
+| Packed, `ccbde15` | 8 | 2,351,405 | 12,589,735 | 5.37x |
+| Packed, `942c752` | 8 | 2,351,405 | 13,059,263 | 5.50x |
+| Raw HGT, `942c752` | 8 | 2,351,405 | 18,318,796 | 7.68x |
+
+Each server ran six workers. The client used one thread and a separate two-second
+warm-up before each of three alternating measured replays. Each replay used 30,000
+requests at one connection or 60,000 at eight connections. All measured requests
+returned HTTP 200. With the updated Zig binary, the raw-input runs used about half
+the server CPU time of the packed-input runs for the same work. The packed result
+remains below 10x at both loads. [Performance gate](https://github.com/zig-utils/zig-routing/issues/42)
+
 #### Request replay
 
 `zr bench` measures throughput and latency against either server. A corpus is one request per
