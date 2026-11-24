@@ -115,7 +115,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PANTRY_TOKEN: ${{ secrets.PANTRY_TOKEN }}
-          PANTRY_REGISTRY_TOKEN: ${{ secrets.PANTRY_TOKEN }}
           RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
           APPROVE_ONE: ${{ inputs.approve_1_0 || false }}
         run: |
