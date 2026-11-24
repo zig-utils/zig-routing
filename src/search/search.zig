@@ -899,6 +899,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             var settled: usize = 0;
             while (true) {
                 if (profiled) observer.expansionSample(popped);
+                if (comptime direction == .forward and @hasDecl(Q, "peek")) self.prefetchTop(&pending, labels.items);
                 const top = (if (@hasDecl(Q, "popWithin")) try pending.popWithin(a, control) else pending.pop()) orelse break;
                 if (profiled) observer.expansionStage(.labels);
                 popped += 1;
@@ -1437,6 +1438,23 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             return marked;
         }
 
+        /// Start the graph reads of the queue top before the pop reorders
+        /// the heap, so they overlap it. A stale top only wastes the hints.
+        inline fn prefetchTop(self: *const Self, pending: *const Q, labels: []const Label) void {
+            const top = pending.peek() orelse return;
+            if (top.label >= labels.len) return;
+            const edge = labels[top.label].edge;
+            const view = self.view;
+            if (edge >= view.edges.len) return;
+            const head = view.edges[edge].head;
+            if (head >= view.nodes.len) return;
+            @prefetch(&view.first_edge[head], .{});
+            const turn_off = view.nodes[head].turn_off;
+            if (turn_off < view.turns.len) @prefetch(&view.turns[turn_off], .{});
+            const first = view.first_edge[head];
+            if (first < view.edges.len) @prefetch(&view.edges[first], .{});
+        }
+
         inline fn findStatus(self: *Self, tracker: anytype, edge: u32, context: TurnContext, closure: u32) Status {
             if (@TypeOf(tracker) == @TypeOf(null)) return self.status.get(edge);
             if (tracker.keep_time) return if (tracker.has_exclusions) self.status.get(edge) else .{};
@@ -1682,4 +1700,61 @@ test "L2 remains admissible when sub-ULP edge costs round away" {
     try std.testing.expect(potential.estimate(origin) > 0);
     try std.testing.expectEqual(@as(f32, 0), potential.estimate(destination));
     try std.testing.expectEqual(@as(f32, 0), potential.estimateAt(origin, 0x1p25));
+}
+
+test "queue-top hints stay inside every graph array" {
+    const t = std.testing;
+    const Kernel = struct {
+        pub fn edgeCost(_: @This(), _: *const View, _: EdgeId, _: *const EdgeHot, _: Direction) !costing.Cost {
+            return .{ .cost = 1, .secs = 1 };
+        }
+
+        pub fn turnCost(_: @This(), _: *const View, _: Transition, _: Label, _: Direction) !costing.Cost {
+            return .{};
+        }
+    };
+    const attr: @FieldType(graph.format.NodeHot, "attr") = .{ .access = 0xfff, .type = 0, .density = 0, .signal = 0 };
+    // Node 1 has a turn offset past the turn table and no out edges, and
+    // edge 1 points past the last node.
+    const nodes = [_]graph.format.NodeHot{ .{ .turn_off = 0, .attr = attr }, .{ .turn_off = 9, .attr = attr } };
+    const arc: @FieldType(EdgeHot, "geom") = .{ .len_m = 1, .grade = 6, .curvature = 0 };
+    const edges = [_]EdgeHot{
+        .{ .head = 1, .geom = arc, .cls = .{ .class_id = 0, .local = 0, .opp_local = 0, .cold_checks = 0, .pred_speed = 0 }, .speed = @splat(0) },
+        .{ .head = 7, .geom = arc, .cls = .{ .class_id = 0, .local = 1, .opp_local = 0, .cold_checks = 0, .pred_speed = 0 }, .speed = @splat(0) },
+    };
+    const first = [_]u32{ 0, 2, 2 };
+    const view: View = .{
+        .headers = .initFill(null),
+        .dataset_uuid = @splat(0),
+        .nodes = &nodes,
+        .edges = &edges,
+        .first_edge = &first,
+        .turns = &.{ 0, 0, 0, 0 },
+        .classes = null,
+        .coordinates = null,
+        .cold_idx = null,
+        .cold = null,
+        .cold_data = null,
+        .slopes = null,
+        .spatial = null,
+        .spatial_index = null,
+        .metadata = null,
+        .components = null,
+        .turn_sides = null,
+        .turn_side_index = null,
+    };
+    var engine = try Search(Kernel, queue.Heap).init(t.allocator, &view);
+    defer engine.deinit();
+    var arena = memory.Arena.init(t.allocator, .{});
+    defer arena.deinit();
+    const labels = [_]Label{ .{ .edge = 0 }, .{ .edge = 1 }, .{ .edge = no_index }, .{ .edge = 5 } };
+    var pending: queue.Heap = .{};
+    engine.prefetchTop(&pending, &labels);
+    // Each top in turn: a valid chain with a bad turn offset, a head past
+    // the nodes, no edge, an edge past the edges, and a label past the list.
+    for ([_]u32{ 0, 1, 2, 3, 4 }) |index| {
+        pending.items.clearRetainingCapacity();
+        try pending.push(arena.allocator(), queue.Entry.init(0, index));
+        engine.prefetchTop(&pending, &labels);
+    }
 }
