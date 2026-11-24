@@ -12,7 +12,13 @@ pub const Entry = extern struct {
     }
 
     fn less(a: Entry, b: Entry) bool {
-        return a.key < b.key or (a.key == b.key and a.label < b.label);
+        return a.rank() < b.rank();
+    }
+
+    /// The key is the bit pattern of a non-negative f32, so one u64 with the
+    /// key above the label orders exactly like (cost, label).
+    inline fn rank(self: Entry) u64 {
+        return (@as(u64, self.key) << 32) | self.label;
     }
 };
 
@@ -21,21 +27,29 @@ comptime {
     std.debug.assert(@offsetOf(Entry, "key") == 0 and @offsetOf(Entry, "label") == 4);
 }
 
+/// Four-way min-heap ordered by (key, label). Search pushes unique pairs, so
+/// any correct heap pops the same sequence there.
 pub const Heap = struct {
     items: std.ArrayList(Entry) = .empty,
 
     pub fn push(self: *Heap, arena: std.mem.Allocator, entry: Entry) !void {
-        try self.items.ensureUnusedCapacity(arena, 1);
+        if (self.items.items.len == self.items.capacity) try self.grow(arena);
+        const items = self.items.items.ptr;
+        const rank = entry.rank();
         var hole = self.items.items.len;
         self.items.items.len += 1;
         while (hole != 0) {
             const parent = (hole - 1) / 4;
-            const item = self.items.items[parent];
-            if (!entry.less(item)) break;
-            self.items.items[hole] = item;
+            const item = items[parent];
+            if (rank >= item.rank()) break;
+            items[hole] = item;
             hole = parent;
         }
-        self.items.items[hole] = entry;
+        items[hole] = entry;
+    }
+
+    noinline fn grow(self: *Heap, arena: std.mem.Allocator) !void {
+        try self.items.ensureUnusedCapacity(arena, 1);
     }
 
     pub fn peek(self: *const Heap) ?Entry {
@@ -43,23 +57,52 @@ pub const Heap = struct {
     }
 
     pub fn pop(self: *Heap) ?Entry {
-        if (self.items.items.len == 0) return null;
-        const root = self.items.items[0];
-        const last = self.items.pop().?;
-        const items = self.items.items;
-        if (items.len == 0) return root;
+        const len = self.items.items.len;
+        if (len == 0) return null;
+        const items = self.items.items.ptr;
+        const root = items[0];
+        const count = len - 1;
+        self.items.items.len = count;
+        if (count == 0) return root;
+        const last = items[count];
+        const rank = last.rank();
 
         var hole: usize = 0;
-        while (hole <= (items.len - 1) / 4) {
+        // Full sibling groups: pick the least child without branches.
+        while (hole * 4 + 4 < count) {
             const first = hole * 4 + 1;
-            if (first >= items.len) break;
-            var least = first;
-            for (first + 1..@min(items.len, first + 4)) |i| {
-                if (items[i].less(items[least])) least = i;
+            const a = items[first].rank();
+            const b = items[first + 1].rank();
+            const c = items[first + 2].rank();
+            const d = items[first + 3].rank();
+            const ab: usize = if (b < a) first + 1 else first;
+            const cd: usize = if (d < c) first + 3 else first + 2;
+            const ab_rank = @min(a, b);
+            const cd_rank = @min(c, d);
+            const least = if (cd_rank < ab_rank) cd else ab;
+            if (@min(ab_rank, cd_rank) >= rank) {
+                items[hole] = last;
+                return root;
             }
-            if (!items[least].less(last)) break;
             items[hole] = items[least];
             hole = least;
+        }
+        // At most one partial sibling group remains below the hole.
+        const first = hole * 4 + 1;
+        if (first < count) {
+            var least = first;
+            var least_rank = items[first].rank();
+            for (first + 1..count) |i| {
+                const r = items[i].rank();
+                if (r < least_rank) {
+                    least = i;
+                    least_rank = r;
+                }
+            }
+            if (least_rank < rank) {
+                items[hole] = items[least];
+                hole = least;
+            }
         }
         items[hole] = last;
         return root;
@@ -304,6 +347,51 @@ test "four-way heap handles ties and sparse final child groups" {
     }.less);
     for (sorted) |row| try std.testing.expectEqual(row, heap.pop().?);
     try std.testing.expectEqual(@as(?Entry, null), heap.pop());
+}
+
+test "heap matches a scan oracle under interleaved pushes and pops" {
+    const t = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var rng = std.Random.DefaultPrng.init(0x265);
+    const random = rng.random();
+    var heap: Heap = .{};
+    var oracle: std.ArrayList(Entry) = .empty;
+    // Labels above 2^31 and keys that tie or differ only in low mantissa bits
+    // check that the key always outranks the label in the combined order.
+    const keys = [_]f32{ 0, -0.0, 1, 1.0000001, 2.5, 1e30, std.math.floatMax(f32) };
+    var next_label: u32 = std.math.maxInt(u32);
+    for (0..20000) |step| {
+        // Grow and shrink repeatedly so every partial sibling group shape is
+        // popped through, including the empty heap.
+        const phase = (step / 700) % 2 == 0;
+        if (random.uintLessThan(u32, 10) < @as(u32, if (phase) 7 else 3)) {
+            const key = if (random.boolean())
+                keys[random.uintLessThan(usize, keys.len)]
+            else
+                @as(f32, @floatFromInt(random.uintLessThan(u32, 64))) * 0.25;
+            const label = if (random.boolean()) next_label else random.uintLessThan(u32, 1 << 20) * 4096 + @as(u32, @intCast(step % 4096));
+            next_label -= 1;
+            const entry = Entry.init(key, label);
+            var duplicate = false;
+            for (oracle.items) |row| duplicate = duplicate or std.meta.eql(row, entry);
+            if (duplicate) continue;
+            try heap.push(a, entry);
+            try oracle.append(a, entry);
+        } else {
+            var least: ?usize = null;
+            for (oracle.items, 0..) |row, i| {
+                const better = if (least) |l| row.key < oracle.items[l].key or
+                    (row.key == oracle.items[l].key and row.label < oracle.items[l].label) else true;
+                if (better) least = i;
+            }
+            const expected: ?Entry = if (least) |i| oracle.swapRemove(i) else null;
+            try t.expectEqual(expected, heap.peek());
+            try t.expectEqual(expected, heap.pop());
+        }
+        try t.expectEqual(oracle.items.len, heap.items.items.len);
+    }
 }
 
 const Uncancelled = struct {
