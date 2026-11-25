@@ -16,6 +16,9 @@ pub const Options = struct {
     /// rounded up to a whole node.
     max_side_percent: u8 = 80,
     threads: usize = 1,
+    /// Leaf paths only join nodes whose input IDs are at most this far
+    /// apart, which keeps the input order's locality between paths.
+    max_link_gap: u32 = 256,
     deadline: io.Deadline = .none,
 };
 
@@ -50,7 +53,17 @@ pub const Order = struct {
     }
 };
 
+/// Dissect, then order each leaf and separator so neighbors take adjacent
+/// ranks where they can.
 pub fn build(a: Allocator, view: *const View, options: Options) !Order {
+    const order = try dissect(a, view, options);
+    errdefer order.deinit(a);
+    try orderRanges(view, order, options);
+    return order;
+}
+
+/// The nested dissection alone: each range keeps the input ID order.
+pub fn dissect(a: Allocator, view: *const View, options: Options) !Order {
     if (options.threads == 0 or options.leaf_edges == 0 or
         options.max_side_percent < 50 or options.max_side_percent >= 100) return error.InvalidPartitionOptions;
     try check(options.deadline, 0);
@@ -447,3 +460,114 @@ const Task = struct {
         }
     }
 };
+
+const no_link = std.math.maxInt(u32);
+
+const Link = struct {
+    gap: u32,
+    u: u32,
+    v: u32,
+
+    fn less(_: void, x: Link, y: Link) bool {
+        if (x.gap != y.gap) return x.gap < y.gap;
+        if (x.u != y.u) return x.u < y.u;
+        return x.v < y.v;
+    }
+};
+
+/// Reorder every leaf and every separator in place. Within a range, edges
+/// are taken in order of input ID gap and kept when they extend two
+/// different paths, so the result is a set of disjoint paths. Each path is
+/// then written contiguously, starting from the range's lowest unwritten
+/// endpoint. Ranges, leaf membership and separator positions are unchanged,
+/// and the result depends only on the dissection, not on the thread count.
+pub fn orderRanges(view: *const View, order: Order, options: Options) !void {
+    const deadline = options.deadline;
+    const a = std.heap.smp_allocator;
+    if (order.nodes.len != view.nodes.len) return error.InvalidOrder;
+    const ranks = try a.alloc(u32, order.nodes.len);
+    defer a.free(ranks);
+    for (order.nodes, 0..) |node, rank| {
+        try check(deadline, rank);
+        ranks[@backingInt(node)] = @intCast(rank);
+    }
+    var longest: usize = 0;
+    for (order.cells) |cell| longest = @max(longest, if (cell.isLeaf()) cell.end - cell.begin else cell.end - cell.separator_begin);
+    const nodes = try a.alloc(NodeId, longest);
+    defer a.free(nodes);
+    const sets = try a.alloc(u32, longest);
+    defer a.free(sets);
+    const links = try a.alloc([2]u32, longest);
+    defer a.free(links);
+    var edges: std.ArrayList(Link) = .empty;
+    defer edges.deinit(a);
+
+    for (order.cells, 0..) |cell, index| {
+        try check(deadline, index);
+        const begin = if (cell.isLeaf()) cell.begin else cell.separator_begin;
+        const count = cell.end - begin;
+        if (count < 2) continue;
+        const range = order.nodes[begin..cell.end];
+        @memcpy(nodes[0..count], range);
+
+        edges.clearRetainingCapacity();
+        for (nodes[0..count], 0..) |node, u| {
+            try check(deadline, u);
+            for (try view.outEdges(node)) |edge| {
+                const rank = ranks[edge.head];
+                if (rank <= begin + u or rank >= cell.end) continue;
+                const tail = @backingInt(node);
+                const gap = if (edge.head > tail) edge.head - tail else tail - edge.head;
+                if (gap > options.max_link_gap) continue;
+                try edges.append(a, .{ .gap = gap, .u = @intCast(u), .v = rank - begin });
+            }
+        }
+        std.mem.sortUnstable(Link, edges.items, {}, Link.less);
+
+        for (sets[0..count], links[0..count], 0..) |*set, *link, i| {
+            set.* = @intCast(i);
+            link.* = .{ no_link, no_link };
+        }
+        for (edges.items, 0..) |edge, i| {
+            try check(deadline, i);
+            const u_free = std.mem.indexOfScalar(u32, &links[edge.u], no_link) orelse continue;
+            const v_free = std.mem.indexOfScalar(u32, &links[edge.v], no_link) orelse continue;
+            const root_u = findSet(sets, edge.u);
+            const root_v = findSet(sets, edge.v);
+            if (root_u == root_v) continue;
+            sets[@max(root_u, root_v)] = @min(root_u, root_v);
+            links[edge.u][u_free] = edge.v;
+            links[edge.v][v_free] = edge.u;
+        }
+
+        // Reuse the set slots as written marks.
+        @memset(sets[0..count], 0);
+        var written: usize = 0;
+        for (0..count) |start| {
+            try check(deadline, start);
+            if (sets[start] != 0 or (links[start][0] != no_link and links[start][1] != no_link)) continue;
+            var previous: u32 = no_link;
+            var current: u32 = @intCast(start);
+            while (current != no_link) {
+                try check(deadline, written);
+                range[written] = nodes[current];
+                written += 1;
+                sets[current] = 1;
+                const pair = links[current];
+                const next = if (pair[0] != previous) pair[0] else pair[1];
+                previous = current;
+                current = next;
+            }
+        }
+        if (written != count) return error.InvalidLeafPaths;
+    }
+}
+
+fn findSet(sets: []u32, start: u32) u32 {
+    var node = start;
+    while (sets[node] != node) {
+        sets[node] = sets[sets[node]];
+        node = sets[node];
+    }
+    return node;
+}

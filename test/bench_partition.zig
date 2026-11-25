@@ -41,28 +41,32 @@ pub fn main(init: std.process.Init) !void {
     if (args.next()) |arg| options.threads = try std.fmt.parseUnsigned(usize, arg, 10);
     if (args.next()) |arg| options.leaf_edges = try std.fmt.parseUnsigned(u32, arg, 10);
     if (args.next()) |arg| options.max_side_percent = try std.fmt.parseUnsigned(u8, arg, 10);
+    if (args.next()) |arg| options.max_link_gap = try std.fmt.parseUnsigned(u32, arg, 10);
     if (args.next() != null) return error.InvalidPartitionBenchmarkArguments;
 
     var bundle = try routing.graph.reader.Bundle.open(path);
     defer bundle.close();
     const a = init.arena.allocator();
     const timer = io.Timer.start();
-    const order = try partition.build(a, &bundle.view, options);
+    const order = try partition.dissect(a, &bundle.view, options);
     const elapsed = timer.read();
     defer order.deinit(a);
 
     const ranks = try init.gpa.alloc(u32, order.nodes.len);
     defer init.gpa.free(ranks);
+    const input_distance = try adjacent_id_distance.summary(init.gpa, &bundle.view, null);
     for (order.nodes, 0..) |node, rank| ranks[@backingInt(node)] = @intCast(rank);
-    const input_distance = try adjacent_id_distance.median(init.gpa, &bundle.view, null);
-    const partition_distance = try adjacent_id_distance.median(init.gpa, &bundle.view, ranks);
+    const dissection_distance = try adjacent_id_distance.summary(init.gpa, &bundle.view, ranks);
+    const dissection_hash = orderHash(order);
+    const leaf_timer = io.Timer.start();
+    try partition.orderRanges(&bundle.view, order, options);
+    const leaf_elapsed = leaf_timer.read();
+    for (order.nodes, 0..) |node, rank| ranks[@backingInt(node)] = @intCast(rank);
+    const partition_distance = try adjacent_id_distance.summary(init.gpa, &bundle.view, ranks);
 
     var levels: std.ArrayList(Level) = .empty;
     defer levels.deinit(a);
     if (order.cells.len != 0) try measureLevels(0, order.cells, &levels, 0, a);
-    var hash = std.hash.XxHash3.init(0);
-    hash.update(std.mem.sliceAsBytes(order.nodes));
-    hash.update(std.mem.sliceAsBytes(order.cells));
     var buffer: [4096]u8 = undefined;
     var stdout = io.stdoutWriter(init.io, &buffer);
     try std.json.Stringify.value(.{
@@ -74,13 +78,27 @@ pub fn main(init: std.process.Init) !void {
         .threads = options.threads,
         .leaf_edges = options.leaf_edges,
         .max_side_percent = options.max_side_percent,
+        .max_link_gap = options.max_link_gap,
         .elapsed_ns = elapsed,
-        .input_median_adjacent_id_distance = input_distance,
-        .partition_median_adjacent_id_distance = partition_distance,
+        .leaf_order_ns = leaf_elapsed,
+        .input_median_adjacent_id_distance = input_distance.median,
+        .dissection_median_adjacent_id_distance = dissection_distance.median,
+        .partition_median_adjacent_id_distance = partition_distance.median,
+        .input_adjacent_id_distance = input_distance,
+        .dissection_adjacent_id_distance = dissection_distance,
+        .partition_adjacent_id_distance = partition_distance,
         .top_level_separator_nodes = if (levels.items.len == 0) 0 else levels.items[0].separator_nodes,
-        .order_and_tree_xxh3 = std.fmt.hex(hash.final()),
+        .dissection_order_and_tree_xxh3 = std.fmt.hex(dissection_hash),
+        .order_and_tree_xxh3 = std.fmt.hex(orderHash(order)),
         .levels = levels.items,
     }, .{}, &stdout.interface);
     try stdout.interface.writeByte('\n');
     try stdout.interface.flush();
+}
+
+fn orderHash(order: partition.Order) u64 {
+    var hash = std.hash.XxHash3.init(0);
+    hash.update(std.mem.sliceAsBytes(order.nodes));
+    hash.update(std.mem.sliceAsBytes(order.cells));
+    return hash.final();
 }

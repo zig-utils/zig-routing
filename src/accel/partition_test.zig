@@ -239,3 +239,83 @@ fn cutSize(links: []const Link, mask: u8) u32 {
     }
     return edges;
 }
+
+/// Each leaf and each separator holds the same nodes after leaf ordering as
+/// after the dissection alone, and the cell tree is unchanged.
+fn expectSameRanges(dissected: partition.Order, ordered: partition.Order) !void {
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(dissected.cells), std.mem.sliceAsBytes(ordered.cells));
+    for (dissected.cells) |cell| {
+        const begin = if (cell.isLeaf()) cell.begin else cell.separator_begin;
+        const before = try a.dupe(format.NodeId, dissected.nodes[begin..cell.end]);
+        defer a.free(before);
+        const after = try a.dupe(format.NodeId, ordered.nodes[begin..cell.end]);
+        defer a.free(after);
+        std.mem.sortUnstable(u32, std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(before)), {}, std.sort.asc(u32));
+        std.mem.sortUnstable(u32, std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(after)), {}, std.sort.asc(u32));
+        try std.testing.expectEqualSlices(format.NodeId, before, after);
+    }
+}
+
+test "leaf ordering keeps every range's nodes and is identical with one or eight threads" {
+    var prng = std.Random.DefaultPrng.init(266);
+    const random = prng.random();
+    for (0..24) |trial| {
+        const count = 40 + trial * 7;
+        const points = try a.alloc(format.Coordinate, count);
+        defer a.free(points);
+        for (points) |*point| point.* = .{ .lng = random.intRangeAtMost(i32, 0, 200_000), .lat = random.intRangeAtMost(i32, 0, 200_000) };
+        var links: std.ArrayList(Link) = .empty;
+        defer links.deinit(a);
+        // A spanning path in input ID order, random chords, a loop and a
+        // parallel road, so leaves see joins, cycles and duplicate edges.
+        for (1..count) |id| try links.append(a, .{ @intCast(id - 1), @intCast(id) });
+        for (0..count) |_| try links.append(a, .{ random.uintLessThan(u32, @intCast(count)), random.uintLessThan(u32, @intCast(count)) });
+        try links.append(a, .{ 3, 3 });
+        try links.append(a, .{ 1, 2 });
+        const fixture = try Fixture.init(points, links.items);
+        defer fixture.deinit();
+        for ([_]u32{ 0, 1, 8, std.math.maxInt(u32) }) |gap| {
+            var options: partition.Options = .{ .leaf_edges = 40, .max_side_percent = 70, .max_link_gap = gap };
+            const dissected = try partition.dissect(a, &fixture.view, options);
+            defer dissected.deinit(a);
+            const single = try partition.build(a, &fixture.view, options);
+            defer single.deinit(a);
+            options.threads = 8;
+            const parallel = try partition.build(a, &fixture.view, options);
+            defer parallel.deinit(a);
+            try validate(single, &fixture.view, options);
+            try expectSameRanges(dissected, single);
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(single.nodes), std.mem.sliceAsBytes(parallel.nodes));
+            // No two distinct nodes are zero IDs apart, so nothing links.
+            if (gap == 0) try std.testing.expectEqualSlices(format.NodeId, dissected.nodes, single.nodes);
+        }
+    }
+}
+
+test "leaf ordering lays a shuffled road out at consecutive ranks" {
+    const count = 64;
+    var ids: [count]u32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = @intCast(i);
+    var prng = std.Random.DefaultPrng.init(2661);
+    prng.random().shuffle(u32, &ids);
+    var points: [count]format.Coordinate = undefined;
+    // Position i along the road holds node ids[i].
+    for (ids, 0..) |id, i| points[id] = .{ .lng = @intCast(1_000 * i), .lat = 0 };
+    var links: [count - 1]Link = undefined;
+    for (&links, 1..) |*link, i| link.* = .{ ids[i - 1], ids[i] };
+    const fixture = try Fixture.init(&points, &links);
+    defer fixture.deinit();
+    const options: partition.Options = .{ .leaf_edges = 1_000, .max_link_gap = std.math.maxInt(u32) };
+    const order = try partition.build(a, &fixture.view, options);
+    defer order.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), order.cells.len);
+    var ranks: [count]u32 = undefined;
+    for (order.nodes, 0..) |node, rank| ranks[@backingInt(node)] = @intCast(rank);
+    for (links) |link| {
+        const u = ranks[link[0]];
+        const v = ranks[link[1]];
+        try std.testing.expectEqual(@as(u32, 1), @max(u, v) - @min(u, v));
+    }
+    // The walk starts from the road's end with the lower input ID.
+    try std.testing.expectEqual(@min(ids[0], ids[count - 1]), @backingInt(order.nodes[0]));
+}
