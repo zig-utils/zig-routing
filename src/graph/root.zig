@@ -28,6 +28,7 @@ pub const lanes = @import("lanes.zig");
 pub const linguistics = @import("linguistics.zig");
 pub const spatial = @import("spatial.zig");
 pub const snap_bins = @import("snap_bins.zig");
+pub const dissection_cells = @import("dissection_cells.zig");
 pub const speed = @import("speed.zig");
 
 test {

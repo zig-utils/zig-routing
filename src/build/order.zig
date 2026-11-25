@@ -21,6 +21,8 @@ pub const Ordering = struct {
             id.* = @intCast(i);
         }
         switch (self.kind) {
+            // Needs the topology, so the build orders it in its own stage.
+            .nested_dissection => return error.UnsupportedOrdering,
             .encounter => {},
             .hilbert => {
                 if (points.len < 2) return ids;

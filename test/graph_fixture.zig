@@ -5,7 +5,7 @@ const format = routing.graph.format;
 const transit = routing.graph.transit;
 const edge_keys = routing.graph.edge_keys;
 
-const uuid: format.DatasetUuid = .{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x46, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
+pub const uuid: format.DatasetUuid = .{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x46, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
 
 const nodes = [_]format.NodeHot{
     .{ .turn_off = 0, .attr = .{ .access = 3, .type = 1, .density = 2, .signal = 0 } },
@@ -102,6 +102,9 @@ pub fn records(comptime kind: format.SectionKind) []const kind.Record() {
         .spatial => spatial,
         .metadata => &metadata,
         .dataset_id => &.{1001},
+        // One leaf over both nodes and the single cold record. Written only
+        // into nested-dissection variants, since this fixture is Hilbert ordered.
+        .dissection_cells => &.{.{ .begin = 0, .separator_begin = 2, .end = 2, .subtree_end = 1, .cold_separator = 1, .cold_end = 1 }},
         .snap_bins => &([_]u32{ 1, 818660 } ++ (@as([25]u32, @splat(1))) ++ [_]u32{ 0, @bitCast(routing.graph.snap_bins.Circle.absent) }),
         .components => &.{ 0, 0 },
         .turn_sides => &.{ 3, 0, 0 },
@@ -209,6 +212,7 @@ fn writeFixture(path: []const u8, index: ?transit.Indexed) !void {
     var writer = try format.BundleWriter.init(path, uuid, .none);
     defer writer.deinit();
     inline for (std.enums.values(format.SectionKind)) |kind| {
+        if (kind == .dissection_cells) continue;
         if (comptime std.mem.indexOfScalar(format.SectionKind, &format.transit_sections, kind) != null) {
             if (index) |table| try writer.write(kind, switch (kind) {
                 .transit_lines => table.lines,

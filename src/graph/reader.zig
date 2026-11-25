@@ -170,6 +170,7 @@ pub const View = struct {
     spatial_index: ?spatial.View,
     snap_bins: ?[]const u32 = null,
     snap_bin_index: ?@import("snap_bins.zig").View = null,
+    dissection_cells: ?[]const @import("dissection_cells.zig").Cell = null,
     metadata: ?[]const format.Metadata,
     dataset_id: ?[]const u64 = null,
     components: ?[]const u32,
@@ -379,6 +380,7 @@ pub const View = struct {
             note(diagnostic, .metadata);
             if (records[0].reserved != 0 or records[0].ordering() == null) return error.InvalidBundleMetadata;
         }
+        try graph.openDissectionCells(deadline, diagnostic);
         if (graph.coverage) |records| {
             note(diagnostic, .coverage);
             if (records.len != 1 or !records[0].valid()) return error.InvalidBundleCoverage;
@@ -414,6 +416,28 @@ pub const View = struct {
         try graph.openEdgeKeys(diagnostic);
         note(diagnostic, null);
         return graph;
+    }
+
+    /// A nested-dissection bundle stores its cell tree, and only such a bundle
+    /// does. No cell boundary may fall inside a junction's alias group.
+    fn openDissectionCells(self: *View, deadline: io.Deadline, diagnostic: ?*Diagnostic) !void {
+        const ordered = if (self.metadata) |records| records[0].ordering() == .nested_dissection else false;
+        if ((self.dissection_cells != null) != ordered) {
+            note(diagnostic, if (ordered) .dissection_cells else .metadata);
+            return error.MissingSection;
+        }
+        const cells = self.dissection_cells orelse return;
+        note(diagnostic, .dissection_cells);
+        const records: ?usize = if (self.cold_data) |data| data.header.record_count else null;
+        try @import("dissection_cells.zig").verify(cells, self.nodes.len, records, deadline);
+        if (self.classes == null) return;
+        for (cells, 0..) |cell, i| {
+            if (i % 256 == 0 and deadline.expired()) return error.DeadlineExceeded;
+            for ([_]u32{ cell.begin, cell.separator_begin, cell.end }) |boundary| {
+                if (boundary == 0 or boundary >= self.nodes.len) continue;
+                if (try self.aliasNeighbor(boundary - 1, true) == boundary) return error.SplitAliasGroup;
+            }
+        }
     }
 
     fn openEdgeKeys(self: *View, diagnostic: ?*Diagnostic) !void {
