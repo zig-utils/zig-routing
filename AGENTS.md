@@ -91,6 +91,13 @@ Changes in this dev std that bite ported code and memory of older Zig:
 zig build test
 ```
 
+CI runs the suite a second time with the Gurka test bundles built in nested-dissection order.
+Tests that depend on the order ask for it explicitly; the rest follow `-Dtest-order`.
+
+```bash
+zig build test -Dtest-order=nested_dissection
+```
+
 ```bash
 zig fmt --check build.zig build.zig.zon src test packages
 ```

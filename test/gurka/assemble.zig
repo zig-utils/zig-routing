@@ -9,6 +9,9 @@ const gurka = @import("gurka.zig");
 const pbf = @import("pbf.zig");
 const testing = std.testing;
 
+/// The order for bundles whose test does not ask for one (-Dtest-order).
+pub const test_order = std.meta.stringToEnum(format.OrderingKind, @import("gurka_options").order).?;
+
 const Built = struct {
     parent: io.Directory,
     root: io.Directory,
@@ -20,7 +23,15 @@ const Built = struct {
         return assembleWithOptions(dataset, .{ .scratch_dir = "", .workers = workers });
     }
 
+    /// A test that leaves the ordering at its default gets the test order.
     fn assembleWithOptions(dataset: gurka.Dataset, options: build.assemble.Options) !Built {
+        var input = options;
+        if (std.meta.eql(input.ordering, build.order.Ordering{})) input.ordering.kind = test_order;
+        return assembleExactly(dataset, input);
+    }
+
+    /// Build with exactly these options, for tests that depend on the order.
+    fn assembleExactly(dataset: gurka.Dataset, options: build.assemble.Options) !Built {
         const parent = try io.Directory.open(".");
         errdefer parent.close();
         const root = try parent.temporaryChild();
@@ -642,7 +653,7 @@ test "Hilbert and encounter bundles preserve the graph and the same shortest rou
     }, &.{}, &.{});
     var original = try Built.assembleWithOptions(fixture.osm, .{ .scratch_dir = "", .workers = 1, .ordering = .{ .kind = .encounter } });
     defer original.deinit();
-    var reordered = try Built.assemble(fixture.osm, 4);
+    var reordered = try Built.assembleExactly(fixture.osm, .{ .scratch_dir = "", .workers = 4 });
     defer reordered.deinit();
     const before = &original.bundle.view;
     const after = &reordered.bundle.view;
@@ -6340,7 +6351,7 @@ test "nested-dissection and Hilbert bundles hold the same graph" {
     defer arena.deinit();
     const gpa = arena.allocator();
     const dataset = try gridDataset(gpa, 7, 6, 0);
-    var hilbert = try Built.assemble(dataset, 2);
+    var hilbert = try Built.assembleExactly(dataset, .{ .scratch_dir = "", .workers = 2 });
     defer hilbert.deinit();
     var nested = try Built.assembleWithOptions(dataset, .{ .scratch_dir = "", .workers = 2, .ordering = .{ .kind = .nested_dissection, .leaf_edges = 16 } });
     defer nested.deinit();
@@ -6442,7 +6453,7 @@ test "nested-dissection and Hilbert bundles match edge for edge across alias gro
     defer arena.deinit();
     const gpa = arena.allocator();
     const dataset = try gridDataset(gpa, 9, 8, 40);
-    var hilbert = try Built.assemble(dataset, 2);
+    var hilbert = try Built.assembleExactly(dataset, .{ .scratch_dir = "", .workers = 2 });
     defer hilbert.deinit();
     var nested = try Built.assembleWithOptions(dataset, .{ .scratch_dir = "", .workers = 2, .ordering = .{ .kind = .nested_dissection, .leaf_edges = 24 } });
     defer nested.deinit();
@@ -6528,4 +6539,14 @@ test "staged nested-dissection builds resume after the order stage with identica
     var blank = try graph.reader.Bundle.openVerified(try path(a, &scratch.name, "empty"), .none, null);
     defer blank.close();
     try testing.expectEqual(@as(usize, 0), blank.view.dissection_cells.?.len);
+}
+
+test "Gurka bundles follow the requested test order" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var built = try Built.assemble(try gridDataset(arena.allocator(), 3, 3, 0), 1);
+    defer built.deinit();
+    const view = &built.bundle.view;
+    try testing.expectEqual(test_order, view.metadata.?[0].ordering().?);
+    try testing.expectEqual(test_order == .nested_dissection, view.dissection_cells != null);
 }

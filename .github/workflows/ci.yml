@@ -41,6 +41,8 @@ jobs:
           cache-key: ${{ matrix.os }}-${{ hashFiles('build.zig.zon') }}
       - run: zig build
       - run: zig build test --summary all
+      - name: Test on nested-dissection bundles
+        run: zig build test -Dtest-order=nested_dissection --summary all
       - run: zig build -Doptimize=ReleaseFast
       - name: Valhalla tag parity
         if: matrix.os == 'ubuntu-latest'

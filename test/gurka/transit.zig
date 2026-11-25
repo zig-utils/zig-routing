@@ -6,6 +6,7 @@ const build = routing.build;
 const graph = routing.graph;
 const testing = std.testing;
 const feed = @embedFile("transit.zip");
+const test_order = @import("assemble.zig").test_order;
 
 // Ported from test/gurka/test_gtfs.cc (Valhalla 3.9.3), route_trip1 and route_trip4.
 test "Toronto scheduled routes continue across stops and across midnight" {
@@ -63,6 +64,7 @@ test "Toronto scheduled routes continue across stops and across midnight" {
     var diagnostic: build.driver.Diagnostic = .{};
     const built = try build.driver.run(testing.allocator, .{
         .inputs = &.{street},
+        .order = test_order,
         .gtfs_inputs = &.{ first, second },
         .timezone_geojson = zones,
         .timezone_rules = "src/graph/timezones/iana-2026f.ztz",
@@ -185,6 +187,7 @@ test "GTFS transit prepares a restartable graph with the same bytes across worke
     var diagnostic: build.driver.Diagnostic = .{};
     const common: build.driver.Options = .{
         .inputs = &.{street},
+        .order = test_order,
         .gtfs_inputs = &.{feed_path},
         .timezone_geojson = zone_path,
         .timezone_rules = "test/fuzz/seeds/timezone-rules.bin",

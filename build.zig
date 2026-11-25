@@ -255,9 +255,15 @@ pub fn build(b: *std.Build) void {
     graph_inspect.expectStdOutMatch("\"node\":{\"id\":1,\"first_edge\":1,\"degree\":1");
     test_step.dependOn(&graph_inspect.step);
 
+    // zig build test -Dtest-order=nested_dissection builds every Gurka test
+    // bundle that does not ask for an order in that order instead of Hilbert.
+    const test_order = b.option(enum { hilbert, nested_dissection }, "test-order", "Node order of the bundles the Gurka tests build (default hilbert)") orelse .hilbert;
+    const gurka_options = b.addOptions();
+    gurka_options.addOption([]const u8, "order", @tagName(test_order));
     const gurka_imports: []const std.Build.Module.Import = &.{
         .{ .name = "routing", .module = lib_mod },
         .{ .name = "protobuf", .module = protobuf },
+        .{ .name = "gurka_options", .module = gurka_options.createModule() },
     };
     const gurka_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("test/gurka/examples.zig"),
