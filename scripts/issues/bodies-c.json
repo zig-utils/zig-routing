@@ -69,6 +69,101 @@
     ]
   },
   {
+    "key": "P4.02b",
+    "goal": "Let the partitioner run on a plain CSR graph, so the build can partition its logical junction graph before a bundle exists.",
+    "scope": [
+      "Add a CSR input type (offsets, heads, reverse arcs) and make the dissection and the leaf ordering take it with the node coordinates.",
+      "Keep `partition.build` over a bundle view as an adapter that reads the view into the CSR input, with the existing opposing-edge checks.",
+      "Keep deadline checks in every long loop and the output deterministic across thread counts."
+    ],
+    "out_of_scope": ["Using the partition in the build (P4.02d)."],
+    "notes": [
+      "The dissection frees its root graph while it works, so the leaf ordering must read the caller's CSR, not the internal copy."
+    ],
+    "accept": [
+      "Tests show the CSR path and the bundle-view path give byte-identical orders and cells on the existing partition fixtures.",
+      "The Germany dissection order-and-tree XXH3 is unchanged (`65694228a79be14e`) when partitioned through the adapter, or the change is explained.",
+      "`zig build test` passes."
+    ]
+  },
+  {
+    "key": "P4.02c",
+    "goal": "A bundle section that stores the nested-dissection cell tree as node ID ranges, and an ordering kind that names the order.",
+    "scope": [
+      "Add a `dissection_cells` section kind: one fixed-size extern record per cell in preorder with begin, separator begin, end, children and the cell's cold record ranges, with comptime size, offset and little-endian assertions.",
+      "Add `OrderingKind.nested_dissection` and require the section exactly when the metadata names that order.",
+      "Parse and verify the table without recursion: root covers every node, children tile the parent's interior, separators are a suffix, ranges never split an alias group, and leaves are cells without children.",
+      "Add a fuzz target for the section parser."
+    ],
+    "out_of_scope": ["Producing the table in the build (P4.02d)."],
+    "notes": [
+      "The section is additive, so the format version does not change and Hilbert bundles stay byte-identical.",
+      "A cell with two children can have an empty separator when the dissection packs whole components."
+    ],
+    "accept": [
+      "Malformed tables return an error and never panic or read out of bounds, including the fuzz seeds.",
+      "A hand-built bundle with a valid table opens and verifies; each violated invariant is rejected by a test.",
+      "`zig build test` passes."
+    ]
+  },
+  {
+    "key": "P4.02d",
+    "goal": "Build bundles whose node IDs are the nested-dissection order, with every section produced natively in that order.",
+    "scope": [
+      "In the order stage, apply the Hilbert order, build the logical junction graph from the segments, partition it (P4.02b) and use the result as the logical node order, before alias nodes are numbered.",
+      "Map the cells to physical node IDs through each junction's first alias and write the cell table (P4.02c), with per-cell cold record ranges.",
+      "Add `--order nested_dissection`; keep Hilbert the default and selectable.",
+      "Hash the partition options into the dataset identity and the resume check only for nested-dissection builds, so Hilbert UUIDs do not change."
+    ],
+    "out_of_scope": [
+      "Running the whole suite under the new order (P4.02e).",
+      "The Germany measurement (P4.02f).",
+      "Cold chunks aligned exactly to leaf cells, which needs a format version change."
+    ],
+    "notes": [
+      "Because all later sections derive from the logical node order, no section needs a separate remapping pass.",
+      "Cold records are already contiguous per cell in this order; the fixed 256-record chunks stay, so at most one chunk straddles each range boundary."
+    ],
+    "accept": [
+      "Test: for every cell, node IDs form one contiguous range, separator nodes rank above the interior, no arc joins the left and right subtrees, and alias groups stay inside one range.",
+      "Test: a nested-dissection bundle and a Hilbert bundle of the same input agree on every section's content up to the node and edge renumbering.",
+      "Builds are identical with one and eight workers.",
+      "`zig build test` passes."
+    ]
+  },
+  {
+    "key": "P4.02e",
+    "goal": "Prove that nested-dissection bundles behave like Hilbert bundles for every reader, snap and routing test.",
+    "scope": [
+      "Add a build option that sets the order used by the test bundle builders, and run the full suite with it in CI.",
+      "Pin Hilbert explicitly in tests that assert the default order."
+    ],
+    "out_of_scope": ["Changing the default order."],
+    "notes": [
+      "Exact cost ties may resolve differently because edge IDs are the last tie key; such differences are reported, not hidden."
+    ],
+    "accept": [
+      "`zig build test` passes with the nested-dissection order and with the default order.",
+      "CI runs both."
+    ]
+  },
+  {
+    "key": "P4.02f",
+    "goal": "Measure adjacent node locality of a Germany bundle built in nested-dissection order and compare it with Hilbert.",
+    "scope": [
+      "Build the pinned Germany extract with `--order nested_dissection`, verify it, and record the median, p90 and p99 adjacent ID distance against the Hilbert bundle.",
+      "Record build time and peak memory with the hardware and commit in bench/experiments/E4.md."
+    ],
+    "out_of_scope": ["Changing the partitioner or leaf ordering, unless the gate fails."],
+    "notes": [
+      "The leaf-path median of 1 in E4.md was measured on the Hilbert bundle's physical graph; the build partitions the logical junction graph, so it must be measured again."
+    ],
+    "accept": [
+      "The Germany median adjacent ID distance is below the Hilbert median of 2, with tails recorded.",
+      "`zr inspect --verify` passes on the bundle."
+    ]
+  },
+  {
     "key": "P4.03",
     "goal": "The customizable contraction hierarchy topology for a bundle: the chordal supergraph produced by contracting nodes in id order, its elimination tree, and a versioned `cch.topo` section that every metric refers to.",
     "upstream": [],

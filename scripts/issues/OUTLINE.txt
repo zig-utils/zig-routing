@@ -102,8 +102,13 @@ P3.42 | Cut over /route for the consuming apps with Valhalla as fallback | infra
 
 ## P4 | P4 Acceleration and scale | Customised potentials, node ordering, lazy loading and planet-scale builds.
 P4.01 | Separator partitioner (inertial flow) and nested-dissection order | accel | new | L | P3.15 P0.13
-P4.02 | Make the nested-dissection order the graph id order, with cells as contiguous ranges | build | new | M | P4.01 P3.21 P4.02a
+P4.02 | Make the nested-dissection order the graph id order, with cells as contiguous ranges | build | new | M | P4.01 P3.21 P4.02a P4.02e P4.02f
 P4.02a | Improve adjacent node locality within nested-dissection leaves | accel | perf | M | P4.01
+P4.02b | Partition a plain CSR graph instead of a bundle view | accel | new | S | P4.01 P4.02a
+P4.02c | Cell table section and the nested-dissection ordering kind | graph | new | S | P4.01 P3.21
+P4.02d | Nested-dissection node order in the build's order stage | build | new | M | P3.21 P4.02b P4.02c
+P4.02e | Run the full test suite on nested-dissection bundles | infra | test | S | P4.02d
+P4.02f | Germany locality of the nested-dissection bundle against Hilbert | build | experiment | S | P4.02d P0.13
 P4.03 | CCH topology: contraction over the order, elimination tree, cch.topo section | accel | new | L | P4.02
 P4.04 | Metric customisation: lower-bound weights from compiled costing, parallel triangle relaxation | accel | new | L | P4.03 P3.25
 P4.05 | Metric keys and metric files: 128-bit key, u16 minifloat storage, mmap, versioning | accel | new | M | P4.04
