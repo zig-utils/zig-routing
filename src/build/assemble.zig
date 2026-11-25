@@ -39,6 +39,9 @@ const transit_stage = @import("transit_stage.zig");
 const transit_connections = @import("transit_connections.zig");
 const gtfs = @import("gtfs/root.zig");
 const edge_key_hash = @import("edge_key_hash.zig");
+const partition = @import("../accel/partition.zig");
+const flow = @import("../accel/inertial_flow.zig");
+const dissection_cells = graph.dissection_cells;
 
 const Allocator = std.mem.Allocator;
 const max_degree = turns.max_degree;
@@ -235,7 +238,7 @@ pub fn build(gpa: Allocator, source: pbf.file.Stream, writer: *format.BundleWrit
     if (options.timezone_source) |source_tz| try writeTimezones(gpa, writer, source_tz, topology.coordinates, options.scratch_dir, &plan, &metadata);
     const topology_ns = timer.read();
     const means: []const i16 = if (terrain) |*present| present.means.data else &.{};
-    const cold_bytes = try buildCold(gpa, &shared, &metadata, &plan, table.classes, writer, options.scratch_dir, means);
+    const cold_bytes = try buildCold(gpa, &shared, &metadata, &plan, table.classes, writer, options.scratch_dir, means, options.ordering.kind == .nested_dissection);
     try writeEdgeKeys(gpa, &shared, &plan, writer, options);
     const spatial = try buildSpatial(gpa, &shared, writer, options.scratch_dir, options.workers);
     const bundle_metadata = [_]format.Metadata{.{
@@ -494,7 +497,7 @@ noinline fn saveColdStage(session: *checkpoint.Session, shared: *const Shared, m
         defer rows.unmap();
         try writer.write(.restriction_conditions, try checkpoint.array(automaton.Condition, rows));
     }
-    const cold_bytes = try buildCold(gpa, shared, metadata, plan, edge_classes, &writer, options.scratch_dir, means);
+    const cold_bytes = try buildCold(gpa, shared, metadata, plan, edge_classes, &writer, options.scratch_dir, means, options.ordering.kind == .nested_dissection);
     try writeEdgeKeys(gpa, shared, plan, &writer, options.*);
     try tx.writeJson(gpa, cold_bytes, .source_stats);
     try writer.write(.metadata, &.{.{
@@ -1159,6 +1162,8 @@ const Layout = struct {
     split_nodes: u32 = 0,
     connectors: u32 = 0,
     order_hash: u64 = 0,
+    /// Nested-dissection cells over physical node IDs, with cold ranges unset.
+    cells: []dissection_cells.Cell = &.{},
 
     fn plan(gpa: Allocator, segments: []const edges.Edge, points: []const geo.FixedLL, metadata: *const Metadata, options: Options) !Layout {
         const deadline = options.deadline;
@@ -1171,7 +1176,13 @@ const Layout = struct {
             try self.countNode(gpa, metadata, segment.from, shape[0]);
             try self.countNode(gpa, metadata, segment.to, shape[shape.len - 1]);
         }
-        try self.applyOrder(gpa, options);
+        const logical_cells = if (options.ordering.kind == .nested_dissection)
+            try self.orderNested(gpa, segments, options)
+        else blk: {
+            try self.applyOrder(gpa, options);
+            break :blk &.{};
+        };
+        defer gpa.free(logical_cells);
         for (self.nodes.items, 0..) |*node, i| {
             try checkDeadline(deadline, i);
             const aliases = aliasCount(node.degree);
@@ -1182,11 +1193,127 @@ const Layout = struct {
         }
         if (2 * (@as(u64, segments.len) + self.connectors) > std.math.maxInt(u32))
             return error.TooManyDirectedEdges;
+        if (logical_cells.len != 0) {
+            self.cells = try self.physicalCells(gpa, logical_cells, deadline);
+            self.order_hash = try extendHash(self.order_hash, std.mem.sliceAsBytes(self.cells), deadline);
+        }
         return self;
+    }
+
+    /// Order junctions by Hilbert, then by nested dissection of the junction
+    /// graph, so alias nodes numbered afterwards stay consecutive and each cell
+    /// becomes one contiguous ID range. Returns the cells over junction IDs.
+    fn orderNested(self: *Layout, gpa: Allocator, segments: []const edges.Edge, options: Options) ![]partition.Cell {
+        const deadline = options.deadline;
+        const n = self.nodes.items.len;
+        const coordinates = try gpa.alloc(geo.FixedLL, n);
+        defer gpa.free(coordinates);
+        for (self.nodes.items, coordinates, 0..) |node, *point, i| {
+            try checkDeadline(deadline, i);
+            point.* = node.point;
+        }
+        // Hilbert IDs first: the dissection breaks ties by input ID and the
+        // leaf paths only join IDs that are close.
+        const hilbert: node_order.Ordering = .{ .kind = .hilbert };
+        const first = try hilbert.permutation(gpa, coordinates, deadline);
+        defer gpa.free(first);
+        try self.permuteNodes(gpa, first, options);
+        for (self.nodes.items, coordinates, 0..) |node, *point, i| {
+            try checkDeadline(deadline, i);
+            point.* = node.point;
+        }
+
+        if (segments.len > std.math.maxInt(u32) / 2) return error.TooManyDirectedEdges;
+        const offsets = try gpa.alloc(u32, n + 1);
+        defer gpa.free(offsets);
+        @memset(offsets, 0);
+        for (segments, 0..) |segment, i| {
+            try checkDeadline(deadline, i);
+            offsets[self.by_id.get(segment.from).? + 1] += 1;
+            offsets[self.by_id.get(segment.to).? + 1] += 1;
+        }
+        for (1..n + 1) |i| {
+            try checkDeadline(deadline, i);
+            offsets[i] += offsets[i - 1];
+        }
+        const cursor = try gpa.dupe(u32, offsets[0..n]);
+        defer gpa.free(cursor);
+        const arcs = try gpa.alloc(flow.Arc, 2 * segments.len);
+        defer gpa.free(arcs);
+        for (segments, 0..) |segment, i| {
+            try checkDeadline(deadline, i);
+            const u = self.by_id.get(segment.from).?;
+            const v = self.by_id.get(segment.to).?;
+            const forward = cursor[u];
+            const backward = cursor[v];
+            cursor[u] += 1;
+            cursor[v] += 1;
+            arcs[forward] = .{ .head = v, .reverse = backward };
+            arcs[backward] = .{ .head = u, .reverse = forward };
+        }
+        const workers = if (options.workers == 0) std.Thread.getCpuCount() catch 1 else options.workers;
+        const order = try partition.buildInput(gpa, .{ .offsets = offsets, .arcs = arcs, .coordinates = coordinates }, .{
+            .leaf_edges = options.ordering.leaf_edges,
+            .max_side_percent = options.ordering.max_side_percent,
+            .max_link_gap = options.ordering.max_link_gap,
+            .threads = @max(1, @min(workers, max_workers)),
+            .deadline = deadline,
+        });
+        defer gpa.free(order.nodes);
+        errdefer gpa.free(order.cells);
+
+        const second: []const u32 = @ptrCast(order.nodes);
+        // The order hash covers the composed permutation from encounter IDs.
+        const composed = try gpa.alloc(u32, n);
+        defer gpa.free(composed);
+        for (composed, second, 0..) |*id, rank, i| {
+            try checkDeadline(deadline, i);
+            id.* = first[rank];
+        }
+        try self.permuteNodes(gpa, second, options);
+        self.order_hash = try node_order.hash(composed, deadline);
+        return order.cells;
+    }
+
+    /// Junction ranges become node ID ranges through each junction's first
+    /// alias. The map is strictly increasing, so tiling and separator
+    /// suffixes carry over, and an alias group never straddles a boundary.
+    fn physicalCells(self: *const Layout, gpa: Allocator, logical: []const partition.Cell, deadline: io.Deadline) ![]dissection_cells.Cell {
+        const cells = try gpa.alloc(dissection_cells.Cell, logical.len);
+        errdefer gpa.free(cells);
+        const ids = self.nodes.items;
+        const physical = struct {
+            fn at(nodes: []const Node, total: u32, index: u32) u32 {
+                return if (index == nodes.len) total else nodes[index].first_alias;
+            }
+        }.at;
+        var i = logical.len;
+        while (i > 0) {
+            i -= 1;
+            try checkDeadline(deadline, i);
+            const cell = logical[i];
+            const subtree_end: u32 = if (cell.right != partition.no_child)
+                cells[cell.right].subtree_end
+            else if (cell.left != partition.no_child)
+                cells[cell.left].subtree_end
+            else
+                @intCast(i + 1);
+            cells[i] = .{
+                .begin = physical(ids, self.node_count, cell.begin),
+                .separator_begin = physical(ids, self.node_count, cell.separator_begin),
+                .end = physical(ids, self.node_count, cell.end),
+                .left = cell.left,
+                .right = cell.right,
+                .subtree_end = subtree_end,
+            };
+        }
+        try dissection_cells.verify(cells, self.node_count, null, deadline);
+        return cells;
     }
 
     fn save(self: *const Layout, gpa: Allocator, tx: *checkpoint.Transaction) !void {
         try tx.writeArray(self.nodes.items, .logical_nodes);
+        if (self.cells.len != 0) try tx.writeArray(self.cells, .order_cells);
         try tx.writeJson(gpa, LayoutStats{
             .node_count = self.node_count,
             .split_nodes = self.split_nodes,
@@ -1217,6 +1344,12 @@ const Layout = struct {
             try self.by_id.putNoClobber(gpa, node.osm_id, @intCast(i));
         }
         if (total != self.node_count) return error.InvalidCheckpoint;
+        if (saved.manifest.files.get(.order_cells) != null) {
+            const cells = try saved.map(.order_cells, deadline);
+            defer cells.unmap();
+            self.cells = try gpa.dupe(dissection_cells.Cell, try checkpoint.array(dissection_cells.Cell, cells));
+            dissection_cells.verify(self.cells, self.node_count, null, deadline) catch return error.InvalidCheckpoint;
+        }
         return self;
     }
 
@@ -1231,7 +1364,11 @@ const Layout = struct {
         defer gpa.free(permutation);
         self.order_hash = try node_order.hash(permutation, options.deadline);
         if (options.ordering.kind == .encounter) return;
+        try self.permuteNodes(gpa, permutation, options);
+    }
 
+    /// Renumber logical nodes so new ID `i` is old ID `permutation[i]`.
+    fn permuteNodes(self: *Layout, gpa: Allocator, permutation: []const u32, options: Options) !void {
         const previous_to_next = try Scratch(u32).init(permutation.len, options.scratch_dir);
         defer previous_to_next.deinit();
         const next_nodes = try gpa.alloc(Node, permutation.len);
@@ -1282,10 +1419,24 @@ const Layout = struct {
     }
 
     fn deinit(self: *Layout, gpa: Allocator) void {
+        if (self.cells.len != 0) gpa.free(self.cells);
         self.by_id.deinit(gpa);
         self.nodes.deinit(gpa);
     }
 };
+
+/// Continue an order hash over more bytes, so the cell tree is part of it.
+fn extendHash(previous: u64, bytes: []const u8, deadline: io.Deadline) !u64 {
+    var hasher: std.hash.XxHash3 = .init(previous);
+    var rest = bytes;
+    while (rest.len != 0) {
+        if (deadline.expired()) return error.DeadlineExceeded;
+        const chunk = rest[0..@min(rest.len, 64 * 1024)];
+        hasher.update(chunk);
+        rest = rest[chunk.len..];
+    }
+    return hasher.final();
+}
 
 fn aliasCount(degree: u32) u32 {
     if (degree <= max_degree) return 1;
@@ -2772,7 +2923,7 @@ fn appendLevels(out: *std.ArrayList(graph.cold.LevelRange), gpa: Allocator, sour
     }
 }
 
-noinline fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *Metadata, plan: *const Layout, edge_classes: []const classes.EdgeClass, writer: *format.BundleWriter, scratch_dir: []const u8, means: []const i16) !u64 {
+noinline fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *Metadata, plan: *const Layout, edge_classes: []const classes.EdgeClass, writer: *format.BundleWriter, scratch_dir: []const u8, means: []const i16, nested: bool) !u64 {
     const topo = shared.topology;
     var coverage: graph.coverage.Builder = .{};
     try coverage.add(topo.coordinates, writer.deadline);
@@ -2785,8 +2936,13 @@ noinline fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *Metadata
     var refs: [graph.cold.max_names]u32 = undefined;
     var access_scratch: std.ArrayList(access_restriction.Entry) = .empty;
     defer access_scratch.deinit(gpa);
+    // Each node's first cold record, for the cell table's cold ranges. A
+    // nested-dissection bundle always has the table, even with no nodes.
+    const cold_starts = if (nested) try Scratch(u32).init(topo.nodes.len + 1, scratch_dir) else null;
+    defer if (cold_starts) |starts| starts.deinit();
     for (topo.nodes, 0..) |_, node| {
         try checkDeadline(shared.deadline, node);
+        if (cold_starts) |starts| starts.data[node] = builder.record_count;
         const first = topo.first_edge[node];
         const end = topo.first_edge[node + 1];
         for (topo.output.data[first..end], first..end) |edge, slot| {
@@ -2854,10 +3010,27 @@ noinline fn buildCold(gpa: Allocator, shared: *const Shared, metadata: *Metadata
     }
     if (builder.record_count != topo.output.data.len / 2) return error.InvalidColdRecordCount;
     try writer.write(.cold_idx, index.data);
+    if (cold_starts) |starts| try writeCells(gpa, plan.cells, starts.data, builder.record_count, writer);
     if (coverage.finish()) |bounds| try writer.write(.coverage, &.{bounds});
     try writeSigns(shared, metadata, plan, edge_classes, &builder, writer);
     if (shared.transit) |input| try writeTransitSections(input, metadata, plan, &builder, writer);
     return builder.write(writer);
+}
+
+/// Cold records are emitted in node order, so each cell's records are the
+/// contiguous range owned by its nodes.
+fn writeCells(gpa: Allocator, layout: []const dissection_cells.Cell, starts: []u32, records: u32, writer: *format.BundleWriter) !void {
+    starts[starts.len - 1] = records;
+    const cells = try gpa.dupe(dissection_cells.Cell, layout);
+    defer gpa.free(cells);
+    for (cells, 0..) |*cell, i| {
+        try checkDeadline(writer.deadline, i);
+        cell.cold_begin = starts[cell.begin];
+        cell.cold_separator = starts[cell.separator_begin];
+        cell.cold_end = starts[cell.end];
+    }
+    try dissection_cells.verify(cells, starts.len - 1, records, writer.deadline);
+    try writer.write(.dissection_cells, cells);
 }
 
 fn writeTransitSections(input: TransitInput, metadata: *const Metadata, plan: *const Layout, cold: *ColdBuilder, writer: *format.BundleWriter) !void {

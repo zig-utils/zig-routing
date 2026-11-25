@@ -9,6 +9,11 @@ const Allocator = std.mem.Allocator;
 
 pub const Ordering = struct {
     kind: format.OrderingKind = .hilbert,
+    /// Nested dissection only: the partitioner's leaf size, balance and
+    /// leaf link gap. They are part of a nested-dissection build's identity.
+    leaf_edges: u32 = 65_536,
+    max_side_percent: u8 = 80,
+    max_link_gap: u32 = 256,
 
     /// The output maps each new dense ID to its provisional node ID.
     /// Equal Hilbert keys keep their provisional order.
