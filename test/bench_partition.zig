@@ -47,8 +47,10 @@ pub fn main(init: std.process.Init) !void {
     var bundle = try routing.graph.reader.Bundle.open(path);
     defer bundle.close();
     const a = init.arena.allocator();
+    const input = try partition.Input.fromView(init.gpa, &bundle.view, options.deadline);
+    defer input.deinitView(init.gpa);
     const timer = io.Timer.start();
-    const order = try partition.dissect(a, &bundle.view, options);
+    const order = try partition.dissect(a, input, options);
     const elapsed = timer.read();
     defer order.deinit(a);
 
@@ -59,7 +61,7 @@ pub fn main(init: std.process.Init) !void {
     const dissection_distance = try adjacent_id_distance.summary(init.gpa, &bundle.view, ranks);
     const dissection_hash = orderHash(order);
     const leaf_timer = io.Timer.start();
-    try partition.orderRanges(&bundle.view, order, options);
+    try partition.orderRanges(input, order, options);
     const leaf_elapsed = leaf_timer.read();
     for (order.nodes, 0..) |node, rank| ranks[@backingInt(node)] = @intCast(rank);
     const partition_distance = try adjacent_id_distance.summary(init.gpa, &bundle.view, ranks);

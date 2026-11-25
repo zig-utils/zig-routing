@@ -276,7 +276,9 @@ test "leaf ordering keeps every range's nodes and is identical with one or eight
         defer fixture.deinit();
         for ([_]u32{ 0, 1, 8, std.math.maxInt(u32) }) |gap| {
             var options: partition.Options = .{ .leaf_edges = 40, .max_side_percent = 70, .max_link_gap = gap };
-            const dissected = try partition.dissect(a, &fixture.view, options);
+            const input = try partition.Input.fromView(a, &fixture.view, .none);
+            defer input.deinitView(a);
+            const dissected = try partition.dissect(a, input, options);
             defer dissected.deinit(a);
             const single = try partition.build(a, &fixture.view, options);
             defer single.deinit(a);
@@ -318,4 +320,67 @@ test "leaf ordering lays a shuffled road out at consecutive ranks" {
     }
     // The walk starts from the road's end with the lower input ID.
     try std.testing.expectEqual(@min(ids[0], ids[count - 1]), @backingInt(order.nodes[0]));
+}
+
+test "CSR input gives the same order as the bundle view and rejects broken arcs" {
+    const width = 13;
+    const height = 11;
+    var points: [width * height]format.Coordinate = undefined;
+    var links: std.ArrayList(Link) = .empty;
+    defer links.deinit(a);
+    for (&points, 0..) |*point, id| {
+        const x = id % width;
+        const y = id / width;
+        point.* = .{ .lng = @intCast(7_000 * x + 300 * y), .lat = @intCast(9_000 * y) };
+        if (x > 0) try links.append(a, .{ @intCast(id - 1), @intCast(id) });
+        if (y > 0) try links.append(a, .{ @intCast(id - width), @intCast(id) });
+        if (x > 0 and y > 0 and id % 3 == 0) try links.append(a, .{ @intCast(id - width - 1), @intCast(id) });
+    }
+    // A second component and a parallel road.
+    try links.append(a, .{ 0, 1 });
+    const fixture = try Fixture.init(&points, links.items);
+    defer fixture.deinit();
+
+    // Build the CSR by hand from the fixture's edges, independently of fromView.
+    const arcs = try a.alloc(flow.Arc, fixture.view.edges.len);
+    defer a.free(arcs);
+    for (fixture.view.edges, arcs, 0..) |edge, *arc, id| {
+        arc.* = .{ .head = edge.head, .reverse = @backingInt(try fixture.view.oppEdge(@fromBackingInt(@as(u32, @intCast(id))))) };
+    }
+    const input: partition.Input = .{ .offsets = fixture.view.first_edge, .arcs = arcs, .coordinates = &points };
+    for ([_]usize{ 1, 8 }) |threads| {
+        const options: partition.Options = .{ .leaf_edges = 48, .max_side_percent = 65, .threads = threads };
+        const from_view = try partition.build(a, &fixture.view, options);
+        defer from_view.deinit(a);
+        const from_csr = try partition.buildInput(a, input, options);
+        defer from_csr.deinit(a);
+        try validate(from_csr, &fixture.view, options);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(from_view.nodes), std.mem.sliceAsBytes(from_csr.nodes));
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(from_view.cells), std.mem.sliceAsBytes(from_csr.cells));
+        const dissected = try partition.dissect(a, input, options);
+        defer dissected.deinit(a);
+        try expectSameRanges(dissected, from_csr);
+    }
+
+    const options: partition.Options = .{ .leaf_edges = 48 };
+    const broken = try a.dupe(flow.Arc, arcs);
+    defer a.free(broken);
+    // An arc whose reverse does not point back.
+    broken[0].reverse = broken[1].reverse;
+    try std.testing.expectError(error.InvalidOpposingEdge, partition.buildInput(a, .{ .offsets = input.offsets, .arcs = broken, .coordinates = &points }, options));
+    @memcpy(broken, arcs);
+    // A head past the last node.
+    broken[2].head = points.len;
+    try std.testing.expectError(error.InvalidOpposingEdge, partition.buildInput(a, .{ .offsets = input.offsets, .arcs = broken, .coordinates = &points }, options));
+    @memcpy(broken, arcs);
+    // An arc that is its own reverse.
+    broken[3].reverse = 3;
+    try std.testing.expectError(error.InvalidOpposingEdge, partition.buildInput(a, .{ .offsets = input.offsets, .arcs = broken, .coordinates = &points }, options));
+    // Offsets that do not cover the arcs, and a point off the globe.
+    try std.testing.expectError(error.InvalidCsrRange, partition.buildInput(a, .{ .offsets = input.offsets[0..points.len], .arcs = arcs, .coordinates = &points }, options));
+    var far = points;
+    far[5].lat = 1_000_000_000;
+    try std.testing.expectError(error.InvalidCoordinate, partition.buildInput(a, .{ .offsets = input.offsets, .arcs = arcs, .coordinates = &far }, options));
+    const empty = try partition.buildInput(a, .{ .offsets = &.{0}, .arcs = &.{}, .coordinates = &.{} }, options);
+    try std.testing.expectEqual(@as(usize, 0), empty.nodes.len);
 }

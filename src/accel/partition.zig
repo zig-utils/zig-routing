@@ -53,34 +53,104 @@ pub const Order = struct {
     }
 };
 
+/// An undirected graph as CSR: arcs of node `i` are `arcs[offsets[i]..offsets[i + 1]]`, and
+/// every arc's `reverse` is the index of its opposing arc. Node `i` sits at `coordinates[i]`.
+/// Input IDs should be spatially local (Hilbert order, say): ties and the leaf link gap use them.
+pub const Input = struct {
+    offsets: []const u32,
+    arcs: []const flow.Arc,
+    coordinates: []const format.Coordinate,
+
+    /// Read a bundle's topology, checking each opposing edge against its local slot.
+    pub fn fromView(a: Allocator, view: *const View, deadline: io.Deadline) !Input {
+        if (view.nodes.len >= flow.unseen or view.edges.len >= flow.unseen) return error.GraphTooLarge;
+        if (view.nodes.len == 0) return .{ .offsets = &.{0}, .arcs = &.{}, .coordinates = &.{} };
+        const all_coordinates = view.coordinates orelse return error.MissingCoordinatesSection;
+        if (all_coordinates.len < view.nodes.len) return error.InvalidNodeId;
+        const coordinates = all_coordinates[0..view.nodes.len];
+        if (view.first_edge.len != view.nodes.len + 1 or view.first_edge[0] != 0 or
+            view.first_edge[view.nodes.len] != view.edges.len) return error.InvalidCsrRange;
+        const arcs = try a.alloc(flow.Arc, view.edges.len);
+        errdefer a.free(arcs);
+        for (0..view.nodes.len) |i| {
+            try check(deadline, i);
+            const id: NodeId = @fromBackingInt(@as(u32, @intCast(i)));
+            _ = try view.coordinate(id);
+            const row = try view.outEdgeRange(id);
+            for (row.first..row.end) |edge| {
+                const reverse = @backingInt(try view.oppEdge(@fromBackingInt(@as(u32, @intCast(edge)))));
+                const opposing = view.edges[reverse];
+                if (opposing.head != i or edge - row.first != opposing.cls.opp_local or edge == reverse) {
+                    return error.InvalidOpposingEdge;
+                }
+                arcs[edge] = .{ .head = view.edges[edge].head, .reverse = reverse };
+            }
+        }
+        return .{ .offsets = view.first_edge, .arcs = arcs, .coordinates = coordinates };
+    }
+
+    /// Free what `fromView` allocated.
+    pub fn deinitView(self: Input, a: Allocator) void {
+        if (self.arcs.len != 0) a.free(self.arcs);
+    }
+
+    fn nodeCount(self: Input) usize {
+        return self.coordinates.len;
+    }
+
+    fn validate(self: Input, deadline: io.Deadline) !void {
+        const n = self.coordinates.len;
+        if (n >= flow.unseen or self.arcs.len >= flow.unseen) return error.GraphTooLarge;
+        if (self.offsets.len != n + 1 or self.offsets[0] != 0 or self.offsets[n] != self.arcs.len) return error.InvalidCsrRange;
+        for (0..n) |i| {
+            try check(deadline, i);
+            if (!self.coordinates[i].inRange()) return error.InvalidCoordinate;
+            const first = self.offsets[i];
+            const end = self.offsets[i + 1];
+            if (first > end or end > self.arcs.len) return error.InvalidCsrRange;
+            for (first..end) |edge| {
+                const arc = self.arcs[edge];
+                if (arc.head >= n or arc.reverse >= self.arcs.len or arc.reverse == edge) return error.InvalidOpposingEdge;
+                const opposing = self.arcs[arc.reverse];
+                // The opposing arc must leave the head and point back at this node.
+                if (opposing.reverse != edge or opposing.head != i or
+                    arc.reverse < self.offsets[arc.head] or arc.reverse >= self.offsets[arc.head + 1]) return error.InvalidOpposingEdge;
+            }
+        }
+    }
+};
+
 /// Dissect, then order each leaf and separator so neighbors take adjacent
 /// ranks where they can.
 pub fn build(a: Allocator, view: *const View, options: Options) !Order {
-    const order = try dissect(a, view, options);
+    const input = try Input.fromView(std.heap.smp_allocator, view, options.deadline);
+    defer input.deinitView(std.heap.smp_allocator);
+    return buildInput(a, input, options);
+}
+
+/// `build` over a CSR graph.
+pub fn buildInput(a: Allocator, input: Input, options: Options) !Order {
+    const order = try dissect(a, input, options);
     errdefer order.deinit(a);
-    try orderRanges(view, order, options);
+    try orderRanges(input, order, options);
     return order;
 }
 
 /// The nested dissection alone: each range keeps the input ID order.
-pub fn dissect(a: Allocator, view: *const View, options: Options) !Order {
+pub fn dissect(a: Allocator, input: Input, options: Options) !Order {
     if (options.threads == 0 or options.leaf_edges == 0 or
         options.max_side_percent < 50 or options.max_side_percent >= 100) return error.InvalidPartitionOptions;
     try check(options.deadline, 0);
-    if (view.nodes.len >= flow.unseen or view.edges.len >= flow.unseen) return error.GraphTooLarge;
-    if (view.nodes.len == 0) return .{ .nodes = &.{}, .cells = &.{} };
-    const coordinates = view.coordinates orelse return error.MissingCoordinatesSection;
-    for (0..view.nodes.len) |i| {
-        try check(options.deadline, i);
-        _ = try view.coordinate(@fromBackingInt(@as(u32, @intCast(i))));
-    }
+    try input.validate(options.deadline);
+    const n = input.nodeCount();
+    if (n == 0) return .{ .nodes = &.{}, .cells = &.{} };
 
-    const nodes = try a.alloc(NodeId, view.nodes.len);
+    const nodes = try a.alloc(NodeId, n);
     errdefer a.free(nodes);
     // Scratch is shared by concurrent subtrees, independently of the result
     // allocator supplied by the caller.
-    const work: Work = .{ .a = std.heap.smp_allocator, .coordinates = coordinates, .options = options };
-    const tree = try work.subtree(try readGraph(work.a, view, options.deadline), nodes, 0, options.threads);
+    const work: Work = .{ .a = std.heap.smp_allocator, .coordinates = input.coordinates, .options = options };
+    const tree = try work.subtree(try readGraph(work.a, input, options.deadline), nodes, 0, options.threads);
     defer tree.deinit(work.a);
     const cells = try a.alloc(Cell, tree.count);
     errdefer a.free(cells);
@@ -112,27 +182,16 @@ const Graph = struct {
     }
 };
 
-fn readGraph(a: Allocator, view: *const View, deadline: io.Deadline) !Graph {
-    var graph = try Graph.init(a, view.nodes.len, view.edges.len);
+/// Copy the input into the dissection's own graph, which the recursion frees as it splits.
+fn readGraph(a: Allocator, input: Input, deadline: io.Deadline) !Graph {
+    var graph = try Graph.init(a, input.nodeCount(), input.arcs.len);
     errdefer graph.deinit(a);
-    if (view.first_edge.len != graph.offsets.len or view.first_edge[0] != 0 or
-        view.first_edge[graph.ids.len] != graph.arcs.len) return error.InvalidCsrRange;
-
     for (graph.ids, 0..) |*id, i| {
         try check(deadline, i);
         id.* = @fromBackingInt(@as(u32, @intCast(i)));
-        const row = try view.outEdgeRange(id.*);
-        graph.offsets[i] = row.first;
-        for (row.first..row.end) |edge| {
-            const reverse = @backingInt(try view.oppEdge(@fromBackingInt(@as(u32, @intCast(edge)))));
-            const opposing = view.edges[reverse];
-            if (opposing.head != i or edge - row.first != opposing.cls.opp_local or edge == reverse) {
-                return error.InvalidOpposingEdge;
-            }
-            graph.arcs[edge] = .{ .head = view.edges[edge].head, .reverse = reverse };
-        }
     }
-    graph.offsets[graph.ids.len] = @intCast(graph.arcs.len);
+    @memcpy(graph.offsets, input.offsets);
+    @memcpy(graph.arcs, input.arcs);
     return graph;
 }
 
@@ -481,10 +540,10 @@ const Link = struct {
 /// then written contiguously, starting from the range's lowest unwritten
 /// endpoint. Ranges, leaf membership and separator positions are unchanged,
 /// and the result depends only on the dissection, not on the thread count.
-pub fn orderRanges(view: *const View, order: Order, options: Options) !void {
+pub fn orderRanges(input: Input, order: Order, options: Options) !void {
     const deadline = options.deadline;
     const a = std.heap.smp_allocator;
-    if (order.nodes.len != view.nodes.len) return error.InvalidOrder;
+    if (order.nodes.len != input.nodeCount()) return error.InvalidOrder;
     const ranks = try a.alloc(u32, order.nodes.len);
     defer a.free(ranks);
     for (order.nodes, 0..) |node, rank| {
@@ -513,10 +572,10 @@ pub fn orderRanges(view: *const View, order: Order, options: Options) !void {
         edges.clearRetainingCapacity();
         for (nodes[0..count], 0..) |node, u| {
             try check(deadline, u);
-            for (try view.outEdges(node)) |edge| {
+            const tail = @backingInt(node);
+            for (input.arcs[input.offsets[tail]..input.offsets[tail + 1]]) |edge| {
                 const rank = ranks[edge.head];
                 if (rank <= begin + u or rank >= cell.end) continue;
-                const tail = @backingInt(node);
                 const gap = if (edge.head > tail) edge.head - tail else tail - edge.head;
                 if (gap > options.max_link_gap) continue;
                 try edges.append(a, .{ .gap = gap, .u = @intCast(u), .v = rank - begin });
