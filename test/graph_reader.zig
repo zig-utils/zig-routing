@@ -796,3 +796,64 @@ test "HTTP range cache shares a verified retry, bounds stalled transfers and rec
     try cache.fill(&.{}, .fromNowMs(3000));
     try testing.expectEqual(calls + 1, handler.calls.load(.acquire));
 }
+
+/// The fixture's sections in memory, with any kind replaced or removed.
+fn fixtureFiles(a: std.mem.Allocator, overrides: anytype) !reader.Files {
+    var files: reader.Files = .initFill(null);
+    inline for (std.enums.values(format.SectionKind)) |kind| {
+        const replaced = @hasField(@TypeOf(overrides), @tagName(kind));
+        const records: ?[]const kind.Record() = if (replaced) @field(overrides, @tagName(kind)) else if (kind == .dissection_cells) null else sample.records(kind);
+        if (records) |data| {
+            const payload = std.mem.sliceAsBytes(data);
+            const header: format.SectionHeader = .{
+                .kind = @backingInt(kind),
+                .dataset_uuid = sample.uuid,
+                .record_size = kind.recordSize(),
+                .count = data.len,
+                .payload_hash = std.hash.XxHash3.hash(0, payload),
+            };
+            const bytes = try a.alignedAlloc(u8, .of(u64), format.payload_offset + payload.len);
+            @memset(bytes, 0);
+            @memcpy(bytes[0..@sizeOf(format.SectionHeader)], std.mem.asBytes(&header));
+            @memcpy(bytes[format.payload_offset..], payload);
+            files.set(kind, bytes);
+        }
+    }
+    return files;
+}
+
+test "nested-dissection bundles carry a verified cell table that keeps alias groups whole" {
+    var state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer state.deinit();
+    const a = state.allocator();
+    const Cell = routing.graph.dissection_cells.Cell;
+    const nested = [_]format.Metadata{.{ .ordering_kind = @backingInt(format.OrderingKind.nested_dissection), .order_hash = 7 }};
+    const leaf = sample.records(.dissection_cells);
+    {
+        const view = try reader.View.parse(try fixtureFiles(a, .{ .metadata = &nested, .dissection_cells = leaf }), null);
+        try view.verify(.none, null);
+        try testing.expectEqual(@as(usize, 1), view.dissection_cells.?.len);
+    }
+    // Hilbert bundles have no table, and the fixture as written has none.
+    try testing.expectEqual(null, (try reader.View.parse(try fixtureFiles(a, .{}), null)).dissection_cells);
+    try testing.expectError(error.MissingSection, reader.View.parse(try fixtureFiles(a, .{ .metadata = &nested }), null));
+    try testing.expectError(error.MissingSection, reader.View.parse(try fixtureFiles(a, .{ .dissection_cells = leaf }), null));
+
+    // Two leaves with a separator-free root split the nodes at ID 1.
+    const halves = [_]Cell{
+        .{ .begin = 0, .separator_begin = 2, .end = 2, .left = 1, .right = 2, .subtree_end = 3, .cold_separator = 1, .cold_end = 1 },
+        .{ .begin = 0, .separator_begin = 1, .end = 1, .subtree_end = 2, .cold_separator = 1, .cold_end = 1 },
+        .{ .begin = 1, .separator_begin = 2, .end = 2, .subtree_end = 3, .cold_begin = 1, .cold_separator = 1, .cold_end = 1 },
+    };
+    _ = try reader.View.parse(try fixtureFiles(a, .{ .metadata = &nested, .dissection_cells = &halves }), null);
+    // When both edges join aliases of one junction, that split is refused.
+    var connectors = sample.records(.classes)[0..2].*;
+    for (&connectors) |*class| class.flags.node_connector = true;
+    try testing.expectError(error.SplitAliasGroup, reader.View.parse(try fixtureFiles(a, .{ .metadata = &nested, .dissection_cells = &halves, .classes = &connectors }), null));
+    _ = try reader.View.parse(try fixtureFiles(a, .{ .metadata = &nested, .dissection_cells = leaf, .classes = &connectors }), null);
+    // Cold ranges must match the cold section's record count.
+    var wrong = leaf[0..1].*;
+    wrong[0].cold_end = 2;
+    wrong[0].cold_separator = 2;
+    try testing.expectError(error.InvalidDissectionCells, reader.View.parse(try fixtureFiles(a, .{ .metadata = &nested, .dissection_cells = &wrong }), null));
+}

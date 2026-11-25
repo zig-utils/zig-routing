@@ -598,10 +598,11 @@ fn buildGraph(ctx: *Context) !u8 {
         return badOption(ctx, "unknown --from stage");
     const to = std.meta.stringToEnum(driver.Stage, ctx.getOption("to") orelse "finalize") orelse
         return badOption(ctx, "unknown --to stage");
-    const order = if (ctx.getOption("order")) |text|
-        std.meta.stringToEnum(routing.graph.format.OrderingKind, text) orelse return badOption(ctx, "--order expects hilbert or encounter")
-    else
-        null;
+    const order = if (ctx.getOption("order")) |text| switch (std.meta.stringToEnum(routing.graph.format.OrderingKind, text) orelse
+        return badOption(ctx, "--order expects hilbert or encounter")) {
+        .nested_dissection => return badOption(ctx, "--order expects hilbert or encounter"),
+        else => |kind| kind,
+    } else null;
     const side = if (ctx.getOption("drive-side")) |text|
         std.meta.stringToEnum(routing.build.edge_class.DriveSide, text) orelse return badOption(ctx, "--drive-side expects right or left")
     else
