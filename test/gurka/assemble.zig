@@ -651,6 +651,23 @@ test "Hilbert and encounter bundles preserve the graph and the same shortest rou
     try testing.expectEqual(format.OrderingKind.encounter, before.metadata.?[0].ordering().?);
     try testing.expectEqual(format.OrderingKind.hilbert, after.metadata.?[0].ordering().?);
     try testing.expect(before.metadata.?[0].order_hash != after.metadata.?[0].order_hash);
+    try expectSameGraph(gpa, before, after);
+    const start = fixture.findNode("B").?.location.toFixed();
+    const end = fixture.findNode("E").?.location.toFixed();
+    const route1 = try fixtureRoute(gpa, before, try at(before, start), try at(before, end));
+    const route2 = try fixtureRoute(gpa, after, try at(after, start), try at(after, end));
+    try testing.expectEqualSlices(u64, route1, route2);
+    try testing.expectEqualSlices(u64, &.{
+        @intCast(fixture.findWay("BC").?.id), @intCast(fixture.findWay("CE").?.id),
+    }, route2);
+}
+
+/// Both bundles hold the same graph up to node and edge renumbering: every
+/// node, its out edges in local order, their heads, attributes, turn rows,
+/// way IDs and shapes. Nodes are matched by coordinate, so no two may share one.
+fn expectSameGraph(gpa: std.mem.Allocator, before: *const graph.reader.View, after: *const graph.reader.View) !void {
+    try testing.expectEqual(before.nodes.len, after.nodes.len);
+    try testing.expectEqual(before.edges.len, after.edges.len);
     for (before.coordinates.?, 0..) |point, i| {
         const old: format.NodeId = @fromBackingInt(@as(u32, @intCast(i)));
         const new = try at(after, point);
@@ -675,14 +692,6 @@ test "Hilbert and encounter bundles preserve the graph and the same shortest rou
             try testing.expectEqualSlices(format.Coordinate, way1, way2);
         }
     }
-    const start = fixture.findNode("B").?.location.toFixed();
-    const end = fixture.findNode("E").?.location.toFixed();
-    const route1 = try fixtureRoute(gpa, before, try at(before, start), try at(before, end));
-    const route2 = try fixtureRoute(gpa, after, try at(after, start), try at(after, end));
-    try testing.expectEqualSlices(u64, route1, route2);
-    try testing.expectEqualSlices(u64, &.{
-        @intCast(fixture.findWay("BC").?.id), @intCast(fixture.findWay("CE").?.id),
-    }, route2);
 }
 
 fn fixtureRoute(arena: std.mem.Allocator, view: *const graph.reader.View, source: format.NodeId, target: format.NodeId) ![]u64 {
@@ -6239,4 +6248,284 @@ test "Gurka linear features resolve directed cuts and price search and recost id
     const failed = (try linear.resolve(view, a, &workspace, &.{.{ .points = &.{b} }}, .{}, .{})).ok;
     try testing.expectEqualStrings("0", failed.failed);
     try testing.expectEqual(@as(u16, 234), (try linear.resolve(view, a, &workspace, &.{.{ .points = &.{ b, c, d }, .factor = 2 }}, .{ .max_edges = 0 }, .{})).failure.code);
+}
+
+/// A grid of residential streets, optionally with a hub of `spokes` dead ends
+/// joined to one grid corner, so the hub splits into alias nodes.
+fn gridDataset(a: std.mem.Allocator, width: usize, height: usize, spokes: usize) !gurka.Dataset {
+    const road: gurka.Tags = &.{.{ .key = "highway", .value = "residential" }};
+    var nodes: std.ArrayList(gurka.OsmNode) = .empty;
+    var ways: std.ArrayList(gurka.OsmWay) = .empty;
+    for (0..height) |y| for (0..width) |x| {
+        // Uneven spacing keeps every coordinate distinct and the cuts unambiguous.
+        const lng = 9.6 + @as(f64, @floatFromInt(x)) * 0.002 + @as(f64, @floatFromInt(y)) * 0.0001;
+        const lat = 47.1 + @as(f64, @floatFromInt(y)) * 0.0017;
+        try nodes.append(a, .{ .id = @intCast(1 + y * width + x), .label = "", .location = .{ .lat = lat, .lng = lng }, .tags = &.{} });
+    };
+    const link = struct {
+        fn add(list: *std.ArrayList(gurka.OsmWay), alloc: std.mem.Allocator, from: i64, to: i64, tags: gurka.Tags) !void {
+            try list.append(alloc, .{ .id = @intCast(list.items.len + 1), .label = "", .refs = try alloc.dupe(i64, &.{ from, to }), .tags = tags });
+        }
+    }.add;
+    for (0..height) |y| for (0..width) |x| {
+        const id: i64 = @intCast(1 + y * width + x);
+        if (x + 1 < width) try link(&ways, a, id, id + 1, road);
+        if (y + 1 < height) try link(&ways, a, id, id + @as(i64, @intCast(width)), road);
+    };
+    if (spokes != 0) {
+        const hub: i64 = @intCast(width * height + 1);
+        try nodes.append(a, .{ .id = hub, .label = "", .location = .{ .lat = 47.09, .lng = 9.59 }, .tags = &.{} });
+        try link(&ways, a, hub, 1, road);
+        for (0..spokes) |i| {
+            const id: i64 = hub + 1 + @as(i64, @intCast(i));
+            const angle = @as(f64, @floatFromInt(i)) * 0.15;
+            try nodes.append(a, .{ .id = id, .label = "", .location = .{ .lat = 47.09 - 0.0006 * @cos(angle), .lng = 9.59 - 0.0006 * @sin(angle) }, .tags = &.{} });
+            try link(&ways, a, hub, id, road);
+        }
+    }
+    return .{ .nodes = nodes.items, .ways = ways.items, .relations = &.{} };
+}
+
+test "nested-dissection bundles store each cell as one contiguous ID range" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const dataset = try gridDataset(arena.allocator(), 9, 8, 40);
+    const nested: build.order.Ordering = .{ .kind = .nested_dissection, .leaf_edges = 24 };
+    var single = try Built.assembleWithOptions(dataset, .{ .scratch_dir = "", .workers = 1, .ordering = nested });
+    defer single.deinit();
+    var parallel = try Built.assembleWithOptions(dataset, .{ .scratch_dir = "", .workers = 8, .ordering = nested });
+    defer parallel.deinit();
+    const view = &single.bundle.view;
+    try checkOpposites(view, view.edges.len);
+    try testing.expectEqual(format.OrderingKind.nested_dissection, view.metadata.?[0].ordering().?);
+    try testing.expect(single.stats.split_nodes == 1 and single.stats.connectors >= 1);
+
+    // Every section is identical with one and eight workers.
+    for (std.enums.values(format.SectionKind)) |kind| {
+        const one = view.header(kind);
+        const eight = parallel.bundle.view.header(kind);
+        try testing.expectEqual(one == null, eight == null);
+        if (one) |header| try testing.expectEqual(header.payload_hash, eight.?.payload_hash);
+    }
+
+    // Opening the bundle verified the tree, its cold ranges and that no
+    // boundary splits the hub's aliases. Check the separators really separate.
+    const cells = view.dissection_cells.?;
+    try testing.expect(cells.len >= 7);
+    try testing.expectEqual(@as(u32, @intCast(view.nodes.len)), cells[0].end);
+    var splits: usize = 0;
+    for (cells) |cell| {
+        if (cell.left == graph.dissection_cells.no_cell or cell.right == graph.dissection_cells.no_cell) continue;
+        splits += 1;
+        const left = cells[cell.left];
+        const right = cells[cell.right];
+        for (left.begin..left.end) |id| {
+            for (try view.outEdges(@fromBackingInt(@as(u32, @intCast(id))))) |edge| {
+                try testing.expect(edge.head < right.begin or edge.head >= right.end);
+            }
+        }
+    }
+    try testing.expect(splits >= 3);
+    // The hub's aliases share a coordinate and sit at consecutive IDs.
+    var hub_ids: std.ArrayList(usize) = .empty;
+    for (view.coordinates.?, 0..) |point, i| {
+        if (std.meta.eql(point, dataset.nodes[9 * 8].location.toFixed())) try hub_ids.append(arena.allocator(), i);
+    }
+    try testing.expect(hub_ids.items.len >= 2);
+    for (hub_ids.items[1..], hub_ids.items[0 .. hub_ids.items.len - 1]) |next, previous| try testing.expectEqual(previous + 1, next);
+}
+
+test "nested-dissection and Hilbert bundles hold the same graph" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const dataset = try gridDataset(gpa, 7, 6, 0);
+    var hilbert = try Built.assemble(dataset, 2);
+    defer hilbert.deinit();
+    var nested = try Built.assembleWithOptions(dataset, .{ .scratch_dir = "", .workers = 2, .ordering = .{ .kind = .nested_dissection, .leaf_edges = 16 } });
+    defer nested.deinit();
+    const before = &hilbert.bundle.view;
+    const after = &nested.bundle.view;
+    try checkOpposites(after, before.edges.len);
+    try testing.expectEqual(null, before.dissection_cells);
+    try testing.expect(after.dissection_cells.?.len > 1);
+    try testing.expect(before.metadata.?[0].order_hash != after.metadata.?[0].order_hash);
+    try testing.expect(!std.mem.eql(u8, std.mem.sliceAsBytes(before.coordinates.?), std.mem.sliceAsBytes(after.coordinates.?)));
+    try expectSameGraph(gpa, before, after);
+    // Component labels partition the nodes the same way.
+    for (before.coordinates.?, 0..) |point, i| {
+        const old: format.NodeId = @fromBackingInt(@as(u32, @intCast(i)));
+        const new = try at(after, point);
+        for (before.coordinates.?, 0..) |other, j| {
+            const old_other: format.NodeId = @fromBackingInt(@as(u32, @intCast(j)));
+            const new_other = try at(after, other);
+            try testing.expectEqual(try before.component(old) == try before.component(old_other), try after.component(new) == try after.component(new_other));
+        }
+    }
+    try expectSameEdges(gpa, before, after);
+    const corner = (try at(before, dataset.nodes[0].location.toFixed()));
+    const far = (try at(before, dataset.nodes[dataset.nodes.len - 1].location.toFixed()));
+    const route1 = try fixtureRoute(gpa, before, corner, far);
+    const route2 = try fixtureRoute(gpa, after, try at(after, dataset.nodes[0].location.toFixed()), try at(after, dataset.nodes[dataset.nodes.len - 1].location.toFixed()));
+    try testing.expectEqualSlices(u64, route1, route2);
+}
+
+fn deleteNamedBundle(root: io.Directory, name: [:0]const u8) void {
+    const dir = root.child(name) catch return;
+    for (std.enums.values(format.SectionKind)) |kind| dir.deleteFile(kind.filename()) catch {};
+    dir.close();
+    root.deleteDir(name) catch {};
+}
+
+fn deleteStagedWork(root: io.Directory, name: [:0]const u8) void {
+    const work = root.child(name) catch return;
+    defer work.close();
+    for (std.enums.values(build.driver.Stage)) |stage| {
+        const dir = work.child(stage.folder()) catch continue;
+        var buffer: [96]u8 = undefined;
+        for (std.enums.values(build.checkpoint.Artifact)) |artifact| {
+            const filename = std.fmt.bufPrint(&buffer, "{s}.bin\x00", .{@tagName(artifact)}) catch unreachable;
+            dir.deleteFile(filename[0 .. filename.len - 1 :0]) catch {};
+        }
+        dir.deleteFile("manifest.json") catch {};
+        dir.close();
+        work.deleteDir(stage.folder()) catch {};
+    }
+    work.deleteFile("build-stats.json") catch {};
+    root.deleteDir(name) catch {};
+}
+
+/// Match every directed edge, connector arcs included, through its edge key,
+/// and check it carries the same attributes, local slot, turn row, opposite,
+/// cold record and endpoints. Unlike expectSameGraph this works when alias
+/// nodes share a coordinate.
+fn expectSameEdges(gpa: std.mem.Allocator, before: *const graph.reader.View, after: *const graph.reader.View) !void {
+    const keys1 = before.edge_key_index.?;
+    const keys2 = after.edge_key_index.?;
+    try testing.expectEqual(before.edges.len, after.edges.len);
+    try testing.expectEqual(before.nodes.len, after.nodes.len);
+    var tails1: std.ArrayList(u32) = .empty;
+    var tails2: std.ArrayList(u32) = .empty;
+    for ([_]*const graph.reader.View{ before, after }, [_]*std.ArrayList(u32){ &tails1, &tails2 }) |view, tails| {
+        try tails.resize(gpa, view.edges.len);
+        for (0..view.nodes.len) |node| {
+            const range = try view.outEdgeRange(@fromBackingInt(@as(u32, @intCast(node))));
+            for (range.first..range.end) |edge| tails.items[edge] = @intCast(node);
+        }
+    }
+    for (0..before.edges.len) |i| {
+        const id1: format.EdgeId = @fromBackingInt(@as(u32, @intCast(i)));
+        const key = try keys1.key(id1);
+        const id2 = (try keys2.find(key)) orelse return error.MissingTestEdge;
+        const e1 = try before.edge(id1);
+        const e2 = try after.edge(id2);
+        try testing.expectEqual(e1.geom, e2.geom);
+        try testing.expectEqual(e1.speed, e2.speed);
+        try testing.expectEqual(e1.cls.local, e2.cls.local);
+        try testing.expectEqual(e1.cls.opp_local, e2.cls.opp_local);
+        try testing.expectEqual((try before.class(e1.cls.class_id)).*, (try after.class(e2.cls.class_id)).*);
+        try testing.expectEqual(try keys2.find(try keys1.key(try before.oppEdge(id1))), try after.oppEdge(id2));
+        const tail1: format.NodeId = @fromBackingInt(tails1.items[i]);
+        const tail2: format.NodeId = @fromBackingInt(tails2.items[@backingInt(id2)]);
+        try testing.expectEqual(try before.coordinate(tail1), try after.coordinate(tail2));
+        try testing.expectEqual(try before.coordinate(@fromBackingInt(e1.head)), try after.coordinate(@fromBackingInt(e2.head)));
+        try testing.expectEqual((try before.node(tail1)).attr, (try after.node(tail2)).attr);
+        try testing.expectEqualSlices(u8, try before.turnRow(tail1, e1.cls.local), try after.turnRow(tail2, e2.cls.local));
+        try testing.expectEqual(try before.wayId(id1), try after.wayId(id2));
+        try testing.expectEqualSlices(format.Coordinate, try before.shape(id1, gpa), try after.shape(id2, gpa));
+        try testing.expectEqual(try before.edgeSlopes(id1), try after.edgeSlopes(id2));
+    }
+}
+
+test "nested-dissection and Hilbert bundles match edge for edge across alias groups" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const dataset = try gridDataset(gpa, 9, 8, 40);
+    var hilbert = try Built.assemble(dataset, 2);
+    defer hilbert.deinit();
+    var nested = try Built.assembleWithOptions(dataset, .{ .scratch_dir = "", .workers = 2, .ordering = .{ .kind = .nested_dissection, .leaf_edges = 24 } });
+    defer nested.deinit();
+    try testing.expect(hilbert.stats.split_nodes == 1 and hilbert.stats.connectors == nested.stats.connectors);
+    try expectSameEdges(gpa, &hilbert.bundle.view, &nested.bundle.view);
+    try testing.expectEqualDeep(hilbert.bundle.view.coverage, nested.bundle.view.coverage);
+    try testing.expectEqual(hilbert.bundle.view.cold_data.?.header.record_count, nested.bundle.view.cold_data.?.header.record_count);
+}
+
+test "staged nested-dissection builds resume after the order stage with identical sections" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const a = memory.allocator();
+    const parent = try io.Directory.open(".");
+    defer parent.close();
+    const scratch = try parent.temporaryChild();
+    defer parent.deleteDir(&scratch.name) catch {};
+    defer scratch.dir.close();
+    const names = [_][:0]const u8{ "full", "resumed", "empty" };
+    defer {
+        for (names) |name| deleteNamedBundle(scratch.dir, name);
+        for ([_][:0]const u8{ "work-full", "work-resumed", "work-empty" }) |name| deleteStagedWork(scratch.dir, name);
+        for ([_][:0]const u8{ "grid.osm.pbf", "empty.osm.pbf" }) |name| scratch.dir.deleteFile(name) catch {};
+    }
+    const path = struct {
+        fn join(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) ![]const u8 {
+            return std.fs.path.join(alloc, &.{ dir, name });
+        }
+    }.join;
+    const grid = try path(a, &scratch.name, "grid.osm.pbf");
+    try (try gridDataset(a, 8, 7, 40)).writePbf(a, grid);
+    var diagnostic: build.driver.Diagnostic = .{};
+    const full = try build.driver.run(testing.allocator, .{
+        .inputs = &.{grid},
+        .work_dir = try path(a, &scratch.name, "work-full"),
+        .output = try path(a, &scratch.name, "full"),
+        .workers = 4,
+        .order = .nested_dissection,
+    }, null, &diagnostic);
+    defer full.deinit(testing.allocator);
+    const ordered = try build.driver.run(testing.allocator, .{
+        .inputs = &.{grid},
+        .work_dir = try path(a, &scratch.name, "work-resumed"),
+        .output = try path(a, &scratch.name, "resumed"),
+        .workers = 1,
+        .order = .nested_dissection,
+        .to = .order,
+    }, null, &diagnostic);
+    defer ordered.deinit(testing.allocator);
+    const resumed = try build.driver.run(testing.allocator, .{
+        .work_dir = try path(a, &scratch.name, "work-resumed"),
+        .output = try path(a, &scratch.name, "resumed"),
+        .workers = 4,
+        .from = .assemble,
+    }, null, &diagnostic);
+    defer resumed.deinit(testing.allocator);
+
+    var first = try graph.reader.Bundle.openVerified(try path(a, &scratch.name, "full"), .none, null);
+    defer first.close();
+    var second = try graph.reader.Bundle.openVerified(try path(a, &scratch.name, "resumed"), .none, null);
+    defer second.close();
+    try testing.expectEqual(format.OrderingKind.nested_dissection, first.view.metadata.?[0].ordering().?);
+    try testing.expect(first.view.dissection_cells.?.len >= 1);
+    try testing.expectEqualSlices(u8, &first.view.dataset_uuid, &second.view.dataset_uuid);
+    for (std.enums.values(format.SectionKind)) |kind| {
+        const one = first.view.header(kind);
+        const two = second.view.header(kind);
+        try testing.expectEqual(one == null, two == null);
+        if (one) |header| try testing.expectEqual(header.payload_hash, two.?.payload_hash);
+    }
+
+    // A graph with no roads still carries its (empty) cell table.
+    const empty = try path(a, &scratch.name, "empty.osm.pbf");
+    try (gurka.Dataset{ .nodes = &.{.{ .id = 1, .label = "", .location = .{ .lat = 47.1, .lng = 9.6 }, .tags = &.{} }}, .ways = &.{}, .relations = &.{} }).writePbf(a, empty);
+    const nothing = try build.driver.run(testing.allocator, .{
+        .inputs = &.{empty},
+        .work_dir = try path(a, &scratch.name, "work-empty"),
+        .output = try path(a, &scratch.name, "empty"),
+        .workers = 1,
+        .order = .nested_dissection,
+    }, null, &diagnostic);
+    defer nothing.deinit(testing.allocator);
+    var blank = try graph.reader.Bundle.openVerified(try path(a, &scratch.name, "empty"), .none, null);
+    defer blank.close();
+    try testing.expectEqual(@as(usize, 0), blank.view.dissection_cells.?.len);
 }
