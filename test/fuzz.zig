@@ -21,7 +21,8 @@
 //! `motor-tags` (motor vehicle access and unit normalization), `admin-index`
 //! (stored administrative boundaries), `timezone-geojson`, `timezone-rules`,
 //! `datetime`, `time-domain`, `lane-tags`, `name-tags`, `geocode-bundle` and
-//! `geocode-address`, `geocode-analysis`, `geocode-index` and `geocode-query`.
+//! `geocode-address`, `geocode-analysis`, `geocode-index` and `geocode-query`,
+//! and `dissection-cells` (the nested-dissection cell table).
 //!
 //! The contract for every parser: malformed input returns an error, never
 //! panics, overflows or reads out of bounds. The fuzz step builds ReleaseSafe
@@ -225,7 +226,8 @@ test "fuzz graph-bundle" {
         const section = try a.alignedAlloc(u8, .of(u64), graph.format.payload_offset + data.len);
         @memcpy(section[0..prefix.len], prefix);
         @memcpy(section[graph.format.payload_offset..], data);
-        baseline.set(kind, section);
+        // The fixture is Hilbert ordered, so its baseline has no cell table.
+        if (kind != .dissection_cells) baseline.set(kind, section);
         const raw = try a.alloc(u8, 1 + prefix.len + data.len);
         raw[0] = i;
         @memcpy(raw[1..][0..prefix.len], prefix);
@@ -233,6 +235,45 @@ test "fuzz graph-bundle" {
         candidates[i + 1] = raw;
     }
     try std.testing.fuzz(&baseline, fuzzGraphBundle, .{ .corpus = try seeds(a, &candidates) });
+}
+
+/// The first eight bytes pick the node and cold record counts, the rest are cell records.
+fn fuzzDissectionCells(_: void, s: *Smith) !void {
+    var buf: [max_input]u8 align(8) = undefined;
+    const bytes = draw(s, &buf, 0x6463_656c);
+    if (bytes.len < 8) return;
+    const Cell = graph.dissection_cells.Cell;
+    const nodes = std.mem.readInt(u32, bytes[0..4], .little);
+    const cold = std.mem.readInt(u32, bytes[4..8], .little);
+    const body = bytes[8..];
+    const cells: []const Cell = @alignCast(std.mem.bytesAsSlice(Cell, body[0 .. body.len - body.len % @sizeOf(Cell)]));
+    const records: ?usize = if (cold == std.math.maxInt(u32)) null else cold;
+    graph.dissection_cells.verify(cells, nodes, records, .none) catch return;
+    // A table that verifies covers every node exactly once.
+    var covered: u64 = 0;
+    for (cells) |cell| {
+        try std.testing.expect(cell.begin < cell.end and cell.end <= nodes);
+        covered += if (cell.isLeaf()) cell.end - cell.begin else cell.end - cell.separator_begin;
+    }
+    try std.testing.expectEqual(@as(u64, nodes), covered);
+}
+
+test "fuzz dissection-cells" {
+    var state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer state.deinit();
+    const a = state.allocator();
+    const Cell = graph.dissection_cells.Cell;
+    const tree = [_]Cell{
+        .{ .begin = 0, .separator_begin = 6, .end = 7, .left = 1, .right = 2, .subtree_end = 5, .cold_separator = 5, .cold_end = 6 },
+        .{ .begin = 0, .separator_begin = 2, .end = 2, .subtree_end = 2, .cold_separator = 1, .cold_end = 1 },
+        .{ .begin = 2, .separator_begin = 5, .end = 6, .left = 3, .right = 4, .subtree_end = 5, .cold_begin = 1, .cold_separator = 4, .cold_end = 5 },
+        .{ .begin = 2, .separator_begin = 3, .end = 3, .subtree_end = 4, .cold_begin = 1, .cold_separator = 2, .cold_end = 2 },
+        .{ .begin = 3, .separator_begin = 5, .end = 5, .subtree_end = 5, .cold_begin = 2, .cold_separator = 4, .cold_end = 4 },
+    };
+    const leaf = [_]Cell{.{ .begin = 0, .separator_begin = 3, .end = 3, .subtree_end = 1 }};
+    const tree_seed = try std.mem.concat(a, u8, &.{ &.{ 7, 0, 0, 0, 6, 0, 0, 0 }, std.mem.sliceAsBytes(&tree) });
+    const leaf_seed = try std.mem.concat(a, u8, &.{ &.{ 3, 0, 0, 0, 0xff, 0xff, 0xff, 0xff }, std.mem.sliceAsBytes(&leaf) });
+    try std.testing.fuzz({}, fuzzDissectionCells, .{ .corpus = try seeds(a, &.{ "", tree_seed, leaf_seed, tree_seed[0 .. tree_seed.len - 1] }) });
 }
 
 const traffic = routing.traffic.live;
