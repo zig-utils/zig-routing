@@ -110,6 +110,15 @@ const Inputs = struct {
             @intFromBool(self.allow_alt_name),
             @intFromBool(self.use_direction_on_ways),
         });
+        if (self.order == .nested_dissection) {
+            // Partition settings change the order, so they name the dataset.
+            // Other orders keep their identity.
+            const settings: @import("order.zig").Ordering = .{ .kind = self.order };
+            hash.update("nested-dissection-v1");
+            hash.update(std.mem.asBytes(&settings.leaf_edges));
+            hash.update(&.{settings.max_side_percent});
+            hash.update(std.mem.asBytes(&settings.max_link_gap));
+        }
         if (self.dem_digest) |digest| {
             hash.update("dem-bytes-v1");
             hash.update(&digest);

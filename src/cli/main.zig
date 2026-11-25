@@ -112,7 +112,7 @@ fn createCommands(a: Allocator) !*Command {
         option("pbf-buffer-bytes", "Cap decoded PBF buffers (default 512 MiB)", .int),
         option("from", "First stage to run (default read)", .string),
         option("to", "Last stage to run (default finalize)", .string),
-        option("order", "Dense node ordering (hilbert or encounter)", .string),
+        option("order", "Dense node ordering (hilbert, encounter or nested_dissection)", .string),
         option("drive-side", "Default driving side (right or left)", .string),
     }, &.{arg("OSM_PBF", "Source OSM PBF files").withRequired(false).withVariadic(true)});
     _ = try command(root, "route", "Run one request in process", route, &.{
@@ -598,11 +598,10 @@ fn buildGraph(ctx: *Context) !u8 {
         return badOption(ctx, "unknown --from stage");
     const to = std.meta.stringToEnum(driver.Stage, ctx.getOption("to") orelse "finalize") orelse
         return badOption(ctx, "unknown --to stage");
-    const order = if (ctx.getOption("order")) |text| switch (std.meta.stringToEnum(routing.graph.format.OrderingKind, text) orelse
-        return badOption(ctx, "--order expects hilbert or encounter")) {
-        .nested_dissection => return badOption(ctx, "--order expects hilbert or encounter"),
-        else => |kind| kind,
-    } else null;
+    const order = if (ctx.getOption("order")) |text|
+        std.meta.stringToEnum(routing.graph.format.OrderingKind, text) orelse return badOption(ctx, "--order expects hilbert, encounter or nested_dissection")
+    else
+        null;
     const side = if (ctx.getOption("drive-side")) |text|
         std.meta.stringToEnum(routing.build.edge_class.DriveSide, text) orelse return badOption(ctx, "--drive-side expects right or left")
     else
