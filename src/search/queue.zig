@@ -3,8 +3,10 @@
 const std = @import("std");
 
 pub const Entry = extern struct {
-    key: u32,
+    // The label sits below the key, so on little-endian targets the rank is
+    // the entry's own 8 bytes and the heap compares it with one plain load.
     label: u32,
+    key: u32,
 
     pub fn init(priority: f32, label: u32) Entry {
         std.debug.assert(!std.math.isNan(priority) and priority >= 0);
@@ -24,7 +26,7 @@ pub const Entry = extern struct {
 
 comptime {
     std.debug.assert(@sizeOf(Entry) == 8);
-    std.debug.assert(@offsetOf(Entry, "key") == 0 and @offsetOf(Entry, "label") == 4);
+    std.debug.assert(@offsetOf(Entry, "label") == 0 and @offsetOf(Entry, "key") == 4);
 }
 
 /// Four-way min-heap ordered by (key, label). Search pushes unique pairs, so
@@ -328,6 +330,13 @@ fn Radix(comptime include_ties: bool, comptime track_replacements: bool) type {
             self.redistributing = null;
         }
     };
+}
+
+test "entry rank is its little-endian memory image" {
+    const entry = Entry.init(2.5, 0x8000_0001);
+    const image = std.mem.readInt(u64, std.mem.asBytes(&entry), .little);
+    try std.testing.expectEqual(entry.rank(), image);
+    try std.testing.expect(Entry.init(1, std.math.maxInt(u32)).less(Entry.init(1.0000001, 0)));
 }
 
 test "four-way heap handles ties and sparse final child groups" {
