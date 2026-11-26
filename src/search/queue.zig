@@ -30,6 +30,10 @@ comptime {
 /// Four-way min-heap ordered by (key, label). Search pushes unique pairs, so
 /// any correct heap pops the same sequence there.
 pub const Heap = struct {
+    /// Search marks a replaced label in place, so a pop skips its stale
+    /// entry from the label it already reads instead of its status slot.
+    pub const label_activity = true;
+
     items: std.ArrayList(Entry) = .empty,
 
     pub fn push(self: *Heap, arena: std.mem.Allocator, entry: Entry) !void {

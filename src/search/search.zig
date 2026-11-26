@@ -1466,7 +1466,7 @@ pub fn Search(comptime K: type, comptime Q: type) type {
             return tracker.aliases.get(Restrictions.aliasKey(edge, context, closure)) orelse .{};
         }
 
-        fn offer(self: *Self, pool: *Pool, labels: *std.ArrayList(Label), pending: *Q, potential: anytype, target: ?NodeId, head: NodeId, status: Status, tracker: anytype, context: TurnContext, label: Label, seed_slot: anytype, comptime distance_only: bool, floor: f32, observer: anytype) !void {
+        inline fn offer(self: *Self, pool: *Pool, labels: *std.ArrayList(Label), pending: *Q, potential: anytype, target: ?NodeId, head: NodeId, status: Status, tracker: anytype, context: TurnContext, label: Label, seed_slot: anytype, comptime distance_only: bool, floor: f32, observer: anytype) !void {
             const use_time = @TypeOf(tracker) != @TypeOf(null) and tracker.keep_time;
             const pareto = if (distance_only and @TypeOf(tracker) != @TypeOf(null)) tracker.pareto else false;
             var key: Restrictions.AliasKey = if (use_time) Restrictions.timedKey(label, context) else undefined;
@@ -1690,6 +1690,77 @@ test "a running sweep polls the atomic cancel flag and clears its pages" {
     arena.reset();
     const after_cancel = try expansion.expand(&arena, kernel, .{ .origins = &.{start}, .limit = 7 }, {}, .{ .cancel = &cancelled });
     try t.expectEqual(7, after_cancel.settled);
+}
+
+test "a cheaper later offer retires the earlier queue entry of its edge" {
+    const t = std.testing;
+    // 0 -> 1 directly, or 0 -> 2 -> 1. Turning from 0 -> 1 onto 1 -> 3
+    // costs 10, so the later arrival through 2 replaces the first offer
+    // of 1 -> 3, and the search must pop and skip that stale entry.
+    const Kernel = struct {
+        pub fn edgeCost(_: @This(), _: *const View, _: EdgeId, _: *const EdgeHot, _: Direction) !costing.Cost {
+            return .{ .cost = 1, .secs = 1 };
+        }
+
+        pub fn turnCost(_: @This(), _: *const View, movement: Transition, _: Label, _: Direction) !costing.Cost {
+            const slow = @backingInt(movement.incoming) == 0 and @backingInt(movement.outgoing) == 4;
+            return if (slow) .{ .cost = 10, .secs = 10 } else .{};
+        }
+    };
+    const Spec = struct { head: u32, local: u5, opp: u5 };
+    const specs = [_]Spec{
+        .{ .head = 1, .local = 0, .opp = 0 }, .{ .head = 2, .local = 1, .opp = 0 },
+        .{ .head = 0, .local = 0, .opp = 0 }, .{ .head = 2, .local = 1, .opp = 1 },
+        .{ .head = 3, .local = 2, .opp = 0 }, .{ .head = 0, .local = 0, .opp = 1 },
+        .{ .head = 1, .local = 1, .opp = 1 }, .{ .head = 1, .local = 0, .opp = 2 },
+    };
+    var edges: [specs.len]EdgeHot = undefined;
+    for (specs, &edges) |spec, *edge| edge.* = .{
+        .head = spec.head,
+        .geom = .{ .len_m = 1, .grade = 6, .curvature = 0 },
+        .cls = .{ .class_id = 0, .local = spec.local, .opp_local = spec.opp, .cold_checks = 0, .pred_speed = 0 },
+        .speed = @splat(0),
+    };
+    var nodes: [4]graph.format.NodeHot = undefined;
+    for (&nodes, [_]u32{ 0, 4, 13, 17 }) |*node, turn_off| {
+        node.* = .{ .turn_off = turn_off, .attr = .{ .access = 0xfff, .type = 0, .density = 0, .signal = 0 } };
+    }
+    const first = [_]u32{ 0, 2, 5, 7, 8 };
+    const turns: [18]graph.format.TurnEntry = @splat(0);
+    const view: View = .{
+        .headers = .initFill(null),
+        .dataset_uuid = @splat(0),
+        .nodes = &nodes,
+        .edges = &edges,
+        .first_edge = &first,
+        .turns = &turns,
+        .classes = null,
+        .coordinates = null,
+        .cold_idx = null,
+        .cold = null,
+        .cold_data = null,
+        .slopes = null,
+        .spatial = null,
+        .spatial_index = null,
+        .metadata = null,
+        .components = null,
+        .turn_sides = null,
+        .turn_side_index = null,
+    };
+    var engine = try Search(Kernel, queue.Heap).init(t.allocator, &view);
+    defer engine.deinit();
+    var arena = memory.Arena.init(t.allocator, .{});
+    defer arena.deinit();
+    const origin: NodeId = @fromBackingInt(@as(u32, 0));
+    const stats = try engine.sweep(&arena, .{}, origin, .forward, 100, .{});
+    try t.expectEqual(edges.len, stats.settled);
+    try t.expectEqual(edges.len + 1, stats.popped);
+    arena.reset();
+    const route = try engine.run(&arena, .{}, .{ .origin = origin, .destination = @fromBackingInt(@as(u32, 3)) }, Zero{}, .{});
+    const end = route.labels[route.index];
+    try t.expectEqual(4, end.edge);
+    try t.expectEqual(3, end.cost);
+    try t.expectEqual(6, route.labels[end.pred].edge);
 }
 
 test "L2 remains admissible when sub-ULP edge costs round away" {

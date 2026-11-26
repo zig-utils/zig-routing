@@ -36,14 +36,18 @@ pub fn EdgeStatus(comptime T: type) type {
             return page[id & (per_page - 1)];
         }
 
-        pub fn at(self: *Self, pool: *Pool, id: u32) !*T {
-            const index = id >> page_shift;
-            const slot = &self.slots[index];
-            if (slot.* == null) {
-                try self.touched.append(pool.arena.allocator(), index);
-                slot.* = @ptrCast(try pool.get());
-            }
-            return &slot.*.?[id & (per_page - 1)];
+        /// Inline so the search loop pays one directory load and a branch.
+        /// Only the first write to a page leaves it.
+        pub inline fn at(self: *Self, pool: *Pool, id: u32) !*T {
+            const page = self.slots[id >> page_shift] orelse try self.touch(pool, id >> page_shift);
+            return &page[id & (per_page - 1)];
+        }
+
+        noinline fn touch(self: *Self, pool: *Pool, index: u32) !*align(64) Page {
+            try self.touched.append(pool.arena.allocator(), index);
+            const page: *align(64) Page = @ptrCast(try pool.get());
+            self.slots[index] = page;
+            return page;
         }
 
         pub fn clear(self: *Self) void {
