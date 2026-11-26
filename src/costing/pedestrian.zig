@@ -275,6 +275,14 @@ pub const Turn = struct {
     sides: graph.turn_sides.Sides = .{},
     levels: u32 = 1,
 
+    fn levelCount(self: Turn) error{}!u32 {
+        return self.levels;
+    }
+
+    fn crossingSides(self: Turn) error{}!graph.turn_sides.Sides {
+        return self.sides;
+    }
+
     /// Uses the incoming opposing local even during reverse traversal.
     pub fn read(view: *const graph.reader.View, node: graph.format.NodeId, incoming: graph.format.EdgeId, outgoing: graph.format.EdgeId) !Turn {
         return fromIntersection(view, try view.node(node), incoming, outgoing, try base.IntersectionTurn.read(view, node, incoming, outgoing));
@@ -299,6 +307,29 @@ pub const Turn = struct {
     }
 };
 
+/// A turn at a node read from its turn row, with the crossing sides and
+/// elevator levels left to be read when the cost needs them.
+pub const RowTurn = struct {
+    view: *const graph.reader.View,
+    node: graph.format.NodeId,
+    degree: u32,
+    incoming: graph.format.EdgeId,
+    outgoing: graph.format.EdgeId,
+    from: u5,
+    to: u5,
+    row: graph.format.TurnEntry,
+    /// Sides already known to the caller, such as a compact movement's.
+    sides: ?graph.turn_sides.Sides = null,
+
+    fn levelCount(self: RowTurn) !u32 {
+        return elevatorLevels(self.view, self.incoming, self.outgoing);
+    }
+
+    fn crossingSides(self: RowTurn) !graph.turn_sides.Sides {
+        return self.sides orelse self.view.turnSidesAtDegree(self.node, self.degree, self.from, self.to);
+    }
+};
+
 noinline fn elevatorLevels(view: *const graph.reader.View, incoming: graph.format.EdgeId, outgoing: graph.format.EdgeId) !u32 {
     if (view.cold_data == null) return 1;
     const entry = (try view.coldRecord(incoming)).indoor.levels;
@@ -314,7 +345,19 @@ pub const Kernel = struct {
     /// PedestrianCost::Allowed in forward travel order. Conditional access
     /// restrictions live in the graph's cold policy for the search.
     pub fn allowed(profile: *const Profile, previous: *const EdgeClass, next: *const EdgeClass, edge: EdgeHot, check: PathCheck) bool {
-        return allowedPath(profile, previous, next, next, check) and
+        return allowedForward(profile, previous, next, edge, check, true);
+    }
+
+    /// allowed() for a caller that prices every admitted edge with edgeCost
+    /// and drops it when the cost is forbidden. Without request-local edge
+    /// admission, the class factor is infinite exactly when
+    /// pathClassAllowed(next) fails, so edgeCost repeats that check.
+    pub fn allowedPriced(profile: *const Profile, previous: *const EdgeClass, next: *const EdgeClass, edge: EdgeHot, check: PathCheck) bool {
+        return allowedForward(profile, previous, next, edge, check, profile.may_allow_edges);
+    }
+
+    inline fn allowedForward(profile: *const Profile, previous: *const EdgeClass, next: *const EdgeClass, edge: EdgeHot, check: PathCheck, check_class: bool) bool {
+        return allowedPathWith(profile, previous, next, next, check, check_class) and
             (check.allowed_by_linear_feature or profile.allow_transit_connections or
                 @as(u64, check.previous_distance) + edge.geom.len_m <= profile.max_distance);
     }
@@ -326,10 +369,14 @@ pub const Kernel = struct {
     }
 
     fn allowedPath(profile: *const Profile, incoming: *const EdgeClass, outgoing: *const EdgeClass, candidate: *const EdgeClass, check: PathCheck) bool {
+        return allowedPathWith(profile, incoming, outgoing, candidate, check, true);
+    }
+
+    inline fn allowedPathWith(profile: *const Profile, incoming: *const EdgeClass, outgoing: *const EdgeClass, candidate: *const EdgeClass, check: PathCheck, check_class: bool) bool {
         if (check.allowed_by_linear_feature) return true;
         return !check.shortcut and !check.avoided and !check.restricted and
             !(check.backtrack and !check.previous_dead_end and check.previous_pedestrian) and
-            profile.pathClassAllowed(candidate) and profile.permission.allowedExclusions(incoming, outgoing);
+            (!check_class or profile.pathClassAllowed(candidate)) and profile.permission.allowedExclusions(incoming, outgoing);
     }
 
     /// PedestrianCost::EdgeCost. The caller supplies the resolved ferry
@@ -371,15 +418,31 @@ pub const Kernel = struct {
     /// the same turn in travel order. Reverse search passes the opposed
     /// edges in travel order and supplies the same incoming/outgoing row.
     pub fn turnCost(profile: *const Profile, node: *const NodeHot, incoming: *const EdgeClass, outgoing: *const EdgeClass, turn: Turn) Cost {
+        return turnCostFrom(profile, node, incoming, outgoing, turn.base_turn, turn) catch |err| switch (err) {};
+    }
+
+    /// turnCost for a turn read from the node's row. The crossing sides and
+    /// elevator levels are read only when the cost depends on them.
+    pub fn turnCostRow(profile: *const Profile, node: *const NodeHot, incoming: *const EdgeClass, outgoing: *const EdgeClass, turn: RowTurn) !Cost {
+        return turnCostFrom(profile, node, incoming, outgoing, .{ .row = turn.row }, turn);
+    }
+
+    /// `source` supplies levelCount() and crossingSides() on demand.
+    inline fn turnCostFrom(profile: *const Profile, node: *const NodeHot, incoming: *const EdgeClass, outgoing: *const EdgeClass, base_turn: base.Turn, source: anytype) !Cost {
         if (isUse(outgoing, .steps) or isUse(outgoing, .ladder)) return .{ .cost = profile.step_penalty };
         if (isUse(outgoing, .elevator)) return .{ .cost = profile.elevator_penalty };
         if (node.attr.type == @backingInt(graph.constants.NodeType.elevator))
-            return .{ .cost = profile.elevator_penalty * @as(f32, @floatFromInt(turn.levels)) };
-        var cost = profile.shared.modeTransition(true, node, incoming, outgoing, turn.base_turn);
-        if (turn.sides.left and turn.sides.right) {
-            const seconds = turn.base_turn.stopSeconds(&crossing_costs);
-            cost.secs += seconds;
-            if (!profile.shared.shortest) cost.cost += seconds;
+            return .{ .cost = profile.elevator_penalty * @as(f32, @floatFromInt(try source.levelCount())) };
+        var cost = profile.shared.modeTransition(true, node, incoming, outgoing, base_turn);
+        // Crossing costs are never negative, so adding a zero leaves the
+        // cost unchanged and the sides need not be read.
+        const seconds = base_turn.stopSeconds(&crossing_costs);
+        if (seconds != 0) {
+            const sides = try source.crossingSides();
+            if (sides.left and sides.right) {
+                cost.secs += seconds;
+                if (!profile.shared.shortest) cost.cost += seconds;
+            }
         }
         return cost;
     }
@@ -635,4 +698,57 @@ test "pedestrian snapping and path expansion preserve their different access che
     try t.expect(!Kernel.allowedReverse(&profile, &from, &to, .{}));
     try t.expect(Kernel.allowedReverse(&profile, &to, &from, .{}));
     try t.expect(Kernel.allowed(&profile, &from, &to, edge, .{ .allowed_by_linear_feature = true, .avoided = true }));
+}
+
+test "priced admission leaves the class check to the infinite class factor" {
+    const t = std.testing;
+    var arena_state: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var warnings: std.ArrayList(base.Warning) = .empty;
+    var classes = [_]EdgeClass{
+        testClass(.road),    testClass(.footway), testClass(.ferry), testClass(.transit_connection),
+        testClass(.road),    testClass(.road),    testClass(.road),  testClass(.construction),
+        testClass(.footway),
+    };
+    classes[4].access.forward = 0;
+    classes[4].access.reverse = @bitCast(@as(graph.constants.AccessMask, .{ .pedestrian = true }));
+    classes[5].category.surface = @backingInt(Surface.path);
+    classes[6].category.sac_scale = 3;
+    classes[7].access.forward = 0;
+    classes[8].flags.bridge = true;
+    const bodies = [_][]const u8{
+        "{}",
+        \\{"type":"wheelchair"}
+        ,
+        \\{"type":"blind","max_hiking_difficulty":6,"ignore_oneways":true}
+        ,
+        \\{"ignore_access":true,"ignore_construction":true,"exclude_bridges":true}
+        ,
+        \\{"shortest":true,"ignore_oneways":true}
+        ,
+    };
+    for (bodies) |body| {
+        const options = try parse(arena, try json.parse(arena, body), &warnings, .none);
+        var cache: Cache = try .init(t.allocator, &classes, 1);
+        defer cache.deinit();
+        var lease = try cache.acquire(options, .none);
+        defer lease.release();
+        const profile = lease.profile();
+        try t.expect(!profile.may_allow_edges);
+        var rejected: usize = 0;
+        for (&classes, 0..) |*next, id| {
+            const admitted = profile.pathClassAllowed(next);
+            if (!admitted) rejected += 1;
+            try t.expectEqual(!admitted, lease.tables().factor(@intCast(id)) == inf);
+            const edge = testEdge(@intCast(id), 40, 6);
+            if (!admitted) try t.expectEqual(Cost.forbidden, Kernel.edgeCost(profile, lease.tables(), next, edge, 0, .{}));
+            for (&classes) |*previous| {
+                for ([_]PathCheck{ .{}, .{ .backtrack = true }, .{ .previous_distance = 99_990 } }) |check| {
+                    try t.expectEqual(Kernel.allowed(profile, previous, next, edge, check), Kernel.allowedPriced(profile, previous, next, edge, check) and admitted);
+                }
+            }
+        }
+        try t.expect(rejected > 0);
+    }
 }

@@ -4169,6 +4169,52 @@ test "leased compiled classes drive graph-based snapping and the cold permission
     try testing.expect(!costing.Kernel.slowAllowed(lease.tables(), view, bc, Cold{}));
 }
 
+/// The row-read pedestrian turn cost, which reads crossing sides and
+/// elevator levels only when needed, must match the eager turn at every
+/// movement through the node. Every class the profile rejects must also
+/// carry an infinite factor, which lets allowedPriced skip that check.
+fn expectPedestrianRowTurns(view: *const routing.graph.reader.View, profile: *const routing.costing.pedestrian.Profile, tables: *const routing.costing.compiled.Compiled, node: routing.graph.format.NodeId) !void {
+    const pedestrian = routing.costing.pedestrian;
+    const record = try view.node(node);
+    const range = try view.outEdgeRange(node);
+    const degree = range.count();
+    var checked: usize = 0;
+    for (0..degree) |from_local| {
+        const incoming = try view.opposingId(&view.edges[range.first + from_local]);
+        const incoming_edge = try view.edge(incoming);
+        const row = try view.turnRowAt(record, degree, incoming_edge.cls.opp_local);
+        for (0..degree) |to_local| {
+            const outgoing: routing.graph.format.EdgeId = @fromBackingInt(@as(u32, @intCast(range.first + to_local)));
+            const outgoing_edge = try view.edge(outgoing);
+            const from = try view.class(incoming_edge.cls.class_id);
+            const to = try view.class(outgoing_edge.cls.class_id);
+            const eager = pedestrian.Kernel.turnCost(profile, record, from, to, try pedestrian.Turn.read(view, node, incoming, outgoing));
+            const lazy = try pedestrian.Kernel.turnCostRow(profile, record, from, to, .{
+                .view = view,
+                .node = node,
+                .degree = degree,
+                .incoming = incoming,
+                .outgoing = outgoing,
+                .from = incoming_edge.cls.opp_local,
+                .to = outgoing_edge.cls.local,
+                .row = row[outgoing_edge.cls.local],
+            });
+            try testing.expectEqual(@as(u32, @bitCast(eager.cost)), @as(u32, @bitCast(lazy.cost)));
+            try testing.expectEqual(@as(u32, @bitCast(eager.secs)), @as(u32, @bitCast(lazy.secs)));
+            const check: pedestrian.PathCheck = .{ .backtrack = from_local == to_local };
+            const priced = pedestrian.Kernel.allowedPriced(profile, from, to, outgoing_edge.*, check);
+            const full = pedestrian.Kernel.allowed(profile, from, to, outgoing_edge.*, check);
+            try testing.expectEqual(full, priced and profile.pathClassAllowed(to));
+            if (!profile.pathClassAllowed(to)) try testing.expectEqual(Cost.forbidden, pedestrian.Kernel.edgeCost(profile, tables, to, outgoing_edge.*, 0, .{}));
+            checked += 1;
+        }
+    }
+    try testing.expect(checked > 0);
+    for (view.classes.?, 0..) |*class, id| {
+        if (!profile.pathClassAllowed(class)) try testing.expectEqual(std.math.inf(f32), tables.factor(@intCast(id)));
+    }
+}
+
 test "pedestrian and bicycle turns use assembled crossing and elevator metadata" {
     const pedestrian = routing.costing.pedestrian;
     const bicycle = routing.costing.bicycle;
@@ -4208,6 +4254,7 @@ test "pedestrian and bicycle turns use assembled crossing and elevator metadata"
     var lease = try cache.acquire(options, .none);
     defer lease.release();
     const crossing = pedestrian.Kernel.turnCost(lease.profile(), try view.node(x), from, to, turn);
+    for (0..view.nodes.len) |node| try expectPedestrianRowTurns(view, lease.profile(), lease.tables(), @fromBackingInt(@as(u32, @intCast(node))));
     try testing.expectEqual(@as(f32, 5), crossing.secs);
     try testing.expectEqual(@as(f32, 5), crossing.cost);
     try testing.expect(pedestrian.Kernel.allowed(lease.profile(), from, to, (try view.edge(out)).*, .{}));
@@ -4235,6 +4282,11 @@ test "pedestrian and bicycle turns use assembled crossing and elevator metadata"
     const exit = try directedBetween(lift_view, &elevator, "K", "B");
     const elevator_turn = try pedestrian.Turn.read(lift_view, k, entry, exit);
     try testing.expectEqual(3, elevator_turn.levels);
+    var lift_cache = try pedestrian.Cache.init(testing.allocator, lift_view.classes.?, 1);
+    defer lift_cache.deinit();
+    var lift_lease = try lift_cache.acquire(options, .none);
+    defer lift_lease.release();
+    for (0..lift_view.nodes.len) |node| try expectPedestrianRowTurns(lift_view, lift_lease.profile(), lift_lease.tables(), @fromBackingInt(@as(u32, @intCast(node))));
     const elevator_cost = pedestrian.Kernel.turnCost(lease.profile(), try lift_view.node(k), from, to, elevator_turn);
     try testing.expectEqual(@as(f32, 15), elevator_cost.cost);
     try testing.expectEqual(@as(f32, 0), elevator_cost.secs);

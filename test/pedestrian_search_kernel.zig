@@ -42,7 +42,7 @@ pub const Foot = struct {
             .backtrack = movement.incoming_edge.cls.opp_local == movement.outgoing_edge.cls.local,
         };
         return if (direction == .forward)
-            pedestrian.Kernel.allowed(self.profile, from, to, movement.outgoing_edge.*, check)
+            pedestrian.Kernel.allowedPriced(self.profile, from, to, movement.outgoing_edge.*, check)
         else
             pedestrian.Kernel.allowedReverse(self.profile, from, to, check);
     }
@@ -51,13 +51,16 @@ pub const Foot = struct {
         const from = try movement.incomingClass(view);
         const to = try movement.outgoingClass(view);
         const node = try movement.nodeRecord(view);
-        const turn = if (movement.compact_movement) |cached|
-            try pedestrian.Turn.fromIntersection(view, node, movement.incoming, movement.outgoing, .{
-                .base_turn = .{ .row = cached.row },
-                .sides = cached.sides,
-            })
-        else
-            try pedestrian.Turn.fromRow(view, movement.node, node, (try movement.edgeRange(view)).count(), movement.incoming, movement.outgoing, movement.incoming_edge.cls.opp_local, movement.outgoing_edge.cls.local, movement.row);
-        return pedestrian.Kernel.turnCost(self.profile, node, from, to, turn);
+        return pedestrian.Kernel.turnCostRow(self.profile, node, from, to, .{
+            .view = view,
+            .node = movement.node,
+            .degree = if (movement.compact_movement == null) (try movement.edgeRange(view)).count() else 0,
+            .incoming = movement.incoming,
+            .outgoing = movement.outgoing,
+            .from = movement.incoming_edge.cls.opp_local,
+            .to = movement.outgoing_edge.cls.local,
+            .row = if (movement.compact_movement) |cached| cached.row else movement.row,
+            .sides = if (movement.compact_movement) |cached| cached.sides else null,
+        });
     }
 };

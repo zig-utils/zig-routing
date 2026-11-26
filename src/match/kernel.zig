@@ -300,10 +300,17 @@ pub fn Active(comptime model: type) type {
             const degree = (try movement.edgeRange(view)).count();
             const from_local = movement.incoming_edge.cls.opp_local;
             const to_local = movement.outgoing_edge.cls.local;
-            const turn: model.Turn = if (model == costing.pedestrian)
-                try model.Turn.fromRow(view, movement.node, node, degree, movement.incoming, movement.outgoing, from_local, to_local, movement.row)
-            else
-                .{ .base_turn = .{ .row = movement.row }, .sides = try view.turnSidesAtDegree(movement.node, degree, from_local, to_local) };
+            if (model == costing.pedestrian) return model.Kernel.turnCostRow(self.profile, node, from, to, .{
+                .view = view,
+                .node = movement.node,
+                .degree = degree,
+                .incoming = movement.incoming,
+                .outgoing = movement.outgoing,
+                .from = from_local,
+                .to = to_local,
+                .row = movement.row,
+            });
+            const turn: model.Turn = .{ .base_turn = .{ .row = movement.row }, .sides = try view.turnSidesAtDegree(movement.node, degree, from_local, to_local) };
             return model.Kernel.turnCost(self.profile, node, from, to, turn);
         }
     };
