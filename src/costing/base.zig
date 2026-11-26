@@ -415,6 +415,28 @@ pub const Shared = struct {
     }
 
     pub fn modeTransition(self: *const Shared, comptime pedestrian: bool, node: *const NodeHot, previous: *const EdgeClass, next: *const EdgeClass, turn: Turn) Cost {
+        const use = next.category.use;
+        // Most transitions meet none of the node or use-change charges in
+        // chargedTransition. They take only the penalties that always apply,
+        // in the same order, so the sums are bit-identical.
+        const charged_nodes = comptime nodeMask(pedestrian);
+        const charged_uses = comptime useMask(&.{ .ferry, .rail_ferry, .alley, .living_street, .track, .service_road });
+        const plain = (charged_nodes >> node.attr.type) & 1 == 0 and
+            (previous.category.use == use or (charged_uses >> use) & 1 == 0) and
+            (pedestrian or !(next.flags.toll and !previous.flags.toll));
+        if (!plain) return self.chargedTransition(pedestrian, node, previous, next, turn);
+        var result: Cost = .{};
+        if (turn.entersDestinationOnly(previous, next)) result.cost += self.destination_only_penalty;
+        const transit = use == @backingInt(Use.egress_connection) or use == @backingInt(Use.platform_connection);
+        if (!next.flags.link and !turn.nameConsistent() and !(pedestrian and transit)) result.cost += self.maneuver_penalty;
+        if (self.shortest) result.cost = 0;
+        return result;
+    }
+
+    /// The full transition charge. modeTransition gives the same result
+    /// for every input and skips the node and use-change tests when none
+    /// can apply.
+    fn chargedTransition(self: *const Shared, comptime pedestrian: bool, node: *const NodeHot, previous: *const EdgeClass, next: *const EdgeClass, turn: Turn) Cost {
         const kind = node.attr.type;
         const node_type = graph.constants.NodeType;
         const use = next.category.use;
@@ -441,6 +463,22 @@ pub const Shared = struct {
         return result;
     }
 };
+
+fn nodeMask(comptime pedestrian: bool) u16 {
+    const node_type = graph.constants.NodeType;
+    var mask: u16 = 0;
+    for ([_]node_type{ .border_control, .gate, .bike_share }) |kind| mask |= @as(u16, 1) << @backingInt(kind);
+    if (!pedestrian) {
+        for ([_]node_type{ .bollard, .toll_booth }) |kind| mask |= @as(u16, 1) << @backingInt(kind);
+    }
+    return mask;
+}
+
+fn useMask(comptime uses: []const Use) u64 {
+    var mask: u64 = 0;
+    for (uses) |use| mask |= @as(u64, 1) << @backingInt(use);
+    return mask;
+}
 
 pub const density_factor = blk: {
     var table: [16]f32 = undefined;
@@ -938,4 +976,54 @@ test "shared transitions keep elapsed time separate from penalties and apply acc
     permission.flags.insert(.ignore_construction);
     try testing.expect(permission.accessibleClass(&other));
     try testing.expect(!permission.allowedClass(&other));
+}
+
+test "mode transitions skip only the charges that cannot apply" {
+    const testing = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var warnings: std.ArrayList(Warning) = .empty;
+    var common = Shared.init(try parse(a, .null, .{}, &warnings, .none));
+    // Distinct charges make a skipped or misordered term visible.
+    common.country_crossing = .{ .cost = 3, .secs = 5 };
+    common.gate = .{ .cost = 7, .secs = 11 };
+    common.private_access = .{ .cost = 13, .secs = 17 };
+    common.toll_booth = .{ .cost = 19, .secs = 23 };
+    common.ferry = .{ .cost = 29, .secs = 31 };
+    common.rail_ferry = .{ .cost = 37, .secs = 41 };
+    common.bike_share = .{ .cost = 43, .secs = 47 };
+    common.destination_only_penalty = 0.1;
+    common.maneuver_penalty = 0.3;
+    common.alley_penalty = 0.7;
+    common.living_streets.penalty = 1.1;
+    common.tracks.penalty = 1.3;
+    common.service_penalty = 1.7;
+    const others = [_]Use{ .road, .ferry, .service_road, .track };
+    for (0..16) |kind| for (0..64) |use| for (0..others.len + 1) |o| for (0..1024) |bits| {
+        const flag = struct {
+            fn at(value: usize, bit: u4) bool {
+                return value >> bit & 1 != 0;
+            }
+        }.at;
+        var node: NodeHot = .{ .turn_off = 0, .attr = .{ .access = 0, .type = @intCast(kind), .density = 0, .signal = 0 } };
+        node.attr.tagged_access = flag(bits, 0);
+        node.attr.private_access = flag(bits, 1);
+        var next: EdgeClass = .{ .category = .{ .use = @intCast(use) } };
+        var previous: EdgeClass = .{ .category = .{ .use = if (o == others.len) @intCast(use) else @intCast(@backingInt(others[o])) } };
+        next.flags.toll = flag(bits, 2);
+        previous.flags.toll = flag(bits, 3);
+        next.flags.link = flag(bits, 4);
+        next.flags.internal = flag(bits, 5);
+        next.flags.destination_only = flag(bits, 6);
+        previous.flags.destination_only = flag(bits, 7);
+        common.shortest = flag(bits, 8);
+        const turn: Turn = .{ .row = if (flag(bits, 9)) 0x40 else 0 };
+        inline for (.{ false, true }) |pedestrian| {
+            const fast = common.modeTransition(pedestrian, &node, &previous, &next, turn);
+            const full = common.chargedTransition(pedestrian, &node, &previous, &next, turn);
+            try testing.expectEqual(@as(u32, @bitCast(full.cost)), @as(u32, @bitCast(fast.cost)));
+            try testing.expectEqual(@as(u32, @bitCast(full.secs)), @as(u32, @bitCast(fast.secs)));
+        }
+    };
 }

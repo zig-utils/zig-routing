@@ -540,6 +540,16 @@ pub const Restrictions = struct {
         return self.advanceState(parent, previous, node, id, allowed);
     }
 
+    /// advanceKnown for a label with no restriction context at a node whose
+    /// simple restrictions cannot apply: only a complex restriction that
+    /// starts on the next edge can change the context.
+    inline fn advanceFresh(self: *const Restrictions, comptime direction: Direction, previous: Label, node: NodeId, id: EdgeId, class: *const EdgeClass, allowed: bool) !TurnContext {
+        std.debug.assert(self.access.direction == direction);
+        const start = if (direction == .forward) class.restrictions.start else class.restrictions.end;
+        if (class.flags.node_connector or start & self.modes == 0) return .{};
+        return self.advanceState(if (direction == .forward) automaton.forward_root else automaton.reverse_root, previous, node, id, allowed);
+    }
+
     noinline fn simpleBlocked(self: *const Restrictions, previous: EdgeId, next: EdgeId) bool {
         const modes = if (self.access.direction == .forward)
             self.access.view.turnRestrictionModes(previous, next)
@@ -987,6 +997,10 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                 };
                 const restrict = with_restrictions and tracker.hasRestrictions();
                 const restriction_predecessor: ?EdgeId = if (restrict) tracker.simplePredecessor(context, last, node) else null;
+                // Without a context or an applicable simple restriction, only
+                // a complex restriction starting on the next edge matters.
+                const fresh = restrict and restriction_predecessor == null and !context.present();
+                const fresh_states = fresh and tracker.states.len != 0;
                 const forward_row = if (direction == .forward and !compact_moves) try self.view.turnRowAt(node, exits.count(), geometry.cls.opp_local) else &.{};
                 const movement_offset = if (compact_moves) layout.node_offsets[@backingInt(at)] else 0;
                 for (self.view.edges[exits.first..exits.end], exits.first.., 0..) |*outward, index, local| {
@@ -1021,7 +1035,9 @@ pub fn Search(comptime K: type, comptime Q: type) type {
                     else {};
                     const cached_modes: ?u12 = if (compact_moves and restriction_predecessor == @as(?EdgeId, previous_id)) packed_move.prohibited_modes else null;
                     if (profiled) observer.expansionStage(.restrictions);
-                    const next_context: TurnContext = if (restrict)
+                    const next_context: TurnContext = if (fresh)
+                        if (fresh_states) try tracker.advanceFresh(direction, last, at, next_id, restrict_class.?, allowed) else .{}
+                    else if (restrict)
                         try tracker.advanceKnown(context, last, at, next_id, restrict_class.?, restriction_predecessor, allowed, cached_modes)
                     else
                         .{};
